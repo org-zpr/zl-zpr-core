@@ -2,7 +2,7 @@ name: Rust-node
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "zipline" ]
     paths:
       - 'libnode2/**'
       - '.github/workflows/libnode.yml'

@@ -14,7 +14,7 @@ aws-lc-rs = "1.17"
 capnp = { version = "0.26", features = ["sync_reader"] }
 capnp-futures = "0.26"
 capnp-rpc = "0.26"
-cbpf-rs = { git = "https://github.com/mkolehmainen/zl-zpr-utils.git", tag = "cbpf-rs-v0.2.0" }
+cbpf-rs = { git = "https://github.com/org-zpr/zl-zpr-utils.git", tag = "cbpf-rs-v0.2.0" }
 clap = { version = "4.5.23", features = ["derive"] }
 clap_complete = "4.5.57"
 ip4sum = "0.1.0"
@@ -27,9 +27,9 @@ tokio-util = { version = "0.7.17", features = ["rt", "compat"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.20"
 x509-cert = "0.3.0"
-zpr = { git = "https://github.com/mkolehmainen/zl-zpr-common.git", tag = "v0.30.1", features = ["vsapi", "policy"] }
-zpr-ext = { git = "https://github.com/mkolehmainen/zl-zpr-utils.git", tag = "zpr-ext-v0.6.1" }
-zpr-utils = { git = "https://github.com/mkolehmainen/zl-zpr-utils.git", tag = "zpr-utils-v0.2.3" }
+zpr = { git = "https://github.com/org-zpr/zl-zpr-common.git", tag = "v0.30.2", features = ["vsapi", "policy"] }
+zpr-ext = { git = "https://github.com/org-zpr/zl-zpr-utils.git", tag = "zpr-ext-v0.6.1" }
+zpr-utils = { git = "https://github.com/org-zpr/zl-zpr-utils.git", tag = "zpr-utils-v0.2.3" }
 
 [profile.release]
 panic = "abort"

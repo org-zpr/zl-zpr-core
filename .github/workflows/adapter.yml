@@ -140,14 +140,58 @@ jobs:
       no-default-features: true
     secrets: inherit
 
-  # Integration tests
-  basic-integration-test:
-    name: Run 1-Node Test (v6)
-    needs: [build-ph, build-ph-cli]
+  # Integration tests (zl-zipline#210)
+  #
+  # CI runs the same set of scripts as the local netns tier
+  # (`zpr-dev build --test netns`): every top-level
+  # integration-test/*-test.sh. The list is taken from that glob rather than
+  # written out here, so a new script runs in CI without a workflow change.
+  # zpr-dev's drift guard (tiers.rs, NETNS_SCRIPTS) uses the same glob.
+
+  # List the integration scripts, and run the helper-library self-check,
+  # which needs no built binaries.
+  list-integration-tests:
+    name: List integration tests
+    runs-on: ubuntu-latest
+    outputs:
+      scripts: ${{ steps.list.outputs.scripts }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Allow unprivileged user namespaces
+      # common_funcs_check.sh uses `unshare -r`, like the tests themselves;
+      # Ubuntu 24.04's AppArmor restriction would block that.
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    - name: Check common_funcs.sh
+      timeout-minutes: 5
+      run: integration-test/common_funcs_check.sh
+
+    - name: List *-test.sh scripts
+      id: list
+      run: |
+        # Fail closed: an empty matrix would report green with nothing run.
+        shopt -s nullglob
+        scripts=(integration-test/*-test.sh)
+        if [ ${#scripts[@]} -eq 0 ]; then
+          echo "no integration-test/*-test.sh scripts found" >&2
+          exit 1
+        fi
+        json=$(printf '%s\n' "${scripts[@]##*/}" | jq -R . | jq -sc .)
+        echo "scripts=$json" >> "$GITHUB_OUTPUT"
+        echo "$json"
+
+  # Run each integration script on its own runner, against the ph and ph-cli
+  # built above and the visa service release named by VISA_SERVICE_RELEASE.
+  integration-test:
+    name: Integration (${{ matrix.script }})
+    needs: [build-ph, build-ph-cli, list-integration-tests]
     strategy:
+      # One failing script must not cancel the others: report every failure.
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+        script: ${{ fromJSON(needs.list-integration-tests.outputs.scripts) }}
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
     # Necessary to run before rust-cache
@@ -175,7 +219,7 @@ jobs:
 
     - uses: actions/download-artifact@v8
       with:
-        pattern: ph-*${{ matrix.os }}
+        pattern: ph-*ubuntu-latest
         merge-multiple: true
 
     - name: Build
@@ -186,6 +230,8 @@ jobs:
         tar -xvf ph.tar
         tar -xvf ph-cli.tar
 
+    # The release carries vs, vs-admin and zpr-attr-server; extracting it into
+    # integration-test/ puts them where the scripts' default *_BIN paths look.
     - name: Download Asset
       uses: robinraju/release-downloader@v1
       with:
@@ -213,318 +259,9 @@ jobs:
       # Ubuntu 24.04's AppArmor restriction would block that.
       run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
-    - name: One Node v6 Test
-      timeout-minutes: 10
-      run: |
-        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-v6-test.sh
-
-  oidc-integration-test:
-    name: Run 1-Node OIDC Test
-    needs: [build-ph, build-ph-cli]
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-    - uses: actions/checkout@v7
-    # Necessary to run before rust-cache
-    - run: rustup toolchain install stable --profile minimal
-    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-      with:
-        workspaces: |
-          adapter/ph
-          adapter/cli
-          zpr-ext
-          cslab
-          cbpf-rs
-
-    # see <https://github.com/docker-library/golang/issues/452>
-    - name: Set workspace as safe
-      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-    - name: Setup Git credentials
-      timeout-minutes: 1
-      run: |
-        echo 'echo $ZPR_CICD_RO_TOKEN' > "$HOME/.git-askpass"
-        chmod +x "$HOME/.git-askpass"
-        echo "GIT_ASKPASS=$HOME/.git-askpass" >> "$GITHUB_ENV"
-        go env -w GOPRIVATE="github.com/org-zpr/*"
-
-    - uses: actions/download-artifact@v8
-      with:
-        pattern: ph-*${{ matrix.os }}
-        merge-multiple: true
-
-    - name: Build
-      timeout-minutes: 10
-      env:
-        ZPR_CICD_RO_TOKEN: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-      run: |
-        tar -xvf ph.tar
-        tar -xvf ph-cli.tar
-
-    - name: Download Asset
-      uses: robinraju/release-downloader@v1
-      with:
-        repository: 'org-zpr/zl-zpr-visaservice'
-        tag: ${{ env.VISA_SERVICE_RELEASE }}
-        fileName: 'release-linux-x86_64.tar.gz'
-        extract: true
-        out-file-path: 'integration-test'
-        token: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-
-    - name: Set env
-      run: |
-        echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
-
-    - name: Install valkey
-      timeout-minutes: 5
-      run: |
-        sudo apt-get update
-        sudo apt install -y valkey
-        sudo systemctl stop valkey-server
-        sudo systemctl disable valkey-server
-
-    - name: Allow unprivileged user namespaces
-      # The integration tests run inside `unshare -nr` instead of sudo;
-      # Ubuntu 24.04's AppArmor restriction would block that.
-      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-    - name: One Node OIDC Test
-      timeout-minutes: 10
-      run: |
-        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-oidc-test.sh
-
-  oidc-renewal-integration-test:
-    name: Run 1-Node OIDC Renewal Test
-    needs: [build-ph, build-ph-cli]
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-    - uses: actions/checkout@v7
-    # Necessary to run before rust-cache
-    - run: rustup toolchain install stable --profile minimal
-    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-      with:
-        workspaces: |
-          adapter/ph
-          adapter/cli
-          zpr-ext
-          cslab
-          cbpf-rs
-
-    # see <https://github.com/docker-library/golang/issues/452>
-    - name: Set workspace as safe
-      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-    - name: Setup Git credentials
-      timeout-minutes: 1
-      run: |
-        echo 'echo $ZPR_CICD_RO_TOKEN' > "$HOME/.git-askpass"
-        chmod +x "$HOME/.git-askpass"
-        echo "GIT_ASKPASS=$HOME/.git-askpass" >> "$GITHUB_ENV"
-        go env -w GOPRIVATE="github.com/org-zpr/*"
-
-    - uses: actions/download-artifact@v8
-      with:
-        pattern: ph-*${{ matrix.os }}
-        merge-multiple: true
-
-    - name: Build
-      timeout-minutes: 10
-      env:
-        ZPR_CICD_RO_TOKEN: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-      run: |
-        tar -xvf ph.tar
-        tar -xvf ph-cli.tar
-
-    - name: Download Asset
-      uses: robinraju/release-downloader@v1
-      with:
-        repository: 'org-zpr/zl-zpr-visaservice'
-        tag: ${{ env.VISA_SERVICE_RELEASE }}
-        fileName: 'release-linux-x86_64.tar.gz'
-        extract: true
-        out-file-path: 'integration-test'
-        token: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-
-    - name: Set env
-      run: |
-        echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
-
-    - name: Install valkey
-      timeout-minutes: 5
-      run: |
-        sudo apt-get update
-        sudo apt install -y valkey
-        sudo systemctl stop valkey-server
-        sudo systemctl disable valkey-server
-
-    - name: Allow unprivileged user namespaces
-      # The integration tests run inside `unshare -nr` instead of sudo;
-      # Ubuntu 24.04's AppArmor restriction would block that.
-      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-    - name: One Node OIDC Renewal Test
+    - name: Run ${{ matrix.script }}
+      # One limit for every script: the longest (OIDC renewal, policy
+      # reauth) needed 25 minutes as separate jobs.
       timeout-minutes: 25
       run: |
-        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-oidc-renewal-test.sh
-
-  # Policy-install re-authentication e2e (zipline#124): same harness shape as
-  # the OIDC renewal job above. Dormant on this fork (Actions disabled); the
-  # netns/Docker run quoted in the PR is the gate here.
-  policy-reauth-integration-test:
-    name: Run 1-Node Policy Reauth Test
-    needs: [build-ph, build-ph-cli]
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-    - uses: actions/checkout@v7
-    # Necessary to run before rust-cache
-    - run: rustup toolchain install stable --profile minimal
-    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-      with:
-        workspaces: |
-          adapter/ph
-          adapter/cli
-          zpr-ext
-          cslab
-          cbpf-rs
-
-    # see <https://github.com/docker-library/golang/issues/452>
-    - name: Set workspace as safe
-      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-    - name: Setup Git credentials
-      timeout-minutes: 1
-      run: |
-        echo 'echo $ZPR_CICD_RO_TOKEN' > "$HOME/.git-askpass"
-        chmod +x "$HOME/.git-askpass"
-        echo "GIT_ASKPASS=$HOME/.git-askpass" >> "$GITHUB_ENV"
-        go env -w GOPRIVATE="github.com/org-zpr/*"
-
-    - uses: actions/download-artifact@v8
-      with:
-        pattern: ph-*${{ matrix.os }}
-        merge-multiple: true
-
-    - name: Build
-      timeout-minutes: 10
-      env:
-        ZPR_CICD_RO_TOKEN: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-      run: |
-        tar -xvf ph.tar
-        tar -xvf ph-cli.tar
-
-    - name: Download Asset
-      uses: robinraju/release-downloader@v1
-      with:
-        repository: 'org-zpr/zl-zpr-visaservice'
-        tag: ${{ env.VISA_SERVICE_RELEASE }}
-        fileName: 'release-linux-x86_64.tar.gz'
-        extract: true
-        out-file-path: 'integration-test'
-        token: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-
-    - name: Set env
-      run: |
-        echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
-
-    - name: Install valkey
-      timeout-minutes: 5
-      run: |
-        sudo apt-get update
-        sudo apt install -y valkey
-        sudo systemctl stop valkey-server
-        sudo systemctl disable valkey-server
-
-    - name: Allow unprivileged user namespaces
-      # The integration tests run inside `unshare -nr` instead of sudo;
-      # Ubuntu 24.04's AppArmor restriction would block that.
-      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-    - name: One Node Policy Reauth Test
-      timeout-minutes: 25
-      run: |
-        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/one-node-policy-reauth-test.sh
-
-  capture-integration-test:
-    name: Run Capture Test
-    needs: [build-ph, build-ph-cli]
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-    - uses: actions/checkout@v7
-    # Necessary to run before rust-cache
-    - run: rustup toolchain install stable --profile minimal
-    - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-      with:
-        workspaces: |
-          adapter/ph
-          adapter/cli
-          zpr-ext
-          cslab
-          cbpf-rs
-
-    # see <https://github.com/docker-library/golang/issues/452>
-    - name: Set workspace as safe
-      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-    - name: Setup Git credentials
-      timeout-minutes: 1
-      run: |
-        echo 'echo $ZPR_CICD_RO_TOKEN' > "$HOME/.git-askpass"
-        chmod +x "$HOME/.git-askpass"
-        echo "GIT_ASKPASS=$HOME/.git-askpass" >> "$GITHUB_ENV"
-        go env -w GOPRIVATE="github.com/org-zpr/*"
-
-    - uses: actions/download-artifact@v8
-      with:
-        pattern: ph-*${{ matrix.os }}
-        merge-multiple: true
-
-    - name: Build
-      timeout-minutes: 10
-      env:
-        ZPR_CICD_RO_TOKEN: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-      run: |
-        tar -xvf ph.tar
-        tar -xvf ph-cli.tar  
-
-    - name: Download Asset
-      uses: robinraju/release-downloader@v1
-      with:
-        repository: 'org-zpr/zl-zpr-visaservice'
-        tag: ${{ env.VISA_SERVICE_RELEASE }}
-        fileName: 'release-linux-x86_64.tar.gz'
-        extract: true
-        out-file-path: 'integration-test'
-        token: ${{ secrets.ZPR_CICD_RO_TOKEN }}
-
-    - name: Install valkey
-      timeout-minutes: 5
-      run: |
-        sudo apt-get update
-        sudo apt install -y valkey
-        sudo systemctl stop valkey-server
-        sudo systemctl disable valkey-server
-
-    - name: Set env
-      run: |
-        echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
-
-    - name: Allow unprivileged user namespaces
-      # The integration tests run inside `unshare -nr` instead of sudo;
-      # Ubuntu 24.04's AppArmor restriction would block that.
-      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-    - name: Capture Test
-      timeout-minutes: 10
-      run: |
-        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/capture-test.sh
+        ZPR_TEST_VERBOSE=1 VALKEY_SERVER_BIN=/usr/bin/valkey-server integration-test/${{ matrix.script }}

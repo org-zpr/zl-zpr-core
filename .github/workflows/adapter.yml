@@ -230,6 +230,20 @@ jobs:
         tar -xvf ph.tar
         tar -xvf ph-cli.tar
 
+    # a2a-pubkey-test.sh starts its node with
+    # --security-testing-mangle-forwarded-pings, which only an
+    # enable-security-testing build of ph accepts (zpr-dev's netns tier makes
+    # the same prep build). It overwrites target/debug/ph on this runner
+    # only; the uploaded ph artifact is never a security-testing build.
+    - name: Build security-testing ph
+      if: matrix.script == 'a2a-pubkey-test.sh'
+      timeout-minutes: 20
+      env:
+        ZPR_CICD_RO_TOKEN: ${{ secrets.ZPR_CICD_RO_TOKEN }}
+      run: |
+        sudo apt-get install -y capnproto
+        cargo build -p ph --features enable-security-testing
+
     # The release carries vs, vs-admin and zpr-attr-server; extracting it into
     # integration-test/ puts them where the scripts' default *_BIN paths look.
     - name: Download Asset

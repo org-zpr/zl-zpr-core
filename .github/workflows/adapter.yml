@@ -2,7 +2,7 @@ name: Rust-adapter
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "zipline" ]
     paths:
       - 'adapter/ph/**'
       - 'adapter/cli/**'

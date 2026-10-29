@@ -29,7 +29,7 @@
 #
 # No process is ever SIGSTOPped: an earlier forced round froze the VS adapter,
 # which cut the node's only path to the VS and left the launch wrappers stopped
-# so cleanup hung (https://github.com/mkolehmainen/zipline/issues/171).
+# so cleanup hung (https://github.com/org-zpr/zl-zipline/issues/171).
 set -euo pipefail
 
 export RUST_BACKTRACE=1

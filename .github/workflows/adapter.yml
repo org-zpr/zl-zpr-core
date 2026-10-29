@@ -48,7 +48,7 @@ jobs:
   # call cannot vary the path per matrix OS.
   build-ph:
     name: PH
-    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
+    uses: org-zpr/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
     with:
       name: 'ph'
       path: './adapter/ph'
@@ -62,7 +62,7 @@ jobs:
   # runs-on and the .exe suffix on package-path. See the comment above.
   build-ph-windows:
     name: PH
-    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
+    uses: org-zpr/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
     with:
       name: 'ph'
       path: './adapter/ph'
@@ -75,7 +75,7 @@ jobs:
   # Build and upload ph-cli
   build-ph-cli:
     name: PH CLI
-    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
+    uses: org-zpr/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
     with:
       name: 'ph-cli'
       path: './adapter/cli'
@@ -91,7 +91,7 @@ jobs:
   # is off (--no-default-features, plan D13) and libpcap is not installed.
   build-ph-cli-windows:
     name: PH CLI
-    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
+    uses: org-zpr/zl-zpr-dev-tools/.github/workflows/rust-build-test.yml@v1.5
     with:
       name: 'ph-cli'
       path: './adapter/cli'
@@ -106,7 +106,7 @@ jobs:
   test-ph:
     name: PH
     needs: [build-ph, build-ph-windows]
-    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
+    uses: org-zpr/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
     with:
       name: 'ph'
       path: './adapter/ph'
@@ -118,7 +118,7 @@ jobs:
   test-ph-cli:
     name: PH CLI
     needs: [build-ph-cli]
-    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
+    uses: org-zpr/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
     with:
       name: 'ph-cli'
       path: './adapter/cli'
@@ -131,7 +131,7 @@ jobs:
   test-ph-cli-windows:
     name: PH CLI
     needs: [build-ph-cli-windows]
-    uses: mkolehmainen/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
+    uses: org-zpr/zl-zpr-dev-tools/.github/workflows/rust-test.yml@v1.5
     with:
       name: 'ph-cli'
       path: './adapter/cli'
@@ -189,7 +189,7 @@ jobs:
     - name: Download Asset
       uses: robinraju/release-downloader@v1
       with:
-        repository: 'mkolehmainen/zl-zpr-visaservice'
+        repository: 'org-zpr/zl-zpr-visaservice'
         tag: ${{ env.VISA_SERVICE_RELEASE }}
         fileName: 'release-linux-x86_64.tar.gz'
         extract: true
@@ -266,7 +266,7 @@ jobs:
     - name: Download Asset
       uses: robinraju/release-downloader@v1
       with:
-        repository: 'mkolehmainen/zl-zpr-visaservice'
+        repository: 'org-zpr/zl-zpr-visaservice'
         tag: ${{ env.VISA_SERVICE_RELEASE }}
         fileName: 'release-linux-x86_64.tar.gz'
         extract: true
@@ -343,7 +343,7 @@ jobs:
     - name: Download Asset
       uses: robinraju/release-downloader@v1
       with:
-        repository: 'mkolehmainen/zl-zpr-visaservice'
+        repository: 'org-zpr/zl-zpr-visaservice'
         tag: ${{ env.VISA_SERVICE_RELEASE }}
         fileName: 'release-linux-x86_64.tar.gz'
         extract: true
@@ -423,7 +423,7 @@ jobs:
     - name: Download Asset
       uses: robinraju/release-downloader@v1
       with:
-        repository: 'mkolehmainen/zl-zpr-visaservice'
+        repository: 'org-zpr/zl-zpr-visaservice'
         tag: ${{ env.VISA_SERVICE_RELEASE }}
         fileName: 'release-linux-x86_64.tar.gz'
         extract: true
@@ -500,7 +500,7 @@ jobs:
     - name: Download Asset
       uses: robinraju/release-downloader@v1
       with:
-        repository: 'mkolehmainen/zl-zpr-visaservice'
+        repository: 'org-zpr/zl-zpr-visaservice'
         tag: ${{ env.VISA_SERVICE_RELEASE }}
         fileName: 'release-linux-x86_64.tar.gz'
         extract: true

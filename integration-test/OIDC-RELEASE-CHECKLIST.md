@@ -4,7 +4,7 @@ CI (the fake-IdP `one-node-oidc-test.sh` and
 `one-node-oidc-renewal-test.sh`) cannot cover real Google. Before an
 OIDC release is called done, run this checklist once against a real Google
 Workspace and record the outcome on the umbrella issue
-([mkolehmainen/zipline#1](https://github.com/mkolehmainen/zipline/issues/1)).
+([org-zpr/zl-zipline#1](https://github.com/org-zpr/zl-zipline/issues/1)).
 The `hd`-absent case in particular is the one a fake IdP is most likely to
 model wrongly (docs/OIDC.md, "What CI cannot cover").
 
@@ -138,6 +138,6 @@ session ceiling lands 30 minutes after login.
 
 Close-out is the operator's step: after one full run, record the outcomes
 (sections 1–5, including the recorded YES / NO answers) in a comment on
-[zipline#1](https://github.com/mkolehmainen/zipline/issues/1) for sections
-1–4 and on [zipline#40](https://github.com/mkolehmainen/zipline/issues/40)
+[zipline#1](https://github.com/org-zpr/zl-zipline/issues/1) for sections
+1–4 and on [zipline#40](https://github.com/org-zpr/zl-zipline/issues/40)
 for section 5.

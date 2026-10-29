@@ -391,7 +391,7 @@ accepts docking adapters, and forwards their traffic, exactly like
   `advertised_substrate_addr` is needed.
 * **Single-homed only** — one substrate address, configured once at startup;
   multi-homed hosts and address changes while running are
-  [zipline#150](https://github.com/mkolehmainen/zipline/issues/150).
+  [zipline#150](https://github.com/org-zpr/zl-zipline/issues/150).
 * **Elevated console** — Wintun device creation requires Run as
   administrator, same as the adapter role.
 * **A single, unbatched datapath worker** — Wintun enforces one queue and
@@ -406,7 +406,7 @@ accepts docking adapters, and forwards their traffic, exactly like
 * **One `ph` instance per user without `--control-path`**: the default
   control path is derived from the owner alone, so a node and an adapter for
   the same user on one host need explicit `--control-path`s to coexist
-  ([zipline#169](https://github.com/mkolehmainen/zipline/issues/169)).
+  ([zipline#169](https://github.com/org-zpr/zl-zipline/issues/169)).
 
 The hand-run, end-to-end verification of the Windows node (a Windows VM
 forwarding real traffic between Linux adapters and hosting the visa
@@ -416,7 +416,7 @@ run it whenever a change touches the Windows node path. CI covers Windows
 builds and unit tests (`.github/workflows/adapter.yml` builds and tests `ph`
 and `ph-cli` on `windows-latest`), but there is no automated end-to-end
 Windows tier that carries real traffic
-([zipline#152](https://github.com/mkolehmainen/zipline/issues/152)); note
+([zipline#152](https://github.com/org-zpr/zl-zipline/issues/152)); note
 that Actions is currently disabled on this fork, so no CI runs here either
 way.
 
@@ -427,7 +427,7 @@ way.
 * a **Windows service or installer** — this repository ships none;
   `ph.exe` is started by hand from an elevated console, and packaging
   (including the service) belongs to Zipline
-  ([zipline#147](https://github.com/mkolehmainen/zipline/issues/147)). The
+  ([zipline#147](https://github.com/org-zpr/zl-zipline/issues/147)). The
   contract a service package relies on is under "Control pipe access and
   non-elevated `ph-cli`" below,
 * **`ph-cli` filter compilation** — the `pcap` feature is off on Windows, so
@@ -570,7 +570,7 @@ subsection follows.
 * **One `ph` instance per user without `--control-path`**: the default
   control path is derived from the owner alone, so a node and an adapter
   for the same user on one host need explicit `--control-path`s to coexist
-  ([zipline#169](https://github.com/mkolehmainen/zipline/issues/169)).
+  ([zipline#169](https://github.com/org-zpr/zl-zipline/issues/169)).
 
 **Addressing.** The node creates the utun through `TunCtl` and applies its
 ZPR address with `ifconfig <utun> inet6 <addr>/32 alias`. The alias alone
@@ -619,22 +619,22 @@ against the code, not copied from the node list):
 * **One adapter per host** — at startup, and again at every link
   activation, the adapter refuses to run when `fd5a:5052::/32` already
   routes to another live interface
-  ([zipline#101](https://github.com/mkolehmainen/zipline/issues/101)).
+  ([zipline#101](https://github.com/org-zpr/zl-zipline/issues/101)).
   This also means a node and an adapter cannot share a Mac.
 * **One `ph` instance per user without `--control-path`**: the default
   control path is derived from the owner alone
-  ([zipline#169](https://github.com/mkolehmainen/zipline/issues/169)).
+  ([zipline#169](https://github.com/org-zpr/zl-zipline/issues/169)).
 
 **Addressing.** Unlike the node, the adapter does not self-address at
 startup: the utun is created **unaddressed**
-([zipline#161](https://github.com/mkolehmainen/zipline/issues/161)), and
+([zipline#161](https://github.com/org-zpr/zl-zipline/issues/161)), and
 when the dock link activates with a granted ZPR address, the activation
 sequence in `link_state.rs` applies it via `TunCtl::add_address`
 (`ifconfig <utun> inet6 <addr>/32 alias`) and then ensures the internal-
 network route via `TunCtl::add_route` (`/sbin/route -n add -inet6
 fd5a:5052::/32 -interface <utun>` — idempotent: a route already present
 is verified to run via this utun and replaced if not,
-[zipline#100](https://github.com/mkolehmainen/zipline/issues/100)). On
+[zipline#100](https://github.com/org-zpr/zl-zipline/issues/100)). On
 macOS the `/32` alias alone already installs the on-link route (verified
 in the node's first end-to-end run, 2026-10-02), so the explicit
 `add_route` is normally a no-op safety net. No manual `ifconfig` or
@@ -655,7 +655,7 @@ to a Linux node and carrying real traffic both ways) is
 [`integration-test/macos-adapter-test.md`](../integration-test/macos-adapter-test.md);
 run it whenever a change touches the macOS adapter path. Its first
 execution — and the firewall findings above — is tracked as
-[zipline#174](https://github.com/mkolehmainen/zipline/issues/174).
+[zipline#174](https://github.com/org-zpr/zl-zipline/issues/174).
 
 
 ## Certificate and peer verification reference

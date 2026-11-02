@@ -423,7 +423,7 @@ dependencies = [
 [[package]]
 name = "capnp"
 version = "0.26.2"
-source = "git+https://github.com/mkolehmainen/capnproto-rust.git?rev=1e1d5ad692b4b2c2b942f04f32550df6445f4216#1e1d5ad692b4b2c2b942f04f32550df6445f4216"
+source = "git+https://github.com/mkolehmainen/capnproto-rust.git?rev=df689fe439453ad28ca28333d616cc438f887cce#df689fe439453ad28ca28333d616cc438f887cce"
 dependencies = [
  "embedded-io",
 ]
@@ -431,7 +431,7 @@ dependencies = [
 [[package]]
 name = "capnp-futures"
 version = "0.26.1"
-source = "git+https://github.com/mkolehmainen/capnproto-rust.git?rev=1e1d5ad692b4b2c2b942f04f32550df6445f4216#1e1d5ad692b4b2c2b942f04f32550df6445f4216"
+source = "git+https://github.com/mkolehmainen/capnproto-rust.git?rev=df689fe439453ad28ca28333d616cc438f887cce#df689fe439453ad28ca28333d616cc438f887cce"
 dependencies = [
  "capnp",
  "futures-channel",
@@ -444,7 +444,7 @@ dependencies = [
 [[package]]
 name = "capnp-rpc"
 version = "0.26.1"
-source = "git+https://github.com/mkolehmainen/capnproto-rust.git?rev=1e1d5ad692b4b2c2b942f04f32550df6445f4216#1e1d5ad692b4b2c2b942f04f32550df6445f4216"
+source = "git+https://github.com/mkolehmainen/capnproto-rust.git?rev=df689fe439453ad28ca28333d616cc438f887cce#df689fe439453ad28ca28333d616cc438f887cce"
 dependencies = [
  "capnp",
  "capnp-futures",
@@ -456,7 +456,7 @@ dependencies = [
 [[package]]
 name = "capnpc"
 version = "0.26.0"
-source = "git+https://github.com/mkolehmainen/capnproto-rust.git?rev=1e1d5ad692b4b2c2b942f04f32550df6445f4216#1e1d5ad692b4b2c2b942f04f32550df6445f4216"
+source = "git+https://github.com/mkolehmainen/capnproto-rust.git?rev=df689fe439453ad28ca28333d616cc438f887cce#df689fe439453ad28ca28333d616cc438f887cce"
 dependencies = [
  "capnp",
 ]

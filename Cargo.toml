@@ -61,7 +61,7 @@ panic = "abort"
 # Without it, Cargo keeps the registry entries already in Cargo.lock and only
 # warns `patch ... was not used in the crate graph`.
 [patch.crates-io]
-capnp = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "1e1d5ad692b4b2c2b942f04f32550df6445f4216" }
-capnp-futures = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "1e1d5ad692b4b2c2b942f04f32550df6445f4216" }
-capnp-rpc = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "1e1d5ad692b4b2c2b942f04f32550df6445f4216" }
-capnpc = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "1e1d5ad692b4b2c2b942f04f32550df6445f4216" }
+capnp = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "df689fe439453ad28ca28333d616cc438f887cce" }
+capnp-futures = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "df689fe439453ad28ca28333d616cc438f887cce" }
+capnp-rpc = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "df689fe439453ad28ca28333d616cc438f887cce" }
+capnpc = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "df689fe439453ad28ca28333d616cc438f887cce" }

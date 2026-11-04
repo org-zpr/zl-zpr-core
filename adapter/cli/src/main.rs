@@ -218,8 +218,8 @@ async fn process_command(command: Commands, socket: &PathBuf) -> Result<bool, Cl
 
     // FD-passing transport (zipline#142): `capture set-file` sends the opened
     // capture file's descriptor to ph as SCM_RIGHTS ancillary data. Needs the
-    // capnproto-rust fork — see [patch.crates-io] in the workspace root
-    // Cargo.toml.
+    // capnproto-rust fork, so normal builds compile this out — see the
+    // workspace root Cargo.toml.
     #[cfg(all(unix, feature = "capnp-ancillary"))]
     let network = {
         let (reader, writer) = sock.into_split();

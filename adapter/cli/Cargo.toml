@@ -32,22 +32,10 @@ serde_json = "1.0"
 sha2 = "0.10"
 url = "2.5"
 
-[target.'cfg(unix)'.dependencies]
-# FD-passing admin RPC transport (zipline#142): unix-only, enabled by the
-# capnp-ancillary feature. Needs the capnproto-rust fork — see the
-# [patch.crates-io] comment in the workspace root Cargo.toml.
-capnp-futures = { workspace = true, optional = true }
-
 [features]
-default = ["pcap", "capnp-ancillary"]
+default = ["pcap"]
 pcap = ["dep:pcap", "cbpf-rs/pcap"]
 complete = ["clap_complete"]
-# FD passing for `capture set-file` over the admin RPC. The dependency lives in
-# [target.'cfg(unix)'.dependencies], so on Windows the feature is a no-op; code
-# is gated on cfg(all(unix, feature = "capnp-ancillary")). A mainline-capnp
-# build must delete this feature and the optional capnp-futures dependency —
-# see the [patch.crates-io] comment in the workspace root Cargo.toml.
-capnp-ancillary = ["dep:capnp-futures", "capnp-futures/tokio-unix-fd-stream"]
 
 [[bin]]
 name = "ph-cli"
@@ -59,7 +47,8 @@ path = "src/generate_completions.rs"
 required-features = ["complete"]
 
 [lints.rust]
-# Keeps a mainline-capnp build (capnp-ancillary feature deleted per the D4
-# recipe in the root Cargo.toml) warning-free: check-cfg keeps the cfg a
-# known value after the feature is gone.
+# The `capnp-ancillary` feature (FD-passing packet capture) is not declared:
+# it needs the capnproto-rust fork, which normal builds no longer use (see the
+# root Cargo.toml). check-cfg keeps its cfg gates a known value, so the
+# compiled-out capture code does not warn.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"capnp-ancillary\"))"] }

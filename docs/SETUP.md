@@ -423,7 +423,9 @@ way.
 **Not supported on Windows** (deliberately, in this release):
 
 * **packet capture to a file** — `ph-cli capture set-file` returns
-  `Unsupported`,
+  `Unsupported`. This is now true on every platform, not only Windows: capture
+  needs the capnproto-rust FD-passing fork, which normal builds no longer use
+  (see the workspace root `Cargo.toml`),
 * a **Windows service or installer** — this repository ships none;
   `ph.exe` is started by hand from an elevated console, and packaging
   (including the service) belongs to Zipline

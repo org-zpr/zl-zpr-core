@@ -48,8 +48,8 @@ pub async fn launch_capnp(
 
         // FD-passing transport (zipline#142): `setCaptureFile` receives the
         // capture file's descriptor as SCM_RIGHTS ancillary data, so ph never
-        // opens a user-chosen path as root. Needs the capnproto-rust fork —
-        // see [patch.crates-io] in the workspace root Cargo.toml.
+        // opens a user-chosen path as root. Needs the capnproto-rust fork, so
+        // normal builds compile this out — see the workspace root Cargo.toml.
         #[cfg(all(unix, feature = "capnp-ancillary"))]
         let network = {
             let (reader, writer) = stream.into_split();

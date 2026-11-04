@@ -12,6 +12,14 @@ NODE_AUTH_PRIVATE_KEY="${NODE_AUTH_PRIVATE_KEY:-$PREGEN/node-rsa-key.pem}"
 
 source "$(dirname $0)/lib/common_funcs.sh"
 
+# Packet capture to a file is compiled out of normal builds: it needs the
+# capnproto-rust FD-passing fork, which zl-zpr-core no longer depends on (see
+# the root Cargo.toml), so `ph` answers setCaptureFile with "capture is not
+# available". Skip instead of failing. Reverting the commit that removed the
+# fork also removes this guard, so a capture-enabled debug build runs the test.
+echo "SKIP: packet capture is not built (no capnproto-rust FD-passing fork)"
+exit 0
+
 # Re-exec inside an unprivileged user+network namespace; everything below
 # runs there and needs no sudo.
 enter_test_namespace "$@"

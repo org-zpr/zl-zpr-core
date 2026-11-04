@@ -67,10 +67,6 @@ tokio-tun = { version = "0.15" }
 # Unix-only (fds, poll, uids): every use site lives in a cfg(unix) module
 # (zipline#131 step 6).
 nix = { version = "0.31", features = ["fs", "ioctl", "net", "poll", "uio", "user"] }
-# FD-passing admin RPC transport (zipline#142): unix-only, enabled by the
-# capnp-ancillary feature. Needs the capnproto-rust fork — see the
-# [patch.crates-io] comment in the workspace root Cargo.toml.
-capnp-futures = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # Safe bindings that load the signed wintun.dll at runtime; the DLL ships
@@ -103,13 +99,7 @@ tokio-rustls = "0.26.4"
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
-default = ["io-uring", "rcu-crossbeam-epoch", "capnp-ancillary"]
-# FD passing for `setCaptureFile` over the admin RPC. The dependency lives in
-# [target.'cfg(unix)'.dependencies], so on Windows the feature is a no-op; code
-# is gated on cfg(all(unix, feature = "capnp-ancillary")). A mainline-capnp
-# build must delete this feature and the optional capnp-futures dependency —
-# see the [patch.crates-io] comment in the workspace root Cargo.toml.
-capnp-ancillary = ["dep:capnp-futures", "capnp-futures/tokio-unix-fd-stream"]
+default = ["io-uring", "rcu-crossbeam-epoch"]
 ci = []
 enable-security-testing = []
 rcu-aarc = ["rcu/rcu-aarc", "zpr/rcu-aarc"]
@@ -130,7 +120,8 @@ path = "src/generate_completions.rs"
 required-features = ["complete"]
 
 [lints.rust]
-# Keeps a mainline-capnp build (capnp-ancillary feature deleted per the D4
-# recipe in the root Cargo.toml) warning-free: check-cfg keeps the cfg a
-# known value after the feature is gone.
+# The `capnp-ancillary` feature (FD-passing packet capture) is not declared:
+# it needs the capnproto-rust fork, which normal builds no longer use (see the
+# root Cargo.toml). check-cfg keeps its cfg gates a known value, so the
+# compiled-out capture code does not warn.
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"capnp-ancillary\"))"] }

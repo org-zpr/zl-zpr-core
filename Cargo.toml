@@ -12,7 +12,6 @@ rust-version = "1.98.1"
 [workspace.dependencies]
 aws-lc-rs = "1.17"
 capnp = { version = "0.26", features = ["sync_reader"] }
-capnp-futures = "0.26"
 capnp-rpc = "0.26"
 cbpf-rs = { git = "https://github.com/org-zpr/zl-zpr-utils.git", tag = "cbpf-rs-v0.2.0" }
 clap = { version = "4.5.23", features = ["derive"] }
@@ -34,34 +33,13 @@ zpr-utils = { git = "https://github.com/org-zpr/zl-zpr-utils.git", tag = "zpr-ut
 [profile.release]
 panic = "abort"
 
-# Cap'n Proto FD-passing fork (zipline#140/#142, org-zpr#1399).
+# Mainline crates.io Cap'n Proto only; no capnproto-rust fork.
 #
-# Why: `ph-cli capture set-file` hands the capture file descriptor to `ph`
-# over the admin RPC (`setCaptureFile`), which needs ancillary-data (SCM_RIGHTS)
-# FD passing that crates.io capnp 0.26 does not have. The fork is emilazy's
-# capnproto-rust PR #666 work plus our fixes; its maintenance rules live in
-# ZIPLINE.md on the fork's `zipline` branch:
-# https://github.com/mkolehmainen/capnproto-rust/blob/zipline/ZIPLINE.md
-#
-# The patch applies to every target, and the fork MUST build on every target
-# (Windows included) — Cargo cannot scope a [patch] to unix. Only the FD-passing
-# *use* is gated, on cfg(all(unix, feature = "capnp-ancillary")).
-#
-# Building against mainline capnp (no FD capture) takes TWO edits, not one:
-#   1. delete this [patch.crates-io] block;
-#   2. in adapter/ph/Cargo.toml and adapter/cli/Cargo.toml, delete the
-#      `capnp-ancillary` feature (and remove it from `default`) and the
-#      optional `capnp-futures` dependency it enables.
-# `--no-default-features` alone is NOT enough: crates.io capnp-futures declares
-# no features, so any manifest naming `capnp-futures/tokio-unix-fd-stream`
-# fails resolution against mainline.
-#
-# After changing this block, re-resolve the lockfile onto the fork with
-#   cargo update -p capnp -p capnp-futures -p capnp-rpc -p capnpc
-# Without it, Cargo keeps the registry entries already in Cargo.lock and only
-# warns `patch ... was not used in the crate graph`.
-[patch.crates-io]
-capnp = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "df689fe439453ad28ca28333d616cc438f887cce" }
-capnp-futures = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "df689fe439453ad28ca28333d616cc438f887cce" }
-capnp-rpc = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "df689fe439453ad28ca28333d616cc438f887cce" }
-capnpc = { git = "https://github.com/mkolehmainen/capnproto-rust.git", rev = "df689fe439453ad28ca28333d616cc438f887cce" }
+# Packet capture to a file (`ph-cli capture ...`) used to need the
+# FD-passing fork (emilazy's capnproto-rust PR #666, carried as
+# mkolehmainen/capnproto-rust). It is compiled out of normal builds so that
+# fork is no longer a dependency. The capture code is still in the tree, gated
+# on cfg(all(unix, feature = "capnp-ancillary")). For a debug build that needs
+# capture, revert the commit that removed the fork: it restores this file's
+# [patch.crates-io] block, the `capnp-futures` workspace dependency, and the
+# `capnp-ancillary` feature in adapter/ph and adapter/cli.

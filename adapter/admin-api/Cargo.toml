@@ -24,4 +24,4 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [build-dependencies]
-capnpc = "0.26"
+capnpc = "0.27"

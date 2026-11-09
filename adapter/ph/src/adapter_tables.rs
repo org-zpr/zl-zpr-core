@@ -460,6 +460,24 @@ mod test {
         assert!(dlt.get(id_c).is_some(), "insert after clear must work");
     }
 
+    /// A guard taken before `clear()` must stay valid after it: clearing
+    /// publishes a fresh reader, and readers still holding the old one keep
+    /// reading the entry until they drop it (RCU). From upstream #1410.
+    #[test]
+    fn test_dlt_clear_keeps_old_guards_valid() {
+        let dlt = DockLookupTable::new();
+        let id = dlt
+            .insert(DltPep::new(tc::Ip5TupleTc::new(five_tuple(1000)), None))
+            .unwrap();
+        let old_guard = dlt.get(id).unwrap();
+
+        dlt.clear();
+
+        assert!(dlt.get(id).is_none(), "entry must be gone for new readers");
+        assert_eq!(old_guard.tc.five_tuple(), &five_tuple(1000));
+        drop(old_guard);
+    }
+
     /// Removing a tether id that is not in the DLT must be a no-op, not a
     /// panic: the id comes from the node (`unbind_stream`), and after a dock
     /// link teardown flushed the table (zipline#170) a late or duplicate

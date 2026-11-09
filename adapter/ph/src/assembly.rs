@@ -61,6 +61,7 @@ pub const VERSION: &'static str = build_info::BUILD_VERSION;
 /// visible queue becoming full.
 
 pub struct Assembly {
+    pub actor_rejected: std::sync::atomic::AtomicBool,
     pub ph_mode: PhMode,
     pub topology_config: config::TopologyConfig,
 
@@ -112,11 +113,10 @@ pub struct Assembly {
     /// The operator-configured ZPR address demand as it stood at startup
     /// (`--zpr-addr` / `zpr_addr`), frozen at construction (zipline#83).
     /// Empty means "accept whatever the fabric assigns". This is what the
-    /// granted-address mismatch check compares against — `config.zpr_addr`
-    /// cannot be, because [`Self::set_local_zpr_addrs`] overwrites it with
-    /// each dynamic grant and teardown never restores the startup value, so
-    /// after a reconnect it would mistake the previous dynamic address for
-    /// a configured demand.
+    /// granted-address mismatch check compares against. (Since #1410 an
+    /// adapter's granted address lives on its actor, not in
+    /// `config.zpr_addr`; the frozen copy keeps the check independent of
+    /// any later config change.)
     pub configured_zpr_addr_demand: Vec<IpAddr>,
     /// A fatal, unrecoverable error signalled from a worker (zipline#83:
     /// the granted-ZPR-address mismatch). Set via
@@ -274,28 +274,31 @@ impl Assembly {
         }
     }
 
-    /// Update the local ZPR addresses of this node or adapter. Though presumably
-    /// this is called only on an adapter as a nodes addresses are currently set
-    /// through configuration or command line args.
-    pub fn set_local_zpr_addrs<T>(&self, addrs: impl IntoIterator<Item = T>)
-    where
-        T: Into<IpAddr>,
-    {
-        let addrs: Vec<IpAddr> = addrs.into_iter().map(|a| a.into()).collect();
-        self.config
-            .update(move |cfg| {
-                Some(config::Config {
-                    zpr_addr: addrs.clone(),
-                    ..cfg.clone()
-                })
-            })
-            .unwrap();
+    pub fn adapter_owns_address(&self, addr: IpAddress) -> bool {
+        self.peer_table.get(DOCK_LINK_ID).is_some_and(|peer| {
+            peer.link_state_machine.is_ready()
+                && (peer.actor_auth.owns_address(&addr)
+                    || peer.link_state_machine.aaa_address() == Some(addr))
+        })
     }
 
     /// Get a copy of the local ZPR addresses. May be empty on an adapter until we
     /// have been granted a ZPR address.
     pub fn get_local_zpr_addrs_std(&self) -> Vec<IpAddr> {
-        self.config.get().zpr_addr.clone()
+        if self.ph_mode == PhMode::Adapter {
+            self.peer_table
+                .get(DOCK_LINK_ID)
+                .map(|p| {
+                    p.actor_auth
+                        .addresses()
+                        .into_iter()
+                        .map(Into::into)
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.config.get().zpr_addr.clone()
+        }
     }
 
     /// Record `msg` as a fatal, unrecoverable error and wake main's watcher
@@ -350,8 +353,8 @@ impl Assembly {
     /// This deliberately reads the *current* address set via
     /// [`Self::get_local_zpr_addrs_std`] rather than the startup
     /// configuration, so it remains correct for an address that is assigned or
-    /// reassigned at run time (as an adapter's is today, via
-    /// [`Self::set_local_zpr_addrs`]).  Re-run it after any such change.
+    /// reassigned at run time (as an adapter's is today: its address is the
+    /// one granted to its actor).  Re-run it after any such change.
     ///
     /// Addresses the platform cannot inspect are reported as present: a check
     /// that cannot see the truth must not manufacture a failure.  The same
@@ -634,9 +637,7 @@ impl Assembly {
     pub fn find_egress_link(&self, actor_addr: IpAddress) -> Option<NonZero<LinkId>> {
         // First check the local actor addresses to see if it's a locally-destined packet
         if self
-            .config
-            .get()
-            .zpr_addr
+            .get_local_zpr_addrs_std()
             .iter()
             .any(|addr| IpAddress::new_from_std(addr) == actor_addr)
         {
@@ -646,10 +647,8 @@ impl Assembly {
         // Check peer actor addresses to see if one of them matches
         self.peer_table
             .find(|(_id, peer)| {
-                peer.link_state_machine
-                    .get_actor_addresses()
-                    .iter()
-                    .any(|addr| *addr == actor_addr)
+                peer.actor_auth.owns_address(&actor_addr)
+                    || peer.link_state_machine.aaa_address() == Some(actor_addr)
             })
             .map(|(id, _peer)| id)
     }
@@ -724,6 +723,13 @@ pub mod test {
         fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
+        fn add_authentication_address(
+            &self,
+            _addr: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
         fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
@@ -760,6 +766,10 @@ pub mod test {
         fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
+        /// The AAA is just another address to this double.
+        fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+            self.add_address(addr, prefix_len)
+        }
         fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
@@ -788,7 +798,10 @@ pub mod test {
     /// concurrent-activation race, where the other adapter's carrier-up
     /// lands between our pre-install probe and the post-carrier re-check.
     /// `carriers` logs every `set_carrier` call so tests can assert an
-    /// adapter that backed off did not leave its carrier up.
+    /// adapter that backed off did not leave its carrier up. `addresses`
+    /// is the set of addresses on the TUN: `add_address` adds to it,
+    /// `clear_address` removes from it and `has_address` reports it, so
+    /// tests can see what an activation left behind (zipline#157).
     #[cfg(test)]
     pub struct RecordingTunCtl {
         pub routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
@@ -802,6 +815,7 @@ pub mod test {
         pub probes: Arc<std::sync::atomic::AtomicUsize>,
         pub carriers: Arc<std::sync::Mutex<Vec<bool>>>,
         pub teardowns: Arc<std::sync::atomic::AtomicUsize>,
+        pub addresses: Arc<std::sync::Mutex<Vec<IpAddr>>>,
     }
 
     #[cfg(test)]
@@ -819,6 +833,7 @@ pub mod test {
                     probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                     carriers: Arc::new(std::sync::Mutex::new(Vec::new())),
                     teardowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    addresses: Arc::new(std::sync::Mutex::new(Vec::new())),
                 },
                 routes,
             )
@@ -864,20 +879,31 @@ pub mod test {
             self.carriers.lock().unwrap().push(carrier);
             Ok(())
         }
-        fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+        fn add_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             if self.fail_addresses {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "RecordingTunCtl: add_address deliberately failing (EPERM)",
                 ));
             }
+            self.addresses.lock().unwrap().push(addr);
             Ok(())
         }
-        fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+        /// Always succeeds: `fail_addresses` models the *granted* ZPR
+        /// address failing (zipline#157), not the AAA installed at Hello.
+        fn add_authentication_address(
+            &self,
+            _addr: IpAddr,
+            _prefix_len: u8,
+        ) -> std::io::Result<()> {
             Ok(())
         }
-        fn has_address(&self, _addr: IpAddr) -> std::io::Result<bool> {
-            Ok(true)
+        fn clear_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            self.addresses.lock().unwrap().retain(|a| *a != addr);
+            Ok(())
+        }
+        fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
+            Ok(self.addresses.lock().unwrap().contains(&addr))
         }
         fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
             if self.fail_routes {
@@ -1050,6 +1076,10 @@ pub mod test {
             }
             self.added.lock().unwrap().push((addr, prefix_len));
             Ok(())
+        }
+        /// The AAA is just another address to this double.
+        fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+            self.add_address(addr, prefix_len)
         }
         fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
@@ -1457,6 +1487,7 @@ pub mod test {
         });
 
         Assembly {
+            actor_rejected: std::sync::atomic::AtomicBool::new(false),
             ph_mode,
             topology_config,
             mgmt_substrate_egress,

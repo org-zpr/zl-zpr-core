@@ -1,5 +1,5 @@
 use crate::auth::AuthBlob;
-use crate::link_state::{LinkEvent, LinkStateError};
+use crate::link_state::LinkStateError;
 use crate::prelude::*;
 use crate::visa_table;
 
@@ -41,101 +41,69 @@ pub async fn send_deferred_vs_connect(
 }
 
 /// Store the authentication expiry the VS reported in a `Connection`
-/// response on the link, converting the wire's epoch seconds and computing
-/// the renewal deadline from the configured lead (zipline#45).
-fn record_auth_expires(asm: &Arc<Assembly>, link_id: LinkId, auth_expires_epoch_secs: u64) {
+/// response on the link's actor, converting the wire's epoch seconds and
+/// computing the renewal deadline from the configured lead (zipline#45).
+pub fn record_auth_expires(asm: &Arc<Assembly>, link_id: LinkId, auth_expires_epoch_secs: u64) {
     let Some(peer) = asm.peer_table.get(link_id) else {
         return;
     };
     let expires = std::time::UNIX_EPOCH + std::time::Duration::from_secs(auth_expires_epoch_secs);
-    peer.link_state_machine.set_auth_expires(
+    peer.actor_auth.renewal.set_auth_expires(
         std::time::SystemTime::now(),
         expires,
         asm.config.get().auth_renewal_lead,
     );
 }
 
-pub fn authorize_connect(
+/// Ask the visa service to authorize an actor connection. The caller
+/// (ActorAuthorization on the node) owns the result: it grants or refuses
+/// the address and records the authentication expiry (#1410).
+pub async fn authorize_connect(
     asm: &Arc<Assembly>,
-    link_id: LinkId,
     connect_req: vsapi_types::ConnectRequest,
-) {
-    let task_asm = asm.clone();
-    tokio::task::spawn_local(async move {
-        match task_asm
-            .vsconn
-            .as_ref()
-            .unwrap()
-            .authorize_connect(connect_req)
-            .await
+) -> Result<vsapi_types::Connection, VSApiError> {
+    asm.vsconn
+        .as_ref()
+        .ok_or(VSApiError::ConnClosed)?
+        .authorize_connect(connect_req)
+        .await
+}
+
+/// Map a failed visa service authorization to the status reported to the
+/// adapter in the Grant.
+///
+/// Explicit credential denials are [AuthenticationStatus::Rejected] and a
+/// policy that admits no endpoint is [AuthenticationStatus::PolicyDenied]
+/// (zipline#12); both are terminal on the adapter. Everything else -- a
+/// closed connection, a timeout, an internal or temporarily-unavailable
+/// visa service -- is [AuthenticationStatus::Retryable] (#1410).
+///
+/// [AuthenticationStatus::Rejected]: crate::zdp::AuthenticationStatus::Rejected
+/// [AuthenticationStatus::PolicyDenied]: crate::zdp::AuthenticationStatus::PolicyDenied
+/// [AuthenticationStatus::Retryable]: crate::zdp::AuthenticationStatus::Retryable
+pub fn authorization_error_status(err: &VSApiError) -> crate::zdp::AuthenticationStatus {
+    use crate::zdp::AuthenticationStatus;
+    use vsapi_types::ErrorCode;
+    match err {
+        VSApiError::AuthFailed(_) => AuthenticationStatus::Rejected,
+        VSApiError::CodedError(e) if e.code == ErrorCode::PolicyDenied => {
+            AuthenticationStatus::PolicyDenied
+        }
+        VSApiError::CodedError(e)
+            if matches!(
+                e.code,
+                ErrorCode::AuthRequired
+                    | ErrorCode::InvalidSignature
+                    | ErrorCode::AuthError
+                    | ErrorCode::ParamError
+                    | ErrorCode::InvalidOperation
+                    | ErrorCode::NotFound
+            ) =>
         {
-            Ok(cr) => {
-                info!(target: VISA_MGMT, "{}: VS authorize_connect returned successfully", task_asm.formatted_link_id(link_id));
-                match cr.zpr_addr {
-                    IpAddr::V4(_) => {
-                        // Our ZPR addresses should be IPv6 -- at least for now.
-                        error!(target: VISA_MGMT, "{} authorized, but zpr address is not IPv6", task_asm.formatted_link_id(link_id));
-                        let _ignore_error =
-                            task_asm.process_link_state_event(link_id, LinkEvent::Error);
-                        return;
-                    }
-                    IpAddr::V6(_) => {
-                        record_auth_expires(&task_asm, link_id, cr.auth_expires);
-                        let zpr_addr = IpAddress::new_from_std(&cr.zpr_addr);
-                        let _ignore_error = task_asm.process_link_state_event(
-                            link_id,
-                            LinkEvent::ReceivedAuthorizeResponse(zpr_addr),
-                        );
-                    }
-                }
-            }
-
-            Err(err) => {
-                warn!(target: VISA_MGMT, "{}: VS authorize_connect failed with error: {err}", task_asm.formatted_link_id(link_id));
-                let _ignore_error =
-                    task_asm.process_link_state_event(link_id, authorize_failure_event(&err));
-            }
+            AuthenticationStatus::Rejected
         }
-    });
-}
-
-/// Map a visa service [ErrorCode](zpr::vsapi_types::ErrorCode) to the ZDP
-/// [ResponseCode](crate::zdp::ResponseCode) reported to the adapter in the
-/// grant, or `None` for codes that keep the generic error path.
-fn response_code_for_vs_error(
-    code: &zpr::vsapi_types::ErrorCode,
-) -> Option<crate::zdp::ResponseCode> {
-    use crate::zdp::ResponseCode;
-    use zpr::vsapi_types::ErrorCode;
-    match code {
-        ErrorCode::InvalidSignature | ErrorCode::AuthError | ErrorCode::ParamError => {
-            Some(ResponseCode::AuthFailed)
-        }
-        ErrorCode::PolicyDenied => Some(ResponseCode::PolicyDenied),
-        ErrorCode::TemporarilyUnavailable => Some(ResponseCode::AuthUnavailable),
-        _ => None,
+        _ => AuthenticationStatus::Retryable,
     }
-}
-
-/// Map an authorize_connect failure to the link event to raise: a
-/// [VSApiError::CodedError] whose code has a ZDP mapping becomes
-/// [LinkEvent::ReceivedAuthorizeFailure] (so the failure reason reaches the
-/// adapter in the grant); everything else keeps the generic
-/// [LinkEvent::Error] path.
-fn authorize_failure_event(err: &VSApiError) -> LinkEvent {
-    if let VSApiError::CodedError(api_err) = err
-        && response_code_for_vs_error(&api_err.code).is_some()
-    {
-        return LinkEvent::ReceivedAuthorizeFailure(api_err.code.clone(), api_err.message.clone());
-    }
-    LinkEvent::Error
-}
-
-/// The ZDP ResponseCode for a VS error carried by
-/// [LinkEvent::ReceivedAuthorizeFailure]. The event is only constructed for
-/// mapped codes, so the fallback is defensive.
-pub fn grant_code_for_vs_error(code: &zpr::vsapi_types::ErrorCode) -> crate::zdp::ResponseCode {
-    response_code_for_vs_error(code).unwrap_or(crate::zdp::ResponseCode::Other)
 }
 
 /// Creates a ConnectRequest, unless none is necessary because the link is
@@ -161,36 +129,7 @@ fn build_connect_request_from_parts(
     a2a_dh_public_key: Option<x25519_dalek::PublicKey>,
     substrate_addr: IpAddr,
 ) -> Result<vsapi_types::ConnectRequest, LinkStateError> {
-    // Convert the adapter's AuthBlobs to the vsapi_types AuthBlobs for the v2 protocol.
-    let vsapi_blobs = blobs
-        .iter()
-        .map(|blob| match blob {
-            AuthBlob::SelfSigned(ss) => vsapi_types::AuthBlob::SS(vsapi_types::SelfSignedBlob {
-                alg: vsapi_types::ChallengeAlg::RsaSha256Pkcs1v15,
-                challenge: BASE64_STANDARD.decode(&ss.challenge).unwrap_or_default(),
-                cn: ss.cn.clone(),
-                timestamp: ss.ts,
-                signature: BASE64_STANDARD.decode(&ss.sig).unwrap_or_default(),
-            }),
-            AuthBlob::Oidc(oidc) => {
-                // The nonce claim expected in the ID token is derived from the
-                // link challenge. The caller has already verified the
-                // challenge HMAC (see process_acquire_zpr_address_request),
-                // so deriving from the blob's challenge field here is
-                // deriving from authenticated bytes.
-                let challenge_bytes = BASE64_STANDARD.decode(&oidc.challenge).unwrap_or_default();
-                let mut challenge = [0u8; 48];
-                if challenge_bytes.len() == 48 {
-                    challenge.copy_from_slice(&challenge_bytes);
-                }
-                vsapi_types::AuthBlob::Oidc(vsapi_types::OidcBlob {
-                    issuer: oidc.issuer.clone(),
-                    id_token: oidc.id_token.clone(),
-                    nonce: crate::auth::oidc_nonce_for_challenge(&challenge),
-                })
-            }
-        })
-        .collect::<Vec<_>>();
+    let vsapi_blobs = vsapi_blobs(blobs)?;
 
     let mut request_claims = Vec::new();
     if addr != IpAddress::UNSPECIFIED {
@@ -228,6 +167,51 @@ fn build_connect_request_from_parts(
         a2a_dh_public_key,
     };
     Ok(connect_req)
+}
+
+/// Convert the adapter's [AuthBlob]s to VS-API blobs, in order. Used for
+/// both `authorize_connect` and the renewal `reauthorize` (zipline#122).
+///
+/// Malformed base64 is an error rather than an empty field (#1410). The OIDC
+/// nonce the ID token must carry is derived from the blob's challenge; the
+/// caller has already verified that challenge, so the nonce is derived from
+/// authenticated bytes.
+pub fn vsapi_blobs(blobs: &[AuthBlob]) -> Result<Vec<vsapi_types::AuthBlob>, LinkStateError> {
+    let invalid = |what: &str, err: base64::DecodeError| {
+        LinkStateError::InvalidOperation(format!("invalid actor {what}: {err}"))
+    };
+    blobs
+        .iter()
+        .map(|blob| match blob {
+            AuthBlob::SelfSigned(ss) => {
+                Ok(vsapi_types::AuthBlob::SS(vsapi_types::SelfSignedBlob {
+                    alg: vsapi_types::ChallengeAlg::RsaSha256Pkcs1v15,
+                    challenge: BASE64_STANDARD
+                        .decode(&ss.challenge)
+                        .map_err(|e| invalid("challenge", e))?,
+                    cn: ss.cn.clone(),
+                    timestamp: ss.ts,
+                    signature: BASE64_STANDARD
+                        .decode(&ss.sig)
+                        .map_err(|e| invalid("signature", e))?,
+                }))
+            }
+            AuthBlob::Oidc(oidc) => {
+                let challenge: [u8; 48] = BASE64_STANDARD
+                    .decode(&oidc.challenge)
+                    .map_err(|e| invalid("challenge", e))?
+                    .try_into()
+                    .map_err(|_| {
+                        LinkStateError::InvalidOperation("invalid actor challenge length".into())
+                    })?;
+                Ok(vsapi_types::AuthBlob::Oidc(vsapi_types::OidcBlob {
+                    issuer: oidc.issuer.clone(),
+                    id_token: oidc.id_token.clone(),
+                    nonce: crate::auth::oidc_nonce_for_challenge(&challenge),
+                }))
+            }
+        })
+        .collect()
 }
 
 /// This uses "RemoteDisconnect" as the reason passed to the visa service.
@@ -312,7 +296,7 @@ pub fn handle_revocation(
 mod tests {
     use super::*;
     use crate::auth::{self, BLOB_TYPE_OIDC, BLOB_TYPE_SS, ZdpOidcBlob, ZdpSelfSignedBlob};
-    use crate::zdp::ResponseCode;
+    use crate::zdp::AuthenticationStatus;
     use zpr::vsapi_types::{ApiResponseError, ErrorCode};
 
     /// A pushed visa whose next hop has no egress link yet (e.g. a bootstrap
@@ -355,64 +339,48 @@ mod tests {
         ));
     }
 
+    /// Explicit denials are terminal and kept distinct from service failures
+    /// (#1410); a policy that admits no endpoint is reported as PolicyDenied
+    /// so ph-cli can say so (zipline#12).
     #[test]
-    fn test_response_code_for_vs_error_mapping_table() {
-        // Auth-mechanism failures -> AuthFailed.
+    fn test_authorization_error_status_mapping() {
+        let coded = |code| VSApiError::CodedError(ApiResponseError::new_code_msg(code, "x"));
         for code in [
+            ErrorCode::AuthRequired,
             ErrorCode::InvalidSignature,
             ErrorCode::AuthError,
             ErrorCode::ParamError,
+            ErrorCode::InvalidOperation,
+            ErrorCode::NotFound,
         ] {
             assert_eq!(
-                response_code_for_vs_error(&code),
-                Some(ResponseCode::AuthFailed),
+                authorization_error_status(&coded(code.clone())),
+                AuthenticationStatus::Rejected,
                 "{code:?}"
             );
         }
-        // Authenticated but no admitting policy -> PolicyDenied.
         assert_eq!(
-            response_code_for_vs_error(&ErrorCode::PolicyDenied),
-            Some(ResponseCode::PolicyDenied)
+            authorization_error_status(&VSApiError::AuthFailed("denied".into())),
+            AuthenticationStatus::Rejected
         );
-        // Transient VS-side failure -> AuthUnavailable.
         assert_eq!(
-            response_code_for_vs_error(&ErrorCode::TemporarilyUnavailable),
-            Some(ResponseCode::AuthUnavailable)
+            authorization_error_status(&coded(ErrorCode::PolicyDenied)),
+            AuthenticationStatus::PolicyDenied
         );
-        // Everything else keeps the existing generic error path.
-        for code in [
-            ErrorCode::Internal,
-            ErrorCode::NotFound,
-            ErrorCode::Fail,
-            ErrorCode::QuotaExceeded,
+        for err in [
+            coded(ErrorCode::TemporarilyUnavailable),
+            coded(ErrorCode::Internal),
+            coded(ErrorCode::QuotaExceeded),
+            VSApiError::ConnClosed,
+            VSApiError::Timeout("service".into()),
+            VSApiError::CommandFailed("nope".into()),
         ] {
-            assert_eq!(response_code_for_vs_error(&code), None, "{code:?}");
+            assert_eq!(
+                authorization_error_status(&err),
+                AuthenticationStatus::Retryable,
+                "{err:?}"
+            );
         }
-    }
-
-    #[test]
-    fn test_authorize_failure_event_mapping() {
-        // A CodedError with a mapped code produces ReceivedAuthorizeFailure
-        // carrying the code and message.
-        let err = VSApiError::CodedError(ApiResponseError::new_code_msg(
-            ErrorCode::PolicyDenied,
-            "no join policy admits this endpoint",
-        ));
-        match authorize_failure_event(&err) {
-            LinkEvent::ReceivedAuthorizeFailure(ErrorCode::PolicyDenied, msg) => {
-                assert_eq!(msg, "no join policy admits this endpoint");
-            }
-            other => panic!("expected ReceivedAuthorizeFailure(PolicyDenied), got {other:?}"),
-        }
-
-        // A CodedError with an unmapped code keeps the generic error path.
-        let err =
-            VSApiError::CodedError(ApiResponseError::new_code_msg(ErrorCode::Internal, "boom"));
-        assert!(matches!(authorize_failure_event(&err), LinkEvent::Error));
-
-        // A non-coded error keeps the generic error path.
-        let err = VSApiError::CommandFailed("nope".to_string());
-        assert!(matches!(authorize_failure_event(&err), LinkEvent::Error));
     }
 
     #[test]
@@ -463,5 +431,39 @@ mod tests {
             .collect();
         assert_eq!(cn_claims.len(), 1);
         assert_eq!(cn_claims[0].value, "adapter.cn.zpr");
+    }
+
+    /// Malformed evidence must be refused, not forwarded with empty or
+    /// zeroed fields (#1410): bad base64 in an SS challenge or signature, or
+    /// an OIDC challenge that is not exactly 48 bytes.
+    #[test]
+    fn test_vsapi_blobs_rejects_malformed_evidence() {
+        let ss = |challenge: &str, sig: &str| {
+            AuthBlob::SelfSigned(ZdpSelfSignedBlob {
+                blob_type: BLOB_TYPE_SS.to_string(),
+                ts: 1,
+                cn: "adapter.cn.zpr".to_string(),
+                challenge: challenge.to_string(),
+                sig: sig.to_string(),
+            })
+        };
+        let oidc = |challenge: String| {
+            AuthBlob::Oidc(ZdpOidcBlob {
+                blob_type: BLOB_TYPE_OIDC.to_string(),
+                issuer: "https://idp.test".to_string(),
+                id_token: "t".to_string(),
+                challenge,
+            })
+        };
+        let good = BASE64_STANDARD.encode([5u8; 48]);
+        assert!(vsapi_blobs(&[ss(&good, &good), oidc(good.clone())]).is_ok());
+        for bad in [
+            ss("not base64!", &good),
+            ss(&good, "not base64!"),
+            oidc("not base64!".to_string()),
+            oidc(BASE64_STANDARD.encode([5u8; 47])),
+        ] {
+            assert!(vsapi_blobs(&[bad]).is_err());
+        }
     }
 }

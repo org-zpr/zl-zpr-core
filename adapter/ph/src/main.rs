@@ -12,12 +12,16 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::*;
 
+mod actor_activation;
+mod actor_auth;
+mod actor_renewal;
 mod adapter_manager_worker;
 mod adapter_tables;
 mod address_pool;
 mod admin_worker;
 mod assembly;
 mod auth;
+mod auth_agent;
 mod batch_io;
 mod capture_worker;
 mod classifier;
@@ -516,6 +520,7 @@ fn main() -> ExitCode {
     //
 
     let asm = Arc::new(Assembly {
+        actor_rejected: std::sync::atomic::AtomicBool::new(false),
         ph_mode,
         topology_config,
         mgmt_substrate_egress: MgmtSubstrateEgress::new(mgmt_substrate_inq),
@@ -611,8 +616,8 @@ fn main() -> ExitCode {
                 asm.peer_table
                     .get(LOCAL_ACTOR_LINK_ID)
                     .unwrap()
-                    .link_state_machine
-                    .add_internal_actor_address(addr.into());
+                    .actor_auth
+                    .add_internal_address(addr.into());
             }
 
             // Those are the only source addresses the node will accept from

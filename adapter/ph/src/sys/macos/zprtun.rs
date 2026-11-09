@@ -89,6 +89,19 @@ impl ZprTun {
     }
 
     pub fn add_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+        self.add_address_impl(addr, prefix_len, false)
+    }
+
+    pub fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+        self.add_address_impl(addr, prefix_len, true)
+    }
+
+    fn add_address_impl(
+        &self,
+        addr: IpAddr,
+        prefix_len: u8,
+        authentication: bool,
+    ) -> std::io::Result<()> {
         let mtx = self
             .mtx
             .lock()
@@ -113,6 +126,9 @@ impl ZprTun {
             }
         }
         c.arg("alias");
+        if authentication {
+            c.arg("deprecated");
+        }
         debug!(target: NET_OS, "{:?}", c);
         let output = c.output()?;
         if !output.status.success() {

@@ -38,9 +38,13 @@ pub enum ZdpPacketType {
     AcquireZprAddress = 138, // TODO: add to RFC 6
     GrantZprAddress = 139,   // TODO: add to RFC 6
     RevokeZprAddress = 140,
-    InitAuthenticationRequest = 141,   // TODO: add to RFC 6
-    RenewAuthenticationRequest = 142,  // TODO: add to RFC 6 (zipline#66)
-    RenewAuthenticationResponse = 143, // TODO: add to RFC 6 (zipline#66)
+    InitAuthenticationRequest = 141, // TODO: add to RFC 6
+    StartAuthentication = 142,       // Experimental; see diagrams/actor_authorization.md
+    AbandonAuthenticationAttempt = 143,
+    // Zipline-local assignments (zipline#66). Formerly 142/143; moved when
+    // upstream #1410 claimed those for StartAuthentication/Abandon.
+    RenewAuthenticationRequest = 144, // TODO: add to RFC 6 (zipline#66)
+    RenewAuthenticationResponse = 145, // TODO: add to RFC 6 (zipline#66)
 
     Canceled = 252, // TODO: add to RFC 17
     Cancel = 253,   // TODO: add to RFC 17
@@ -72,12 +76,26 @@ impl ZdpPacketType {
 pub enum ResponseCode {
     Success = 0,
     Other = 1,
-    /// Authentication failed: bad signature, bad token, or malformed request.
-    AuthFailed = 2,
-    /// Authentication succeeded, but no join policy admits this endpoint.
-    PolicyDenied = 3,
+    UnsupportedProtocol = 2,
+    TemporarilyUnavailable = 3,
+}
+
+/// Outcome of an actor authentication step, carried in GrantZprAddress and
+/// (zipline#66) RenewAuthenticationResponse.
+#[open_enum]
+#[derive(Copy, Clone, Debug, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(u8)]
+pub enum AuthenticationStatus {
+    Success = 0,
+    /// Credentials or evidence rejected (bad signature, bad token, malformed
+    /// request). Terminal: the adapter latches the rejection.
+    Rejected = 1,
     /// The authentication backend is temporarily unavailable; retry later.
-    AuthUnavailable = 4,
+    Retryable = 2,
+    /// Zipline-local (zipline#12): authentication succeeded, but no join
+    /// policy admits this endpoint. Terminal like [Self::Rejected]; kept
+    /// distinct so ph-cli can tell the user which one happened.
+    PolicyDenied = 3,
 }
 
 #[derive(Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
@@ -160,6 +178,7 @@ pub mod init_authentication_flags {
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(packed)]
 pub struct ZdpInitAuthenticationRequestHeader {
+    pub status: AuthenticationStatus,
     pub flags: u8,
     pub data_len: U16,
     // Followed by challenge payload, eg ZdpInitAuthenticationPayload in auth.rs.
@@ -180,9 +199,9 @@ pub struct ZdpRenewAuthenticationRequestHeader {
 
 /// Renew Authentication response (adapter → node; zipline#66, pending RFC 6).
 ///
-/// On [ResponseCode::Success] carries the renewed auth blob — the same
-/// base64-encoded JSON encoding [ZdpAcquireZprAddressHeader]'s blob uses.
-/// [ResponseCode::AuthUnavailable] means no AuthAgent is registered (or it
+/// On [AuthenticationStatus::Success] carries the renewed auth blob — the
+/// same base64-encoded JSON encoding [ZdpAcquireZprAddressHeader]'s blob uses.
+/// [AuthenticationStatus::Retryable] means no AuthAgent is registered (or it
 /// could not answer); the blob is then empty.
 ///
 /// `challenge` echoes the request's challenge bytes (nonce || ctime ||
@@ -193,7 +212,7 @@ pub struct ZdpRenewAuthenticationRequestHeader {
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(packed)]
 pub struct ZdpRenewAuthenticationResponseHeader {
-    pub status_code: ResponseCode,
+    pub status_code: AuthenticationStatus,
     pub blob_len: U16,
     pub challenge: [u8; 48],
     // Followed by the BLOB (blob_len bytes): base64 encoded json string.
@@ -213,7 +232,7 @@ pub struct ZdpAcquireZprAddressHeader {
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(packed)]
 pub struct ZdpGrantZprAddressHeader {
-    pub status_code: ResponseCode,
+    pub status_code: AuthenticationStatus,
     pub ip_version: L3Type, // Length of address determined by IP type
     pub addr_count: u8,
     // Followed in memory by:

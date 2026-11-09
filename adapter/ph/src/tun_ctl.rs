@@ -21,6 +21,9 @@ pub trait TunCtl: Sync {
     /// Adds an IP address of the TUN device.
     fn add_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()>;
 
+    /// Add AAA as a valid but non-preferred source; authentication binds it explicitly.
+    fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()>;
+
     /// Clear an IP address from the TUN device.  Does not error if address is not set to begin with.
     fn clear_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()>;
 
@@ -91,6 +94,9 @@ impl TunCtl for TunCtlImpl {
     }
     fn add_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()> {
         self.tun.add_address(addr, prefix_len)
+    }
+    fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()> {
+        self.tun.add_authentication_address(addr, prefix_len)
     }
     fn clear_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()> {
         self.tun.clear_address(addr, prefix_len)

@@ -31,9 +31,7 @@ use tokio::net::TcpListener;
 use url::Url;
 
 /// How long the user has to complete the interactive login. Matches ph's
-/// `OIDC_USER_INTERACTION_TIMEOUT` (adapter/ph/src/config.rs), deliberately
-/// under the node's 330 s `ACTOR_AUTHENTICATION_TIMEOUT` so the CLI side
-/// gives up before the node does.
+/// `OIDC_USER_INTERACTION_TIMEOUT` (adapter/ph/src/config.rs).
 pub const OIDC_LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Fixed `max_age` (seconds, one year) sent on offline-capable authorization
@@ -827,56 +825,55 @@ fn open_in_browser(url: &str) -> Result<(), OidcCliError> {
 /// What one `showLink` snapshot says about a starting link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkOutcome {
-    /// `State: Active` — the link is up.
+    /// `Actor state: Authorized` — the actor holds its ZPR address.
     Up,
     /// Authentication failed; carries the Debug spelling of ph's
-    /// `AuthFailureReason` from the `Last auth failure:` line. Reported for
-    /// the transient `Error` state (empty reason if none was printed) and
-    /// for any teardown state that carries a recorded failure — see
-    /// [`parse_show_link_state`].
+    /// `AuthFailureReason` from the `Last auth failure:` line (empty if the
+    /// link failed with none recorded). See [`parse_show_link_state`].
     Failed(String),
-    /// Any other state — keep polling.
+    /// Anything else — keep polling.
     Pending,
 }
 
-/// Parse the text `showLink` returns. ph prints `  State: {:?} (for {:?})`
-/// (Display for LinkStateMachine) and, when a failure was recorded,
-/// `  Last auth failure: {:?}` (Display for LinkStateWrapper), both in
-/// adapter/ph/src/link_state.rs.
+/// Parse the text `showLink` returns. ph prints the link's
+/// `  State: {:?} (for {:?})` (Display for LinkStateMachine in
+/// adapter/ph/src/link_state.rs) and the actor's `  Actor state: {:?}` and,
+/// when a failure was recorded, `  Last auth failure: {:?}` (Display for
+/// ActorAuthorization in adapter/ph/src/actor_auth.rs).
 ///
-/// The `Error` state is transient: ph's `process_authentication_failure`
-/// sets it and synchronously initiates the close, so a 1-second poll usually
-/// observes the link already in `Closing` (then `Inactive` once the
-/// terminate completes, then restarting). The durable trace of the failure
-/// is the recorded reason, which ph clears when a fresh Start begins a new
-/// attempt — so a teardown state accompanied by a `Last auth failure:` line
-/// is this attempt's terminal outcome, while a teardown state without one is
-/// an ordinary stop/restart and polling continues.
+/// Since #1410 the link is Active once Hello completes and the actor is
+/// authorized afterwards, so success is the *actor* reaching `Authorized`.
+/// ph clears the recorded failure when `connect` starts the link, so a
+/// visible `Last auth failure:` always belongs to this attempt: it is the
+/// outcome unless the actor is visibly mid-attempt (a retry with backoff
+/// after a transient failure only starts after the reason is recorded, so
+/// `connect` reports the first failure, as it did before #1410). A link in
+/// `Error` with no recorded reason also ends the wait.
 pub fn parse_show_link_state(text: &str) -> LinkOutcome {
-    let mut state = None;
+    let mut link_state = None;
+    let mut actor_state = None;
     let mut reason = None;
     for line in text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("State: ") {
             // "Active (for 1.2s)" -> "Active"; Disconnecting(..) has no
             // space before its parenthesis, so split on " (" only.
-            state = Some(rest.split(" (").next().unwrap_or(rest).to_string());
+            link_state = Some(rest.split(" (").next().unwrap_or(rest).to_string());
+        } else if let Some(rest) = line.strip_prefix("Actor state: ") {
+            actor_state = Some(rest.to_string());
         } else if let Some(rest) = line.strip_prefix("Last auth failure: ") {
             reason = Some(rest.to_string());
         }
     }
-    // States a failed authentication tears the link down through
-    // (initiate_close / continue_close / complete_close).
-    let is_teardown = matches!(
-        state.as_deref(),
-        Some("Closing") | Some("Inactive") | Some("Resetting")
-    ) || state
-        .as_deref()
-        .is_some_and(|s| s.starts_with("Disconnecting"));
-    match state.as_deref() {
-        Some("Active") => LinkOutcome::Up,
-        Some("Error") => LinkOutcome::Failed(reason.unwrap_or_default()),
-        _ if is_teardown && reason.is_some() => LinkOutcome::Failed(reason.unwrap_or_default()),
+    // Actor states in which an authentication attempt is under way.
+    let attempting = matches!(
+        actor_state.as_deref(),
+        Some("RequestingAuthentication") | Some("Authenticating") | Some("AcquiringAddress")
+    );
+    match (actor_state.as_deref(), reason) {
+        (Some("Authorized"), _) => LinkOutcome::Up,
+        (_, Some(reason)) if !attempting => LinkOutcome::Failed(reason),
+        _ if link_state.as_deref() == Some("Error") => LinkOutcome::Failed(String::new()),
         _ => LinkOutcome::Pending,
     }
 }
@@ -1585,75 +1582,79 @@ mod tests {
     }
 
     /// Pure parser over the `showLink` result text, matching what ph's
-    /// Display impls actually print: `  State: {:?} (for {:?})` and, when
-    /// set, `  Last auth failure: {:?}`.
+    /// Display impls actually print: the link's `  State: {:?} (for {:?})`,
+    /// the actor's `  Actor state: {:?}` and, when set,
+    /// `  Last auth failure: {:?}`.
     #[test]
     fn test_parse_show_link_state() {
-        assert_eq!(
-            parse_show_link_state("  Type: AdapterToNode\n  State: Active (for 1.2s)\n"),
-            LinkOutcome::Up
-        );
+        // Success is the actor being authorized, not the link being Active.
         assert_eq!(
             parse_show_link_state(
-                "  State: Error (for 3ms)\n  Last auth failure: InteractionTimeout\n"
+                "  Type: AdapterToNode\n  State: Active (for 1.2s)\n  Actor state: Authorized\n"
+            ),
+            LinkOutcome::Up
+        );
+        for actor in [
+            "WaitingForLink",
+            "RequestingAuthentication",
+            "Authenticating",
+            "AcquiringAddress",
+        ] {
+            assert_eq!(
+                parse_show_link_state(&format!(
+                    "  State: Active (for 1.2s)\n  Actor state: {actor}\n"
+                )),
+                LinkOutcome::Pending,
+                "{actor}"
+            );
+        }
+        assert_eq!(
+            parse_show_link_state(
+                "  State: Active (for 1s)\n  Actor state: Rejected\n  Last auth failure: InteractionTimeout\n"
             ),
             LinkOutcome::Failed("InteractionTimeout".to_string())
         );
         assert_eq!(
             parse_show_link_state(
-                "  State: Error (for 3ms)\n  Last auth failure: IdpUnreachable(\"conn refused\")\n"
+                "  State: Active (for 1s)\n  Actor state: RetryBackoff\n  Last auth failure: IdpUnreachable(\"conn refused\")\n"
             ),
             LinkOutcome::Failed("IdpUnreachable(\"conn refused\")".to_string())
         );
-        // Error with no recorded reason still terminates the wait.
+        // A link in Error with no recorded reason still terminates the wait.
         assert_eq!(
-            parse_show_link_state("  State: Error (for 3ms)\n"),
+            parse_show_link_state("  State: Error (for 3ms)\n  Actor state: WaitingForLink\n"),
             LinkOutcome::Failed(String::new())
         );
-        // Anything in-flight keeps polling.
         assert_eq!(
-            parse_show_link_state("  State: WaitForUserAuth (for 10s)\n"),
-            LinkOutcome::Pending
-        );
-        assert_eq!(
-            parse_show_link_state("  State: Keying (for 10ms)\n"),
+            parse_show_link_state("  State: Keying (for 10ms)\n  Actor state: WaitingForLink\n"),
             LinkOutcome::Pending
         );
     }
 
-    /// The Error state is transient: `process_authentication_failure` sets it
-    /// and synchronously initiates the close, so the 1-second poll normally
-    /// observes the link already in Closing (or Inactive, once the terminate
-    /// completes). A teardown state accompanied by a recorded failure is the
-    /// current attempt's outcome — ph clears `last_auth_failure` on Start, so
-    /// a reason that is visible always belongs to the attempt this `connect`
-    /// started — and must be terminal, not Pending.
+    /// Link teardown resets the actor to WaitingForLink but keeps the
+    /// recorded failure, which ph clears only when `connect` starts the link
+    /// again; so a teardown with a reason is this attempt's terminal outcome,
+    /// and one without is an ordinary stop/restart.
     #[test]
     fn test_parse_show_link_state_teardown_with_reason_is_terminal() {
         for state in ["Closing", "Inactive", "Resetting", "Disconnecting(Other)"] {
             assert_eq!(
                 parse_show_link_state(&format!(
-                    "  State: {state} (for 3ms)\n  Last auth failure: InteractionTimeout\n"
+                    "  State: {state} (for 3ms)\n  Actor state: WaitingForLink\n  Last auth failure: ActivationFailed(\"x\")\n"
                 )),
-                LinkOutcome::Failed("InteractionTimeout".to_string()),
+                LinkOutcome::Failed("ActivationFailed(\"x\")".to_string()),
                 "teardown state {state} with a recorded failure must be terminal"
             );
         }
-        // A teardown state with no recorded failure is an ordinary
-        // stop/restart, not an authentication outcome: keep polling.
         assert_eq!(
-            parse_show_link_state("  State: Closing (for 3ms)\n"),
+            parse_show_link_state("  State: Closing (for 3ms)\n  Actor state: WaitingForLink\n"),
             LinkOutcome::Pending
         );
-        assert_eq!(
-            parse_show_link_state("  State: Inactive (for 3ms)\n"),
-            LinkOutcome::Pending
-        );
-        // A running state ignores the reason line (defense in depth: ph
-        // clears it on Start, so it should never be visible here anyway).
+        // A reason next to an attempt in progress is not an outcome
+        // (defense in depth: ph clears it when connect starts the link).
         assert_eq!(
             parse_show_link_state(
-                "  State: WaitForUserAuth (for 10s)\n  Last auth failure: NoAgent\n"
+                "  State: Active (for 10s)\n  Actor state: Authenticating\n  Last auth failure: NoAgent\n"
             ),
             LinkOutcome::Pending
         );
@@ -1670,7 +1671,7 @@ mod tests {
             "LinkFailed(\"link failed before authentication completed (RequestTimedOut)\")";
         assert_eq!(
             parse_show_link_state(&format!(
-                "  State: Inactive (for 3ms)\n  Last auth failure: {reason}\n"
+                "  State: Inactive (for 3ms)\n  Actor state: WaitingForLink\n  Last auth failure: {reason}\n"
             )),
             LinkOutcome::Failed(reason.to_string())
         );

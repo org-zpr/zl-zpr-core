@@ -319,10 +319,9 @@ async fn oidc_login_task(
     }
 }
 
-/// How long `connect` waits for the link to come up. Slightly above ph's
-/// authentication budget (the node's 330 s ACTOR_AUTHENTICATION_TIMEOUT
-/// bounds the 300 s user-interaction window), so ph decides the outcome and
-/// this deadline only catches a wedged link.
+/// How long `connect` waits for the actor to be authorized. Slightly above
+/// ph's 300 s user-interaction window (`OIDC_USER_INTERACTION_TIMEOUT`), so
+/// ph decides the outcome and this deadline only catches a wedged link.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(330);
 
 /// How often `connect` polls `showLink` while waiting for the outcome.

@@ -16,10 +16,8 @@ use thiserror::Error;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use x509_cert::Certificate as X509Certificate;
 use zpr_utils::rsa_sign::{load_rsa_key, sign_rsa_key};
 
-use crate::pki;
 
 /// When a node signs a challenge for an adapter it uses this sort of key.
 pub const AUTH_KEY_SIZE_BYTES: usize = 32; // blake3 256bit key
@@ -37,7 +35,7 @@ pub const MAX_BLOB_AGE_SECONDS: u64 = 120; // 2 minutes
 /// OIDC-specific challenge freshness window. The challenge is issued before
 /// the end user completes the OIDC browser flow, which is allowed up to
 /// OIDC_USER_INTERACTION_TIMEOUT (300 s, D2); this bound must cover that plus
-/// margin, consistent with ACTOR_AUTHENTICATION_TIMEOUT (330 s).
+/// margin.
 pub const MAX_OIDC_BLOB_AGE_SECONDS: u64 = 330;
 
 /// This is the data payload in a [zdp::PacketType::InitAuthenticationRequest] packet.
@@ -183,6 +181,11 @@ pub enum AuthError {
 
     #[error("Authentication Error: {0}")]
     AuthError(String),
+
+    /// The credentials were refused outright (as opposed to a transient
+    /// service failure). Actor authorization latches this (#1410).
+    #[error("authentication rejected: {0}")]
+    Rejected(String),
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +195,9 @@ pub struct RsaBootstrapAuth {
 }
 
 impl ZdpSelfSignedBlob {
-    /// Gets the "encoded" form of the blob: base64 encoded JSON.
+    /// Gets the "encoded" form of the blob: base64 encoded JSON (the legacy
+    /// single-object encoding; evidence is now sent as an array).
+    #[cfg(test)]
     pub fn encode(&self) -> String {
         let json_txt = serde_json::to_string(self).unwrap();
         BASE64_STANDARD.encode(&json_txt)
@@ -200,11 +205,8 @@ impl ZdpSelfSignedBlob {
 
     /// The `challenge` field in the blob is a base64 encoded [zdp::ZdpInitAuthenticationPayload].
     /// This extracts that data and checks that:
-    ///   - If the peer presented a certificate during keying, the CN in that
-    ///     certificate matches the CN in the blob. Adapters using self-generated
-    ///     keys send no certificate (`peer_cert` is `None`); there is then no
-    ///     cert CN to bind to, so this check is skipped and the blob CN is
-    ///     authenticated solely by the visa service's RSA signature check.
+    ///   - Actor identity is independent of the link certificate (#1410). The
+    ///     visa service authenticates the blob CN through its RSA signature.
     ///   - The HMAC in the blob is valid for the provided `key`.
     ///   - The blob is not older than `max_age_seconds`. At connect this is
     ///     [MAX_BLOB_AGE_SECONDS]; on the renewal path it is
@@ -215,23 +217,9 @@ impl ZdpSelfSignedBlob {
     ///     with the single outstanding stashed challenge.
     pub fn verify_blob_challenge(
         &self,
-        peer_cert: Option<&X509Certificate>,
         key: &[u8; AUTH_KEY_SIZE_BYTES],
         max_age_seconds: u64,
     ) -> Result<(), AuthError> {
-        if let Some(peer_cert) = peer_cert {
-            if let Some(link_cn) = pki::common_name(peer_cert) {
-                if link_cn != self.cn {
-                    return Err(AuthError::FormatError(format!(
-                        "CN mismatch: expected {link_cn} found {}",
-                        self.cn
-                    )));
-                }
-            } else {
-                return Err(AuthError::FormatError("no CN in peer cert".to_string()));
-            }
-        }
-
         let payload_bytes = BASE64_STANDARD.decode(self.challenge.clone())?;
         verify_challenge_bytes(&payload_bytes, key, max_age_seconds)?;
         Ok(())
@@ -326,6 +314,17 @@ pub fn oidc_nonce_for_challenge(challenge: &[u8; 48]) -> String {
 }
 
 impl ZdpInitAuthenticationPayload {
+    /// The raw 48-byte challenge: nonce || ctime || hmac. Blobs echo these
+    /// bytes (base64) and OIDC nonces are derived from them
+    /// ([oidc_nonce_for_challenge]).
+    pub fn challenge_bytes(&self) -> [u8; 48] {
+        let mut challenge = [0u8; 48];
+        challenge[0..8].copy_from_slice(&self.nonce);
+        challenge[8..16].copy_from_slice(&self.ctime.to_bytes());
+        challenge[16..48].copy_from_slice(&self.hmac);
+        challenge
+    }
+
     pub fn new(key: &[u8; AUTH_KEY_SIZE_BYTES]) -> Self {
         let ctime = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -350,7 +349,7 @@ impl ZdpInitAuthenticationPayload {
 /// dispatching on its "blob_type" field.
 fn decode_blob_value(jobj: &Value) -> Result<AuthBlob, AuthError> {
     let blob_type = jobj.get("blob_type").ok_or_else(|| {
-        AuthError::FormatError(format!("missing blob_type field in blob: {}", jobj))
+        AuthError::FormatError("authentication evidence has no blob_type field".into())
     })?;
 
     match blob_type.as_str() {
@@ -362,10 +361,9 @@ fn decode_blob_value(jobj: &Value) -> Result<AuthBlob, AuthError> {
             let oidc_blob = serde_json::from_value::<ZdpOidcBlob>(jobj.clone())?;
             Ok(AuthBlob::Oidc(oidc_blob))
         }
-        _ => Err(AuthError::FormatError(format!(
-            "unknown blob_type: {:?}",
-            blob_type
-        ))),
+        _ => Err(AuthError::FormatError(
+            "unsupported authentication evidence type".into(),
+        )),
     }
 }
 
@@ -424,32 +422,20 @@ impl RsaBootstrapAuth {
         })
     }
 
-    /// The returned string is a "SelfSignedBlob" object serialized to JSON and then base64 encoded.
+    /// Sign the node's challenge, producing a [ZdpSelfSignedBlob] for the
+    /// actor's evidence array ([encode_blobs]).
     ///
     /// The signature here is created by signing:
     ///  - the current timestamp (in seconds since the epoch)
     ///  - the common name (cn) of the actor
     ///  - the challenge from the ZDP server, which is the (nonce, ctime, hmac) all concatentated
     ///    together in a byte buffer.
-    pub fn authenticate(
-        &self,
-        payload: &ZdpInitAuthenticationPayload,
-    ) -> Result<String, AuthError> {
-        Ok(self.authenticate_blob(payload)?.encode())
-    }
-
-    /// Like [Self::authenticate] but returns the [ZdpSelfSignedBlob] itself,
-    /// for callers assembling a multi-blob array (e.g. SS + OIDC).
     pub fn authenticate_blob(
         &self,
         payload: &ZdpInitAuthenticationPayload,
     ) -> Result<ZdpSelfSignedBlob, AuthError> {
         // TODO: Check the payload.flags?
-        // TODO: This could be an impl function in zdp
-        let mut challenge = [0u8; 48];
-        challenge[0..8].copy_from_slice(&payload.nonce);
-        challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
-        challenge[16..48].copy_from_slice(&payload.hmac);
+        let challenge = payload.challenge_bytes();
 
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -550,6 +536,52 @@ mod test {
             Err(AuthError::FormatError(_)) => {}
             other => panic!("expected FormatError for AC blob, got {other:?}"),
         }
+    }
+
+    /// Decode errors must not echo the evidence: a blob can carry an ID
+    /// token or authorization code (from upstream #1410).
+    #[test]
+    fn test_evidence_errors_do_not_disclose_contents() {
+        for json in [
+            r#"{"code":"private-authorization-code"}"#,
+            r#"[{"blob_type":"XX","id_token":"private-id-token"}]"#,
+        ] {
+            let blob = BASE64_STANDARD.encode(json);
+            let error = decode_blobs(&blob).unwrap_err().to_string();
+            assert!(!error.contains(&blob));
+            assert!(!error.contains("private-"), "error leaked evidence: {error}");
+        }
+    }
+
+    /// An SS blob whose challenge is older than the permitted age is
+    /// rejected even with a valid HMAC (from upstream #1410).
+    #[test]
+    fn test_expired_bootstrap_challenge_is_rejected() {
+        let key = [42; 32];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut challenge = ZdpInitAuthenticationPayload {
+            nonce: [1; 8],
+            ctime: (now - MAX_BLOB_AGE_SECONDS - 1).into(),
+            hmac: [0; 32],
+        };
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(&challenge.nonce);
+        hasher.update(&challenge.ctime.to_bytes());
+        challenge.hmac = hasher.finalize().into();
+        let blob = ZdpSelfSignedBlob {
+            blob_type: BLOB_TYPE_SS.into(),
+            ts: now,
+            cn: "actor.identity".into(),
+            challenge: BASE64_STANDARD.encode(challenge.as_bytes()),
+            sig: String::new(),
+        };
+        assert!(matches!(
+            blob.verify_blob_challenge(&key, MAX_BLOB_AGE_SECONDS),
+            Err(AuthError::ChallengeTooOld)
+        ));
     }
 
     #[test]
@@ -659,7 +691,7 @@ mod test {
             hmac: [24u8; 32],
         };
 
-        let blob = bs.authenticate(&payload).unwrap();
+        let blob = bs.authenticate_blob(&payload).unwrap().encode();
         assert!(!blob.is_empty());
 
         let blob_json = BASE64_STANDARD.decode(&blob).unwrap();

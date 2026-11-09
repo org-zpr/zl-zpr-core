@@ -75,23 +75,16 @@ pub const MIN_VISA_ID: u64 = 1000;
 /// wait this long before retry.
 pub const VSCONN_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Slightly longer -- asking visa service to grant an address
-/// means it may have to do a lot of work to verify auth.
-pub const VS_GRANT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long to wait for an actor to finish out of band authentication.
-/// Covers OIDC_USER_INTERACTION_TIMEOUT (300 s: a human completing an OIDC
-/// browser flow, see zipline#13/D2) plus margin.
-pub const ACTOR_AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(330);
-
-/// How long the adapter waits in WaitForUserAuth for the AuthAgent to return
-/// an OIDC credential: the human has this long to complete the browser login.
-/// Must stay under ACTOR_AUTHENTICATION_TIMEOUT (330 s), which is the node's
-/// bound on the whole out-of-band exchange.
+/// How long the adapter waits for the AuthAgent to return an OIDC
+/// credential: the human has this long to complete the browser login
+/// (zipline#13/D2). The node sets no timer of its own on the exchange
+/// (#1410); ZDP-R and keep-alives bound it.
 pub const OIDC_USER_INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// How long to wait when we expect the VS to have to talk to external auth services.
-pub const VS_AUTHENTICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Actor authorization retry backoff after a retryable failure: starts at
+/// the initial delay, doubles per attempt, capped at the max (#1410).
+pub const ACTOR_AUTH_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+pub const ACTOR_AUTH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 const DEFAULT_BUFFER_COUNT: usize = 512; // should be at least 5x batch size; see fastpath_worker.rs for explanation
 const DEFAULT_BATCH_SIZE: usize = 64;

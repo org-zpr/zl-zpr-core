@@ -180,15 +180,33 @@ impl ZprTun {
     }
 
     pub fn add_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+        self.add_address_impl(addr, false)
+    }
+
+    /// Add the adapter authentication address (AAA, #1410) as a valid but
+    /// deprecated source (`preferredlifetime=0`), the Windows equivalent of
+    /// Linux's `preferred_lft 0`: applications prefer the granted actor
+    /// address, and authentication binds the AAA explicitly. A deprecated
+    /// address still passes the DAD wait ([dad::DadState::Usable]).
+    pub fn add_authentication_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+        self.add_address_impl(addr, true)
+    }
+
+    /// Shared body of [Self::add_address] and
+    /// [Self::add_authentication_address].
+    fn add_address_impl(&self, addr: IpAddr, authentication: bool) -> std::io::Result<()> {
         let _mtx = self.lock()?;
         if self.has_address(addr)? {
             return Ok(());
         }
         let addr = require_v6("add_address", addr)?;
-        // netsh interface ipv6 add address <if> <addr>
-        let output = self
-            .netsh(&["add", "address", &self.name, &addr.to_string()])
-            .output()?;
+        let addr_text = addr.to_string();
+        // netsh interface ipv6 add address <if> <addr> [preferredlifetime=0]
+        let mut args = vec!["add", "address", self.name.as_str(), addr_text.as_str()];
+        if authentication {
+            args.push("preferredlifetime=0");
+        }
+        let output = self.netsh(&args).output()?;
         if !output.status.success() {
             return Err(std::io::Error::other(format!(
                 "netsh failed to add address {addr} on {}: {}",

@@ -89,6 +89,10 @@ files for each side. [`docs/SETUP.md`](docs/SETUP.md) walks through all of
 it by hand and ends with a reference for the control socket and certificate
 verification.
 
+Adapter-node link establishment and actor authorization have independent
+lifecycles. See [actor authorization](diagrams/actor_authorization.md) for the
+state machines, wire protocol, retry policy, and bootstrap exception.
+
 `ph adapter` also runs on Windows 10/11: `ph.exe adapter -c adapter.toml`
 from an elevated (Administrator) console, with the signed `wintun.dll` from
 [wintun.net](https://www.wintun.net) next to `ph.exe`. `ph-cli.exe` talks to

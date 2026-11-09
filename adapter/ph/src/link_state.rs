@@ -1,123 +1,34 @@
-use crate::auth::{self, AUTH_KEY_SIZE_BYTES, AuthBlob, ZdpSelfSignedBlob};
+use crate::auth;
+use crate::auth_agent::AuthFailureReason;
 use crate::counters::ManagementCounterType;
 use crate::km::ZPIPair;
 use crate::km_multiplexor;
 use crate::mgmt;
-use crate::mgmt::core::{MgmtSendError, PacketStatus};
 use crate::pki;
 use crate::prelude::*;
 use crate::sample_ring::SampleRing;
 use crate::special_peers;
 use crate::special_peers::SpecialPeerName;
-use crate::visa_mgmt;
-use crate::zdp::{self, ResponseCode, TerminateReason};
+use crate::zdp::{ResponseCode, TerminateReason};
 
-use base64::prelude::*;
 use std::fmt::{Display, Formatter};
-use std::net::IpAddr;
 use std::num::NonZero;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use zpr::addrs::{ZPR_INTERNAL_NETWORK, ZPRNET_PREFIX_LEN};
+use zpr::addrs::ZPRNET_PREFIX_LEN;
 use zpr_utils::net_defs::IpAddress;
 
-/// State machine for links and docking sessions
-
-// Node-to-Node
-// +--------------+       +----------+       +--------+
-// | UNCONFIGURED |--CD-->| INACTIVE |--ST-->| KEYING |
-// +--------------+       +----------+       +--------+
-//     ^                       ^               | |  |
-//     |                       |   +------KDe--+ |  +--KDu--------+
-//     |                       CC  |       C    KDo               |
-//     |                       |   V             V                V
-//     |                   +---------+  HDe  +----------+     +----------+
-//     |                   | CLOSING |<--C---| HELLOING |     | HELLOING |
-//     |                   +---------+       +----------+     | SILENT   |
-//     R                       ^                  |   |       +----------+
-//     |                       |                 HDo HDu          |    |
-//     |                       C                  |   |          HDu   C
-//     |                       |                  |   +------+   HDo  HDe
-//     |                       |                  V          V    V     |
-//     |                       | KDe, C, KF   +--------+    +--------+  |
-//     |                       +----------+---| ACTIVE |--->| ACTIVE |  |
-//     |                                  |   +--------+ KDu| Silent |  |
-//     +<-R-[ANY STATE]                   |            +--------+  |
-//     |                                  |                |       |
-// +-------+                              |                C       |
-// | ERROR |<-- Error -- [ANY STATE]      |                |       |
-// +-------+                              +----------------+-------+
-
-// Node-to-Adapter
-// NOTE: The LISTENING state, just like the UNCONFIGURED state, is implicit
-// +--------------+       +-----------+                    +--------+
-// | UNCONFIGURED |--CD-->| LISTENING |---------------RKM->| KEYING |
-// +--------------+       +-----------+                    +--------+
-//     ^                    ^                                | |  |
-//     |                    | +------KDe---------------------+ |  +--KDu--+
-//     |                   CC |       C                       KDo         |
-//     |                    | |                             +--+          |
-//     |                    | V                             V             V
-//     |              +---------+              HDe   +----------+  +----------+
-//     |              | CLOSING |<---------------C---| HELLOING |  | HELLOING |
-//     |              +---------+                    +----------+  | SILENT   |
-//     R                  ^                               |   |    +----------+
-//     |                  |                              HDo HDu        |    |
-//     |                  C             +-----------------+   |      HDo,HDu C
-//     |                  |             |             +-------+<--------+   HDe
-//     |                  |             V             |                      |
-//     |                  |        +-------------+  +-------------+          |
-//     |                  +<-RADe--| REGISTER AA |  | REGISTER AA |          |
-//     |                  |   C    +-------------+  |    SILENT   |-----C--->+
-//     |                  |              |    |     +-------------+          |
-//     |                  |             RADo  RADu     |                     |
-//     |                  |              |    |       RAD                    |
-//     |              +---+              |    +-----+  |                     |
-//     |              |                  V          V  V                     |
-//     |              | KDe, RADe, C +--------+    +--------+                |
-//     |              +----------+---| ACTIVE |--->| ACTIVE |                |
-//     |                 KF      |   +--------+KDu,| Silent |                |
-//     +<-R-[ANY STATE]           \           RADu +--------+                |
-//     |                           \                   |                     |
-// +-------+                        \                  C                     |
-// | ERROR |<-- Error - [ANY STATE]  \                 |                     |
-// +-------+                          +----------------+---------------------+
-
-// Adapter-to-Node
-// +--------------+       +----------+                     +--------+
-// | UNCONFIGURED |--CD-->| INACTIVE |---------ST--------->| KEYING |
-// +--------------+       +----------+                     +--------+
-//     ^                   ^                                 | |  |
-//     |                   |  +------KDe---------------------+ |  +--KDu-----+
-//     |                   CC |       C                       KDo            |
-//     |                   |  |                                |             |
-//     |                   |  V                                V             V
-//     |              +---------+             HDe   +----------+  +----------+
-//     |              | CLOSING |<-------------C----| HELLOING |  | HELLOING |
-//     |              +---------+                   +----------+  | SILENT   |
-//     R                  ^                              |   |    +----------+
-//     |                  |                             HDo HDu        |    |
-//     |                  C            +-----------------+   |      HDu,HDo C
-//     |                  |            |             +-------+<--------+   HDe
-//     |                  |            V             |                      |
-//     |                  |       +-------------+  +-------------+          |
-//     |                  +<-RADe-| REGISTER AA |  | REGISTER AA |          |
-//     |                  |   C   +-------------+  |    SILENT   |----C---->+
-//     |                  |             |    |     +-------------+          |
-//     |                  |            RADo  RADu     |                     |
-//     |             +----+             |    |       RAD                    |
-//     |             |                  |    +-----+  |                     |
-//     |             |                  V          V  V                     |
-//     |             | KDe, RADe, C +--------+    +--------+                |
-//     |             +----------+---| ACTIVE |--->| ACTIVE |                |
-//     |                  KF    |   +--------+KDu,| Silent |                |
-//     +<-R-[ANY STATE]          \           RADu +--------+                |
-//     |                          \                   |                     |
-// +-------+                       \                  C                     |
-// | ERROR |<- Error - [ANY STATE]  \                 |                     |
-// +-------+                         +----------------+---------------------+
-
+/// Encrypted link lifecycle; actor authorization is independent
+/// ([crate::actor_auth]).
+///
+/// Zipline additions to upstream #1410's link layer (search "zipline#"):
+/// OIDC IdP advertisement in Hello (zipline#12), keep-alive miss tolerance
+/// and VSConn recycling (zipline#113), the node keying timeout
+/// (zipline#173), idle mode with auto-connect off (zipline#28), no restart
+/// after a fatal local activation failure (zipline#157), the renewal tick
+/// (zipline#45), and a fresh ZDP-R session per Start.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum LinkState {
     Inactive,
@@ -128,163 +39,17 @@ pub enum LinkState {
     Closing,
     Resetting,
     Active,
-    RegisterAA, // aka acquiring ZPR address
-    WaitForInitAuth,
-    WaitForAcquireZprAddress,
-    /// Adapter side: waiting for the out-of-band AuthAgent (a human in a
-    /// browser) to return an OIDC credential. Bounded by
-    /// [config::OIDC_USER_INTERACTION_TIMEOUT].
-    WaitForUserAuth,
     Error,
 }
 
-/// Why an out-of-band authentication attempt failed, as reported to ph-cli.
-/// Mirrors the spec's error taxonomy (see zipline#13).
-#[allow(dead_code)] // some variants are constructed only by later deliverables
-#[derive(Clone, Debug, PartialEq, strum::IntoStaticStr)]
-pub enum AuthFailureReason {
-    /// OIDC required but startLink registered no AuthAgent.
-    NoAgent,
-    /// The agent returned access_denied: the user refused the login.
-    UserDeclined,
-    /// The user did not complete the login within OIDC_USER_INTERACTION_TIMEOUT.
-    InteractionTimeout,
-    /// Discovery/token endpoint failure (not an authentication problem).
-    IdpUnreachable(String),
-    AgentError(String),
-    /// ResponseCode::AuthFailed -> misconfiguration / token rejected.
-    VisaServiceRejected(String),
-    /// ResponseCode::PolicyDenied -> login worked, endpoint not admitted.
-    PolicyDenied,
-    /// ResponseCode::AuthUnavailable.
-    AuthUnavailable,
-    DeviceBlobRejected,
-    /// The link failed before (or without) an authentication verdict — e.g.
-    /// a handshake timeout in Helloing — and, with auto-connect off, no
-    /// restart is coming (zipline#28). Recorded on the close path so ph-cli
-    /// `connect` sees the permanently Inactive link as this attempt's
-    /// terminal outcome instead of polling it as Pending forever. Carries
-    /// the TerminateReason's Debug spelling.
-    LinkFailed(String),
-    /// The fabric granted a ZPR address set differing from the configured
-    /// `--zpr-addr` / `zpr_addr` (zipline#83): the configured address is a
-    /// demand, not a request, so the adapter refuses to run on the granted
-    /// one — it logs both addresses with the remedy (remove the configured
-    /// address and retry), tears the link down, and exits non-zero. Carries
-    /// both address sets so `ph-cli link show` names them.
-    GrantedAddressMismatch {
-        requested: Vec<IpAddr>,
-        granted: Vec<IpAddr>,
-    },
-    /// A local activation step failed after authentication succeeded —
-    /// setting the granted ZPR address on the TUN, installing the
-    /// internal-network route on a dynamic grant, or a route-owner
-    /// conflict (zipline#157). Local and non-transient (e.g. EPERM will
-    /// not clear on reconnect), so it is fatal for this connect request:
-    /// the link hard-stops instead of reconnecting, and the operator
-    /// re-runs `ph-cli connect` after fixing the host. Carries the
-    /// failure text, which names the failed step.
-    ActivationFailed(String),
-}
-
-/// A single credential request forwarded to the out-of-band AuthAgent
-/// (ph-cli). The admin worker bridges these onto the Cap'n Proto client it
-/// received in startLink.
-pub struct OidcCredentialRequest {
-    /// The advertised identity provider to authenticate against.
-    pub idp: auth::OidcIdpInfo,
-    /// OIDC nonce derived from the link challenge
-    /// ([auth::oidc_nonce_for_challenge]).
-    pub nonce: String,
-    /// `false` means "satisfy from a stored refresh token or fail"; the agent
-    /// must never open a browser on a non-interactive request.
-    pub interactive: bool,
-    /// `Ok(id_token)` on success, otherwise the failure reason.
-    pub reply: tokio::sync::oneshot::Sender<Result<String, AuthFailureReason>>,
-}
-
-/// Handle to the AuthAgent registered for a link via startLink.
-pub type AuthAgentHandle = tokio::sync::mpsc::UnboundedSender<OidcCredentialRequest>;
-
-/// What [LinkStateWrapper::request_renewal_now] did with an on-demand
-/// renewal request (Codex review, zl-zpr-core#45): the VSS dispatcher's ack
-/// counts a re-auth as underway only when an attempt was actually started
-/// (`Accepted`) or is already outstanding (`Coalesced`); an `Ignored`
-/// request — wrong link type, or a link that left `Active` during shutdown
-/// while still holding its actor address — started nothing.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum RenewalStart {
-    /// A new renewal attempt was started (ZDP 142 sent).
-    Accepted,
-    /// An attempt is already in flight; this request coalesced onto it.
-    Coalesced,
-    /// The state guard refused: no attempt is underway for this request.
-    Ignored,
-}
-
-/// The identity a link's actor originally authenticated with, stashed at
-/// auth time so silent renewal (zipline#45) can re-prove against the SAME
-/// issuer. On renewal failure the adapter/user reconnects and re-picks from
-/// the then-advertised providers, so this is never updated in place.
 #[derive(Clone, Debug)]
-pub struct RenewalIdentity {
-    /// The advertised IdP (issuer, client config) the original OIDC blob
-    /// named. Resolved from the node's auth-services list at auth time.
-    pub idp: auth::OidcIdpInfo,
-    /// The challenge-derived OIDC nonce ([auth::oidc_nonce_for_challenge])
-    /// bound into the original credential. Reused verbatim on the renewal
-    /// blob because the VS ignores the nonce on the reauthorize path and
-    /// there is no empty-string special case on the wire. It cannot be
-    /// checked against the renewed id_token in any case: OIDC Core §12.2
-    /// says a refresh-grant id_token SHOULD NOT carry a nonce claim, and
-    /// MUST match the original only if it does — absent or original, never
-    /// fresh.
-    pub nonce: String,
-}
-
-/// The effective renewal lead for a granted authentication lifetime:
-/// the configured lead clamped to half the lifetime, so short
-/// `expiration_seconds` values still renew ahead of expiry by a workable
-/// margin instead of the lead swallowing the whole window (zipline#45).
-pub fn renewal_lead(configured: Duration, granted_lifetime: Duration) -> Duration {
-    configured.min(granted_lifetime / 2)
-}
-
-/// The instant renewal becomes due for an authentication granted at
-/// `granted_at` and expiring at `auth_expires`:
-/// `auth_expires - renewal_lead(configured, lifetime)`.
-/// An already-past (or zero-length) expiry yields a deadline that is never
-/// in the future, so renewal is due immediately.
-pub fn renewal_deadline(
-    granted_at: SystemTime,
-    auth_expires: SystemTime,
-    configured_lead: Duration,
-) -> SystemTime {
-    let lifetime = auth_expires
-        .duration_since(granted_at)
-        .unwrap_or(Duration::ZERO);
-    let lead = renewal_lead(configured_lead, lifetime);
-    auth_expires.checked_sub(lead).unwrap_or(auth_expires)
-}
-
-/// Floor for one silent-renewal attempt's wait on the AuthAgent: even with
-/// (nearly) no window left, give a healthy agent a moment to answer from its
-/// refresh-token cache instead of a zero-length wait.
-pub const RENEWAL_ATTEMPT_TIMEOUT_FLOOR: Duration = Duration::from_secs(5);
-
-/// How long ONE silent-renewal attempt may wait on the AuthAgent: half the
-/// time remaining before `auth_expires`, clamped between
-/// [RENEWAL_ATTEMPT_TIMEOUT_FLOOR] and the bridge's own per-call bound
-/// ([config::OIDC_USER_INTERACTION_TIMEOUT]). Bounding by the remaining
-/// window means a hung request cannot pin `renewal_in_flight` past the point
-/// where a retry could still succeed against the current authentication —
-/// half, so at least one full retry fits in the window left (PR #14 review).
-pub fn renewal_attempt_timeout(now: SystemTime, auth_expires: SystemTime) -> Duration {
-    let remaining = auth_expires.duration_since(now).unwrap_or(Duration::ZERO);
-    (remaining / 2).clamp(
-        RENEWAL_ATTEMPT_TIMEOUT_FLOOR,
-        config::OIDC_USER_INTERACTION_TIMEOUT,
-    )
+pub struct HelloResponse {
+    pub status: ResponseCode,
+    pub aaa_address: Option<IpAddress>,
+    /// Zipline (zipline#12): OIDC IdPs the node advertised. Replaces
+    /// upstream's ASA list, removed with BAS in zipline#15.
+    pub oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
+    pub vs_bootstrap: bool,
 }
 
 #[allow(dead_code)]
@@ -294,36 +59,13 @@ pub enum LinkEvent {
     KeyingDone,
     ReceivedHelloRequest,
     AssignedAAA(IpAddress), // Assigned AAA address for this link
-    ReceivedHelloResponse(
-        ResponseCode,
-        Option<IpAddress>,
-        Option<Vec<auth::OidcIdpInfo>>,
-    ), // (response code, AAA address, advertised OIDC IdPs)
+    ReceivedHelloResponse {
+        status: ResponseCode,
+        aaa_address: Option<IpAddress>,
+        oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
+        vs_bootstrap: bool,
+    },
 
-    ReceivedInitAuth((bool, Option<auth::ZdpInitAuthenticationPayload>)), // (bootstrap_flag, challenge)
-    ReceivedInitAuthAck,
-    ReceivedInitAuthTimeout,
-
-    /// Adapter side (zipline#66): the node asks for a renewed credential,
-    /// carrying the fresh challenge it minted.
-    ReceivedRenewAuthRequest(auth::ZdpInitAuthenticationPayload),
-    /// Node side (zipline#66): the adapter's answer — the echoed challenge
-    /// of the request it answers (so it can be correlated with the attempt
-    /// that is actually outstanding, PR #17 review), plus Ok(blob string)
-    /// on success or Err(the response's failure code) otherwise.
-    ReceivedRenewAuthResponse([u8; 48], Result<String, ResponseCode>),
-
-    ReceivedAcquireZprAddressRequest(Option<Vec<IpAddress>>, String), // (requested_addrs, auth_blob)
-
-    /// Ok(granted_addrs) on success, Err(the grant's failure code) otherwise.
-    ReceivedGrantZprAddressRequest(Result<Vec<IpAddress>, ResponseCode>),
-
-    AuthenticationSuccess(Vec<AuthBlob>), // Blobs collected from the configured authentication method(s)
-    AuthenticationFailure(AuthFailureReason), // Why authentication failed
-
-    ReceivedAuthorizeResponse(IpAddress), // from visa service
-    /// Visa service refused the authorize; carries the VS error code and message.
-    ReceivedAuthorizeFailure(zpr::vsapi_types::ErrorCode, String),
     ReceivedKeepAliveResponse,
     ReceivedTerminateLink(TerminateReason),
     ReceivedTerminateAck,
@@ -371,47 +113,10 @@ pub struct LinkData {
     // For now, keep-alives are attempted every 3 seconds
     // Assuming no loss, 100 samples will store 5 minutes of latency data
     latency_data: SampleRing<Duration, 100>,
-    aaa_address: Option<IpAddress>, // AAA address assigned this link (if any)
-    /// OIDC identity providers advertised by our peer in HelloResponse, if any.
+    /// Zipline (zipline#12): OIDC identity providers advertised by our peer
+    /// in HelloResponse, if any.
     oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
-    /// The out-of-band AuthAgent registered for this link via startLink, if any.
-    auth_agent: Option<AuthAgentHandle>,
-    /// The most recent out-of-band authentication failure, surfaced in showLink.
-    last_auth_failure: Option<AuthFailureReason>,
-    /// Nodes only: when the docked actor's authentication expires, from the
-    /// VS `Connection` response (zipline#45). None until authorized.
-    auth_expires: Option<SystemTime>,
-    /// Nodes only: the precomputed instant renewal becomes due —
-    /// `auth_expires - min(configured lead, lifetime/2)`; see
-    /// [renewal_deadline].
-    auth_renewal_deadline: Option<SystemTime>,
-    /// Nodes only: the issuer/nonce identity the actor originally
-    /// authenticated with, for silent renewal. None on device-only links.
-    renewal_identity: Option<RenewalIdentity>,
-    /// The authority namespace set this link's actor authenticated with
-    /// (zipline#122): recorded at auth time on both sides of the hop. The
-    /// node requires a renewal reply's set to EQUAL it; the adapter builds
-    /// its renewal blob array from it. None until authenticated.
-    authenticated_namespaces: Option<std::collections::BTreeSet<auth::AuthNamespace>>,
-    /// Nodes only: a renewal attempt is underway; suppresses further
-    /// attempts until it completes (one attempt per due tick at most).
-    renewal_in_flight: bool,
-    /// Nodes only: the challenge minted for the in-flight ZDP renewal
-    /// credential request (zipline#66). The RenewAuthenticationResponse's
-    /// blob must carry exactly these bytes; taken (cleared) on completion
-    /// or attempt timeout.
-    renewal_challenge: Option<[u8; 48]>,
-    /// Adapters only: the task awaiting the AuthAgent's answer to the
-    /// current renewal credential request (zipline#66). A new request
-    /// supersedes it: the node only retries after abandoning its previous
-    /// attempt, so the old task is aborted — dropping its reply receiver,
-    /// which the serial bridge observes (`reply.closed()`) and cancels the
-    /// in-flight RPC instead of letting retries queue behind it
-    /// (PR #17 review).
-    adapter_renewal_task: Option<tokio::task::AbortHandle>,
-    /// Nodes only: the one-shot "renewal due but no AuthAgent registered"
-    /// warning has fired for the current authentication window.
-    renewal_no_agent_warned: bool,
+    installed_aaa: bool,
 }
 
 impl LinkData {
@@ -420,35 +125,18 @@ impl LinkData {
             echo_success: 0,
             echo_timeout: 0,
             latency_data: SampleRing::new(Duration::ZERO),
-            aaa_address: None,
             oidc_idps: None,
-            auth_agent: None,
-            last_auth_failure: None,
-            auth_expires: None,
-            auth_renewal_deadline: None,
-            renewal_identity: None,
-            authenticated_namespaces: None,
-            renewal_in_flight: false,
-            renewal_challenge: None,
-            adapter_renewal_task: None,
-            renewal_no_agent_warned: false,
+            installed_aaa: false,
         }
     }
-}
-
-struct InitAuthData {
-    bootstrap: bool,
-    challenge: Option<auth::ZdpInitAuthenticationPayload>,
 }
 
 pub struct LinkStateMachine {
     id: LinkId,
     state: LinkState,
     status: LinkStatus,
+    ready: Arc<AtomicBool>,
     silent: bool,
-
-    /// On a node, actual assigned actor addresses to remote PEER.
-    actor_addresses: Vec<IpAddress>,
 
     last_state_change: Instant,
     /// used to prevent A/B/A errors with timeouts
@@ -457,8 +145,6 @@ pub struct LinkStateMachine {
     /// Counter available for use by states which wish to count timeouts.
     /// Reset to 0 on any state transition.
     timeout_count: usize,
-    /// Used in Helloing when a racy InitAuthRequest arrived
-    stowed_init_auth: Option<InitAuthData>,
     /// Handle to an outstanding echo/keepalive task; used only during Active.
     /// Instant is time at which the echo was sent.
     echo_handle: Option<(Instant, tokio::task::AbortHandle)>,
@@ -476,13 +162,12 @@ impl LinkStateMachine {
             id: link_id,
             state: LinkState::Inactive,
             status: LinkStatus::Down,
+            ready: Arc::new(AtomicBool::new(false)),
             silent: false,
-            actor_addresses: Default::default(),
             last_state_change: std::time::Instant::now(),
             logical_clock: 0,
             timeout_handle: None,
             timeout_count: 0,
-            stowed_init_auth: None,
             echo_handle: None,
             keep_alive_misses: 0,
             shutting_down: false,
@@ -494,6 +179,10 @@ impl LinkStateMachine {
             debug!(target: LINK_STATE, "Link {} state transition {:?} => {:?}", self.id, self.state, new_state);
         }
         self.state = new_state;
+        self.ready.store(
+            self.status == LinkStatus::Up && new_state == LinkState::Active,
+            Ordering::Release,
+        );
         self.last_state_change = std::time::Instant::now();
         self.cancel_timeout();
         self.timeout_count = 0;
@@ -546,14 +235,12 @@ impl LinkStateMachine {
 
 pub struct LinkStateWrapper {
     pub id: LinkId, // set at constructor, never changes.
-    /// Process-unique instance id: distinguishes THIS link from a later link
-    /// that reuses the same slab `id` after teardown. Renewal completions
-    /// carry the uid they were spawned under and are discarded when the
-    /// looked-up peer's uid differs (PR #14 review).
-    uid: u64,
     link_type: LinkType,
     locked_fsm: Mutex<LinkStateMachine>,
     pub locked_data: Mutex<LinkData>,
+    // Shared with the FSM so every state transition publishes fastpath readiness.
+    ready: Arc<AtomicBool>,
+    aaa_address: rcu::RcuBox<Option<IpAddress>>,
     /// Internal links _may_ be associated with another internal link
     /// representing its remote side.
     pub internal_peer_id: Option<NonZero<LinkId>>,
@@ -561,20 +248,19 @@ pub struct LinkStateWrapper {
 
 impl LinkStateWrapper {
     pub fn new(new_id: LinkId, new_link_type: LinkType) -> Self {
-        // Monotonic instance counter; see the `uid` field.
-        static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut lsm = LinkStateMachine::new(new_id);
 
         if matches!(new_link_type, LinkType::Internal) {
             // Internal links are always up and active, that is, `is_ready()`.
-            lsm.state = LinkState::Active;
             lsm.status = LinkStatus::Up;
+            lsm.set_state(LinkState::Active);
         }
 
         Self {
             id: new_id,
-            uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             link_type: new_link_type,
+            ready: lsm.ready.clone(),
+            aaa_address: rcu::RcuBox::new(None),
             locked_fsm: Mutex::new(lsm),
             locked_data: Mutex::new(LinkData::new()),
             internal_peer_id: None,
@@ -590,170 +276,49 @@ impl LinkStateWrapper {
         self.locked_fsm.lock().unwrap().state
     }
 
+    /// Fastpath-readable readiness, published by every FSM state transition.
     pub fn is_ready(&self) -> bool {
-        let locked_fsm = self.locked_fsm.lock().unwrap();
-        locked_fsm.status == LinkStatus::Up
-            && (locked_fsm.state == LinkState::Active || locked_fsm.state == LinkState::RegisterAA)
+        self.ready.load(Ordering::Acquire)
     }
 
     pub fn get_link_type(&self) -> LinkType {
         self.link_type
     }
 
-    /// Register (or replace) the out-of-band AuthAgent handle for this link.
-    /// Set by the admin worker's startLink handler; lives for the link's lifetime.
-    pub fn set_auth_agent(&self, agent: AuthAgentHandle) {
-        self.locked_data.lock().unwrap().auth_agent = Some(agent);
+    /// Read the assigned AAA without taking the link-data mutex.
+    pub fn aaa_address(&self) -> Option<IpAddress> {
+        *self.aaa_address.get()
     }
 
-    /// Clear the AuthAgent slot, but only if it still holds `handle`'s
-    /// channel (zipline#45): the bridge for a dead capnp client must not
-    /// clobber a NEWER agent registered after it (e.g. the user re-ran
-    /// `ph-cli auth-agent`). Returns true if the slot was cleared.
-    pub fn clear_auth_agent_if(&self, handle: &AuthAgentHandle) -> bool {
-        let mut data = self.locked_data.lock().unwrap();
-        if data
-            .auth_agent
-            .as_ref()
-            .is_some_and(|current| current.same_channel(handle))
-        {
-            data.auth_agent = None;
-            return true;
-        }
-        false
-    }
-
-    /// True if `attempt_clock` still identifies the FSM's current
-    /// timeout/attempt. The logical clock advances on every state change
-    /// (and every re-armed timeout), so a mismatch means the attempt that
-    /// captured the value has been superseded. Used to discard a stale
-    /// AuthAgent completion so it cannot be consumed by a newer
-    /// WaitForUserAuth attempt with a different challenge.
-    fn auth_attempt_is_current(&self, attempt_clock: u64) -> bool {
-        self.locked_fsm.lock().unwrap().logical_clock == attempt_clock
-    }
-
-    /// The most recent out-of-band authentication failure on this link, if any.
-    pub fn get_last_auth_failure(&self) -> Option<AuthFailureReason> {
-        self.locked_data.lock().unwrap().last_auth_failure.clone()
-    }
-
-    /// Record why authentication failed, for showLink / ph-cli reporting.
-    fn record_auth_failure(&self, reason: AuthFailureReason) {
-        self.locked_data.lock().unwrap().last_auth_failure = Some(reason);
-    }
-
-    /// Record the actor's authentication expiry from a VS `Connection`
-    /// response and precompute the renewal deadline from the configured
-    /// lead (zipline#45). `granted_at` anchors the lifetime the `remaining/2`
-    /// clamp is computed against (normally "now", when the grant arrived).
-    /// Resets the per-window renewal bookkeeping so a fresh grant warns and
-    /// retries anew.
-    pub fn set_auth_expires(
-        &self,
-        granted_at: SystemTime,
-        auth_expires: SystemTime,
-        configured_lead: Duration,
-    ) {
-        let deadline = renewal_deadline(granted_at, auth_expires, configured_lead);
-        let mut data = self.locked_data.lock().unwrap();
-        data.auth_expires = Some(auth_expires);
-        data.auth_renewal_deadline = Some(deadline);
-        data.renewal_in_flight = false;
-        data.renewal_no_agent_warned = false;
-    }
-
-    /// The actor's authentication expiry, if the VS has reported one.
-    #[cfg(test)]
-    pub fn get_auth_expires(&self) -> Option<SystemTime> {
-        self.locked_data.lock().unwrap().auth_expires
-    }
-
-    /// Stash the issuer/nonce identity the actor originally authenticated
-    /// with, so silent renewal can re-prove against the same issuer.
-    pub fn set_renewal_identity(&self, identity: RenewalIdentity) {
-        self.locked_data.lock().unwrap().renewal_identity = Some(identity);
-    }
-
-    /// Record the authority namespace set the actor authenticated with
-    /// (zipline#122); a renewal must re-prove exactly this set.
-    pub fn set_authenticated_namespaces(
-        &self,
-        namespaces: std::collections::BTreeSet<auth::AuthNamespace>,
-    ) {
-        self.locked_data.lock().unwrap().authenticated_namespaces = Some(namespaces);
-    }
-
-    /// The recorded authority namespace set, if the link has authenticated.
-    pub fn get_authenticated_namespaces(
-        &self,
-    ) -> Option<std::collections::BTreeSet<auth::AuthNamespace>> {
+    /// Zipline (zipline#12): the OIDC IdPs our peer advertised in Hello.
+    pub fn oidc_idps(&self) -> Vec<auth::OidcIdpInfo> {
         self.locked_data
             .lock()
             .unwrap()
-            .authenticated_namespaces
+            .oidc_idps
             .clone()
+            .unwrap_or_default()
     }
 
-    /// The stored renewal identity, if the actor authenticated via OIDC.
+    /// Test-only: pretend a HelloResponse advertised these IdPs.
     #[cfg(test)]
-    pub fn get_renewal_identity(&self) -> Option<RenewalIdentity> {
-        self.locked_data.lock().unwrap().renewal_identity.clone()
-    }
-
-    /// Stash the challenge minted for an in-flight ZDP renewal credential
-    /// request (zipline#66); the response must echo exactly these bytes.
-    fn stash_renewal_challenge(&self, challenge: [u8; 48]) {
-        self.locked_data.lock().unwrap().renewal_challenge = Some(challenge);
-    }
-
-    /// Take the stashed renewal challenge only if it still equals
-    /// `challenge`. Used by the attempt-timeout task so it cannot clobber a
-    /// LATER attempt's challenge: true means this attempt was still the
-    /// in-flight one and has now been failed.
-    fn take_renewal_challenge_if(&self, challenge: &[u8; 48]) -> bool {
-        let mut data = self.locked_data.lock().unwrap();
-        if data.renewal_challenge.as_ref() == Some(challenge) {
-            data.renewal_challenge = None;
-            return true;
-        }
-        false
-    }
-
-    /// Test-only: peek the stashed renewal challenge without consuming it.
-    #[cfg(test)]
-    pub fn test_renewal_challenge(&self) -> Option<[u8; 48]> {
-        self.locked_data.lock().unwrap().renewal_challenge
-    }
-
-    /// Test-only: whether the one-shot "renewal due, no agent" warning fired.
-    #[cfg(test)]
-    pub fn test_renewal_no_agent_warned(&self) -> bool {
-        self.locked_data.lock().unwrap().renewal_no_agent_warned
-    }
-
-    /// Test-only: whether a renewal attempt is currently in flight.
-    #[cfg(test)]
-    pub fn test_renewal_in_flight(&self) -> bool {
-        self.locked_data.lock().unwrap().renewal_in_flight
-    }
-
-    /// Test-only: clear the recorded auth failure.
-    #[cfg(test)]
-    pub fn test_clear_last_auth_failure(&self) {
-        self.locked_data.lock().unwrap().last_auth_failure = None;
-    }
-
-    /// Test-only: whether an AuthAgent handle is registered on this link.
-    #[cfg(test)]
-    pub fn test_has_auth_agent(&self) -> bool {
-        self.locked_data.lock().unwrap().auth_agent.is_some()
+    pub fn test_set_oidc_idps(&self, idps: Vec<auth::OidcIdpInfo>) {
+        self.locked_data.lock().unwrap().oidc_idps = Some(idps);
     }
 
     /// Test-only: force the FSM into a state without walking the transitions.
     #[cfg(test)]
     pub fn test_set_state(&self, state: LinkState) {
         self.locked_fsm.lock().unwrap().set_state(state);
+    }
+
+    /// Test-only: bring the link Up and Active (so `is_ready()` holds)
+    /// without walking keying and Hello.
+    #[cfg(test)]
+    pub fn test_set_active(&self) {
+        let mut fsm = self.locked_fsm.lock().unwrap();
+        fsm.status = LinkStatus::Up;
+        fsm.set_state(LinkState::Active);
     }
 
     /// Test-only: the FSM's current logical clock, for synthesizing a
@@ -763,10 +328,92 @@ impl LinkStateWrapper {
         self.locked_fsm.lock().unwrap().logical_clock
     }
 
-    /// Test-only: pretend a HelloResponse advertised these IdPs.
-    #[cfg(test)]
-    pub fn test_set_oidc_idps(&self, idps: Vec<auth::OidcIdpInfo>) {
-        self.locked_data.lock().unwrap().oidc_idps = Some(idps);
+    fn process_hello_request(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
+        let locked_fsm = self.locked_fsm.lock().unwrap();
+        if self.link_type != LinkType::NodeToAdapter || locked_fsm.state != LinkState::Helloing {
+            return Err(LinkStateError::UnexpectedTransition(
+                locked_fsm.state,
+                "ReceivedHelloRequest",
+            ));
+        }
+        let is_vs = asm
+            .peer_table
+            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter)
+            .is_some_and(|id| id.get() == self.id);
+        let aaa = asm.address_pool.lock().unwrap().as_mut().map(|pool| {
+            let aaa = pool.get_aaa_address();
+            debug!(target: LINK_STATE, "allocated AAA {aaa}; {} active reservations", pool.len());
+            aaa
+        });
+        if aaa.is_none() && !is_vs {
+            mgmt::requests::send_hello_error_response(
+                asm,
+                self.id,
+                ResponseCode::TemporarilyUnavailable,
+            )
+            .enqueue();
+            drop(locked_fsm);
+            return self.initiate_close(asm, TerminateReason::Other);
+        }
+        if let Some(aaa) = aaa {
+            self.process_assigned_aaa(asm, aaa)?;
+        }
+        mgmt::requests::send_hello_success_response(
+            asm,
+            self.id,
+            0,
+            &crate::auth_agent::advertised_oidc_idps(asm, self.id),
+            aaa,
+            is_vs,
+        )
+        .enqueue();
+        self.run_active(asm, locked_fsm)
+    }
+
+    fn process_hello_response(
+        &self,
+        asm: &Arc<Assembly>,
+        response: HelloResponse,
+    ) -> Result<(), LinkStateError> {
+        if response.status != ResponseCode::Success {
+            warn!(target: LINK_STATE, "{}: Hello failed: {:?}", asm.formatted_link_id(self.id), response.status);
+            return self.initiate_close(asm, TerminateReason::Other);
+        }
+        let locked_fsm = self.locked_fsm.lock().unwrap();
+        if self.link_type != LinkType::AdapterToNode || locked_fsm.state != LinkState::Helloing {
+            return Err(LinkStateError::UnexpectedTransition(
+                locked_fsm.state,
+                "ReceivedHelloResponse",
+            ));
+        }
+        if response.aaa_address.is_none() && !response.vs_bootstrap {
+            return Err(LinkStateError::InvalidOperation(
+                "ordinary link established without AAA".into(),
+            ));
+        }
+        {
+            let mut data = self.locked_data.lock().unwrap();
+            self.aaa_address.write(response.aaa_address);
+            data.oidc_idps = response.oidc_idps;
+        }
+        if let Some(aaa) = response.aaa_address {
+            let exists = asm
+                .tun_ctl
+                .has_address(aaa.into())
+                .map_err(|e| LinkStateError::InvalidOperation(format!("inspect AAA: {e}")))?;
+            asm.tun_ctl
+                .add_authentication_address(aaa.into(), ZPRNET_PREFIX_LEN)
+                .map_err(|e| LinkStateError::InvalidOperation(format!("configure AAA: {e}")))?;
+            self.locked_data.lock().unwrap().installed_aaa = !exists;
+        }
+        asm.tun_ctl
+            .set_carrier(true)
+            .map_err(|e| LinkStateError::InvalidOperation(format!("enable AAA carrier: {e}")))?;
+        self.run_active(asm, locked_fsm)?;
+        if let Some(peer) = asm.peer_table.get(self.id) {
+            peer.actor_auth.link_ready(asm);
+        }
+        Ok(())
     }
 
     /// Schedule a `Timeout` event to occur after the specified duration.
@@ -794,68 +441,6 @@ impl LinkStateWrapper {
         });
     }
 
-    /// Takes lock, returns copy of addresses.
-    /// Will hang if you already have fsm lock!
-    ///
-    /// This returns the address assigned to the remote peer on this link.
-    /// Designed to be used in a NODE context.  Also includes the AAA address (if present)
-    ///
-    pub fn get_actor_addresses(&self) -> Vec<IpAddress> {
-        let mut addr_list = Vec::new();
-
-        addr_list.extend(self.locked_fsm.lock().unwrap().actor_addresses.iter());
-
-        match self.locked_data.lock().unwrap().aaa_address.as_ref() {
-            Some(aaa_addr) => addr_list.push(aaa_addr.clone()),
-            None => (),
-        }
-
-        addr_list
-    }
-
-    /// Returns true if the specified address matches any of this link's assigned actor addresses.
-    pub fn has_actor_address(&self, addr: &IpAddress) -> bool {
-        self.locked_fsm
-            .lock()
-            .unwrap()
-            .actor_addresses
-            .iter()
-            .any(|a| a == addr)
-            || self.locked_data.lock().unwrap().aaa_address.as_ref() == Some(addr)
-    }
-
-    /// Sets the actor address of an internal link.
-    pub fn add_internal_actor_address(&self, addr: IpAddress) {
-        assert!(
-            self.is_internal(),
-            "attempt to directly set actor address of non-internal link"
-        );
-        self.locked_fsm.lock().unwrap().actor_addresses.push(addr);
-    }
-
-    /// Test-only: dock an actor address on this link regardless of type.
-    #[cfg(test)]
-    pub fn test_add_actor_address(&self, addr: IpAddress) {
-        self.locked_fsm.lock().unwrap().actor_addresses.push(addr);
-    }
-
-    /// Tell the VS that this actor has disconnected.
-    /// Used in a NODE context only.
-    fn deregister_actor_addresses(&self, asm: &Arc<Assembly>) -> tokio::task::JoinSet<()> {
-        let mut join_set = tokio::task::JoinSet::new();
-        let vs_id = asm
-            .peer_table
-            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
-        if vs_id.is_some() && vs_id.unwrap().get() == self.id {
-            return join_set;
-        }
-        for addr in self.locked_fsm.lock().unwrap().actor_addresses.drain(..) {
-            debug!(target: LINK_STATE, "Deregistering {addr}");
-            join_set.spawn_local(visa_mgmt::actor_disconnect(asm.clone(), addr));
-        }
-        join_set
-    }
-
     pub fn process_event(
         &self,
         asm: &Arc<Assembly>,
@@ -876,46 +461,20 @@ impl LinkStateWrapper {
             LinkEvent::KeyingDone => self.process_keying_done(asm),
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
             LinkEvent::AssignedAAA(addr) => self.process_assigned_aaa(asm, addr),
-            LinkEvent::ReceivedHelloResponse(code, aaa_addr, maybe_oidc_idps) => {
-                self.process_hello_response(asm, code, aaa_addr, maybe_oidc_idps)
-            }
-
-            LinkEvent::ReceivedAcquireZprAddressRequest(addrs, blob) => {
-                self.process_acquire_zpr_address_request(asm, addrs, blob)
-            }
-
-            LinkEvent::ReceivedInitAuth((bootstrap_flag, challenge)) => {
-                self.process_init_auth(asm, bootstrap_flag, challenge)
-            }
-
-            LinkEvent::ReceivedInitAuthAck => self.process_init_auth_ack(asm),
-            LinkEvent::ReceivedInitAuthTimeout => self.process_init_auth_timeout(asm),
-
-            LinkEvent::ReceivedRenewAuthRequest(challenge) => {
-                self.process_renew_auth_request(asm, challenge)
-            }
-            LinkEvent::ReceivedRenewAuthResponse(challenge, result) => {
-                self.process_renew_auth_response(asm, challenge, result)
-            }
-
-            LinkEvent::ReceivedGrantZprAddressRequest(result) => {
-                self.process_grant_zpr_address_request(asm, result)
-            }
-            LinkEvent::AuthenticationFailure(reason) => {
-                self.process_authentication_failure(asm, reason)
-            }
-
-            LinkEvent::AuthenticationSuccess(blobs) => {
-                self.process_authentication_success(asm, blobs)
-            }
-
-            LinkEvent::ReceivedAuthorizeResponse(zpr_addr) => {
-                self.process_authorize_response(asm, zpr_addr)
-            }
-
-            LinkEvent::ReceivedAuthorizeFailure(code, msg) => {
-                self.process_authorize_failure(asm, code, msg)
-            }
+            LinkEvent::ReceivedHelloResponse {
+                status,
+                aaa_address,
+                oidc_idps,
+                vs_bootstrap,
+            } => self.process_hello_response(
+                asm,
+                HelloResponse {
+                    status,
+                    aaa_address,
+                    oidc_idps,
+                    vs_bootstrap,
+                },
+            ),
 
             LinkEvent::ReceivedKeepAliveResponse => self.process_keep_alive_response(asm),
             LinkEvent::ReceivedTerminateLink(code) => self.process_terminate_link(asm, code),
@@ -944,13 +503,6 @@ impl LinkStateWrapper {
 
         locked_fsm.status = LinkStatus::Up;
         locked_fsm.set_state(LinkState::Keying);
-
-        // A Start begins a fresh authentication attempt: drop the previous
-        // attempt's recorded failure so showLink (and ph-cli's `connect`
-        // poll, which treats a teardown state with a recorded failure as
-        // that attempt's terminal outcome) never reports a stale reason
-        // against the new attempt.
-        self.locked_data.lock().unwrap().last_auth_failure = None;
 
         // A Start also begins a fresh ZDP-R session.  An adapter keeps one
         // peer table entry per link for the life of the process, but the
@@ -1093,85 +645,6 @@ impl LinkStateWrapper {
         Ok(())
     }
 
-    /// Update link state based on received hello request
-    /// Transitions from Helloing to Registering Actor Address
-    /// Does not generate any packets
-    fn process_hello_request(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        let link_id = self.id;
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToNode, LinkState::Helloing) => {
-                locked_fsm.set_state(LinkState::Active);
-                debug!(target: LINK_STATE, "{} finished helloing.  Becoming active", asm.formatted_link_id(link_id));
-                Ok(())
-            }
-            (LinkType::NodeToAdapter, LinkState::Helloing) => {
-                debug!(
-                    target: LINK_STATE,
-                    "{} received hello request", asm.formatted_link_id(link_id)
-                );
-
-                // Reply with a Hello Response.
-
-                // Technically we do not need to supply an AAA address to an adapter fronting the visa service,
-                // or if we do not have an external authentication service available.  For simplicity we just
-                // always hand one out -- if we have a pool. And we only have a pool if we have already
-                // connected to the visa service.
-                let maybe_aaa_address = {
-                    let mut address_pool = asm.address_pool.lock().unwrap();
-                    if let Some(pool) = address_pool.as_mut() {
-                        let aaa_address = pool.get_aaa_address();
-                        debug!(target: LINK_STATE, "{}: HelloResponse - allocated AAA address: {aaa_address} (active pool size: {})",
-                            asm.formatted_link_id(link_id), pool.len());
-                        Some(aaa_address)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(aaa_address) = maybe_aaa_address {
-                    self.process_assigned_aaa(asm, aaa_address)?;
-                } else {
-                    // No pool.  Use dummy address.
-                    debug!(target: LINK_STATE, "{}: HelloResponse - no AAA pool available, no AAA address assigned", asm.formatted_link_id(link_id));
-                }
-
-                let policy_id: i64 = 0; // TODO: We get policy ID from visa service. Record that somewhere, access it here.
-                let oidc_idps = get_available_oidc_idps(&asm, link_id);
-
-                mgmt::requests::send_hello_success_response(
-                    &asm,
-                    link_id,
-                    policy_id,
-                    &oidc_idps,
-                    maybe_aaa_address,
-                )
-                .enqueue();
-
-                // Now follow with an init auth request.
-
-                locked_fsm.set_state(LinkState::WaitForAcquireZprAddress);
-                self.send_init_authentication_request(asm);
-                debug!(
-                    target: LINK_STATE,
-                    "{} finished helloing.  Waiting for other side to respond to init-auth", asm.formatted_link_id(link_id)
-                );
-                Ok(())
-            }
-
-            (LinkType::AdapterToNode, _) => {
-                // Adapters should not be receiving these messages from nodes
-                Err(LinkStateError::InvalidOperation(
-                    "Discarded unsolicited Hello Request".to_string(),
-                ))
-            }
-
-            (_, _) => Err(LinkStateError::UnexpectedTransition(
-                locked_fsm.state,
-                "ReceivedHelloRequest",
-            )),
-        }
-    }
-
     /// This is called when we receive an AAA address assignment.
     /// Does not generate an error.
     fn process_assigned_aaa(
@@ -1182,1164 +655,10 @@ impl LinkStateWrapper {
         // Just keep track of this for cleanup later.
         let link_id = self.id;
         debug!(target: LINK_STATE, "Link {link_id} assigned AAA address {aaa_addr}");
-        let mut link_data = self.locked_data.lock().unwrap();
-        link_data.aaa_address = Some(aaa_addr);
+        // Writers share the data lock so cleanup can atomically take AAA ownership.
+        let _data = self.locked_data.lock().unwrap();
+        self.aaa_address.write(Some(aaa_addr));
         Ok(())
-    }
-
-    /// This is kicked off by [LinkEvent::ReceivedHelloResponse].
-    /// That event may be generated when we have sent hello
-    /// message ourselves [LinkStateWrapper::maybe_send_hello]
-    ///
-    /// Update link state based on received hello response
-    /// Transitions from Helloing to Registering Actor Address
-    /// Sends a Register Actor Address request if this is an adapter
-    fn process_hello_response(
-        &self,
-        asm: &Arc<Assembly>,
-        code: ResponseCode,
-        maybe_aaa_addr: Option<IpAddress>,
-        maybe_oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
-    ) -> Result<(), LinkStateError> {
-        if code == ResponseCode::Other {
-            // Received an error response.
-            return self.process_error_response(&asm);
-        }
-
-        let link_id = self.id;
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::Helloing) => {
-                let mut link_data = self.locked_data.lock().unwrap();
-                link_data.oidc_idps = maybe_oidc_idps;
-
-                // On the node side, the aaa_address link_data field is used to keep track of the
-                // AAA we handed out to the peer.  On the client-adapter side, we hold the AAA
-                // we got from the node in there.
-                link_data.aaa_address = maybe_aaa_addr;
-                drop(link_data);
-
-                // The adapter is waiting for an init-auth-request.
-                locked_fsm.set_state(LinkState::WaitForInitAuth);
-                debug!(
-                    target: LINK_STATE,
-                    "{} finished helloing.  Now waiting for init auth.", asm.formatted_link_id(link_id)
-                );
-                let stowed_init_auth = std::mem::take(&mut locked_fsm.stowed_init_auth);
-                drop(locked_fsm);
-                if let Some(stowed_init_auth) = stowed_init_auth {
-                    self.process_init_auth(
-                        asm,
-                        stowed_init_auth.bootstrap,
-                        stowed_init_auth.challenge,
-                    )
-                } else {
-                    Ok(())
-                }
-            }
-            (LinkType::NodeToNode, LinkState::Helloing) => {
-                locked_fsm.set_state(LinkState::Active);
-                debug!(target: LINK_STATE, "{} finished helloing.  Becoming active", asm.formatted_link_id(link_id));
-                Ok(())
-            }
-            (LinkType::NodeToAdapter, _) => {
-                // Nodes should not be receiving these messages from adapters
-                Err(LinkStateError::InvalidOperation(
-                    "Discarded unsolicited Hello Response".to_string(),
-                ))
-            }
-            (_, _) => Err(LinkStateError::UnexpectedTransition(
-                locked_fsm.state,
-                "ReceivedHelloRespone",
-            )),
-        }
-    }
-
-    /// The ZprAddressRequest is from adapter to node (future: joining node to node).
-    /// Includes authentication blob from sender, as well as the requested addresses.
-    /// Inclusion of requested addresses is temporary.
-    ///
-    /// A Node expects this message from an adapter sometime after sending it an
-    /// init-authentication message.
-    ///
-    /// This will call off to visa service for checking.
-    /// Results comes back through a ReceivedAuthorizeResponse event.
-    fn process_acquire_zpr_address_request(
-        &self,
-        asm: &Arc<Assembly>,
-        addrs: Option<Vec<IpAddress>>,
-        blob: String,
-    ) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-        let a2a_dh_public_key = asm //grab public key from its peer state
-            .peer_table
-            .inspect(link_id, |ps| *ps.a2a_dh_pubkey.get())
-            .flatten();
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::WaitForAcquireZprAddress) => {}
-
-            (_, _) => {
-                return Err(LinkStateError::InvalidOperation(
-                    "Discarded unsolicited acquire ZPR address request".to_string(),
-                ));
-            }
-        }
-
-        // The client adapter may already be configured with an address. It will then
-        // be up to the visa service to decide if that is allowed.  If no address is
-        // passed here we expect the visa service to assign an address.
-        //
-        let requested_addr = match addrs {
-            Some(addr) => {
-                if addr.len() == 1 {
-                    addr[0]
-                } else if addr.is_empty() {
-                    IpAddress::UNSPECIFIED
-                } else {
-                    // If we have multiple addresses, we cannot handle that. (yet?)
-                    warn!(target: LINK_STATE, "{} received acquire request with multiple addresses", asm.formatted_link_id(link_id));
-                    drop(locked_fsm);
-                    return self.process_error_response(asm);
-                }
-            }
-            None => IpAddress::UNSPECIFIED,
-        };
-
-        debug!(
-            target: LINK_STATE,
-            "{} received acquire addr request for actor (requested_addr = {}).", asm.formatted_link_id(link_id), requested_addr
-        );
-
-        // Every blob needs its challenge checked before we forward it on.
-
-        let Ok(d_blobs) = auth::decode_blobs(&blob) else {
-            warn!(target: LINK_STATE, "{} received acquire request with invalid blob", asm.formatted_link_id(link_id));
-            drop(locked_fsm);
-            return self.process_error_response(asm);
-        };
-
-        for d_blob in &d_blobs {
-            match d_blob {
-                AuthBlob::SelfSigned(ss_blob) => {
-                    if !self.check_self_signed_blob(
-                        asm,
-                        link_id,
-                        ss_blob,
-                        auth::MAX_BLOB_AGE_SECONDS,
-                    ) {
-                        drop(locked_fsm);
-                        return self.process_error_response(asm);
-                    }
-                }
-                AuthBlob::Oidc(oidc_blob) => {
-                    if !self.check_oidc_blob(asm, link_id, oidc_blob) {
-                        drop(locked_fsm);
-                        return self.process_error_response(asm);
-                    }
-                }
-            }
-        }
-
-        // Stash the OIDC identity the actor is authenticating with so silent
-        // renewal (zipline#45) can re-prove against the SAME issuer later.
-        // The nonce is derived from the (verified) challenge exactly as
-        // build_connect_request derives the one sent to the VS.
-        if let Some(oidc_blob) = d_blobs.iter().find_map(|b| match b {
-            AuthBlob::Oidc(oidc) => Some(oidc),
-            _ => None,
-        }) {
-            self.stash_renewal_identity(asm, link_id, oidc_blob);
-        }
-
-        // Record which authority namespaces this (verified) blob set proves
-        // (zipline#122): a renewal reply must re-prove exactly this set.
-        self.set_authenticated_namespaces(auth::blob_namespaces(&d_blobs));
-
-        locked_fsm.set_state(LinkState::RegisterAA);
-
-        let is_vs_link = asm
-            .peer_table
-            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter)
-            .is_some_and(|vs_id| vs_id.get() == link_id);
-
-        // Now we have verified our part of the blob, we can send to the visa service for checking the signature.
-        // The vs is also sent the public key so it can distribute to peer adapter
-        let conn_req =
-            visa_mgmt::build_connect_request(asm, requested_addr, &d_blobs, a2a_dh_public_key)?;
-        drop(locked_fsm);
-
-        if !is_vs_link {
-            visa_mgmt::authorize_connect(asm, link_id, conn_req);
-            return Ok(());
-        }
-
-        debug!(target: LINK_STATE, "deferring visa service authorize call, authorizing ourselves (requested_addr = {requested_addr})");
-        *asm.deferred_vs_connect.lock().unwrap() = Some((link_id, requested_addr, conn_req));
-
-        // Need to send a grant here anyway to "turn on" the adapter (and outselves)
-        // So pretend we are the visa service and handle our own authorization.
-        if let Err(e) = asm.process_link_state_event(
-            link_id,
-            LinkEvent::ReceivedAuthorizeResponse(requested_addr),
-        ) {
-            error!(target: LINK_STATE, "{} failed to process authorize response: {e}", asm.formatted_link_id(link_id));
-        }
-
-        Ok(())
-    }
-
-    /// Verify an SS blob's challenge: CN binding (when the peer presented a
-    /// cert), HMAC with this link's auth key, and freshness within
-    /// `max_age_seconds` — [auth::MAX_BLOB_AGE_SECONDS] at connect,
-    /// [auth::MAX_OIDC_BLOB_AGE_SECONDS] on the renewal path, where the SS
-    /// leg shares its challenge with an OIDC leg that may lawfully wait for
-    /// the noninteractive agent (Codex review, zl-zpr-core#45 P2).
-    fn check_self_signed_blob(
-        &self,
-        asm: &Arc<Assembly>,
-        link_id: LinkId,
-        ss_blob: &ZdpSelfSignedBlob,
-        max_age_seconds: u64,
-    ) -> bool {
-        // Now check that the CN in the presented blob matches the CN the peer used to establish link.
-        let Some(peer_state) = asm.peer_table.get(link_id) else {
-            warn!(target: LINK_STATE, "{} blob check failed: cannot find peer state entry", asm.formatted_link_id(link_id));
-            return false;
-        };
-        let Some(sa) = peer_state.get_established_transport_association() else {
-            warn!(target: LINK_STATE, "{} blob check failed: cannot find SA", asm.formatted_link_id(link_id));
-            return false;
-        };
-
-        let key = asm.peer_table.inspect(link_id, {
-            |peer| {
-                let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
-                key[0..AUTH_KEY_SIZE_BYTES].copy_from_slice(&peer.auth_key[0..AUTH_KEY_SIZE_BYTES]);
-                key
-            }
-        });
-        if key.is_none() {
-            warn!(target: LINK_STATE, "{} received acquire request but have no auth key", asm.formatted_link_id(link_id));
-            return false;
-        }
-        let key = key.unwrap();
-
-        // Adapters using self-generated keys present no certificate during
-        // keying, so there is no cert CN to bind the blob to; the visa
-        // service still authenticates the blob CN via the RSA signature.
-        if let Err(e) = ss_blob.verify_blob_challenge(
-            sa.peer_cert.as_ref().map(|c| c.get_cert()),
-            &key,
-            max_age_seconds,
-        ) {
-            warn!(target: LINK_STATE, "{} challenge verification failed: {e}", asm.formatted_link_id(link_id));
-            return false;
-        }
-        true
-    }
-
-    /// Verify an OIDC blob's challenge: HMAC with this link's auth key plus
-    /// freshness. Identity itself is carried by the ID token, which the visa
-    /// service verifies; there is no CN leg here.
-    fn check_oidc_blob(
-        &self,
-        asm: &Arc<Assembly>,
-        link_id: LinkId,
-        oidc_blob: &auth::ZdpOidcBlob,
-    ) -> bool {
-        let key = asm.peer_table.inspect(link_id, {
-            |peer| {
-                let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
-                key[0..AUTH_KEY_SIZE_BYTES].copy_from_slice(&peer.auth_key[0..AUTH_KEY_SIZE_BYTES]);
-                key
-            }
-        });
-        let Some(key) = key else {
-            warn!(target: LINK_STATE, "{} received acquire request but have no auth key", asm.formatted_link_id(link_id));
-            return false;
-        };
-
-        if let Err(e) = oidc_blob.verify_challenge(&key) {
-            warn!(target: LINK_STATE, "{} OIDC challenge verification failed: {e}", asm.formatted_link_id(link_id));
-            return false;
-        }
-        true
-    }
-
-    /// Store the OIDC identity (issuer's advertised client config + the
-    /// challenge-derived nonce) this actor is authenticating with, so silent
-    /// renewal (zipline#45) re-proves against the SAME issuer. The issuer is
-    /// resolved from the node's auth-services list; a blob naming an issuer
-    /// the VS no longer advertises just means renewal will not be possible.
-    fn stash_renewal_identity(
-        &self,
-        asm: &Arc<Assembly>,
-        link_id: LinkId,
-        oidc_blob: &auth::ZdpOidcBlob,
-    ) {
-        let Some(idp) = get_available_oidc_idps(asm, link_id)
-            .into_iter()
-            .find(|idp| idp.issuer == oidc_blob.issuer)
-        else {
-            warn!(target: LINK_STATE,
-                "{}: OIDC issuer {} is not in the advertised auth services; silent renewal will not be available",
-                asm.formatted_link_id(link_id), oidc_blob.issuer);
-            return;
-        };
-
-        // Same derivation as build_connect_request: the nonce bound into the
-        // credential is SHA-256 of the (already HMAC-verified) challenge.
-        let challenge_bytes = BASE64_STANDARD
-            .decode(&oidc_blob.challenge)
-            .unwrap_or_default();
-        let mut challenge = [0u8; 48];
-        if challenge_bytes.len() == 48 {
-            challenge.copy_from_slice(&challenge_bytes);
-        }
-        let nonce = auth::oidc_nonce_for_challenge(&challenge);
-        self.set_renewal_identity(RenewalIdentity { idp, nonce });
-    }
-
-    /// Grant ZPR Address message is from a node to an adapter and includes the
-    /// result of authentication verification.
-    ///
-    /// If this inidicates success it will include the ZPR addresses we are
-    /// supposed to use.  If this indicates failure we should tear down the link.
-    ///
-    /// **The address model (zipline#83):** a configured `--zpr-addr` /
-    /// `zpr_addr` is a *demand*, not a request. We forward it to the fabric in
-    /// the acquire request, and the fabric normally grants it back — but when
-    /// the visa service scrubs the request (e.g. a user-only actor matching no
-    /// join policy) it assigns a dynamic address instead. An adapter with a
-    /// configured address cannot honor such a grant: its TUN device and routes
-    /// were provisioned for the configured address, so it would keep sourcing
-    /// traffic from an address it no longer owns and the node would deny every
-    /// bind — silently, from the user's point of view. So a granted set that
-    /// differs from the non-empty configured set is a fatal error: log both
-    /// addresses with the remedy (remove the `--zpr-addr` argument / `zpr_addr`
-    /// config line and try again), record
-    /// [AuthFailureReason::GrantedAddressMismatch] for `ph-cli link show`,
-    /// tear the link down, and exit the process non-zero — even if other links
-    /// exist. An adapter with *no* configured address accepts whatever the
-    /// fabric grants: the granted address is added to the TUN and becomes the
-    /// local ZPR address set.
-    ///
-    /// `result` is Ok(granted addresses) on success; Err(code) carries the
-    /// node's failure code, which we map to an [AuthFailureReason] so ph-cli
-    /// can report why the connection failed.
-    fn process_grant_zpr_address_request(
-        &self,
-        asm: &Arc<Assembly>,
-        result: Result<Vec<IpAddress>, ResponseCode>,
-    ) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::RegisterAA) => {
-                match result {
-                    Ok(addrs) => {
-                        // zipline#83: a configured `--zpr-addr` / `zpr_addr`
-                        // is a demand (see the doc comment above). A grant
-                        // differing from a non-empty configured set means the
-                        // fabric refused it (e.g. the visa service scrubbed
-                        // the unauthenticated claim: no matching join
-                        // policy). Running on the granted address would leave
-                        // the TUN/routes sourcing from the configured one and
-                        // the node denying every bind — so refuse to run:
-                        // record the mismatch, tear the link down, and exit
-                        // the process non-zero with the remedy.
-                        //
-                        // The demand compared against is the STARTUP
-                        // configuration, frozen in
-                        // `Assembly::configured_zpr_addr_demand` — not the
-                        // current `config.zpr_addr`, which
-                        // `set_local_zpr_addrs` overwrites with each dynamic
-                        // grant. An adapter started without `--zpr-addr`
-                        // must keep accepting fabric-assigned addresses on
-                        // every reconnect, even when they differ from the
-                        // previous grant.
-                        let configured = asm.configured_zpr_addr_demand.clone();
-                        let granted_std: Vec<IpAddr> = addrs.iter().map(IpAddr::from).collect();
-                        if !configured.is_empty() && {
-                            let mut c = configured.clone();
-                            let mut g = granted_std.clone();
-                            c.sort();
-                            g.sort();
-                            c != g
-                        } {
-                            let msg = format!(
-                                "fabric granted ZPR address(es) {granted_std:?} but this adapter \
-                                 is configured to demand {configured:?}; it cannot originate \
-                                 traffic from an address it was not granted. Remove the \
-                                 --zpr-addr argument / zpr_addr config line and try again \
-                                 to accept a fabric-assigned address."
-                            );
-                            error!(target: LINK_STATE, "{} {msg}", asm.formatted_link_id(link_id));
-                            self.record_auth_failure(AuthFailureReason::GrantedAddressMismatch {
-                                requested: configured,
-                                granted: granted_std,
-                            });
-                            locked_fsm.set_state(LinkState::Error);
-                            drop(locked_fsm);
-                            asm.signal_fatal_error(msg);
-                            return self.initiate_close(asm, TerminateReason::Other);
-                        }
-
-                        info!(target: LINK_STATE, "{} granted ZPR addresses {:?}, becoming ACTIVE", asm.formatted_link_id(link_id), addrs);
-
-                        let data = self.locked_data.lock().unwrap();
-                        if let Some(aaa_addr) = data.aaa_address {
-                            drop(data);
-                            // TODO: deal with the potential i/o blocking here ( https://github.com/org-zpr/zpr-core/issues/938 )
-                            match asm
-                                .tun_ctl
-                                .clear_address(aaa_addr.into(), ZPRNET_PREFIX_LEN)
-                            {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    warn!(target: LINK_STATE, "{} failed to clear AAA address: {e}", asm.formatted_link_id(link_id));
-                                    // continue...
-                                }
-                            }
-                        } else {
-                            drop(data);
-                        }
-                        // I keep the aaa address around... TODO: should we clear it?
-
-                        if addrs.len() > 1 {
-                            warn!(target: LINK_STATE, "{} multiple addresses in Grant ZPR Address not supported: using first one only", asm.formatted_link_id(link_id));
-                        }
-
-                        // TODO: deal with the potential i/o blocking here ( https://github.com/org-zpr/zpr-core/issues/938 )
-                        if let Err(e) = asm.tun_ctl.add_address(addrs[0].into(), ZPRNET_PREFIX_LEN)
-                        {
-                            // zipline#157: a local, non-transient failure
-                            // (e.g. EPERM) that reconnecting cannot clear.
-                            // Record it so showLink / ph-cli connect report
-                            // the real error, and so complete_close hard-
-                            // stops the reconnect loop instead of retrying
-                            // into a fresh interactive OIDC prompt.
-                            warn!(target: LINK_STATE, "{} failed to set ZPR address: {e}", asm.formatted_link_id(link_id));
-                            self.record_auth_failure(AuthFailureReason::ActivationFailed(format!(
-                                "failed to set ZPR address {}: {e}",
-                                addrs[0]
-                            )));
-                            locked_fsm.set_state(LinkState::Error);
-                            drop(locked_fsm);
-                            return self.initiate_close(asm, TerminateReason::Other);
-                        }
-
-                        // zipline#101: before installing our own internal-
-                        // network route, check whether another live interface
-                        // already owns fd5a:5052::/32 — a second adapter that
-                        // activates anyway gets no traffic and nothing says
-                        // why. Failure handling follows the zipline#88 ruling
-                        // (same split as the add_route failure below): on a
-                        // dynamic grant fail the activation; on the static
-                        // path warn and continue. A query error means
-                        // "unknown", not "conflict" — never fail on a probe
-                        // that could not run.
-                        match asm.tun_ctl.route_owner_conflict(
-                            IpAddr::V6(ZPR_INTERNAL_NETWORK),
-                            ZPRNET_PREFIX_LEN,
-                        ) {
-                            Ok(None) => {}
-                            Ok(Some(owner_if)) => {
-                                if configured.is_empty() {
-                                    warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already routes to interface {owner_if} — another ZPR adapter or tool already owns ZPR traffic on this host; failing activation", asm.formatted_link_id(link_id));
-                                    // zipline#157: local and non-transient —
-                                    // record and hard-stop (see add_address).
-                                    self.record_auth_failure(AuthFailureReason::ActivationFailed(
-                                        format!(
-                                            "{ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already \
-                                             routes to interface {owner_if} — another ZPR \
-                                             adapter or tool already owns ZPR traffic on this \
-                                             host"
-                                        ),
-                                    ));
-                                    locked_fsm.set_state(LinkState::Error);
-                                    drop(locked_fsm);
-                                    return self.initiate_close(asm, TerminateReason::Other);
-                                }
-                                warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already routes to interface {owner_if}; continuing — statically provisioned deployments may carry their own routes", asm.formatted_link_id(link_id));
-                            }
-                            Err(e) => {
-                                warn!(target: LINK_STATE, "{} could not check the owner of {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; continuing", asm.formatted_link_id(link_id));
-                            }
-                        }
-
-                        // zipline#88: replies to a peer on a fabric-assigned
-                        // (dynamic-pool) address are dropped unless every
-                        // adapter's TUN routes the whole ZPR internal network.
-                        // With a /32 address, add_address above already yields
-                        // that route — both kernels install fd5a:5052::/32
-                        // themselves (zipline#101). The explicit install
-                        // matters when an address was pre-provisioned with a
-                        // longer prefix (e.g. /128): add_address skips, no
-                        // /32 route appears, so install it here.
-                        //
-                        // Failure handling differs by path (operator ruling,
-                        // zipline#88): on a dynamic grant (nothing was
-                        // configured) fabric-installed state is all the
-                        // adapter has, so a failed install means the link
-                        // cannot function — fail the activation ASAP, like a
-                        // failed add_address. On the static path the
-                        // deployment provisioned addressing and routes out of
-                        // band and may well already carry them, so warn and
-                        // continue.
-                        if let Err(e) = asm
-                            .tun_ctl
-                            .add_route(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN)
-                        {
-                            if configured.is_empty() {
-                                warn!(target: LINK_STATE, "{} failed to install ZPR internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; a dynamically addressed adapter cannot function without it", asm.formatted_link_id(link_id));
-                                // zipline#157: local and non-transient —
-                                // record and hard-stop (see add_address).
-                                self.record_auth_failure(AuthFailureReason::ActivationFailed(
-                                    format!(
-                                        "failed to install ZPR internal-network route \
-                                         {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}"
-                                    ),
-                                ));
-                                locked_fsm.set_state(LinkState::Error);
-                                drop(locked_fsm);
-                                return self.initiate_close(asm, TerminateReason::Other);
-                            }
-                            warn!(target: LINK_STATE, "{} failed to install ZPR internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN}: {e}; continuing — statically provisioned deployments may already carry it", asm.formatted_link_id(link_id));
-                        }
-
-                        // Update the global view of our ZPR addresses.
-                        asm.set_local_zpr_addrs(addrs);
-
-                        asm.tun_ctl.set_carrier(true).unwrap();
-
-                        // zipline#101 (Codex P1 on PR #35): the pre-install
-                        // probe above cannot see a concurrent adapter whose
-                        // carrier is still down — its route reads `linkdown`
-                        // and is filtered as an unattended persistent TUN —
-                        // so two adapters activating at once both pass it and
-                        // both raise carrier. Re-verify the claim now that
-                        // ours is fully visible (route installed, carrier
-                        // up). The ordering makes the race safe without a
-                        // cross-process lock: each adapter re-probes only
-                        // AFTER its own carrier-up, so two overlapping
-                        // activations cannot both observe a clear table —
-                        // whichever re-probes later sees the other live, and
-                        // at least one backs off (possibly both; failing
-                        // loudly beats both staying active in silence). On a
-                        // dynamic grant a conflict retracts the carrier
-                        // claim and fails the activation; the static path
-                        // warns and continues, same ruling as above. A probe
-                        // error is "unknown", never a conflict.
-                        match asm.tun_ctl.route_owner_conflict(
-                            IpAddr::V6(ZPR_INTERNAL_NETWORK),
-                            ZPRNET_PREFIX_LEN,
-                        ) {
-                            Ok(None) => {}
-                            Ok(Some(owner_if)) => {
-                                if configured.is_empty() {
-                                    warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes to interface {owner_if} after carrier-up — a concurrently starting ZPR adapter owns ZPR traffic on this host; backing off and failing activation", asm.formatted_link_id(link_id));
-                                    asm.tun_ctl.set_carrier(false).unwrap();
-                                    // zipline#157: local and non-transient —
-                                    // record and hard-stop (see add_address).
-                                    self.record_auth_failure(AuthFailureReason::ActivationFailed(
-                                        format!(
-                                            "{ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes \
-                                             to interface {owner_if} after carrier-up — a \
-                                             concurrently starting ZPR adapter owns ZPR \
-                                             traffic on this host"
-                                        ),
-                                    ));
-                                    locked_fsm.set_state(LinkState::Error);
-                                    drop(locked_fsm);
-                                    return self.initiate_close(asm, TerminateReason::Other);
-                                }
-                                warn!(target: LINK_STATE, "{} {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} routes to interface {owner_if} after carrier-up; continuing — statically provisioned deployments may carry their own routes", asm.formatted_link_id(link_id));
-                            }
-                            Err(e) => {
-                                warn!(target: LINK_STATE, "{} could not re-check the owner of {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} after carrier-up: {e}; continuing", asm.formatted_link_id(link_id));
-                            }
-                        }
-
-                        debug!(
-                            target: LINK_STATE,
-                            "{} finished registering actor address: becoming active", asm.formatted_link_id(link_id)
-                        );
-                        self.run_active(asm, locked_fsm)
-                    }
-                    Err(code) => {
-                        // Grant failed: record why so showLink / ph-cli can report it.
-                        let reason = match code {
-                            ResponseCode::PolicyDenied => AuthFailureReason::PolicyDenied,
-                            ResponseCode::AuthUnavailable => AuthFailureReason::AuthUnavailable,
-                            ResponseCode::AuthFailed => AuthFailureReason::VisaServiceRejected(
-                                "visa service rejected authentication".to_string(),
-                            ),
-                            other => AuthFailureReason::VisaServiceRejected(format!(
-                                "grant failed with code {other:?}"
-                            )),
-                        };
-                        warn!(target: LINK_STATE, "{} failed to be granted ZPR address: {reason:?}", asm.formatted_link_id(link_id));
-                        self.record_auth_failure(reason);
-                        locked_fsm.set_state(LinkState::Error);
-                        drop(locked_fsm);
-                        self.initiate_close(asm, TerminateReason::Other)
-                    }
-                }
-            }
-            (LinkType::AdapterToNode, LinkState::Active) => {
-                // Assume this is just a retransmit.
-                debug!(target: LINK_STATE, "{} received unsolicited Grant ZPR Address request while already in active, ignoring", asm.formatted_link_id(link_id));
-                Ok(())
-            }
-            (_, _) => Err(LinkStateError::InvalidOperation(
-                "Discarded unsolicited Grant Zpr Address request".to_string(),
-            )),
-        }
-    }
-
-    /// This is the event handler fro the return path from the visa service AUTHORIZE operation.
-    /// This needs to trigger sending of the Grant Address message.
-    ///
-    /// This is happening on a NODE.
-    ///
-    /// This is only called for SUCCESSFUL responses (unsuccessful responses trigger a link error).
-    ///
-    /// Transitions to [LinkState::Active].  (Adapter will terminate the link if it doesn't like our grant.)
-    ///
-    fn process_authorize_response(
-        &self,
-        asm: &Arc<Assembly>,
-        zpr_addr: IpAddress,
-    ) -> Result<(), LinkStateError> {
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-
-        info!(target: LINK_STATE, "{} received authorize response with ZPR address {}", asm.formatted_link_id(self.id), zpr_addr);
-
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::RegisterAA) => {} // ok
-            (_, _) => {
-                return Err(LinkStateError::InvalidOperation(
-                    "Discarded unsolicited authorize response".to_string(),
-                ));
-            }
-        }
-
-        locked_fsm.actor_addresses.clear();
-        locked_fsm.actor_addresses.push(zpr_addr);
-
-        // Send a Grant message, consume the response and then send in an event
-        // indicating we got it (ReceivedGrantResponse).
-
-        // Will call back via ReceivedGrantResponse event if successful.
-        self.send_grant_zpr_address_request(asm, &locked_fsm.actor_addresses);
-        debug!(target: LINK_STATE, "{} has ACKd the grant.  Becoming active", asm.formatted_link_id(self.id));
-        self.run_active(asm, locked_fsm)
-    }
-
-    /// Handle an authorize failure from the visa service: report the reason to
-    /// the adapter in a Grant with the mapped failure code and no addresses,
-    /// then tear the link down.
-    ///
-    /// This is happening on a NODE.
-    fn process_authorize_failure(
-        &self,
-        asm: &Arc<Assembly>,
-        code: zpr::vsapi_types::ErrorCode,
-        msg: String,
-    ) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-
-        warn!(target: LINK_STATE, "{} visa service refused authorization: {code:?}: {msg}",
-            asm.formatted_link_id(link_id));
-
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::RegisterAA) => {} // ok
-            (_, _) => {
-                return Err(LinkStateError::InvalidOperation(
-                    "Discarded unsolicited authorize failure".to_string(),
-                ));
-            }
-        }
-
-        // The failure grant must go out before the close, or the adapter only
-        // ever observes a terminated link with no reason.
-        mgmt::requests::send_grant_zpr_address_request(
-            asm,
-            link_id,
-            visa_mgmt::grant_code_for_vs_error(&code),
-            &[],
-        )
-        .enqueue();
-
-        asm.counters.management[ManagementCounterType::PeerHandshakeFailure].increment();
-        locked_fsm.set_state(LinkState::Error);
-        drop(locked_fsm);
-        self.initiate_close(asm, TerminateReason::Other)
-    }
-
-    /// Handle an init-auth message from sender.
-    ///
-    /// This is a slow function that is called AFTER we send a reply to the
-    /// init-auth message.
-    ///
-    /// If this is bootstrap and we are configured for bootstrap we can self-authenticate
-    /// and send in an AcquireZprAddressRequest.
-    ///
-    /// For now we must be in WaitForInitAuth to accept this message.
-    /// We transition to RegisterAA if we successfully self-auth, otherwise we go to
-    /// error and shutdown the link.
-    fn process_init_auth(
-        &self,
-        asm: &Arc<Assembly>,
-        bootstrap: bool,
-        challenge: Option<auth::ZdpInitAuthenticationPayload>,
-    ) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-
-        // Grab a copy of what we know about OIDC from the hello exchange.
-        let data = self.locked_data.lock().unwrap();
-        let oidc_idps = data.oidc_idps.clone().unwrap_or_default();
-        let auth_agent = data.auth_agent.clone();
-        drop(data);
-
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            // NOTE: This is not exactly right, in general we can get an InitAuth at any time, though we
-            // may not want to act on it and sometimes may be a protocol error.
-            (LinkType::AdapterToNode, LinkState::WaitForInitAuth) => {
-                debug!(target: LINK_STATE, "{} received init auth (bootstrap_supported: {}, bootstrap_configured: {}, oidc_idps: {}, agent: {})",
-                    asm.formatted_link_id(link_id), bootstrap, asm.config.get().bootstrap.is_some(),
-                    oidc_idps.len(), auth_agent.is_some());
-
-                // An advertised OIDC IdP means the network wants user
-                // authentication: run it through the out-of-band AuthAgent,
-                // adding a bootstrap (SS) blob alongside when a key is
-                // configured. With no agent registered we can still proceed
-                // on the legacy device-only paths below if bootstrap is
-                // available; otherwise the connection cannot be authenticated.
-                if !oidc_idps.is_empty() {
-                    let Some(challenge) = challenge.clone() else {
-                        error!(target: LINK_STATE, "{} received init auth with no challenge", asm.formatted_link_id(link_id));
-                        locked_fsm.set_state(LinkState::Error);
-                        drop(locked_fsm);
-                        return self.initiate_close(asm, TerminateReason::Other);
-                    };
-
-                    if let Some(agent) = auth_agent {
-                        // Bootstrap key configured -> the SS blob rides along.
-                        let mut blobs = Vec::new();
-                        if let Some(bs) = asm.config.get().bootstrap.as_ref() {
-                            match bs.authenticate_blob(&challenge) {
-                                Ok(ss_blob) => blobs.push(AuthBlob::SelfSigned(ss_blob)),
-                                Err(e) => {
-                                    error!(target: LINK_STATE, "{} failed to self-authenticate: {e:?}", asm.formatted_link_id(link_id));
-                                    locked_fsm.set_state(LinkState::Error);
-                                    drop(locked_fsm);
-                                    return self.initiate_close(asm, TerminateReason::Other);
-                                }
-                            }
-                        }
-
-                        locked_fsm.set_state(LinkState::WaitForUserAuth);
-                        self.set_timeout(
-                            asm,
-                            &mut locked_fsm,
-                            config::OIDC_USER_INTERACTION_TIMEOUT,
-                        );
-                        // Tag this attempt with the logical clock its timeout
-                        // was armed with; do_oidc_authenticate discards the
-                        // completion if the clock has moved on (timeout fired,
-                        // link restarted, a newer attempt is underway).
-                        let attempt_clock = locked_fsm.logical_clock;
-                        drop(locked_fsm);
-                        self.do_oidc_authenticate(
-                            asm,
-                            agent,
-                            oidc_idps[0].clone(),
-                            &challenge,
-                            blobs,
-                            attempt_clock,
-                        );
-                        return Ok(());
-                    }
-
-                    if asm.config.get().bootstrap.is_none() {
-                        // OIDC required, no agent, and no device key either.
-                        warn!(target: LINK_STATE, "{} OIDC IdP advertised but no AuthAgent registered and no bootstrap key", asm.formatted_link_id(link_id));
-                        drop(locked_fsm);
-                        return self
-                            .process_authentication_failure(asm, AuthFailureReason::NoAgent);
-                    }
-                    // No agent but a bootstrap key exists: fall through to the
-                    // device-only bootstrap path, exactly as before OIDC.
-                }
-
-                // If we can do bootstrap and it is allowed, then do that.
-                if bootstrap && asm.config.get().bootstrap.is_some() {
-                    if challenge.is_none() {
-                        error!(target: LINK_STATE, "{} received init auth with no challenge", asm.formatted_link_id(link_id));
-                        locked_fsm.set_state(LinkState::Error);
-                        drop(locked_fsm);
-                        return self.initiate_close(asm, TerminateReason::Other);
-                    }
-                    let challenge = challenge.unwrap();
-                    if let Some(bs) = asm.config.get().bootstrap.as_ref() {
-                        match bs.authenticate(&challenge) {
-                            Ok(blobstr) => {
-                                // Device-only bootstrap authentication
-                                // (zipline#122): record the namespace set a
-                                // renewal must re-prove.
-                                self.set_authenticated_namespaces(
-                                    [auth::AuthNamespace::Device].into(),
-                                );
-                                // The send function below will invoke a state event callback.
-                                // We staty in RegisterAA state until we get a grant.
-                                let requested_addrs = asm.get_local_zpr_addrs_std();
-                                self.send_acquire_zpr_address_request(
-                                    asm,
-                                    &requested_addrs,
-                                    &blobstr,
-                                );
-                                locked_fsm.set_state(LinkState::RegisterAA);
-                                self.set_timeout(
-                                    asm,
-                                    &mut locked_fsm,
-                                    config::VS_GRANT_REQUEST_TIMEOUT,
-                                );
-                            }
-                            Err(e) => {
-                                error!(target: LINK_STATE, "{} failed to self-authenticate: {e:?}", asm.formatted_link_id(link_id));
-                                // Shutdown the link
-                                locked_fsm.set_state(LinkState::Error);
-                                drop(locked_fsm);
-                                return self.initiate_close(asm, TerminateReason::Other);
-                            }
-                        }
-                    }
-                } else {
-                    // Bootstrap not allowed or not configured, and no OIDC IdP
-                    // was advertised: there is no way to authenticate this
-                    // link. The legacy BAS/OAuthRsa fallback that used to live
-                    // here was removed (zipline#15).
-                    warn!(target: LINK_STATE, "{} received init auth but no authentication method is available (no OIDC IdP advertised, no bootstrap key)", asm.formatted_link_id(link_id));
-                    drop(locked_fsm);
-                    return self
-                        .process_authentication_failure(asm, AuthFailureReason::AuthUnavailable);
-                }
-            }
-            (LinkType::AdapterToNode, LinkState::Helloing) => {
-                // init auth can race helloing; if so, stow it away until we finish helloing
-                locked_fsm.stowed_init_auth = Some(InitAuthData {
-                    bootstrap,
-                    challenge,
-                });
-            }
-            (_, _) => {
-                return Err(LinkStateError::UnexpectedTransition(
-                    locked_fsm.state,
-                    "ReceivedInitAuth",
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// The node sends init-authentication to the adapter, we await the ACK to
-    /// clear our timeout.  The adapter will in the meantime take care of doing
-    /// whatever authentication it needs to and will eventually send us an acquire-zpr-address
-    /// message with the authentication results (blob).
-    fn process_init_auth_ack(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::WaitForAcquireZprAddress) => {
-                debug!(target: LINK_STATE, "{} received init auth ack", asm.formatted_link_id(self.id));
-                // Now we are waiting on the adapter to perform authentication and
-                // that may involve external services and could be quite slow relative to a
-                // straightforward ZDP response.  So, we set a longer timeout.  We do not retransmit
-                // anything... if we do not get auth within a reasonable amount of time we shut down
-                // the link.
-                self.set_timeout(asm, &mut locked_fsm, config::ACTOR_AUTHENTICATION_TIMEOUT);
-                Ok(())
-            }
-            (_, _) => Err(LinkStateError::InvalidOperation(
-                "Discarded unsolicited init auth ack".to_string(),
-            )),
-        }
-    }
-
-    fn process_init_auth_timeout(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::WaitForAcquireZprAddress) => {
-                error!(target: LINK_STATE, "{} received init auth timeout", asm.formatted_link_id(self.id));
-                locked_fsm.set_state(LinkState::Error);
-                drop(locked_fsm);
-                self.initiate_close(asm, TerminateReason::RequestTimedOut)
-            }
-            (_, _) => Err(LinkStateError::InvalidOperation(
-                "Discarded unsolicited init auth timeout".to_string(),
-            )),
-        }
-    }
-
-    /// Send off the Init-Authentication message with a blob that the receiver could
-    /// use for authentication.
-    fn send_init_authentication_request(&self, asm: &Arc<Assembly>) {
-        let link_id = self.id;
-
-        // TODO: Whether or not we are in bootstrap mode comes from visa service.  For now hardcoded ON.
-        let is_bootstrap = true;
-
-        let payload: auth::ZdpInitAuthenticationPayload;
-        let mut flags = 0u8;
-
-        if is_bootstrap {
-            flags |= zdp::init_authentication_flags::BOOTSTRAP_SUPPORT;
-
-            // TODO: Pretty sure I do not need `inspect_sync` below. The key is set at create time and not changed.
-            let key = asm.peer_table.inspect(link_id, {
-                |peer| {
-                    let mut key = [0u8; auth::AUTH_KEY_SIZE_BYTES];
-                    key[0..auth::AUTH_KEY_SIZE_BYTES]
-                        .copy_from_slice(&peer.auth_key[0..auth::AUTH_KEY_SIZE_BYTES]);
-                    key
-                }
-            });
-            match key {
-                Some(key) => payload = auth::ZdpInitAuthenticationPayload::new(&key),
-                None => {
-                    // TODO: Possibly we want to send the Init Authentication message anyway, but
-                    //       just not support bootstrap mode.
-                    error!(target: LINK_STATE, "unable to send Init Authentication: no auth key found for {}", asm.formatted_link_id(link_id));
-                    if let Err(e) = asm.process_link_state_event(link_id, LinkEvent::Error) {
-                        error!(target: LINK_STATE, "event handling error: {e}");
-                    }
-                    return;
-                }
-            }
-        } else {
-            payload = auth::ZdpInitAuthenticationPayload::default(); // empty
-        }
-
-        let task_asm = asm.clone();
-        tokio::task::spawn_local(async move {
-            match mgmt::requests::send_init_authentication_request(
-                &task_asm, link_id, flags, payload,
-            )
-            .limit_retries(config::DEFAULT_ZDPR_RETRY_LIMIT)
-            .await
-            {
-                Ok(PacketStatus::Acked) => {
-                    // ignore error here, it just means we've moved on to another state and got the ACK (very) late
-                    let _ =
-                        task_asm.process_link_state_event(link_id, LinkEvent::ReceivedInitAuthAck);
-                }
-
-                Ok(PacketStatus::Canceled) => {
-                    // timed out getting the ACK, tear down the link
-                    let _ = task_asm
-                        .process_link_state_event(link_id, LinkEvent::ReceivedInitAuthTimeout);
-                }
-
-                Err(MgmtSendError::LinkClosed) => {
-                    // link was terminated, simply return
-                    return;
-                }
-            }
-        });
-    }
-
-    /// Send the Grant message
-    fn send_grant_zpr_address_request(&self, asm: &Arc<Assembly>, addrs: &[IpAddress]) {
-        // Convert the IpAddresses into IpAddrs
-        let ipaddrs = addrs
-            .iter()
-            .map(|addr| IpAddr::from(addr))
-            .collect::<Vec<_>>();
-
-        mgmt::requests::send_grant_zpr_address_request(
-            asm,
-            self.id,
-            ResponseCode::Success,
-            &ipaddrs,
-        )
-        .enqueue();
-    }
-
-    /// Run the out-of-band OIDC authentication through the registered
-    /// AuthAgent in a tokio task.
-    /// - [LinkEvent::AuthenticationSuccess] with `base_blobs` plus the OIDC
-    ///   blob on success
-    /// - [LinkEvent::AuthenticationFailure] with the agent's reason on failure
-    ///
-    /// The caller has already entered [LinkState::WaitForUserAuth], armed
-    /// [config::OIDC_USER_INTERACTION_TIMEOUT], and passed the logical clock
-    /// captured at arming as `attempt_clock`. A completion whose clock no
-    /// longer matches the FSM's is STALE — its timeout fired, the link was
-    /// closed/restarted, or a newer attempt (with a different challenge) is
-    /// underway — and is discarded here rather than delivered, so an old
-    /// token bound to an old challenge can never be consumed by a newer
-    /// WaitForUserAuth attempt.
-    fn do_oidc_authenticate(
-        &self,
-        asm: &Arc<Assembly>,
-        agent: AuthAgentHandle,
-        idp: auth::OidcIdpInfo,
-        challenge_payload: &auth::ZdpInitAuthenticationPayload,
-        base_blobs: Vec<AuthBlob>,
-        attempt_clock: u64,
-    ) {
-        let link_id = self.id;
-
-        // The raw 48-byte challenge: nonce || ctime || hmac.
-        let mut challenge = [0u8; 48];
-        challenge[0..8].copy_from_slice(&challenge_payload.nonce);
-        challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
-        challenge[16..48].copy_from_slice(&challenge_payload.hmac);
-
-        let nonce = auth::oidc_nonce_for_challenge(&challenge);
-        let issuer = idp.issuer.clone();
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let request = OidcCredentialRequest {
-            idp,
-            nonce,
-            interactive: true,
-            reply: reply_tx,
-        };
-
-        if agent.send(request).is_err() {
-            // The agent went away (ph-cli disconnected).
-            warn!(target: LINK_STATE, "{}: AuthAgent is gone, cannot authenticate", asm.formatted_link_id(link_id));
-            if let Err(e) = asm.process_link_state_event(
-                link_id,
-                LinkEvent::AuthenticationFailure(AuthFailureReason::NoAgent),
-            ) {
-                error!(target: LINK_STATE, "{}: event handling error {e}", asm.formatted_link_id(link_id));
-            }
-            return;
-        }
-
-        let task_asm = asm.clone();
-        tokio::task::spawn_local(async move {
-            let outcome = reply_rx.await;
-
-            // Discard a stale completion: if the logical clock moved on, this
-            // attempt's timeout fired (or the link was closed/restarted) and a
-            // newer attempt may be underway with a different challenge. The
-            // old token must not be delivered as that newer attempt's result.
-            let is_current = task_asm
-                .peer_table
-                .get(link_id)
-                .map(|peer| {
-                    peer.link_state_machine
-                        .auth_attempt_is_current(attempt_clock)
-                })
-                .unwrap_or(false);
-            if !is_current {
-                debug!(target: LINK_STATE, "{}: discarding stale AuthAgent completion (attempt superseded)",
-                    task_asm.formatted_link_id(link_id));
-                return;
-            }
-
-            let event = match outcome {
-                Ok(Ok(id_token)) => {
-                    let oidc_blob = auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer,
-                        id_token,
-                        challenge: BASE64_STANDARD.encode(challenge),
-                    };
-                    let mut blobs = base_blobs;
-                    blobs.push(AuthBlob::Oidc(oidc_blob));
-                    LinkEvent::AuthenticationSuccess(blobs)
-                }
-                Ok(Err(reason)) => LinkEvent::AuthenticationFailure(reason),
-                // The bridge dropped the reply without answering.
-                Err(_) => LinkEvent::AuthenticationFailure(AuthFailureReason::AgentError(
-                    "AuthAgent dropped the request".to_string(),
-                )),
-            };
-            if let Err(e) = task_asm.process_link_state_event(link_id, event) {
-                error!(target: LINK_STATE, "{}: event handling error {e}", task_asm.formatted_link_id(link_id));
-            }
-        });
-    }
-
-    /// Callback via the AuthenticationFailure event.
-    /// Records the reason (for showLink / ph-cli) and tears the link down.
-    fn process_authentication_failure(
-        &self,
-        asm: &Arc<Assembly>,
-        reason: AuthFailureReason,
-    ) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-        self.record_auth_failure(reason.clone());
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-        locked_fsm.set_state(LinkState::Error);
-        drop(locked_fsm);
-        info!(target: LINK_STATE, "{}: authentication failed: {reason:?}", asm.formatted_link_id(link_id));
-        self.initiate_close(asm, TerminateReason::Other)
-    }
-
-    /// Callback via the AuthenticationSuccess event.
-    ///
-    /// We expect to be in the RegisterAA state (legacy ASA path) or
-    /// WaitForUserAuth (OIDC via AuthAgent). Either way we send the encoded
-    /// blob array in an acquire request and move to RegisterAA to wait for
-    /// the grant.
-    fn process_authentication_success(
-        &self,
-        asm: &Arc<Assembly>,
-        blobs: Vec<AuthBlob>,
-    ) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-
-        if !matches!(
-            locked_fsm.state,
-            LinkState::RegisterAA | LinkState::WaitForUserAuth
-        ) {
-            error!(
-                "{}: authentication success ignored in unexpected state {:?}",
-                asm.formatted_link_id(link_id),
-                locked_fsm.state
-            );
-            return Ok(());
-        }
-
-        info!(target: LINK_STATE, "{}: authentication success ({} blob(s))", asm.formatted_link_id(link_id), blobs.len());
-        // Record which authority namespaces we authenticated with
-        // (zipline#122): a later renewal request is answered with exactly
-        // this set of legs.
-        self.set_authenticated_namespaces(auth::blob_namespaces(&blobs));
-        let blobstr = auth::encode_blobs(&blobs);
-        let requested_addrs = asm.get_local_zpr_addrs_std();
-        self.send_acquire_zpr_address_request(asm, &requested_addrs, &blobstr);
-        locked_fsm.set_state(LinkState::RegisterAA);
-        self.set_timeout(asm, &mut locked_fsm, config::VS_AUTHENTICATION_TIMEOUT);
-        Ok(())
-    }
-
-    /// Send Acquire message
-    fn send_acquire_zpr_address_request(
-        &self,
-        asm: &Arc<Assembly>,
-        requesting_addrs: &[IpAddr],
-        blob: &str,
-    ) {
-        mgmt::requests::send_acquire_zpr_address_request(
-            asm,
-            self.id,
-            requesting_addrs,
-            Some(blob.as_bytes()),
-        )
-        .enqueue();
     }
 
     fn process_error_response(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
@@ -2365,16 +684,7 @@ impl LinkStateWrapper {
 
         // handle the timeout...
         match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::WaitForUserAuth) => {
-                // The user did not complete the out-of-band login in time.
-                error!(target: LINK_STATE, "{}: user authentication timed out", asm.formatted_link_id(self.id));
-                drop(locked_fsm);
-                return self
-                    .process_authentication_failure(asm, AuthFailureReason::InteractionTimeout);
-            }
-
-            (LinkType::AdapterToNode, LinkState::RegisterAA)
-            | (LinkType::AdapterToNode, LinkState::Helloing) => {
+            (LinkType::AdapterToNode, LinkState::Helloing) => {
                 // Timeout here means we give up on the link.
                 error!(target: LINK_STATE, "{}: timed out in state {:?}", asm.formatted_link_id(self.id), locked_fsm.state);
                 locked_fsm.set_state(LinkState::Error);
@@ -2495,11 +805,9 @@ impl LinkStateWrapper {
                 // vs_worker — gated on RunLoopStarts before it re-runs
                 // register_vss — would leave the replacement link's
                 // deferred_vs_connect pending forever. `restart` recycles
-                // the loop (RunLoopExits, re-dial, fresh RunLoopStarts)
-                // without stopping the reconnect manager; if the loop is
-                // already mid-dial or in its reconnect delay, the command
-                // is discarded, which is fine — a restart is already in
-                // progress.
+                // the loop without stopping the reconnect manager; if the
+                // loop is already mid-dial or in its reconnect delay, the
+                // command is discarded, which is fine.
                 if !matches!(reason, TerminateReason::Shutdown) {
                     info!(target: LINK_STATE,
                         "{}: VS adapter link closing ({reason:?}); restarting VSConn run loop for reconnect",
@@ -2563,18 +871,21 @@ impl LinkStateWrapper {
         // the tether stays Inactive until the next startLink RPC. Every
         // failure path parks the FSM in Error before initiating the close,
         // while an operator stop arrives from a running state — so an Error
-        // entry with no recorded auth failure (e.g. a Helloing timeout,
-        // which fails before authentication) must record one here, or
-        // ph-cli's `connect` poll reads the permanently Inactive link as
-        // "Pending: restart forthcoming" and hangs until its deadline.
+        // entry with no recorded failure (e.g. a Helloing timeout) must
+        // record one here, or ph-cli's `connect` poll reads the permanently
+        // Inactive link as "restart forthcoming" and hangs until its
+        // deadline.
         if self.link_type == LinkType::AdapterToNode
             && !asm.config.get().auto_connect
             && self.get_state() == LinkState::Error
-            && self.get_last_auth_failure().is_none()
         {
-            self.record_auth_failure(AuthFailureReason::LinkFailed(format!(
-                "link failed before authentication completed ({reason:?})"
-            )));
+            if let Some(peer) = asm.peer_table.get(link_id) {
+                if peer.actor_auth.last_failure().is_none() {
+                    peer.actor_auth.record_failure(AuthFailureReason::LinkFailed(format!(
+                        "link failed before authentication completed ({reason:?})"
+                    )));
+                }
+            }
         }
 
         self.maybe_disconnect_visa_service_client(asm, true, reason)
@@ -2606,6 +917,10 @@ impl LinkStateWrapper {
         // If this timeout fires, we end up going to `clean_up_link_state`.
         // If we get a response to our terminate we also go to `clean_up_link_state`.
         self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_TERMINATE_TIMEOUT);
+        drop(locked_fsm);
+        if let Some(peer) = asm.peer_table.get(self.id) {
+            peer.actor_auth.link_down(asm).detach_all();
+        }
         let task_asm = asm.clone();
         let ingress_link_id = self.id;
         tokio::task::spawn_local(async move {
@@ -2640,9 +955,22 @@ impl LinkStateWrapper {
             LinkState::Closing | LinkState::Resetting => {
                 drop(locked_fsm);
                 info!(target: LINK_STATE, "{} is clearing its state", asm.formatted_link_id(link_id));
+                if let Some(peer) = asm.peer_table.get(link_id) {
+                    join_set = peer.actor_auth.link_down(asm);
+                }
 
                 let mut link_data = self.locked_data.lock().unwrap();
-                if let Some(aaa_addr) = link_data.aaa_address.take() {
+                let aaa = self.aaa_address();
+                self.aaa_address.write(None);
+                if let Some(aaa_addr) = aaa {
+                    if self.link_type == LinkType::AdapterToNode && link_data.installed_aaa {
+                        if let Err(err) = asm
+                            .tun_ctl
+                            .clear_address(aaa_addr.into(), ZPRNET_PREFIX_LEN)
+                        {
+                            error!(target: LINK_STATE, "cannot clear AAA address: {err}");
+                        }
+                    }
                     if let Some(pool) = asm.address_pool.lock().unwrap().as_mut() {
                         match pool.release_address(aaa_addr) {
                             Ok(_) => {
@@ -2654,21 +982,19 @@ impl LinkStateWrapper {
                         };
                     }
                 }
+                link_data.oidc_idps = None;
+                link_data.installed_aaa = false;
+                drop(link_data);
 
                 asm.peer_table.clear_peer_state(link_id);
 
                 match self.link_type {
                     LinkType::AdapterToNode => {
-                        asm.tun_ctl.set_carrier(false).unwrap();
-                        // Every tether in the flow tables was set up with the
-                        // node on this docking session; none survives it, and
-                        // a restarted node knows none of their stream ids.
-                        // Flush them so the next session binds afresh
-                        // (zipline#170).
-                        asm.elt.clear();
-                        asm.dlt.clear();
+                        if let Err(err) = asm.tun_ctl.set_carrier(false) {
+                            error!(target: LINK_STATE, "cannot disable TUN carrier: {err}");
+                        }
                     }
-                    LinkType::NodeToAdapter => join_set = self.deregister_actor_addresses(asm),
+                    LinkType::NodeToAdapter => {}
                     _ => {}
                 }
 
@@ -2712,29 +1038,20 @@ impl LinkStateWrapper {
                 info!(target: LINK_STATE, "{} has fully shut down", asm.formatted_link_id(link_id));
                 if !locked_fsm.shutting_down {
                     drop(locked_fsm);
-                    // With auto-connect off (zipline#28) the AdapterToNode
-                    // tether does not restart itself: it stays Inactive
-                    // until the next startLink RPC (ph-cli connect / link
-                    // start). Every connect is operator-initiated.
-                    if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect {
+                    if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect
+                    {
+                        // With auto-connect off (zipline#28) the tether does
+                        // not restart itself: it stays Inactive until the
+                        // next startLink RPC (ph-cli connect / link start).
                         info!(target: LINK_STATE, "{} idle (auto-connect off); waiting for startLink", asm.formatted_link_id(link_id));
                     } else if self.link_type == LinkType::AdapterToNode
-                        && matches!(
-                            self.get_last_auth_failure(),
-                            Some(AuthFailureReason::ActivationFailed(_))
-                        )
+                        && fatal_activation_failure(asm, link_id)
                     {
-                        // zipline#157 (Q1 ruling): a local activation
-                        // failure (address set, dynamic-grant route
-                        // install, route-owner conflict) is non-transient —
-                        // an EPERM will not clear on reconnect, and each
-                        // retry costs a full keying, a VS round trip, and a
-                        // fresh interactive OIDC prompt that masks the real
-                        // error as InteractionTimeout. Hard stop: stay
-                        // Inactive with the recorded ActivationFailed
-                        // reason (which ph-cli connect reports as this
-                        // attempt's terminal outcome); the operator re-runs
-                        // `ph-cli connect` after fixing the host.
+                        // zipline#157: a local activation failure is
+                        // non-transient (an EPERM will not clear on
+                        // reconnect). Stay Inactive with the recorded reason;
+                        // the operator re-runs `ph-cli connect` after fixing
+                        // the host.
                         warn!(target: LINK_STATE, "{} not reconnecting after a fatal local activation failure; fix the host and re-run `ph-cli connect`", asm.formatted_link_id(link_id));
                     } else {
                         self.setup_restart(asm);
@@ -2762,21 +1079,14 @@ impl LinkStateWrapper {
         let task_asm = asm.clone();
         tokio::task::spawn_local(async move {
             tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN).await;
-            // zipline#157 review round 1 (Codex P1): this timer may have
-            // been scheduled by an earlier, non-fatal close, and a newer
-            // attempt (operator startLink during the holddown) may have
-            // reached a fatal local activation failure while it was
-            // pending. Re-check the recorded failure before starting: a
-            // stale Start would clear it and resume the reconnect loop
-            // the hard stop in complete_close was meant to end.
-            if let Some(peer) = task_asm.peer_table.get(link_id) {
-                if matches!(
-                    peer.link_state_machine.get_last_auth_failure(),
-                    Some(AuthFailureReason::ActivationFailed(_))
-                ) {
-                    info!(target: LINK_STATE, "{} skipping stale holddown restart after a fatal local activation failure", task_asm.formatted_link_id(link_id));
-                    return;
-                }
+            // zipline#157: this timer may have been scheduled by an earlier,
+            // non-fatal close while a newer attempt (an operator startLink
+            // during the holddown) reached a fatal local activation failure.
+            // A stale Start would resume the reconnect loop the hard stop
+            // was meant to end.
+            if fatal_activation_failure(&task_asm, link_id) {
+                info!(target: LINK_STATE, "{} skipping stale holddown restart after a fatal local activation failure", task_asm.formatted_link_id(link_id));
+                return;
             }
             info!(target: LINK_STATE, "Attempting to restart {}", task_asm.formatted_link_id(link_id));
             let _ = task_asm.process_link_state_event(link_id, LinkEvent::Start);
@@ -2883,788 +1193,8 @@ impl LinkStateWrapper {
         // Piggyback the auth-renewal check on the keep-alive heartbeat
         // (zipline#45): every successful echo response on an Active link is
         // a renewal tick.
-        self.maybe_renew_auth(asm);
+        crate::actor_renewal::maybe_renew(asm, self.id);
 
-        Ok(())
-    }
-
-    /// One auth-renewal tick (zipline#45). No-op until the precomputed
-    /// renewal deadline passes; then, per tick:
-    /// - no AuthAgent registered (or no OIDC renewal identity): warn ONCE
-    ///   per authentication window and record [AuthFailureReason::NoAgent];
-    ///   no repeat warnings, no attempts.
-    /// - agent registered: at most one in-flight attempt at a time — a
-    ///   non-interactive getOidcCredential (never opens a browser) bound to
-    ///   the ORIGINAL issuer and challenge-derived nonce the actor
-    ///   authenticated with, then `vsconn.reauthorize`. Success refreshes
-    ///   `auth_expires` (restarting the window); any failure warns, records
-    ///   the reason, and clears the in-flight flag so the next due tick
-    ///   retries.
-    fn maybe_renew_auth(&self, asm: &Arc<Assembly>) {
-        let link_id = self.id;
-
-        // Snapshot under the data lock; bail on the cheap paths.
-        let (identity, auth_expires) = {
-            let mut data = self.locked_data.lock().unwrap();
-            let Some(deadline) = data.auth_renewal_deadline else {
-                return; // never authorized via the VS: nothing to renew
-            };
-            if SystemTime::now() < deadline || data.renewal_in_flight {
-                return;
-            }
-            if data.renewal_identity.is_none() {
-                // No OIDC identity stashed: there is nothing to renew with,
-                // on either side of the hop.
-                if !data.renewal_no_agent_warned {
-                    data.renewal_no_agent_warned = true;
-                    data.last_auth_failure = Some(AuthFailureReason::NoAgent);
-                    warn!(target: LINK_STATE,
-                        "{}: authentication expires soon but no AuthAgent is available to renew it;                          the actor must reconnect to re-authenticate",
-                        asm.formatted_link_id(link_id));
-                }
-                return;
-            }
-            if data.auth_agent.is_none() {
-                if matches!(self.link_type, LinkType::NodeToAdapter) {
-                    // R8 (zipline#66): the AuthAgent registers on the
-                    // ADAPTER's side of the hop, so this node asks the
-                    // adapter for a renewed credential over ZDP instead of
-                    // giving up.
-                    data.renewal_in_flight = true;
-                    let auth_expires = data.auth_expires.unwrap();
-                    drop(data);
-                    self.send_renewal_credential_request(asm, auth_expires);
-                    return;
-                }
-                if !data.renewal_no_agent_warned {
-                    data.renewal_no_agent_warned = true;
-                    data.last_auth_failure = Some(AuthFailureReason::NoAgent);
-                    warn!(target: LINK_STATE,
-                        "{}: authentication expires soon but no AuthAgent is available to renew it;                          the actor must reconnect to re-authenticate",
-                        asm.formatted_link_id(link_id));
-                }
-                return;
-            }
-            data.renewal_in_flight = true;
-            (
-                data.renewal_identity.clone().unwrap(),
-                // A renewal deadline implies set_auth_expires ran: present.
-                data.auth_expires.unwrap(),
-            )
-        };
-
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let request = OidcCredentialRequest {
-            idp: identity.idp.clone(),
-            nonce: identity.nonce.clone(),
-            interactive: false, // renewal must never open a browser
-            reply: reply_tx,
-        };
-
-        // Send to the agent bridge; a closed channel means the bridge task
-        // is gone (its admin connection died), so clear the stale slot (C2).
-        {
-            let mut data = self.locked_data.lock().unwrap();
-            let Some(agent) = data.auth_agent.clone() else {
-                data.renewal_in_flight = false;
-                return;
-            };
-            if agent.send(request).is_err() {
-                data.auth_agent = None;
-                data.renewal_in_flight = false;
-                data.last_auth_failure = Some(AuthFailureReason::AgentError(
-                    "AuthAgent bridge is gone".to_string(),
-                ));
-                warn!(target: LINK_STATE,
-                    "{}: AuthAgent bridge is gone; cleared the stale agent registration",
-                    asm.formatted_link_id(link_id));
-                return;
-            }
-        }
-
-        let task_asm = asm.clone();
-        let issuer = identity.idp.issuer.clone();
-        let nonce = identity.nonce;
-        // Bind the completion to THIS link instance: after teardown the slab
-        // id can be reused by a new peer, and the stale task must not act on
-        // it (PR #14 review).
-        let link_uid = self.uid;
-        // Bound the wait by the remaining authentication window so a hung
-        // agent cannot pin renewal_in_flight past expiry (PR #14 review).
-        let attempt_timeout = renewal_attempt_timeout(SystemTime::now(), auth_expires);
-        tokio::task::spawn_local(async move {
-            let outcome = match tokio::time::timeout(attempt_timeout, reply_rx).await {
-                Ok(outcome) => outcome.map_err(|_| {
-                    AuthFailureReason::AgentError(
-                        "AuthAgent dropped the renewal request".to_string(),
-                    )
-                }),
-                // Dropping reply_rx tells the bridge (via reply.closed()) to
-                // cancel the abandoned RPC.
-                Err(_elapsed) => Err(AuthFailureReason::AgentError(format!(
-                    "renewal attempt timed out after {attempt_timeout:?}"
-                ))),
-            };
-            Self::handle_renewal_reply(&task_asm, link_id, link_uid, issuer, nonce, outcome).await;
-        });
-    }
-
-    /// Completion of one silent-renewal attempt (zipline#45): submit the
-    /// obtained id token to the VS (or record the failure). `link_uid` is the
-    /// [LinkStateWrapper::uid] of the link instance the attempt was spawned
-    /// for; a reply whose looked-up peer carries a DIFFERENT uid belongs to a
-    /// closed link whose slab id was reused, and is discarded without
-    /// touching the new link's state (PR #14 review).
-    async fn handle_renewal_reply(
-        asm: &Arc<Assembly>,
-        link_id: LinkId,
-        link_uid: u64,
-        issuer: String,
-        nonce: String,
-        outcome: Result<Result<String, AuthFailureReason>, AuthFailureReason>,
-    ) {
-        let Some(peer) = asm.peer_table.get(link_id) else {
-            return; // link torn down while we waited
-        };
-        let lsm = &peer.link_state_machine;
-        if lsm.uid != link_uid {
-            // The slab id was reused by a NEW link while this request was
-            // pending: the reply belongs to the closed link's actor and
-            // must not touch the new link's state (PR #14 review).
-            debug!(target: LINK_STATE,
-                "{}: discarding renewal reply for a closed link instance (id reused)",
-                asm.formatted_link_id(link_id));
-            return;
-        }
-
-        let id_token = match outcome {
-            Ok(Ok(id_token)) => id_token,
-            Ok(Err(reason)) | Err(reason) => {
-                lsm.finish_renewal_failure(asm, reason);
-                return;
-            }
-        };
-
-        use zpr::vsapi_types as vst;
-        let blobs = vec![vst::AuthBlob::Oidc(vst::OidcBlob {
-            issuer,
-            id_token,
-            nonce,
-        })];
-        Self::submit_renewal_reauthorize(asm, link_id, link_uid, blobs).await;
-    }
-
-    /// Submit renewed credential blob(s) to the VS in ONE `reauthorize`
-    /// call (zipline#122, K3/K4) and settle the attempt: refreshed expiry
-    /// (clearing in-flight) on success, recorded failure (clearing
-    /// in-flight) otherwise. Shared by the agent-direct OIDC path (one
-    /// blob) and the ZDP multi-blob path. The caller has already checked
-    /// the link uid.
-    async fn submit_renewal_reauthorize(
-        asm: &Arc<Assembly>,
-        link_id: LinkId,
-        link_uid: u64,
-        blobs: Vec<zpr::vsapi_types::AuthBlob>,
-    ) {
-        let Some(peer) = asm.peer_table.get(link_id) else {
-            return; // link torn down while we waited
-        };
-        let lsm = &peer.link_state_machine;
-        if lsm.uid != link_uid {
-            return; // slab id reused by a new link
-        }
-
-        let Some(vsconn) = asm.vsconn.as_ref() else {
-            lsm.finish_renewal_failure(
-                asm,
-                AuthFailureReason::AgentError("no visa service connection for renewal".to_string()),
-            );
-            return;
-        };
-        let Some(actor_addr) = lsm.get_actor_addresses().first().cloned() else {
-            lsm.finish_renewal_failure(
-                asm,
-                AuthFailureReason::AgentError("no actor address to renew".to_string()),
-            );
-            return;
-        };
-
-        use zpr::vsapi_types as vst;
-        let req = vst::ReauthRequest {
-            zpr_addr: std::net::IpAddr::from(actor_addr),
-            blobs,
-        };
-        match vsconn.reauthorize(req).await {
-            Ok(conn) => {
-                let expires = std::time::UNIX_EPOCH + Duration::from_secs(conn.auth_expires);
-                info!(target: LINK_STATE,
-                    "{}: silently re-authenticated; new expiry {expires:?}",
-                    asm.formatted_link_id(link_id));
-                // Restarts the renewal window and clears the
-                // in-flight/warned bookkeeping.
-                lsm.set_auth_expires(
-                    SystemTime::now(),
-                    expires,
-                    asm.config.get().auth_renewal_lead,
-                );
-            }
-            Err(e) => {
-                lsm.finish_renewal_failure(
-                    asm,
-                    AuthFailureReason::VisaServiceRejected(e.to_string()),
-                );
-            }
-        }
-    }
-
-    /// A renewal attempt ended in failure: warn, record the reason for
-    /// showLink, and clear the in-flight flag so the next due keep-alive
-    /// tick may retry (zipline#45).
-    fn finish_renewal_failure(&self, asm: &Arc<Assembly>, reason: AuthFailureReason) {
-        warn!(target: LINK_STATE,
-            "{}: silent re-authentication failed: {reason:?}",
-            asm.formatted_link_id(self.id));
-        let mut data = self.locked_data.lock().unwrap();
-        data.renewal_in_flight = false;
-        data.last_auth_failure = Some(reason);
-    }
-
-    /// N2 (zipline#122), node side: start an on-demand credential renewal
-    /// toward the docked adapter NOW, regardless of any deadline — the visa
-    /// service asked for a re-auth under the new policy (K1/K4), which is
-    /// orthogonal to expiry-driven renewal. Requires an Active
-    /// [LinkType::NodeToAdapter] link; sets `renewal_in_flight` (returning
-    /// [RenewalStart::Coalesced] without sending if an attempt is already in
-    /// flight, which coalesces repeated VS requests onto the outstanding
-    /// attempt) and sends the ZDP 142 request exactly as the deadline path
-    /// does. N1's dispatcher (`vss_worker::process_request_authentication`)
-    /// reaches this through `peer_table.find` on the actor address and
-    /// counts only [RenewalStart::Accepted] / [RenewalStart::Coalesced] in
-    /// its ack — an [RenewalStart::Ignored] request started nothing (Codex
-    /// review, zl-zpr-core#45): a link leaving `Active` during shutdown may
-    /// still hold its actor address, and acknowledging a re-auth that never
-    /// began would misreport it as underway.
-    pub fn request_renewal_now(&self, asm: &Arc<Assembly>) -> RenewalStart {
-        let link_id = self.id;
-
-        if !matches!(self.link_type, LinkType::NodeToAdapter) {
-            warn!(target: LINK_STATE,
-                "{}: on-demand renewal requested on a non-node link; ignoring",
-                asm.formatted_link_id(link_id));
-            return RenewalStart::Ignored;
-        }
-        if self.get_state() != LinkState::Active {
-            warn!(target: LINK_STATE,
-                "{}: on-demand renewal requested on a non-Active link; ignoring",
-                asm.formatted_link_id(link_id));
-            return RenewalStart::Ignored;
-        }
-
-        let auth_expires = {
-            let mut data = self.locked_data.lock().unwrap();
-            if data.renewal_in_flight {
-                debug!(target: LINK_STATE,
-                    "{}: on-demand renewal coalesced onto the in-flight attempt",
-                    asm.formatted_link_id(link_id));
-                return RenewalStart::Coalesced;
-            }
-            data.renewal_in_flight = true;
-            // Bound the attempt by the remaining authentication window when
-            // one is known. With non-expiring bootstrap auth there may be
-            // none (or a far-future one): fall back to a window that yields
-            // the bridge's own per-call bound in renewal_attempt_timeout.
-            data.auth_expires
-                .unwrap_or_else(|| SystemTime::now() + 2 * config::OIDC_USER_INTERACTION_TIMEOUT)
-        };
-        self.send_renewal_credential_request(asm, auth_expires);
-        RenewalStart::Accepted
-    }
-
-    /// R8 (zipline#66), node side: ask the adapter for a renewed credential
-    /// over ZDP. Mints a fresh challenge exactly as
-    /// [Self::send_init_authentication_request] does (so
-    /// [auth::oidc_nonce_for_challenge] applies unchanged), stashes it for
-    /// the response to be verified against, sends a
-    /// RenewAuthenticationRequest, and bounds the wait by
-    /// [renewal_attempt_timeout] so a lost response cannot pin
-    /// `renewal_in_flight` past the point a retry could still succeed.
-    ///
-    /// The caller has already set `renewal_in_flight`.
-    fn send_renewal_credential_request(&self, asm: &Arc<Assembly>, auth_expires: SystemTime) {
-        let link_id = self.id;
-
-        let key = asm.peer_table.inspect(link_id, {
-            |peer| {
-                let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
-                key[0..AUTH_KEY_SIZE_BYTES].copy_from_slice(&peer.auth_key[0..AUTH_KEY_SIZE_BYTES]);
-                key
-            }
-        });
-        let Some(key) = key else {
-            self.finish_renewal_failure(
-                asm,
-                AuthFailureReason::AgentError(
-                    "no auth key to mint a renewal challenge".to_string(),
-                ),
-            );
-            return;
-        };
-
-        let payload = auth::ZdpInitAuthenticationPayload::new(&key);
-        let mut challenge = [0u8; 48];
-        challenge[0..8].copy_from_slice(&payload.nonce);
-        challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
-        challenge[16..48].copy_from_slice(&payload.hmac);
-        self.stash_renewal_challenge(challenge);
-
-        mgmt::requests::send_renew_authentication_request(asm, link_id, payload).enqueue();
-
-        // Bound the wait: if the response never arrives, fail this attempt so
-        // the next due keep-alive tick can retry while auth is still valid.
-        // Guarded by the challenge bytes (a completed or newer attempt has
-        // taken or replaced them) and the link uid (the slab id may be
-        // reused by a new link after teardown).
-        let task_asm = asm.clone();
-        let link_uid = self.uid;
-        let attempt_timeout = renewal_attempt_timeout(SystemTime::now(), auth_expires);
-        tokio::task::spawn_local(async move {
-            tokio::time::sleep(attempt_timeout).await;
-            let Some(peer) = task_asm.peer_table.get(link_id) else {
-                return; // link torn down while we waited
-            };
-            let lsm = &peer.link_state_machine;
-            if lsm.uid != link_uid {
-                return; // slab id reused by a new link
-            }
-            if lsm.take_renewal_challenge_if(&challenge) {
-                lsm.finish_renewal_failure(
-                    &task_asm,
-                    AuthFailureReason::AgentError(format!(
-                        "renewal credential request timed out after {attempt_timeout:?}"
-                    )),
-                );
-            }
-        });
-    }
-
-    /// R8 (zipline#66) / N2 (zipline#122), adapter side: the node asked for
-    /// a renewed credential. Answer with one blob per namespace the link
-    /// authenticated with (K4): the SS (device) leg signs the fresh
-    /// challenge with the bootstrap key synchronously; the OIDC (user) leg
-    /// goes through the registered AuthAgent with `interactive: false`
-    /// (the R6 bridge, unchanged). If any required leg is unproducible —
-    /// no bootstrap key, no agent, no advertised IdP, agent failure — the
-    /// answer is [ResponseCode::AuthUnavailable] rather than a partial set,
-    /// so the node records why renewal is impossible.
-    fn process_renew_auth_request(
-        &self,
-        asm: &Arc<Assembly>,
-        challenge_payload: auth::ZdpInitAuthenticationPayload,
-    ) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-        {
-            let locked_fsm = self.locked_fsm.lock().unwrap();
-            match (self.link_type, locked_fsm.state) {
-                // Renewal runs on an Active link, unlike InitAuthentication.
-                (LinkType::AdapterToNode, LinkState::Active) => {}
-                (_, _) => {
-                    return Err(LinkStateError::UnexpectedTransition(
-                        locked_fsm.state,
-                        "ReceivedRenewAuthRequest",
-                    ));
-                }
-            }
-        }
-
-        // The raw 48-byte challenge: nonce || ctime || hmac. Assembled
-        // before any answer so every response — success or failure — can
-        // echo it for correlation on the node side (PR #17 review).
-        let mut challenge = [0u8; 48];
-        challenge[0..8].copy_from_slice(&challenge_payload.nonce);
-        challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
-        challenge[16..48].copy_from_slice(&challenge_payload.hmac);
-
-        // A new request supersedes any still-outstanding agent call: the
-        // node only retries after abandoning its previous attempt, so
-        // cancel the abandoned call instead of letting this retry queue
-        // behind it on the serial bridge for up to
-        // OIDC_USER_INTERACTION_TIMEOUT (PR #17 review). Aborting the wait
-        // task drops its reply receiver, which the bridge observes
-        // (`reply.closed()`) and drops the in-flight RPC.
-        if let Some(task) = self.locked_data.lock().unwrap().adapter_renewal_task.take() {
-            debug!(target: LINK_STATE,
-                "{}: a new renewal credential request supersedes the outstanding one; cancelling it",
-                asm.formatted_link_id(link_id));
-            task.abort();
-        }
-
-        // Which legs to produce (zipline#122, K4): one blob per namespace
-        // the link authenticated with. A link that never recorded a set
-        // (authenticated before this change) is treated as user-only, the
-        // pre-existing OIDC behavior.
-        let namespaces = self
-            .get_authenticated_namespaces()
-            .unwrap_or_else(|| [auth::AuthNamespace::User].into());
-        let need_ss = namespaces.contains(&auth::AuthNamespace::Device);
-        let need_oidc = namespaces.contains(&auth::AuthNamespace::User);
-
-        // The SS (device) leg: sign the freshly minted challenge with the
-        // bootstrap key. If the leg is required and unproducible, the WHOLE
-        // answer is AuthUnavailable — the node (and the visa service)
-        // reject a partial set, so sending one would only waste a round
-        // trip (K4).
-        let ss_blob = if need_ss {
-            let ss = asm.config.get().bootstrap.as_ref().and_then(|bs| {
-                match bs.authenticate_blob(&challenge_payload) {
-                    Ok(blob) => Some(AuthBlob::SelfSigned(blob)),
-                    Err(e) => {
-                        warn!(target: LINK_STATE,
-                            "{}: failed to sign the renewal challenge: {e:?}",
-                            asm.formatted_link_id(link_id));
-                        None
-                    }
-                }
-            });
-            match ss {
-                Some(blob) => Some(blob),
-                None => {
-                    info!(target: LINK_STATE,
-                        "{}: device leg required for renewal but no bootstrap key can sign it; answering AuthUnavailable",
-                        asm.formatted_link_id(link_id));
-                    mgmt::requests::send_renew_authentication_response(
-                        asm,
-                        link_id,
-                        ResponseCode::AuthUnavailable,
-                        &challenge,
-                        &[],
-                    )
-                    .enqueue();
-                    return Ok(());
-                }
-            }
-        } else {
-            None
-        };
-
-        if !need_oidc {
-            // Device-only: every leg is in hand, answer synchronously.
-            let blob = auth::encode_blobs(&[ss_blob.expect("need_ss holds here")]);
-            mgmt::requests::send_renew_authentication_response(
-                asm,
-                link_id,
-                ResponseCode::Success,
-                &challenge,
-                blob.as_bytes(),
-            )
-            .enqueue();
-            return Ok(());
-        }
-
-        let (agent, idp) = {
-            let data = self.locked_data.lock().unwrap();
-            (
-                data.auth_agent.clone(),
-                data.oidc_idps.as_ref().and_then(|v| v.first().cloned()),
-            )
-        };
-        let (Some(agent), Some(idp)) = (agent, idp) else {
-            info!(target: LINK_STATE,
-                "{}: node asked for credential renewal but no AuthAgent/IdP is available; answering AuthUnavailable",
-                asm.formatted_link_id(link_id));
-            mgmt::requests::send_renew_authentication_response(
-                asm,
-                link_id,
-                ResponseCode::AuthUnavailable,
-                &challenge,
-                &[],
-            )
-            .enqueue();
-            return Ok(());
-        };
-
-        let nonce = auth::oidc_nonce_for_challenge(&challenge);
-        let issuer = idp.issuer.clone();
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let request = OidcCredentialRequest {
-            idp,
-            nonce,
-            interactive: false, // renewal must never open a browser
-            reply: reply_tx,
-        };
-
-        if agent.send(request).is_err() {
-            // The bridge task is gone (its admin connection died): clear the
-            // stale slot, same as the agent-direct renewal path (C2).
-            self.clear_auth_agent_if(&agent);
-            warn!(target: LINK_STATE,
-                "{}: AuthAgent bridge is gone; answering renewal with AuthUnavailable",
-                asm.formatted_link_id(link_id));
-            mgmt::requests::send_renew_authentication_response(
-                asm,
-                link_id,
-                ResponseCode::AuthUnavailable,
-                &challenge,
-                &[],
-            )
-            .enqueue();
-            return Ok(());
-        }
-
-        let task_asm = asm.clone();
-        let link_uid = self.uid;
-        let task = tokio::task::spawn_local(async move {
-            // The bridge bounds each call by OIDC_USER_INTERACTION_TIMEOUT
-            // and answers or drops the reply either way, so awaiting the
-            // reply is itself bounded.
-            let outcome = reply_rx.await;
-
-            let Some(peer) = task_asm.peer_table.get(link_id) else {
-                return; // link torn down while we waited
-            };
-            if peer.link_state_machine.uid != link_uid {
-                return; // slab id reused by a new link
-            }
-
-            let (status, blob) = match outcome {
-                Ok(Ok(id_token)) => {
-                    let oidc_blob = auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer,
-                        id_token,
-                        challenge: BASE64_STANDARD.encode(challenge),
-                    };
-                    // The SS leg (when the link's namespace set requires
-                    // one) rides alongside the OIDC leg, both bound to the
-                    // same echoed challenge (zipline#122, K4).
-                    let mut blobs = Vec::new();
-                    if let Some(ss) = ss_blob {
-                        blobs.push(ss);
-                    }
-                    blobs.push(AuthBlob::Oidc(oidc_blob));
-                    (ResponseCode::Success, auth::encode_blobs(&blobs))
-                }
-                Ok(Err(reason)) => {
-                    warn!(target: LINK_STATE,
-                        "{}: AuthAgent could not renew the credential: {reason:?}",
-                        task_asm.formatted_link_id(link_id));
-                    (ResponseCode::AuthUnavailable, String::new())
-                }
-                Err(_) => {
-                    warn!(target: LINK_STATE,
-                        "{}: AuthAgent dropped the renewal request",
-                        task_asm.formatted_link_id(link_id));
-                    (ResponseCode::AuthUnavailable, String::new())
-                }
-            };
-            mgmt::requests::send_renew_authentication_response(
-                &task_asm,
-                link_id,
-                status,
-                &challenge,
-                blob.as_bytes(),
-            )
-            .enqueue();
-        });
-        // Remember the wait task so the NEXT request can cancel it if the
-        // node abandons this attempt. Aborting an already-finished task is
-        // a no-op, so a stale handle here is harmless.
-        self.locked_data.lock().unwrap().adapter_renewal_task = Some(task.abort_handle());
-
-        Ok(())
-    }
-
-    /// R8 (zipline#66) / N2 (zipline#122), node side: the adapter answered
-    /// the renewal credential request. Verify the returned blob array
-    /// against the stashed challenge — the namespace set must EQUAL the set
-    /// the link authenticated with, and every blob must HMAC-verify with
-    /// this link's auth key and be bound byte-for-byte to the minted
-    /// challenge — then complete as the agent-direct path does, sending ALL
-    /// verified legs in one `reauthorize` (never `authorizeConnect`),
-    /// refreshed expiry on success, recorded failure otherwise. The link
-    /// stays Active throughout; a failed renewal leaves the existing expiry
-    /// to the sweep.
-    fn process_renew_auth_response(
-        &self,
-        asm: &Arc<Assembly>,
-        echoed_challenge: [u8; 48],
-        result: Result<String, ResponseCode>,
-    ) -> Result<(), LinkStateError> {
-        let link_id = self.id;
-        {
-            let locked_fsm = self.locked_fsm.lock().unwrap();
-            match (self.link_type, locked_fsm.state) {
-                (LinkType::NodeToAdapter, LinkState::Active) => {}
-                (_, _) => {
-                    return Err(LinkStateError::UnexpectedTransition(
-                        locked_fsm.state,
-                        "ReceivedRenewAuthResponse",
-                    ));
-                }
-            }
-        }
-
-        // Correlate before consuming: the response echoes the challenge of
-        // the request it answers, and only a response to the CURRENT
-        // attempt may take the stash. A delayed answer to an abandoned
-        // attempt (it timed out; a newer attempt is in flight) must not
-        // consume the newer attempt's challenge and be recorded as its
-        // failure (PR #17 review). No match — stale or unsolicited — is
-        // discarded without touching the renewal state; if a newer attempt
-        // is outstanding, its own response or timeout settles it.
-        if !self.take_renewal_challenge_if(&echoed_challenge) {
-            debug!(target: LINK_STATE,
-                "{}: discarding renewal response that answers no outstanding request",
-                asm.formatted_link_id(link_id));
-            return Ok(());
-        }
-        let challenge = echoed_challenge;
-
-        let blob_str = match result {
-            Ok(blob_str) => blob_str,
-            Err(code) => {
-                let reason = match code {
-                    ResponseCode::AuthUnavailable => AuthFailureReason::AuthUnavailable,
-                    other => AuthFailureReason::AgentError(format!(
-                        "adapter answered renewal with code {other:?}"
-                    )),
-                };
-                self.finish_renewal_failure(asm, reason);
-                return Ok(());
-            }
-        };
-
-        // Decode and verify (zipline#122, K4): the blob array's namespace
-        // set must EQUAL the set the link authenticated with, every blob's
-        // challenge must HMAC-verify with this link's auth key, and every
-        // blob must be bound byte-for-byte to the challenge we minted for
-        // this attempt, so a response cannot smuggle a credential bound
-        // elsewhere.
-        let blobs = match auth::decode_blobs(&blob_str) {
-            Ok(blobs) => blobs,
-            Err(e) => {
-                self.finish_renewal_failure(
-                    asm,
-                    AuthFailureReason::AgentError(format!("invalid renewal blob: {e}")),
-                );
-                return Ok(());
-            }
-        };
-
-        // The set rule: exactly the namespaces recorded at auth time. A
-        // link with no recorded set (authenticated before this change) is
-        // held to the user-only set, the pre-existing OIDC behavior.
-        // ONE blob per namespace (Codex review, zl-zpr-core#45 P1): the set
-        // comparison alone cannot see a duplicate — two OIDC blobs still
-        // collapse to `{User}` — and the issuer pin below examines only one
-        // OIDC blob, so without this rule a second, differently-issued
-        // credential could ride along to the visa service unpinned.
-        let expected = self
-            .get_authenticated_namespaces()
-            .unwrap_or_else(|| [auth::AuthNamespace::User].into());
-        let got = auth::blob_namespaces(&blobs);
-        if blobs.len() != got.len() {
-            self.finish_renewal_failure(
-                asm,
-                AuthFailureReason::AgentError(format!(
-                    "renewal blob array carries a duplicate namespace ({} blobs, {} namespaces)",
-                    blobs.len(),
-                    got.len()
-                )),
-            );
-            return Ok(());
-        }
-        if got != expected {
-            self.finish_renewal_failure(
-                asm,
-                AuthFailureReason::AgentError(format!(
-                    "renewal blob namespace set {got:?} does not match the authenticated set {expected:?}"
-                )),
-            );
-            return Ok(());
-        }
-
-        // Per-blob checks: HMAC/age (and CN for SS) via the same verifiers
-        // the connect path uses, plus byte-for-byte equality with THIS
-        // attempt's challenge. The SS leg is held to the OIDC freshness
-        // window here, not MAX_BLOB_AGE_SECONDS (Codex review,
-        // zl-zpr-core#45 P2): on a combined Device+User renewal both legs
-        // are bound to the SAME challenge, minted before the noninteractive
-        // agent's permitted wait, so the 120-second window would reject an
-        // otherwise timely reply. Replay is prevented by the byte-equality
-        // check against the single outstanding stashed challenge.
-        for d_blob in &blobs {
-            let (ok, blob_challenge) = match d_blob {
-                AuthBlob::SelfSigned(ss_blob) => (
-                    self.check_self_signed_blob(
-                        asm,
-                        link_id,
-                        ss_blob,
-                        auth::MAX_OIDC_BLOB_AGE_SECONDS,
-                    ),
-                    &ss_blob.challenge,
-                ),
-                AuthBlob::Oidc(oidc_blob) => (
-                    self.check_oidc_blob(asm, link_id, oidc_blob),
-                    &oidc_blob.challenge,
-                ),
-            };
-            if !ok {
-                self.finish_renewal_failure(
-                    asm,
-                    AuthFailureReason::AgentError(
-                        "renewal blob challenge failed verification".to_string(),
-                    ),
-                );
-                return Ok(());
-            }
-            let returned_challenge = BASE64_STANDARD.decode(blob_challenge).unwrap_or_default();
-            if returned_challenge != challenge {
-                self.finish_renewal_failure(
-                    asm,
-                    AuthFailureReason::AgentError(
-                        "renewal blob is bound to a different challenge".to_string(),
-                    ),
-                );
-                return Ok(());
-            }
-        }
-
-        // Same guard as the original credential (stash_renewal_identity):
-        // a renewed OIDC leg must come from the issuer the actor
-        // originally authenticated with.
-        if let Some(oidc_blob) = blobs.iter().find_map(|b| match b {
-            AuthBlob::Oidc(oidc) => Some(oidc),
-            _ => None,
-        }) {
-            let expected_issuer = self
-                .locked_data
-                .lock()
-                .unwrap()
-                .renewal_identity
-                .as_ref()
-                .map(|identity| identity.idp.issuer.clone());
-            if expected_issuer.as_deref() != Some(oidc_blob.issuer.as_str()) {
-                self.finish_renewal_failure(
-                    asm,
-                    AuthFailureReason::AgentError(format!(
-                        "renewed credential from unexpected issuer {}",
-                        oidc_blob.issuer
-                    )),
-                );
-                return Ok(());
-            }
-        }
-
-        // Complete as the agent-direct path does, but with EVERY verified
-        // leg in one ReauthRequest (K3/K4). submit_renewal_reauthorize
-        // refreshes auth_expires (clearing in-flight) on success and
-        // records the failure (clearing in-flight) otherwise.
-        let task_asm = asm.clone();
-        let link_uid = self.uid;
-        let vst_blobs = vst_blobs_for_renewal(&blobs);
-        tokio::task::spawn_local(async move {
-            Self::submit_renewal_reauthorize(&task_asm, link_id, link_uid, vst_blobs).await;
-        });
         Ok(())
     }
 
@@ -3687,71 +1217,15 @@ impl LinkStateWrapper {
     }
 }
 
-/// Convert verified ph-side renewal blobs to VS-API blobs for a
-/// `ReauthRequest` (zipline#122, K3/K4): the SS leg maps
-/// cn/challenge/signature/timestamp as `build_connect_request` does at
-/// connect; the OIDC leg derives the nonce from the (already verified)
-/// challenge bytes. Order is preserved.
-fn vst_blobs_for_renewal(blobs: &[AuthBlob]) -> Vec<zpr::vsapi_types::AuthBlob> {
-    use zpr::vsapi_types as vst;
-    blobs
-        .iter()
-        .map(|blob| match blob {
-            AuthBlob::SelfSigned(ss) => vst::AuthBlob::SS(vst::SelfSignedBlob {
-                alg: vst::ChallengeAlg::RsaSha256Pkcs1v15,
-                challenge: BASE64_STANDARD.decode(&ss.challenge).unwrap_or_default(),
-                cn: ss.cn.clone(),
-                timestamp: ss.ts,
-                signature: BASE64_STANDARD.decode(&ss.sig).unwrap_or_default(),
-            }),
-            AuthBlob::Oidc(oidc) => {
-                let challenge_bytes = BASE64_STANDARD.decode(&oidc.challenge).unwrap_or_default();
-                let mut challenge = [0u8; 48];
-                if challenge_bytes.len() == 48 {
-                    challenge.copy_from_slice(&challenge_bytes);
-                }
-                vst::AuthBlob::Oidc(vst::OidcBlob {
-                    issuer: oidc.issuer.clone(),
-                    id_token: oidc.id_token.clone(),
-                    nonce: auth::oidc_nonce_for_challenge(&challenge),
-                })
-            }
-        })
-        .collect()
-}
-
-/// Collect OIDC identity-provider advertisements from the auth-services list:
-/// one [auth::OidcIdpInfo] per descriptor with `stype == OidcAuthentication`
-/// that carries an `OidcClientConfig`.
-fn get_available_oidc_idps(asm: &Assembly, link_id: LinkId) -> Vec<auth::OidcIdpInfo> {
-    use zpr::vsapi_types::ServiceT;
-
-    let mut idps = Vec::new();
-
-    let svclist = asm.vs_auth_services.read().unwrap();
-    if svclist.is_valid() {
-        for authservice in &svclist.services {
-            if authservice.stype != ServiceT::OidcAuthentication {
-                continue;
-            }
-            let Some(cfg) = &authservice.oidc else {
-                warn!(target: LINK_STATE, "{}: HelloResponse - OIDC service {} has no client config",
-                    asm.formatted_link_id(link_id), authservice.service_id);
-                continue;
-            };
-            debug!(target: LINK_STATE, "{}: HelloResponse - adding OIDC IdP: {}",
-                asm.formatted_link_id(link_id), cfg.issuer);
-            idps.push(auth::OidcIdpInfo {
-                issuer: cfg.issuer.clone(),
-                client_id: cfg.client_id.clone(),
-                client_secret: cfg.client_secret.clone(),
-                scopes: cfg.scopes.clone(),
-                allow_offline_access: cfg.allow_offline_access,
-            });
-        }
-    }
-
-    idps
+/// zipline#157: whether the link's actor recorded a fatal local activation
+/// failure, which suppresses automatic reconnects.
+fn fatal_activation_failure(asm: &Assembly, link_id: LinkId) -> bool {
+    asm.peer_table.get(link_id).is_some_and(|peer| {
+        matches!(
+            peer.actor_auth.last_failure(),
+            Some(AuthFailureReason::ActivationFailed(_))
+        )
+    })
 }
 
 impl Display for LinkStateWrapper {
@@ -3761,9 +1235,6 @@ impl Display for LinkStateWrapper {
         write!(f, "  Type: {:?}\n", self.link_type)?;
 
         write!(f, "{}", self.locked_fsm.lock().unwrap())?;
-        if let Some(reason) = self.get_last_auth_failure() {
-            write!(f, "  Last auth failure: {:?}\n", reason)?;
-        }
         if self.get_state() == LinkState::Active {
             write!(f, "{}", self.locked_data.lock().unwrap())?;
         }
@@ -3773,16 +1244,6 @@ impl Display for LinkStateWrapper {
 
 impl Display for LinkStateMachine {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        if self.actor_addresses.is_empty() {
-            write!(f, "  Actor Addresses: None\n")?;
-        } else {
-            write!(f, "  Actor Addresses: [ {}", self.actor_addresses[0])?;
-            for addr in &self.actor_addresses[1..self.actor_addresses.len()] {
-                write!(f, ", {}", addr)?;
-            }
-            write!(f, " ]\n")?;
-        }
-
         // TODO: Format time since last state change better
         write!(
             f,
@@ -3811,2219 +1272,306 @@ impl Display for LinkData {
             "    Latency: Min {:?}, Max {:?}, Avg {average:?}\n",
             self.latency_data.get_min(),
             self.latency_data.get_max(),
-        )?;
-        // Surface the renewal picture in showLink (zipline#45).
-        if let Some(expires) = self.auth_expires {
-            match expires.duration_since(SystemTime::now()) {
-                Ok(remaining) => {
-                    write!(f, "  Auth expires: in {remaining:?}")?;
-                }
-                Err(_) => {
-                    write!(f, "  Auth expires: EXPIRED")?;
-                }
-            }
-            if self.renewal_in_flight {
-                write!(f, " (renewal in progress)")?;
-            }
-            write!(f, "\n")?;
-        }
-        Ok(())
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthFailureReason, LinkEvent, LinkState, LinkStateMachine, LinkType};
+    use super::*;
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
-    use crate::auth;
-    use crate::peer_table;
-    use crate::prelude::*;
-    use crate::special_peers::SpecialPeerName;
-    use crate::zdp::ResponseCode;
-    use crate::zdp::TerminateReason;
-    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-    use std::time::SystemTime;
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
-    use zpr::addrs::{ZPR_INTERNAL_NETWORK, ZPRNET_PREFIX_LEN};
-    use zpr_utils::net_defs;
+
+    fn hello_link(link_type: LinkType) -> LinkStateWrapper {
+        let link = LinkStateWrapper::new(3, link_type);
+        {
+            let mut fsm = link.locked_fsm.lock().unwrap();
+            fsm.status = LinkStatus::Up;
+            fsm.set_state(LinkState::Helloing);
+        }
+        link
+    }
+
+    #[test]
+    fn readiness_tracks_all_link_states() {
+        let link = LinkStateWrapper::new(3, LinkType::AdapterToNode);
+        assert!(!link.is_ready());
+        assert!(LinkStateWrapper::new(1, LinkType::Internal).is_ready());
+
+        for state in [
+            LinkState::Inactive,
+            LinkState::Keying,
+            LinkState::Helloing,
+            LinkState::Disconnecting(TerminateReason::Other),
+            LinkState::Closing,
+            LinkState::Resetting,
+            LinkState::Error,
+        ] {
+            {
+                let mut fsm = link.locked_fsm.lock().unwrap();
+                fsm.status = LinkStatus::Up;
+                fsm.set_state(LinkState::Active);
+            }
+            assert!(link.is_ready());
+            link.locked_fsm.lock().unwrap().set_state(state);
+            assert!(!link.is_ready(), "unexpected readiness in {state:?}");
+        }
+
+        {
+            let mut fsm = link.locked_fsm.lock().unwrap();
+            fsm.status = LinkStatus::Down;
+            fsm.set_state(LinkState::Active);
+        }
+        assert!(!link.is_ready());
+    }
+
+    #[tokio::test]
+    async fn adapter_ownership_reads_do_not_wait_for_link_mutexes() {
+        use crate::peer_table::test::create_dummy_peer_state;
+        use std::net::{IpAddr, Ipv4Addr};
+        use zpr_utils::net_defs::ScopedIpAddr;
+
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        assert!(!asm.adapter_owns_address(IpAddress::UNSPECIFIED));
+        for id in 1..=DOCK_LINK_ID {
+            let entry = asm.peer_table.vacant_entry().unwrap();
+            assert_eq!(entry.key().get(), id);
+            let peer = create_dummy_peer_state(
+                entry.key(),
+                LinkType::AdapterToNode,
+                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), id.try_into().unwrap()),
+                ScopedIpAddr::V4(Ipv4Addr::LOCALHOST),
+            );
+            entry.insert(peer);
+        }
+        let peer = asm.peer_table.get(DOCK_LINK_ID).unwrap();
+        let link = &peer.link_state_machine;
+        let aaa = "fd5a:5052:0:aaa::1".parse::<IpAddr>().unwrap().into();
+        link.process_assigned_aaa(&asm, aaa).unwrap();
+        assert!(!asm.adapter_owns_address(aaa));
+
+        let mut fsm = link.locked_fsm.lock().unwrap();
+        fsm.status = LinkStatus::Up;
+        fsm.set_state(LinkState::Active);
+        let data = link.locked_data.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let asm = &asm;
+            scope.spawn(move || {
+                tx.send((
+                    asm.adapter_owns_address(aaa),
+                    asm.adapter_owns_address(IpAddress::UNSPECIFIED),
+                ))
+                .unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            // Release before checking the result so a regressed reader can finish.
+            drop(data);
+            drop(fsm);
+            assert_eq!(result.unwrap(), (true, false));
+        });
+
+        link.locked_fsm
+            .lock()
+            .unwrap()
+            .set_state(LinkState::Closing);
+        assert_eq!(link.aaa_address(), Some(aaa));
+        assert!(!asm.adapter_owns_address(aaa));
+    }
+
+    #[tokio::test]
+    async fn aaa_assignment_waits_for_cleanup_ownership() {
+        use std::net::IpAddr;
+
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let link = LinkStateWrapper::new(3, LinkType::NodeToAdapter);
+        let aaa = "fd5a:5052:0:aaa::1".parse::<IpAddr>().unwrap().into();
+        let data = link.locked_data.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let asm = &asm;
+            let link = &link;
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                link.process_assigned_aaa(asm, aaa).unwrap();
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            let waited = done_rx.recv_timeout(Duration::from_millis(100)).is_err();
+            let unchanged = link.aaa_address().is_none();
+            drop(data);
+            done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(waited);
+            assert!(unchanged);
+        });
+        assert_eq!(link.aaa_address(), Some(aaa));
+    }
+
+    #[tokio::test]
+    async fn hello_activates_link_and_keepalives_before_actor_authorization() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link = hello_link(LinkType::AdapterToNode);
+                let aaa = "fd5a:5052:0:aaa::1"
+                    .parse::<std::net::IpAddr>()
+                    .unwrap()
+                    .into();
+                link.process_hello_response(
+                    &asm,
+                    HelloResponse {
+                        status: ResponseCode::Success,
+                        aaa_address: Some(aaa),
+                        oidc_idps: None,
+                        vs_bootstrap: false,
+                    },
+                )
+                .unwrap();
+                assert!(link.is_ready());
+                assert_eq!(link.aaa_address(), Some(aaa));
+                assert!(link.locked_fsm.lock().unwrap().timeout_handle.is_some());
+                assert!(asm.get_local_zpr_addrs_std().is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_hello_cannot_succeed_without_aaa() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let adapter = hello_link(LinkType::AdapterToNode);
+                assert!(
+                    adapter
+                        .process_hello_response(
+                            &asm,
+                            HelloResponse {
+                                status: ResponseCode::Success,
+                                aaa_address: None,
+                                oidc_idps: None,
+                                vs_bootstrap: false,
+                            },
+                        )
+                        .is_err()
+                );
+                assert!(!adapter.is_ready());
+                let node = hello_link(LinkType::NodeToAdapter);
+                node.process_hello_request(&asm).unwrap();
+                assert!(!node.is_ready());
+                assert_eq!(node.get_state(), LinkState::Closing);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn only_designated_vs_bootstrap_can_establish_without_pool() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                asm.peer_table
+                    .assign_special_name(SpecialPeerName::VisaServiceAdapter, 3)
+                    .unwrap();
+                let node = hello_link(LinkType::NodeToAdapter);
+                node.process_hello_request(&asm).unwrap();
+                assert!(node.is_ready());
+                assert!(node.aaa_address().is_none());
+                let adapter = hello_link(LinkType::AdapterToNode);
+                adapter
+                    .process_hello_response(
+                        &asm,
+                        HelloResponse {
+                            status: ResponseCode::Success,
+                            aaa_address: None,
+                            oidc_idps: None,
+                            vs_bootstrap: true,
+                        },
+                    )
+                    .unwrap();
+                assert!(adapter.is_ready());
+            })
+            .await;
+    }
 
     /// Insert an adapter-side (AdapterToNode) peer into the table and return
     /// its link id. Each call gets a distinct substrate port: the peer table
     /// rejects duplicate substrate addresses.
     fn add_adapter_peer(asm: &Arc<Assembly>) -> LinkId {
-        let entry = asm.peer_table.vacant_entry().unwrap();
-        let link_id = entry.key();
-        let ps = peer_table::test::create_dummy_peer_state(
-            link_id,
-            LinkType::AdapterToNode,
-            SubstrateAddr::from(([127, 0, 0, 1], 9000 + link_id.get() as u16)),
-            net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2).into()),
-        );
-        entry.insert(ps).get()
+        add_peer(asm, LinkType::AdapterToNode, 9000)
     }
 
-    /// A fixed InitAuth challenge payload. The adapter side does not verify
-    /// the HMAC (the node minted it), so arbitrary bytes are fine.
-    fn test_challenge_payload() -> auth::ZdpInitAuthenticationPayload {
-        auth::ZdpInitAuthenticationPayload {
-            nonce: [7u8; 8],
-            ctime: 424242u64.into(),
-            hmac: [9u8; 32],
-        }
-    }
-
-    /// A minimal advertised OIDC identity provider.
-    fn test_idp() -> auth::OidcIdpInfo {
-        auth::OidcIdpInfo {
-            issuer: "https://idp.test".to_string(),
-            client_id: "test-client".to_string(),
-            client_secret: None,
-            scopes: vec!["openid".to_string()],
-            allow_offline_access: false,
-        }
-    }
-
-    /// `renewal_lead` clamps the configured lead to half the granted
-    /// lifetime, so short `expiration_seconds` values still renew ahead of
-    /// expiry by a workable margin (zipline#45).
-    #[test]
-    fn test_renewal_lead_clamps_to_half_lifetime() {
-        let configured = Duration::from_secs(300);
-        // Long lifetime: the configured lead stands.
-        assert_eq!(
-            super::renewal_lead(configured, Duration::from_secs(3600)),
-            Duration::from_secs(300)
-        );
-        // Lifetime of exactly 2x the lead: still the configured lead.
-        assert_eq!(
-            super::renewal_lead(configured, Duration::from_secs(600)),
-            Duration::from_secs(300)
-        );
-        // Short lifetime: clamped to half.
-        assert_eq!(
-            super::renewal_lead(configured, Duration::from_secs(120)),
-            Duration::from_secs(60)
-        );
-        // Zero lifetime: zero lead (due at expiry, i.e. immediately).
-        assert_eq!(
-            super::renewal_lead(configured, Duration::ZERO),
-            Duration::ZERO
-        );
-    }
-
-    /// `renewal_deadline` is `auth_expires - effective lead`; an
-    /// already-past expiry is due immediately (deadline not in the future).
-    #[test]
-    fn test_renewal_deadline_including_past_expiry() {
-        use std::time::SystemTime;
-        let configured = Duration::from_secs(300);
-        let now = SystemTime::now();
-
-        // 1h lifetime: deadline is expiry minus the full 300s lead.
-        let expires = now + Duration::from_secs(3600);
-        assert_eq!(
-            super::renewal_deadline(now, expires, configured),
-            expires - Duration::from_secs(300)
-        );
-
-        // 120s lifetime: lead clamps to 60s.
-        let expires = now + Duration::from_secs(120);
-        assert_eq!(
-            super::renewal_deadline(now, expires, configured),
-            expires - Duration::from_secs(60)
-        );
-
-        // Expiry already in the past: lifetime saturates to zero, so the
-        // deadline equals the (past) expiry — renewal is due immediately.
-        let expires = now - Duration::from_secs(10);
-        let deadline = super::renewal_deadline(now, expires, configured);
-        assert_eq!(deadline, expires);
-        assert!(deadline <= now, "past expiry must be due immediately");
-    }
-
-    /// `auth_expires` round-trips through the LinkStateWrapper setter/getter
-    /// (zipline#45): unset until authorized, then reads back what was set.
-    #[tokio::test]
-    async fn test_link_data_auth_expires_round_trip() {
-        use std::time::SystemTime;
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(peer.link_state_machine.get_auth_expires(), None);
-
-                let now = SystemTime::now();
-                let expires = now + Duration::from_secs(3600);
-                peer.link_state_machine
-                    .set_auth_expires(now, expires, Duration::from_secs(300));
-                assert_eq!(peer.link_state_machine.get_auth_expires(), Some(expires));
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 1: the authenticated namespace set round-trips
-    /// through the LinkStateWrapper setter/getter — None until recorded.
-    #[tokio::test]
-    async fn test_link_data_authenticated_namespaces_round_trip() {
-        use crate::auth::AuthNamespace;
-        use std::collections::BTreeSet;
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_authenticated_namespaces(),
-                    None,
-                    "no namespace set before authentication"
-                );
-
-                let set: BTreeSet<AuthNamespace> =
-                    [AuthNamespace::Device, AuthNamespace::User].into();
-                peer.link_state_machine
-                    .set_authenticated_namespaces(set.clone());
-                assert_eq!(
-                    peer.link_state_machine.get_authenticated_namespaces(),
-                    Some(set)
-                );
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 1, adapter side: AuthenticationSuccess with an
-    /// SS + OIDC blob array records {Device, User} as the namespace set the
-    /// link authenticated with.
-    #[tokio::test]
-    async fn test_adapter_auth_success_records_namespace_set() {
-        use crate::auth::AuthNamespace;
-        LocalSet::new()
-            .run_until(async {
-                let (asm, _egress_rx) = assembly_with_observable_egress();
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::WaitForUserAuth);
-                }
-
-                let challenge = [5u8; 48];
-                let blobs = vec![
-                    crate::auth::AuthBlob::SelfSigned(auth::ZdpSelfSignedBlob {
-                        blob_type: auth::BLOB_TYPE_SS.to_string(),
-                        ts: 12345,
-                        cn: "test.cn.zpr".to_string(),
-                        challenge: base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            challenge,
-                        ),
-                        sig: base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            [2u8; 16],
-                        ),
-                    }),
-                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer: "https://idp.test".to_string(),
-                        id_token: "tok".to_string(),
-                        challenge: base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            challenge,
-                        ),
-                    }),
-                ];
-                asm.process_link_state_event(link_id, LinkEvent::AuthenticationSuccess(blobs))
-                    .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_authenticated_namespaces(),
-                    Some([AuthNamespace::Device, AuthNamespace::User].into()),
-                    "SS + OIDC authentication must record both namespaces"
-                );
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 1, adapter side: the device-only bootstrap path
-    /// (no OIDC IdP advertised) records {Device}.
-    #[tokio::test]
-    async fn test_adapter_bootstrap_only_auth_records_device_namespace() {
-        use crate::auth::AuthNamespace;
-        LocalSet::new()
-            .run_until(async {
-                let mut config = <config::Config as std::default::Default>::default();
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                config.bootstrap =
-                    Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
-                let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(8);
-                let mut builder = TestAssemblyBuilder::new();
-                builder.mgmt_substrate_egress =
-                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
-                builder.config = Some(rcu::RcuBox::new(config));
-                let asm = Arc::new(create_assembly(builder));
-
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::WaitForInitAuth);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedInitAuth((true, Some(test_challenge_payload()))),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_authenticated_namespaces(),
-                    Some([AuthNamespace::Device].into()),
-                    "bootstrap-only authentication must record the device namespace"
-                );
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 1, node side: a verified acquire request records
-    /// the namespace set of its blobs alongside the renewal identity.
-    #[tokio::test]
-    async fn test_node_acquire_records_namespace_set() {
-        use crate::auth::AuthNamespace;
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_node_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::WaitForAcquireZprAddress);
-                }
-                // The SS challenge check needs an established SA (peer_cert
-                // None skips the CN leg; HMAC and age still verify).
-                asm.peer_table
-                    .set_security_association(link_id, crate::km::KmTransportSA::default())
-                    .unwrap();
-
-                // Blobs bound to a challenge HMAC'd with the dummy peer's
-                // auth key ([42; 32]).
-                let key = [42u8; auth::AUTH_KEY_SIZE_BYTES];
-                let payload = auth::ZdpInitAuthenticationPayload::new(&key);
-                let mut challenge = [0u8; 48];
-                challenge[0..8].copy_from_slice(&payload.nonce);
-                challenge[8..16].copy_from_slice(&payload.ctime.to_bytes());
-                challenge[16..48].copy_from_slice(&payload.hmac);
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
-                let ss = bs.authenticate_blob(&payload).unwrap();
-                let oidc = auth::ZdpOidcBlob {
-                    blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                    issuer: "https://idp.test".to_string(),
-                    id_token: "tok".to_string(),
-                    challenge: base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        challenge,
-                    ),
-                };
-                let blob_str = auth::encode_blobs(&[
-                    crate::auth::AuthBlob::SelfSigned(ss),
-                    crate::auth::AuthBlob::Oidc(oidc),
-                ]);
-
-                // NOTE: no yields after the event — the authorize task the
-                // acquire path spawns toward the (absent) VS must not run.
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedAcquireZprAddressRequest(None, blob_str),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_authenticated_namespaces(),
-                    Some([AuthNamespace::Device, AuthNamespace::User].into()),
-                    "the node must record the verified blob set's namespaces"
-                );
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 2: `request_renewal_now` on an Active
-    /// NodeToAdapter link sends a RenewAuthenticationRequest (142)
-    /// immediately — no deadline needed — and a second call while the
-    /// attempt is in flight is coalesced (no second request).
-    #[tokio::test]
-    async fn test_request_renewal_now_sends_142_and_coalesces() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                // No renewal deadline, no renewal identity: a device-only
-                // link never has either once V1 ships, and the on-demand
-                // path must not require them.
-
-                lsm.request_renewal_now(&asm);
-                assert!(
-                    lsm.test_renewal_in_flight(),
-                    "an on-demand request must mark the renewal in flight"
-                );
-                let pkt = try_recv_egress(&mut egress_rx)
-                    .expect("an on-demand renewal request must be sent");
-                assert_eq!(pkt.metadata().egress_link_id, link_id);
-                assert_eq!(
-                    pkt.body()[0],
-                    142,
-                    "expected a RenewAuthenticationRequest (142)"
-                );
-
-                // While in flight: coalesced, no second packet.
-                lsm.request_renewal_now(&asm);
-                assert!(
-                    try_recv_egress(&mut egress_rx).is_none(),
-                    "a second on-demand request while in flight must be coalesced"
-                );
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 2: `request_renewal_now` requires an Active
-    /// NodeToAdapter link — an adapter-side link and an inactive node link
-    /// both send nothing and claim nothing.
-    #[tokio::test]
-    async fn test_request_renewal_now_requires_active_node_to_adapter() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-
-                // Adapter-side link, Active: wrong link type.
-                let adapter_link = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(adapter_link).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Active);
-                    peer.link_state_machine.request_renewal_now(&asm);
-                    assert!(
-                        !peer.link_state_machine.test_renewal_in_flight(),
-                        "an adapter-side link must not start an on-demand renewal"
-                    );
-                }
-
-                // Node-side link still Helloing: wrong state.
-                let node_link = add_node_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(node_link).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Helloing);
-                    peer.link_state_machine.request_renewal_now(&asm);
-                    assert!(
-                        !peer.link_state_machine.test_renewal_in_flight(),
-                        "a non-Active link must not start an on-demand renewal"
-                    );
-                }
-
-                assert!(
-                    try_recv_egress(&mut egress_rx).is_none(),
-                    "neither call may send a packet"
-                );
-            })
-            .await
-    }
-
-    /// The renewal identity (original issuer + challenge-derived nonce)
-    /// round-trips through the LinkStateWrapper setter/getter.
-    #[tokio::test]
-    async fn test_link_data_renewal_identity_round_trip() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert!(peer.link_state_machine.get_renewal_identity().is_none());
-
-                let challenge = [3u8; 48];
-                peer.link_state_machine
-                    .set_renewal_identity(super::RenewalIdentity {
-                        idp: test_idp(),
-                        nonce: auth::oidc_nonce_for_challenge(&challenge),
-                    });
-                let stored = peer
-                    .link_state_machine
-                    .get_renewal_identity()
-                    .expect("identity must be stored");
-                assert_eq!(stored.idp.issuer, "https://idp.test");
-                assert_eq!(stored.nonce, auth::oidc_nonce_for_challenge(&challenge));
-            })
-            .await
-    }
-
-    /// Insert a node-side (NodeToAdapter) peer into the table and return its
-    /// link id. Distinct substrate port per call, same as [add_adapter_peer].
+    /// Insert a node-side (NodeToAdapter) peer and return its link id.
     fn add_node_peer(asm: &Arc<Assembly>) -> LinkId {
+        add_peer(asm, LinkType::NodeToAdapter, 9500)
+    }
+
+    /// Insert a peer of `link_type` whose substrate port is `base_port`
+    /// plus its link id, and return the link id.
+    fn add_peer(asm: &Arc<Assembly>, link_type: LinkType, base_port: u16) -> LinkId {
+        use crate::peer_table::test::create_dummy_peer_state;
+        use std::net::Ipv4Addr;
+        use zpr_utils::net_defs::ScopedIpAddr;
+
         let entry = asm.peer_table.vacant_entry().unwrap();
         let link_id = entry.key();
-        let ps = peer_table::test::create_dummy_peer_state(
+        let peer = create_dummy_peer_state(
             link_id,
-            LinkType::NodeToAdapter,
-            SubstrateAddr::from(([127, 0, 0, 1], 9500 + link_id.get() as u16)),
-            net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 3).into()),
+            link_type,
+            SubstrateAddr::from(([127, 0, 0, 1], base_port + link_id.get() as u16)),
+            ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
         );
-        entry.insert(ps).get()
+        entry.insert(peer).get()
     }
 
-    /// A test assembly whose management substrate egress is observable: the
-    /// returned receiver sees every packet the code under test sends.
-    fn assembly_with_observable_egress() -> (
-        Arc<Assembly>,
-        crate::packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
-    ) {
-        let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(8);
-        let mut builder = TestAssemblyBuilder::new();
-        builder.mgmt_substrate_egress = Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
-        (Arc::new(create_assembly(builder)), egress_rx)
+    /// A test assembly whose links can be started: `process_start` hands
+    /// the link to the key manager, which needs a noise keypair and a
+    /// certificate exchange. `auto_connect` sets the zipline#28 option.
+    fn keyable_assembly(auto_connect: bool) -> Arc<Assembly> {
+        let mut cfg = <config::Config as std::default::Default>::default();
+        cfg.auto_connect = auto_connect;
+        Arc::new(create_assembly(TestAssemblyBuilder {
+            self_noise_keypair: Some(crate::km_noise::NoiseKeypair::generate()),
+            certx: Some(crate::km_cert_exchange::KmCertExchange::new(None, None)),
+            config: Some(rcu::RcuBox::new(cfg)),
+            ..TestAssemblyBuilder::new()
+        }))
     }
 
-    /// Pop one packet off the observable egress queue, or None if empty.
-    fn try_recv_egress(
-        rx: &mut crate::packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
-    ) -> Option<Packet> {
-        rx.try_recv(vec![0u8; config::PACKET_BUFFER_SIZE].into_boxed_slice())
-            .ok()
+    /// The current FSM state of `link_id`.
+    fn link_state_of(asm: &Arc<Assembly>, link_id: LinkId) -> LinkState {
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .get_state()
     }
 
-    /// R8 (zipline#66): on a node link whose renewal is due, with the
-    /// renewal identity stashed but NO local AuthAgent — the combination the
-    /// production paths actually produce, since the agent registers on the
-    /// ADAPTER's link — the tick must send a RenewAuthenticationRequest
-    /// (ZDP type 142) toward the adapter instead of taking the one-shot
-    /// NoAgent warning path.
-    #[tokio::test]
-    async fn test_due_renewal_on_node_link_without_agent_sends_zdp_request() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-                // Renewal due (deadline in the past) but the authentication
-                // itself still valid for another minute.
-                let now = SystemTime::now();
-                lsm.set_auth_expires(
-                    now - Duration::from_secs(600),
-                    now + Duration::from_secs(60),
-                    Duration::from_secs(300),
-                );
-
-                lsm.maybe_renew_auth(&asm);
-
-                // Must NOT give up with the NoAgent warning: the adapter may
-                // well have an agent, and asking it is this issue's point.
-                assert!(
-                    !lsm.test_renewal_no_agent_warned(),
-                    "node tick took the NoAgent warning path instead of asking the adapter"
-                );
-                assert!(
-                    lsm.get_last_auth_failure().is_none(),
-                    "node tick recorded a failure instead of asking the adapter"
-                );
-                assert!(
-                    lsm.test_renewal_in_flight(),
-                    "the ZDP credential request must mark the renewal in flight"
-                );
-
-                // ...and must emit a RenewAuthenticationRequest on the link.
-                let pkt = try_recv_egress(&mut egress_rx)
-                    .expect("a renewal credential request must be sent toward the adapter");
-                assert_eq!(pkt.metadata().egress_link_id, link_id);
-                // body[0] is ZdpBaseHeader.packet_type;
-                // RenewAuthenticationRequest = 142 per the approved plan.
-                assert_eq!(
-                    pkt.body()[0],
-                    142,
-                    "expected a RenewAuthenticationRequest (142), got type {}",
-                    pkt.body()[0]
-                );
-            })
-            .await
+    /// Deliver a Timeout event carrying the link's CURRENT logical clock,
+    /// as the real timeout task does.
+    fn fire_current_timeout(asm: &Arc<Assembly>, link_id: LinkId) {
+        let logical_clock = asm
+            .peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_logical_clock();
+        asm.process_link_state_event(link_id, LinkEvent::Timeout { logical_clock })
+            .unwrap();
     }
 
-    /// R8 (zipline#66) step 3: an adapter link in Active with a registered
-    /// AuthAgent that receives a RenewAuthenticationRequest forwards exactly
-    /// one `OidcCredentialRequest { interactive: false }` to the agent and
-    /// returns the resulting blob in a Success RenewAuthenticationResponse.
-    #[tokio::test]
-    async fn test_adapter_renew_request_asks_agent_and_answers_with_blob() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.test_set_oidc_idps(vec![test_idp()]);
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                lsm.set_auth_agent(agent_tx);
-                drop(peer);
-
-                let challenge_payload = test_challenge_payload();
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthRequest(challenge_payload.clone()),
-                )
-                .unwrap();
-
-                // Exactly one non-interactive request, bound to the
-                // advertised IdP and the challenge-derived nonce.
-                let req = agent_rx.try_recv().expect("agent must be called once");
-                assert!(
-                    !req.interactive,
-                    "renewal must never open a browser (interactive must be false)"
-                );
-                assert_eq!(req.idp.issuer, "https://idp.test");
-                let mut challenge = [0u8; 48];
-                challenge[0..8].copy_from_slice(&challenge_payload.nonce);
-                challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
-                challenge[16..48].copy_from_slice(&challenge_payload.hmac);
-                assert_eq!(req.nonce, auth::oidc_nonce_for_challenge(&challenge));
-                assert!(agent_rx.try_recv().is_err(), "a second agent call was made");
-
-                // The agent answers; the response goes out with the blob.
-                req.reply.send(Ok("renewed-id-token".to_string())).unwrap();
-                let mut pkt = None;
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    pkt = try_recv_egress(&mut egress_rx);
-                    if pkt.is_some() {
-                        break;
-                    }
-                }
-                let pkt = pkt.expect("a RenewAuthenticationResponse must be sent");
-                assert_eq!(pkt.metadata().egress_link_id, link_id);
-                // body: [0]=type, [1]=excess, [2..10]=seq, [10]=status,
-                // [11..13]=blob_len, [13..61]=echoed challenge, [61..]=blob.
-                assert_eq!(pkt.body()[0], 143, "expected RenewAuthenticationResponse");
-                assert_eq!(
-                    pkt.body()[10],
-                    0, // ResponseCode::Success
-                    "expected a Success response"
-                );
-                let blob_len = u16::from_be_bytes([pkt.body()[11], pkt.body()[12]]) as usize;
-                assert!(blob_len > 0, "success response must carry the blob");
-                assert_eq!(
-                    &pkt.body()[13..61],
-                    &challenge[..],
-                    "the response must echo the request's challenge"
-                );
-                let blob_str =
-                    std::str::from_utf8(&pkt.body()[61..61 + blob_len]).expect("utf8 blob");
-                let blobs = auth::decode_blobs(blob_str).expect("valid blob encoding");
-                match &blobs[0] {
-                    crate::auth::AuthBlob::Oidc(oidc) => {
-                        assert_eq!(oidc.id_token, "renewed-id-token");
-                        assert_eq!(oidc.issuer, "https://idp.test");
-                        assert_eq!(
-                            oidc.challenge,
-                            base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                challenge
-                            ),
-                            "the blob must be bound to the node's challenge"
-                        );
-                    }
-                    other => panic!("expected an OIDC blob, got {other:?}"),
-                }
-                // The link never left Active.
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Active
-                );
-            })
-            .await
-    }
-
-    /// R8 (zipline#66) step 3: an adapter link WITHOUT a registered agent
-    /// answers a RenewAuthenticationRequest with
-    /// [ResponseCode::AuthUnavailable] instead of dropping the packet.
-    #[tokio::test]
-    async fn test_adapter_renew_request_without_agent_answers_auth_unavailable() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Active);
-                    // no agent, no IdP registered
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthRequest(test_challenge_payload()),
-                )
-                .unwrap();
-
-                let pkt = try_recv_egress(&mut egress_rx)
-                    .expect("an agentless adapter must still answer");
-                assert_eq!(pkt.body()[0], 143, "expected RenewAuthenticationResponse");
-                assert_eq!(
-                    pkt.body()[10],
-                    4, // ResponseCode::AuthUnavailable
-                    "expected AuthUnavailable"
-                );
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Active,
-                    "answering must not perturb the link"
-                );
-            })
-            .await
-    }
-
-    /// Codex P1 (PR #17, thread 1): a second RenewAuthenticationRequest on
-    /// the same link supersedes the first — the node only retries after
-    /// abandoning its previous attempt, so the adapter must cancel the
-    /// superseded agent call (drop its reply channel, which the serial
-    /// bridge observes via `reply.closed()`) instead of leaving it to run
-    /// for up to OIDC_USER_INTERACTION_TIMEOUT while retries queue behind
-    /// it.
-    #[tokio::test]
-    async fn test_adapter_second_renew_request_cancels_superseded_agent_call() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, _egress_rx) = assembly_with_observable_egress();
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.test_set_oidc_idps(vec![test_idp()]);
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                lsm.set_auth_agent(agent_tx);
-                drop(peer);
-
-                // Attempt A: the agent receives the call and sits on it
-                // (a hung or slow AuthAgent).
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthRequest(test_challenge_payload()),
-                )
-                .unwrap();
-                let req_a = agent_rx.try_recv().expect("first agent call");
-                assert!(
-                    !req_a.reply.is_closed(),
-                    "attempt A's reply channel must be open while A is current"
-                );
-
-                // The node abandoned A (its attempt timeout fired) and
-                // retried: attempt B's request arrives on the same link.
-                let payload_b = auth::ZdpInitAuthenticationPayload {
-                    nonce: [8u8; 8],
-                    ctime: 434343u64.into(),
-                    hmac: [10u8; 32],
-                };
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthRequest(payload_b),
-                )
-                .unwrap();
-                let _req_b = agent_rx.try_recv().expect("second agent call");
-
-                // The superseded call must be cancelled: aborting the wait
-                // task drops its reply receiver, which tells the bridge to
-                // drop the in-flight RPC and service the next request.
-                let mut closed = false;
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if req_a.reply.is_closed() {
-                        closed = true;
-                        break;
-                    }
-                }
-                assert!(
-                    closed,
-                    "the superseded renewal call must be cancelled so the \
-                     serial bridge can service the retry"
-                );
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 4: an adapter whose link authenticated
-    /// device-only ({Device} recorded) answers a RenewAuthenticationRequest
-    /// with a Success 143 carrying ONE SS blob bound to the echoed
-    /// challenge — no AuthAgent involved.
-    #[tokio::test]
-    async fn test_adapter_renew_request_device_only_answers_with_ss_no_agent() {
-        LocalSet::new()
-            .run_until(async {
-                let mut config = <config::Config as std::default::Default>::default();
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                config.bootstrap =
-                    Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
-                let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
-                let mut builder = TestAssemblyBuilder::new();
-                builder.mgmt_substrate_egress =
-                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
-                builder.config = Some(rcu::RcuBox::new(config));
-                let asm = Arc::new(create_assembly(builder));
-
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Active);
-                    peer.link_state_machine
-                        .set_authenticated_namespaces([auth::AuthNamespace::Device].into());
-                    // no agent, no IdP: an SS-only link needs neither
-                }
-
-                let challenge_payload = test_challenge_payload();
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthRequest(challenge_payload.clone()),
-                )
-                .unwrap();
-
-                let pkt = try_recv_egress(&mut egress_rx)
-                    .expect("a device-only adapter must answer synchronously");
-                assert_eq!(pkt.body()[0], 143, "expected RenewAuthenticationResponse");
-                assert_eq!(pkt.body()[10], 0, "expected a Success response");
-                let blob_len = u16::from_be_bytes([pkt.body()[11], pkt.body()[12]]) as usize;
-                let blob_str =
-                    std::str::from_utf8(&pkt.body()[61..61 + blob_len]).expect("utf8 blob");
-                let blobs = auth::decode_blobs(blob_str).expect("valid blob encoding");
-                assert_eq!(blobs.len(), 1, "device-only means exactly one blob");
-                let mut challenge = [0u8; 48];
-                challenge[0..8].copy_from_slice(&challenge_payload.nonce);
-                challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
-                challenge[16..48].copy_from_slice(&challenge_payload.hmac);
-                match &blobs[0] {
-                    crate::auth::AuthBlob::SelfSigned(ss) => {
-                        assert_eq!(ss.cn, "test.cn.zpr");
-                        assert_eq!(
-                            ss.challenge,
-                            base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                challenge
-                            ),
-                            "the SS blob must be bound to the node's challenge"
-                        );
-                    }
-                    other => panic!("expected an SS blob, got {other:?}"),
-                }
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 4: an adapter whose link authenticated with
-    /// SS+OIDC ({Device, User} recorded) but has NO AuthAgent cannot
-    /// produce every leg, so it answers AuthUnavailable — never a partial
-    /// set.
-    #[tokio::test]
-    async fn test_adapter_renew_request_ss_oidc_without_agent_answers_auth_unavailable() {
-        LocalSet::new()
-            .run_until(async {
-                let mut config = <config::Config as std::default::Default>::default();
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                config.bootstrap =
-                    Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
-                let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
-                let mut builder = TestAssemblyBuilder::new();
-                builder.mgmt_substrate_egress =
-                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
-                builder.config = Some(rcu::RcuBox::new(config));
-                let asm = Arc::new(create_assembly(builder));
-
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Active);
-                    peer.link_state_machine.set_authenticated_namespaces(
-                        [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
-                    );
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    // bootstrap key present, but NO agent: the user leg is
-                    // unproducible, so the whole answer is AuthUnavailable.
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthRequest(test_challenge_payload()),
-                )
-                .unwrap();
-
-                let pkt = try_recv_egress(&mut egress_rx).expect("the adapter must still answer");
-                assert_eq!(pkt.body()[0], 143, "expected RenewAuthenticationResponse");
-                assert_eq!(
-                    pkt.body()[10],
-                    4, // ResponseCode::AuthUnavailable
-                    "an unproducible leg must fail the WHOLE answer (no partial set)"
-                );
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 4: an SS+OIDC adapter WITH an agent answers a
-    /// Success 143 whose blob array carries BOTH legs, each bound to the
-    /// echoed challenge.
-    #[tokio::test]
-    async fn test_adapter_renew_request_ss_oidc_with_agent_answers_both_legs() {
-        LocalSet::new()
-            .run_until(async {
-                let mut config = <config::Config as std::default::Default>::default();
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                config.bootstrap =
-                    Some(auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap());
-                let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
-                let mut builder = TestAssemblyBuilder::new();
-                builder.mgmt_substrate_egress =
-                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
-                builder.config = Some(rcu::RcuBox::new(config));
-                let asm = Arc::new(create_assembly(builder));
-
-                let link_id = add_adapter_peer(&asm);
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Active);
-                    peer.link_state_machine.set_authenticated_namespaces(
-                        [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
-                    );
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    peer.link_state_machine.set_auth_agent(agent_tx);
-                }
-
-                let challenge_payload = test_challenge_payload();
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthRequest(challenge_payload.clone()),
-                )
-                .unwrap();
-
-                let req = agent_rx.try_recv().expect("agent must be called once");
-                assert!(!req.interactive);
-                req.reply.send(Ok("renewed-id-token".to_string())).unwrap();
-
-                let mut pkt = None;
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    pkt = try_recv_egress(&mut egress_rx);
-                    if pkt.is_some() {
-                        break;
-                    }
-                }
-                let pkt = pkt.expect("a RenewAuthenticationResponse must be sent");
-                assert_eq!(pkt.body()[0], 143);
-                assert_eq!(pkt.body()[10], 0, "expected a Success response");
-                let blob_len = u16::from_be_bytes([pkt.body()[11], pkt.body()[12]]) as usize;
-                let blob_str =
-                    std::str::from_utf8(&pkt.body()[61..61 + blob_len]).expect("utf8 blob");
-                let blobs = auth::decode_blobs(blob_str).expect("valid blob encoding");
-                assert_eq!(blobs.len(), 2, "SS+OIDC means exactly two blobs");
-                let mut challenge = [0u8; 48];
-                challenge[0..8].copy_from_slice(&challenge_payload.nonce);
-                challenge[8..16].copy_from_slice(&challenge_payload.ctime.to_bytes());
-                challenge[16..48].copy_from_slice(&challenge_payload.hmac);
-                let challenge_b64 =
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge);
-                let ss = blobs
-                    .iter()
-                    .find_map(|b| match b {
-                        crate::auth::AuthBlob::SelfSigned(ss) => Some(ss),
-                        _ => None,
-                    })
-                    .expect("the array must carry the SS leg");
-                assert_eq!(ss.cn, "test.cn.zpr");
-                assert_eq!(ss.challenge, challenge_b64);
-                let oidc = blobs
-                    .iter()
-                    .find_map(|b| match b {
-                        crate::auth::AuthBlob::Oidc(oidc) => Some(oidc),
-                        _ => None,
-                    })
-                    .expect("the array must carry the OIDC leg");
-                assert_eq!(oidc.id_token, "renewed-id-token");
-                assert_eq!(oidc.issuer, "https://idp.test");
-                assert_eq!(oidc.challenge, challenge_b64);
-            })
-            .await
-    }
-
-    /// R8 (zipline#66) step 4: a RenewAuthenticationResponse whose blob is
-    /// bound to the node's outstanding challenge (HMAC-verified with this
-    /// link's auth key) completes the renewal: the challenge is consumed and
-    /// the completion path (reauthorize) is invoked. The test assembly has
-    /// no VS connection, so the completion ends in the recorded
-    /// "no visa service connection" failure — reaching THAT failure proves
-    /// blob decoding, HMAC verification, challenge equality and issuer
-    /// pinning all passed. The link stays Active throughout, and
-    /// `renewal_in_flight` is cleared by the completion.
-    #[tokio::test]
-    async fn test_node_renew_response_with_valid_blob_reaches_reauthorize() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-                let now = SystemTime::now();
-                lsm.set_auth_expires(
-                    now - Duration::from_secs(600),
-                    now + Duration::from_secs(60),
-                    Duration::from_secs(300),
-                );
-
-                // The due tick sends the request and stashes the challenge.
-                lsm.maybe_renew_auth(&asm);
-                assert!(lsm.test_renewal_in_flight());
-                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
-                assert_eq!(req_pkt.body()[0], 142);
-                // body: [0]=type, [1]=excess, [2..10]=seq, [10..12]=data_len,
-                // [12..60]=challenge (nonce || ctime || hmac).
-                let mut challenge = [0u8; 48];
-                challenge.copy_from_slice(&req_pkt.body()[12..60]);
-
-                // The adapter answers with a blob bound to that challenge.
-                let blob = auth::encode_blobs(&[crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                    blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                    issuer: "https://idp.test".to_string(),
-                    id_token: "renewed-id-token".to_string(),
-                    challenge: base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        challenge,
-                    ),
-                })]);
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
-                )
-                .unwrap();
-
-                // Let the spawned completion task run.
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if !lsm.test_renewal_in_flight() {
-                        break;
-                    }
-                }
-                assert!(
-                    !lsm.test_renewal_in_flight(),
-                    "completion must clear the in-flight flag"
-                );
-                // No vsconn in the test assembly: the completion reaches the
-                // reauthorize step and records exactly this failure. Any
-                // verification failure would have recorded a different one.
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("no visa service connection"),
-                        "expected the reauthorize-step failure, got: {msg}"
-                    ),
-                    other => {
-                        panic!("expected AgentError(no visa service connection), got {other:?}")
-                    }
-                }
-                assert_eq!(
-                    lsm.get_state(),
-                    LinkState::Active,
-                    "the link must stay Active through a renewal round-trip"
-                );
-            })
-            .await
-    }
-
-    /// R8 (zipline#66) step 4: a response whose blob is bound to a DIFFERENT
-    /// challenge than the outstanding one is rejected — failure recorded,
-    /// in-flight cleared (so the next due tick retries), link still Active,
-    /// and the existing expiry left to the sweep.
-    #[tokio::test]
-    async fn test_node_renew_response_with_wrong_challenge_is_rejected() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-                let now = SystemTime::now();
-                let expires = now + Duration::from_secs(60);
-                lsm.set_auth_expires(
-                    now - Duration::from_secs(600),
-                    expires,
-                    Duration::from_secs(300),
-                );
-
-                lsm.maybe_renew_auth(&asm);
-                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
-                // The outstanding challenge, echoed by the (well-behaved)
-                // adapter on its response header.
-                let mut outstanding = [0u8; 48];
-                outstanding.copy_from_slice(&req_pkt.body()[12..60]);
-
-                // A blob correctly HMAC'd with this link's auth key ([42; 32]
-                // in the dummy peer) but bound to a DIFFERENT challenge.
-                let key = [42u8; auth::AUTH_KEY_SIZE_BYTES];
-                let other_payload = auth::ZdpInitAuthenticationPayload::new(&key);
-                let mut other_challenge = [0u8; 48];
-                other_challenge[0..8].copy_from_slice(&other_payload.nonce);
-                other_challenge[8..16].copy_from_slice(&other_payload.ctime.to_bytes());
-                other_challenge[16..48].copy_from_slice(&other_payload.hmac);
-                let blob = auth::encode_blobs(&[crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                    blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                    issuer: "https://idp.test".to_string(),
-                    id_token: "renewed-id-token".to_string(),
-                    challenge: base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        other_challenge,
-                    ),
-                })]);
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(outstanding, Ok(blob)),
-                )
-                .unwrap();
-
-                assert!(
-                    !lsm.test_renewal_in_flight(),
-                    "a rejected response must clear in-flight so the next tick retries"
-                );
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("different challenge"),
-                        "expected the challenge-mismatch failure, got: {msg}"
-                    ),
-                    other => panic!("expected AgentError(different challenge), got {other:?}"),
-                }
-                assert_eq!(lsm.get_state(), LinkState::Active, "link must stay Active");
-                assert_eq!(
-                    lsm.get_auth_expires(),
-                    Some(expires),
-                    "a failed renewal leaves the existing expiry to the sweep"
-                );
-            })
-            .await
-    }
-
-    /// R8 (zipline#66) step 4: an AuthUnavailable response records
-    /// [AuthFailureReason::AuthUnavailable], clears in-flight, and leaves
-    /// the link Active with its expiry intact.
-    #[tokio::test]
-    async fn test_node_renew_response_auth_unavailable_records_failure() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-                let now = SystemTime::now();
-                let expires = now + Duration::from_secs(60);
-                lsm.set_auth_expires(
-                    now - Duration::from_secs(600),
-                    expires,
-                    Duration::from_secs(300),
-                );
-
-                lsm.maybe_renew_auth(&asm);
-                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
-                let mut outstanding = [0u8; 48];
-                outstanding.copy_from_slice(&req_pkt.body()[12..60]);
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(
-                        outstanding,
-                        Err(ResponseCode::AuthUnavailable),
-                    ),
-                )
-                .unwrap();
-
-                assert!(!lsm.test_renewal_in_flight());
-                assert_eq!(
-                    lsm.get_last_auth_failure(),
-                    Some(AuthFailureReason::AuthUnavailable)
-                );
-                assert_eq!(lsm.get_state(), LinkState::Active);
-                assert_eq!(lsm.get_auth_expires(), Some(expires));
-            })
-            .await
-    }
-
-    /// Codex P1 (PR #17, thread 2): attempt A times out, attempt B starts,
-    /// and A's DELAYED response then arrives. The stale response must not
-    /// consume (or fail against) B's challenge: B's attempt stays in
-    /// flight, and B's own valid response still completes the renewal.
-    /// Without correlation, A's response is recorded as B's failure and
-    /// B's valid response is discarded as unsolicited.
-    #[tokio::test]
-    async fn test_node_stale_renew_response_does_not_consume_new_attempts_challenge() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-                let now = SystemTime::now();
-                lsm.set_auth_expires(
-                    now - Duration::from_secs(600),
-                    now + Duration::from_secs(60),
-                    Duration::from_secs(300),
-                );
-
-                // Attempt A: request sent, challenge A stashed.
-                lsm.maybe_renew_auth(&asm);
-                let pkt_a = try_recv_egress(&mut egress_rx).expect("attempt A request");
-                let mut challenge_a = [0u8; 48];
-                challenge_a.copy_from_slice(&pkt_a.body()[12..60]);
-
-                // A's attempt timeout fires — exactly what the spawned
-                // timer does: fail the attempt and clear its challenge.
-                assert!(lsm.take_renewal_challenge_if(&challenge_a));
-                lsm.finish_renewal_failure(
-                    &asm,
-                    AuthFailureReason::AgentError(
-                        "renewal credential request timed out (test)".to_string(),
-                    ),
-                );
-
-                // Attempt B on the next due tick: fresh challenge stashed.
-                // (Its request packet may sit in the ZDP-R send window
-                // behind unacked attempt A — the transport is not under
-                // test — so read the challenge from the stash.)
-                lsm.maybe_renew_auth(&asm);
-                assert!(lsm.test_renewal_in_flight());
-                let challenge_b = lsm
-                    .test_renewal_challenge()
-                    .expect("attempt B must stash its challenge");
-                assert_ne!(
-                    challenge_a, challenge_b,
-                    "attempts must mint fresh challenges"
-                );
-
-                // A's DELAYED response arrives while B is in flight. Its
-                // blob is well-formed and HMAC-valid — just bound to A.
-                let blob_a =
-                    auth::encode_blobs(&[crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer: "https://idp.test".to_string(),
-                        id_token: "stale-id-token".to_string(),
-                        challenge: base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            challenge_a,
-                        ),
-                    })]);
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(challenge_a, Ok(blob_a)),
-                )
-                .unwrap();
-
-                // The stale response must be discarded: B stays in flight
-                // and its failure record is not overwritten with a
-                // misattributed challenge-mismatch failure.
-                assert!(
-                    lsm.test_renewal_in_flight(),
-                    "a stale response from a timed-out attempt must not fail \
-                     the newer attempt"
-                );
-
-                // B's own valid response still completes the renewal (the
-                // test assembly has no VS connection, so completion ends in
-                // exactly the reauthorize-step failure — reaching it proves
-                // B's challenge was still stashed and verified).
-                let blob_b =
-                    auth::encode_blobs(&[crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer: "https://idp.test".to_string(),
-                        id_token: "renewed-id-token".to_string(),
-                        challenge: base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            challenge_b,
-                        ),
-                    })]);
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(challenge_b, Ok(blob_b)),
-                )
-                .unwrap();
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if !lsm.test_renewal_in_flight() {
-                        break;
-                    }
-                }
-                assert!(
-                    !lsm.test_renewal_in_flight(),
-                    "B's valid response must complete the attempt"
-                );
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("no visa service connection"),
-                        "B's response must reach reauthorize, got: {msg}"
-                    ),
-                    other => {
-                        panic!("expected AgentError(no visa service connection), got {other:?}")
-                    }
-                }
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 5: a renewal response whose blob set does not
-    /// EQUAL the namespace set the link authenticated with is rejected —
-    /// here the link authenticated SS+OIDC but the reply carries only the
-    /// OIDC leg. Failure recorded, in-flight cleared, link Active.
-    #[tokio::test]
-    async fn test_node_renew_response_set_mismatch_is_rejected() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_authenticated_namespaces(
-                    [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
-                );
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-
-                lsm.request_renewal_now(&asm);
-                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
-                let mut challenge = [0u8; 48];
-                challenge.copy_from_slice(&req_pkt.body()[12..60]);
-
-                // Only the OIDC leg comes back: {User} != {Device, User}.
-                let blob = auth::encode_blobs(&[crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                    blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                    issuer: "https://idp.test".to_string(),
-                    id_token: "renewed-id-token".to_string(),
-                    challenge: base64::Engine::encode(
-                        &base64::engine::general_purpose::STANDARD,
-                        challenge,
-                    ),
-                })]);
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
-                )
-                .unwrap();
-
-                assert!(
-                    !lsm.test_renewal_in_flight(),
-                    "a rejected response must clear in-flight so the next tick retries"
-                );
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("namespace"),
-                        "expected the set-mismatch failure, got: {msg}"
-                    ),
-                    other => panic!("expected AgentError(namespace set), got {other:?}"),
-                }
-                assert_eq!(lsm.get_state(), LinkState::Active, "link must stay Active");
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 5: an SS blob bound to a DIFFERENT challenge
-    /// than the outstanding one is rejected even though the wire header
-    /// echoes the right challenge and the blob's own HMAC is valid.
-    #[tokio::test]
-    async fn test_node_renew_response_wrong_challenge_ss_is_rejected() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                asm.peer_table
-                    .set_security_association(link_id, crate::km::KmTransportSA::default())
-                    .unwrap();
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_authenticated_namespaces([auth::AuthNamespace::Device].into());
-
-                lsm.request_renewal_now(&asm);
-                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
-                let mut outstanding = [0u8; 48];
-                outstanding.copy_from_slice(&req_pkt.body()[12..60]);
-
-                // An SS blob whose embedded challenge is a DIFFERENT one,
-                // HMAC-valid with this link's auth key ([42; 32]).
-                let key = [42u8; auth::AUTH_KEY_SIZE_BYTES];
-                let other_payload = auth::ZdpInitAuthenticationPayload::new(&key);
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
-                let ss = bs.authenticate_blob(&other_payload).unwrap();
-                let blob = auth::encode_blobs(&[crate::auth::AuthBlob::SelfSigned(ss)]);
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(outstanding, Ok(blob)),
-                )
-                .unwrap();
-
-                assert!(!lsm.test_renewal_in_flight());
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("different challenge"),
-                        "expected the challenge-mismatch failure, got: {msg}"
-                    ),
-                    other => panic!("expected AgentError(different challenge), got {other:?}"),
-                }
-                assert_eq!(lsm.get_state(), LinkState::Active);
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 5: a valid SS answer on a device-only link
-    /// passes every check and reaches the reauthorize step (the test
-    /// assembly has no VS connection, so it ends in exactly that recorded
-    /// failure — any verification failure would record a different one).
-    #[tokio::test]
-    async fn test_node_renew_response_valid_ss_reaches_reauthorize() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                asm.peer_table
-                    .set_security_association(link_id, crate::km::KmTransportSA::default())
-                    .unwrap();
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.test_add_actor_address(zpr_utils::net_defs::IpAddress::new_from_std(
-                    &"10.9.8.7".parse::<IpAddr>().unwrap(),
-                ));
-                lsm.set_authenticated_namespaces([auth::AuthNamespace::Device].into());
-
-                lsm.request_renewal_now(&asm);
-                assert!(lsm.test_renewal_in_flight());
-                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
-                assert_eq!(req_pkt.body()[0], 142);
-                let mut challenge = [0u8; 48];
-                challenge.copy_from_slice(&req_pkt.body()[12..60]);
-
-                // The adapter signs the outstanding challenge.
-                let payload = auth::ZdpInitAuthenticationPayload {
-                    nonce: challenge[0..8].try_into().unwrap(),
-                    ctime: u64::from_be_bytes(challenge[8..16].try_into().unwrap()).into(),
-                    hmac: challenge[16..48].try_into().unwrap(),
-                };
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
-                let ss = bs.authenticate_blob(&payload).unwrap();
-                let blob = auth::encode_blobs(&[crate::auth::AuthBlob::SelfSigned(ss)]);
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
-                )
-                .unwrap();
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if !lsm.test_renewal_in_flight() {
-                        break;
-                    }
-                }
-                assert!(
-                    !lsm.test_renewal_in_flight(),
-                    "completion must clear the in-flight flag"
-                );
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("no visa service connection"),
-                        "expected the reauthorize-step failure, got: {msg}"
-                    ),
-                    other => {
-                        panic!("expected AgentError(no visa service connection), got {other:?}")
-                    }
-                }
-                assert_eq!(lsm.get_state(), LinkState::Active);
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 5: a valid SS+OIDC answer on a link that
-    /// authenticated with both namespaces passes the set check and both
-    /// per-blob checks and reaches the reauthorize step.
-    #[tokio::test]
-    async fn test_node_renew_response_valid_ss_oidc_reaches_reauthorize() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                asm.peer_table
-                    .set_security_association(link_id, crate::km::KmTransportSA::default())
-                    .unwrap();
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.test_add_actor_address(zpr_utils::net_defs::IpAddress::new_from_std(
-                    &"10.9.8.7".parse::<IpAddr>().unwrap(),
-                ));
-                lsm.set_authenticated_namespaces(
-                    [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
-                );
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-
-                lsm.request_renewal_now(&asm);
-                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
-                let mut challenge = [0u8; 48];
-                challenge.copy_from_slice(&req_pkt.body()[12..60]);
-
-                let payload = auth::ZdpInitAuthenticationPayload {
-                    nonce: challenge[0..8].try_into().unwrap(),
-                    ctime: u64::from_be_bytes(challenge[8..16].try_into().unwrap()).into(),
-                    hmac: challenge[16..48].try_into().unwrap(),
-                };
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
-                let ss = bs.authenticate_blob(&payload).unwrap();
-                let blob = auth::encode_blobs(&[
-                    crate::auth::AuthBlob::SelfSigned(ss),
-                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer: "https://idp.test".to_string(),
-                        id_token: "renewed-id-token".to_string(),
-                        challenge: base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            challenge,
-                        ),
-                    }),
-                ]);
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
-                )
-                .unwrap();
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if !lsm.test_renewal_in_flight() {
-                        break;
-                    }
-                }
-                assert!(!lsm.test_renewal_in_flight());
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("no visa service connection"),
-                        "expected the reauthorize-step failure, got: {msg}"
-                    ),
-                    other => {
-                        panic!("expected AgentError(no visa service connection), got {other:?}")
-                    }
-                }
-                assert_eq!(lsm.get_state(), LinkState::Active);
-            })
-            .await
-    }
-
-    /// Codex review (zl-zpr-core#45, P2): a combined Device+User renewal
-    /// whose noninteractive agent answers after the 120-second SS window
-    /// but within the permitted 300-second agent wait must still verify.
-    /// The SS leg is bound to the SAME minted challenge as the OIDC leg,
-    /// and that challenge is issued before the agent wait, so on the
-    /// renewal path the SS leg must be held to the OIDC freshness window
-    /// (which covers the wait) — replay is already prevented by exact
-    /// byte-equality with the single outstanding stashed challenge.
-    #[tokio::test]
-    async fn test_node_renew_response_combined_ss_leg_survives_agent_wait() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, _egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                asm.peer_table
-                    .set_security_association(link_id, crate::km::KmTransportSA::default())
-                    .unwrap();
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_authenticated_namespaces(
-                    [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
-                );
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-
-                // Mint a challenge whose ctime is 150 s in the past — the
-                // agent took 150 s to answer, allowed by the 300 s bound,
-                // beyond MAX_BLOB_AGE_SECONDS (120 s) but within
-                // MAX_OIDC_BLOB_AGE_SECONDS (330 s). HMAC-keyed with the
-                // dummy peer's auth key, and stashed as the outstanding
-                // attempt exactly as send_renewal_credential_request does.
-                let key = [42u8; crate::auth::AUTH_KEY_SIZE_BYTES];
-                let ctime = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    - 150;
-                let nonce = [9u8; 8];
-                let be_time = ctime.to_be_bytes();
-                let mut hasher = blake3::Hasher::new_keyed(&key);
-                hasher.update(&nonce);
-                hasher.update(&be_time);
-                let hmac = hasher.finalize();
-                let mut challenge = [0u8; 48];
-                challenge[0..8].copy_from_slice(&nonce);
-                challenge[8..16].copy_from_slice(&be_time);
-                challenge[16..48].copy_from_slice(hmac.as_bytes());
-                lsm.stash_renewal_challenge(challenge);
-                {
-                    let mut data = lsm.locked_data.lock().unwrap();
-                    data.renewal_in_flight = true;
-                }
-
-                let payload = auth::ZdpInitAuthenticationPayload {
-                    nonce,
-                    ctime: ctime.into(),
-                    hmac: hmac.into(),
-                };
-                let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-                keypath.push("tests");
-                keypath.push("data");
-                keypath.push("rsa-key.pem");
-                let bs = auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap();
-                let ss = bs.authenticate_blob(&payload).unwrap();
-                let blob = auth::encode_blobs(&[
-                    crate::auth::AuthBlob::SelfSigned(ss),
-                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer: "https://idp.test".to_string(),
-                        id_token: "renewed-id-token".to_string(),
-                        challenge: base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            challenge,
-                        ),
-                    }),
-                ]);
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
-                )
-                .unwrap();
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if !lsm.test_renewal_in_flight() {
-                        break;
-                    }
-                }
-                assert!(!lsm.test_renewal_in_flight());
-                // Reaching the reauthorize step (its no-vsconn failure in
-                // this test assembly) proves the SS leg's 150-second-old
-                // challenge was NOT rejected as too old.
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("no visa service connection"),
-                        "the timely combined renewal must reach reauthorize, got: {msg}"
-                    ),
-                    other => {
-                        panic!("expected AgentError(no visa service connection), got {other:?}")
-                    }
-                }
-                assert_eq!(lsm.get_state(), LinkState::Active);
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 5: the ph-blob -> VS-API blob conversion for a
-    /// renewal reply maps the SS leg (cn/challenge/signature/timestamp) and
-    /// the OIDC leg (issuer/id_token/challenge-derived nonce) faithfully —
-    /// the ReauthRequest carries every leg (the "one ReauthRequest with all
-    /// blobs" half of K3/K4 that the no-vsconn integration tests above
-    /// cannot observe).
-    #[test]
-    fn test_vst_blobs_for_renewal_maps_both_legs() {
-        use zpr::vsapi_types as vst;
-        let challenge = [5u8; 48];
-        let challenge_b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge);
-        let blobs = vec![
-            crate::auth::AuthBlob::SelfSigned(auth::ZdpSelfSignedBlob {
-                blob_type: auth::BLOB_TYPE_SS.to_string(),
-                ts: 12345,
-                cn: "test.cn.zpr".to_string(),
-                challenge: challenge_b64.clone(),
-                sig: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [2u8; 16]),
-            }),
-            crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                issuer: "https://idp.test".to_string(),
-                id_token: "tok".to_string(),
-                challenge: challenge_b64,
-            }),
-        ];
-
-        let vst_blobs = super::vst_blobs_for_renewal(&blobs);
-        assert_eq!(vst_blobs.len(), 2, "every leg must be forwarded");
-        match &vst_blobs[0] {
-            vst::AuthBlob::SS(ss) => {
-                assert_eq!(ss.cn, "test.cn.zpr");
-                assert_eq!(ss.timestamp, 12345);
-                assert_eq!(ss.challenge, challenge.to_vec());
-                assert_eq!(ss.signature, vec![2u8; 16]);
-            }
-            other => panic!("expected SS first, got {other:?}"),
-        }
-        match &vst_blobs[1] {
-            vst::AuthBlob::Oidc(oidc) => {
-                assert_eq!(oidc.issuer, "https://idp.test");
-                assert_eq!(oidc.id_token, "tok");
-                assert_eq!(oidc.nonce, auth::oidc_nonce_for_challenge(&challenge));
-            }
-            other => panic!("expected Oidc second, got {other:?}"),
-        }
-    }
-
-    /// Codex review (zl-zpr-core#45, P1): a renewal reply carrying TWO OIDC
-    /// blobs — the first from the pinned issuer, the second from another —
-    /// must be rejected outright. The namespace SET comparison cannot see
-    /// the duplicate (both collapse to `{User}`), every blob is bound to
-    /// the same echoed challenge so the per-blob checks pass, and the
-    /// issuer pin used to validate only the FIRST OIDC blob while
-    /// `vst_blobs_for_renewal` forwarded both credentials to the visa
-    /// service. One blob per namespace is the rule.
-    #[tokio::test]
-    async fn test_node_renew_response_duplicate_oidc_blobs_rejected() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress();
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-                lsm.set_authenticated_namespaces([auth::AuthNamespace::User].into());
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-
-                lsm.request_renewal_now(&asm);
-                let req_pkt = try_recv_egress(&mut egress_rx).expect("request must be sent");
-                let mut challenge = [0u8; 48];
-                challenge.copy_from_slice(&req_pkt.body()[12..60]);
-                let challenge_b64 =
-                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, challenge);
-
-                // Both blobs echo the correct challenge; only the first names
-                // the pinned issuer. The second must not ride along.
-                let blob = auth::encode_blobs(&[
-                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer: "https://idp.test".to_string(),
-                        id_token: "renewed-id-token".to_string(),
-                        challenge: challenge_b64.clone(),
-                    }),
-                    crate::auth::AuthBlob::Oidc(auth::ZdpOidcBlob {
-                        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-                        issuer: "https://evil.example".to_string(),
-                        id_token: "forged-id-token".to_string(),
-                        challenge: challenge_b64,
-                    }),
-                ]);
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(challenge, Ok(blob)),
-                )
-                .unwrap();
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if !lsm.test_renewal_in_flight() {
-                        break;
-                    }
-                }
-                assert!(!lsm.test_renewal_in_flight());
-                match lsm.get_last_auth_failure() {
-                    Some(AuthFailureReason::AgentError(msg)) => assert!(
-                        msg.contains("duplicate"),
-                        "expected the duplicate-namespace rejection, got: {msg}"
-                    ),
-                    other => panic!("expected AgentError(duplicate ...), got {other:?}"),
-                }
-                assert_eq!(lsm.get_state(), LinkState::Active);
-            })
-            .await
-    }
-
-    /// R8 (zipline#66) step 4: a response with no outstanding request (no
-    /// stashed challenge — completed, timed out, or never sent) is discarded
-    /// without touching the renewal state.
-    #[tokio::test]
-    async fn test_node_unsolicited_renew_response_is_discarded() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_node_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-                lsm.test_set_state(LinkState::Active);
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedRenewAuthResponse(
-                        [3u8; 48],
-                        Ok("not-even-base64".to_string()),
-                    ),
-                )
-                .unwrap();
-
-                assert!(
-                    lsm.get_last_auth_failure().is_none(),
-                    "an unsolicited response must not record a failure"
-                );
-                assert!(!lsm.test_renewal_in_flight());
-                assert_eq!(lsm.get_state(), LinkState::Active);
-            })
-            .await
-    }
-
-    /// C4 (zipline#45): a due renewal tick with NO AuthAgent registered
-    /// warns exactly once per authentication window and records
-    /// [AuthFailureReason::NoAgent]; later due ticks are silent no-ops.
-    #[tokio::test]
-    async fn test_renewal_tick_without_agent_warns_once() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-
-                // Renewal overdue: the expiry is already in the past.
-                let past = SystemTime::now() - Duration::from_secs(10);
-                lsm.set_auth_expires(
-                    past - Duration::from_secs(600),
-                    past,
-                    Duration::from_secs(300),
-                );
-
-                lsm.maybe_renew_auth(&asm);
-                assert!(lsm.test_renewal_no_agent_warned());
-                assert!(matches!(
-                    lsm.get_last_auth_failure(),
-                    Some(AuthFailureReason::NoAgent)
-                ));
-
-                // Second due tick: no new failure is recorded (warned flag
-                // holds), and nothing is attempted.
-                lsm.test_clear_last_auth_failure();
-                lsm.maybe_renew_auth(&asm);
-                assert!(
-                    lsm.get_last_auth_failure().is_none(),
-                    "no-agent warning repeated on a later tick"
-                );
-                assert!(!lsm.test_renewal_in_flight());
-            })
-            .await
-    }
-
-    /// C4 (zipline#45): a renewal tick before the deadline attempts nothing,
-    /// even with an agent registered.
-    #[tokio::test]
-    async fn test_renewal_tick_before_deadline_is_noop() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                lsm.set_auth_agent(agent_tx);
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-                // Expires an hour out with a 300s lead: not due yet.
-                let now = SystemTime::now();
-                lsm.set_auth_expires(
-                    now,
-                    now + Duration::from_secs(3600),
-                    Duration::from_secs(300),
-                );
-
-                lsm.maybe_renew_auth(&asm);
-                assert!(!lsm.test_renewal_in_flight());
-                assert!(
-                    agent_rx.try_recv().is_err(),
-                    "agent was called before the renewal deadline"
-                );
-            })
-            .await
-    }
-
-    /// C4 (zipline#45): a due tick with a registered agent sends exactly ONE
-    /// non-interactive credential request bound to the ORIGINAL issuer and
-    /// the stored challenge-derived nonce; while that attempt is in flight,
-    /// further due ticks do not send another.
-    #[tokio::test]
-    async fn test_renewal_tick_sends_one_noninteractive_request() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                lsm.set_auth_agent(agent_tx);
-                let challenge = [7u8; 48];
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&challenge),
-                });
-                let past = SystemTime::now() - Duration::from_secs(1);
-                lsm.set_auth_expires(
-                    past - Duration::from_secs(600),
-                    past,
-                    Duration::from_secs(300),
-                );
-
-                lsm.maybe_renew_auth(&asm);
-                let req = agent_rx.try_recv().expect("agent must be called once");
-                assert!(
-                    !req.interactive,
-                    "renewal must never open a browser (interactive must be false)"
-                );
-                assert_eq!(req.idp.issuer, "https://idp.test");
-                assert_eq!(req.nonce, auth::oidc_nonce_for_challenge(&challenge));
-
-                // In flight: the next due tick must not send a second call.
-                lsm.maybe_renew_auth(&asm);
-                assert!(
-                    agent_rx.try_recv().is_err(),
-                    "second agent call while a renewal attempt is in flight"
-                );
-            })
-            .await
-    }
-
-    /// PR #14 review: one silent-renewal attempt waits at most half the time
-    /// remaining before expiry — clamped between the 5 s floor and the 300 s
-    /// interaction timeout — so a hung attempt can always be retried while
-    /// the current authentication is still valid.
-    #[test]
-    fn test_renewal_attempt_timeout_bounded_by_remaining_window() {
-        let now = SystemTime::now();
-        // Plenty of window: capped at the bridge's own per-call bound.
-        assert_eq!(
-            super::renewal_attempt_timeout(now, now + Duration::from_secs(3600)),
-            config::OIDC_USER_INTERACTION_TIMEOUT,
-        );
-        // 600 s remaining (the default-lead case that motivated the review
-        // finding): half the window, leaving room for a retry before expiry.
-        assert_eq!(
-            super::renewal_attempt_timeout(now, now + Duration::from_secs(600)),
-            Duration::from_secs(300),
-        );
-        // 60 s remaining: 30 s, again half.
-        assert_eq!(
-            super::renewal_attempt_timeout(now, now + Duration::from_secs(60)),
-            Duration::from_secs(30),
-        );
-        // Nearly (or already) expired: the floor keeps a healthy agent
-        // answerable instead of a zero-length wait.
-        assert_eq!(
-            super::renewal_attempt_timeout(now, now + Duration::from_secs(4)),
-            super::RENEWAL_ATTEMPT_TIMEOUT_FLOOR,
-        );
-        assert_eq!(
-            super::renewal_attempt_timeout(now, now - Duration::from_secs(10)),
-            super::RENEWAL_ATTEMPT_TIMEOUT_FLOOR,
-        );
-    }
-
-    /// PR #14 review: an AuthAgent that never answers must not pin
-    /// `renewal_in_flight` past the authentication window. The attempt times
-    /// out (bounded by the remaining window), records a failure, and the next
-    /// due tick retries.
-    #[tokio::test(start_paused = true)]
-    async fn test_hung_renewal_attempt_times_out_and_next_tick_retries() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                lsm.set_auth_agent(agent_tx);
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-                // Renewal overdue with ~20 s of validity left: the attempt
-                // timeout must be ~10 s, far below the 300 s bridge bound.
-                let now = SystemTime::now();
-                lsm.set_auth_expires(
-                    now - Duration::from_secs(580),
-                    now + Duration::from_secs(20),
-                    Duration::from_secs(300),
-                );
-
-                lsm.maybe_renew_auth(&asm);
-                // The agent hangs: hold the request (and its reply sender)
-                // without ever answering.
-                let hung_req = agent_rx.try_recv().expect("agent must be called");
-                assert!(lsm.test_renewal_in_flight());
-
-                // Let the spawned completion task register its timeout timer
-                // before advancing the paused clock.
-                for _ in 0..10 {
-                    tokio::task::yield_now().await;
-                }
-                // Well past the bounded attempt timeout, but well short of
-                // the 300 s bridge bound the review flagged.
-                tokio::time::advance(Duration::from_secs(30)).await;
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if !lsm.test_renewal_in_flight() {
-                        break;
-                    }
-                }
-                assert!(
-                    !lsm.test_renewal_in_flight(),
-                    "hung attempt still in flight after the remaining-window timeout"
-                );
-                assert!(matches!(
-                    lsm.get_last_auth_failure(),
-                    Some(AuthFailureReason::AgentError(_))
-                ));
-
-                // The next due tick retries while auth is still valid.
-                lsm.maybe_renew_auth(&asm);
-                assert!(
-                    agent_rx.try_recv().is_ok(),
-                    "next due tick must retry after a timed-out attempt"
-                );
-                drop(hung_req);
-            })
-            .await
-    }
-
-    /// PR #14 review: a renewal task that outlives its link must not act on
-    /// a NEW link that reused the same slab id. The reply from the closed
-    /// link's AuthAgent request carries the old instance's uid; when the
-    /// current occupant of the id has a different uid, the outcome must be
-    /// discarded instead of pushing the old actor's renewal result onto the
-    /// new link's state. The uid mismatch is driven directly through
-    /// [LinkStateWrapper::handle_renewal_reply] (exactly the call the task
-    /// spawned by maybe_renew_auth makes): the RCU slab defers slot
-    /// reclamation, so a unit test cannot force a real id reuse without
-    /// draining the epoch machinery.
-    #[tokio::test]
-    async fn test_stale_renewal_reply_after_link_id_reuse_is_discarded() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let current_uid = asm.peer_table.get(link_id).unwrap().link_state_machine.uid;
-
-                // A stale task from the closed PREVIOUS occupant of this id
-                // delivers a successful renewal outcome for the old actor.
-                let stale_uid = current_uid.wrapping_add(1);
-                super::LinkStateWrapper::handle_renewal_reply(
-                    &asm,
-                    link_id,
-                    stale_uid,
-                    "https://idp.test".to_string(),
-                    auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                    Ok(Ok("stale-id-token".to_string())),
-                )
-                .await;
-
-                {
-                    let new_peer = asm.peer_table.get(link_id).unwrap();
-                    let new_lsm = &new_peer.link_state_machine;
-                    assert!(
-                        new_lsm.get_last_auth_failure().is_none(),
-                        "stale renewal task from the closed link wrote a failure onto the new link"
-                    );
-                    assert!(
-                        !new_lsm.test_renewal_in_flight(),
-                        "stale renewal task perturbed the new link's in-flight flag"
-                    );
-                    assert_eq!(
-                        new_lsm.get_auth_expires(),
-                        None,
-                        "stale renewal task overwrote the new link's auth expiry"
-                    );
-                }
-
-                // Control: the SAME reply with the matching uid is acted on
-                // (the test assembly has no vsconn, so the Ok token ends in a
-                // recorded failure) — proving the uid guard, not something
-                // else, discarded the stale reply above.
-                super::LinkStateWrapper::handle_renewal_reply(
-                    &asm,
-                    link_id,
-                    current_uid,
-                    "https://idp.test".to_string(),
-                    auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                    Ok(Ok("current-id-token".to_string())),
-                )
-                .await;
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert!(
-                    peer.link_state_machine.get_last_auth_failure().is_some(),
-                    "a reply with the matching uid must be processed"
-                );
-            })
-            .await
-    }
-
-    /// C4 (zipline#45): a failed attempt records the reason, clears the
-    /// in-flight flag, and the NEXT due tick retries (one attempt per tick).
-    #[tokio::test]
-    async fn test_renewal_failure_records_reason_and_next_tick_retries() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let lsm = &peer.link_state_machine;
-
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                lsm.set_auth_agent(agent_tx);
-                lsm.set_renewal_identity(super::RenewalIdentity {
-                    idp: test_idp(),
-                    nonce: auth::oidc_nonce_for_challenge(&[7u8; 48]),
-                });
-                let past = SystemTime::now() - Duration::from_secs(1);
-                lsm.set_auth_expires(
-                    past - Duration::from_secs(600),
-                    past,
-                    Duration::from_secs(300),
-                );
-
-                // Attempt 1: the agent answers with a failure.
-                lsm.maybe_renew_auth(&asm);
-                let req = agent_rx.try_recv().expect("agent must be called");
-                req.reply
-                    .send(Err(AuthFailureReason::IdpUnreachable(
-                        "refresh failed".to_string(),
-                    )))
-                    .unwrap();
-                // Let the completion task run.
-                for _ in 0..20 {
-                    tokio::task::yield_now().await;
-                    if !lsm.test_renewal_in_flight() {
-                        break;
-                    }
-                }
-                assert!(
-                    !lsm.test_renewal_in_flight(),
-                    "failure must clear in-flight"
-                );
-                assert!(matches!(
-                    lsm.get_last_auth_failure(),
-                    Some(AuthFailureReason::IdpUnreachable(_))
-                ));
-
-                // Attempt 2 on the next due tick.
-                lsm.maybe_renew_auth(&asm);
-                assert!(
-                    agent_rx.try_recv().is_ok(),
-                    "registered-but-failing agent must be retried once per due tick"
-                );
-            })
-            .await
-    }
-
-    /// C2 (zipline#45): clearing the AuthAgent slot is guarded — the handle
-    /// of a dead admin connection only clears the slot while it is still the
-    /// registered agent; a newer agent registered afterwards is left alone.
-    #[tokio::test]
-    async fn test_clear_auth_agent_if_only_clears_matching_handle() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let peer = asm.peer_table.get(link_id).unwrap();
-
-                let (agent1, _rx1) = tokio::sync::mpsc::unbounded_channel();
-                let (agent2, _rx2) = tokio::sync::mpsc::unbounded_channel();
-
-                // agent1 registers, then its admin connection dies: cleared.
-                peer.link_state_machine.set_auth_agent(agent1.clone());
-                assert!(peer.link_state_machine.test_has_auth_agent());
-                assert!(peer.link_state_machine.clear_auth_agent_if(&agent1));
-                assert!(!peer.link_state_machine.test_has_auth_agent());
-
-                // agent1 re-registers, then agent2 replaces it. agent1's
-                // stale cleanup must NOT clobber agent2.
-                peer.link_state_machine.set_auth_agent(agent1.clone());
-                peer.link_state_machine.set_auth_agent(agent2.clone());
-                assert!(!peer.link_state_machine.clear_auth_agent_if(&agent1));
-                assert!(
-                    peer.link_state_machine.test_has_auth_agent(),
-                    "stale bridge cleanup clobbered the newer agent"
-                );
-            })
-            .await
+    /// Complete a close of `link_id` (Closing -> CloseDone), as the
+    /// terminate handshake does.
+    fn complete_close_of(asm: &Arc<Assembly>, link_id: LinkId) {
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_set_state(LinkState::Closing);
+        asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+            .unwrap();
     }
 
     /// With `auto_connect = false` (zipline#28), a dropped AdapterToNode
@@ -6034,42 +1582,42 @@ mod tests {
     async fn test_no_restart_after_close_when_auto_connect_disabled() {
         LocalSet::new()
             .run_until(async {
-                let mut builder = TestAssemblyBuilder::new();
-                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-                let mut cfg = <crate::config::Config as std::default::Default>::default();
-                cfg.auto_connect = false;
-                builder.config = Some(rcu::RcuBox::new(cfg));
-                let asm = Arc::new(create_assembly(builder));
+                let asm = keyable_assembly(false);
                 let link_id = add_adapter_peer(&asm);
 
-                // The link is closing (e.g. auth failed); the close completes.
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Closing);
-                }
-                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
-                    .unwrap();
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Inactive
-                );
+                complete_close_of(&asm, link_id);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Inactive);
 
                 // Advance well past the restart holddown: still Inactive.
                 tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
                     .await;
                 assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
+                    link_state_of(&asm, link_id),
                     LinkState::Inactive,
                     "auto_connect=false link must wait for startLink, not self-restart"
+                );
+            })
+            .await
+    }
+
+    /// Companion: with the default config (`auto_connect = true`) the
+    /// holddown restart still happens.
+    #[tokio::test(start_paused = true)]
+    async fn test_restart_after_close_with_default_auto_connect() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = keyable_assembly(true);
+                let link_id = add_adapter_peer(&asm);
+
+                complete_close_of(&asm, link_id);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Inactive);
+
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
+                    .await;
+                assert_eq!(
+                    link_state_of(&asm, link_id),
+                    LinkState::Keying,
+                    "default config must keep the automatic holddown restart"
                 );
             })
             .await
@@ -6079,41 +1627,27 @@ mod tests {
     /// BEFORE authentication (here: the Helloing timeout in
     /// `process_timeout`, which records no `AuthFailureReason`) ends up
     /// permanently Inactive — terminal, since no restart is coming. The
-    /// terminal state must carry a recorded failure reason: ph-cli's
-    /// `connect` poll classifies a teardown state *without* a
-    /// `Last auth failure:` line as Pending (restart forthcoming) and
-    /// would otherwise wait forever on a link that will never recover.
+    /// close path must record `LinkFailed` on the actor: ph-cli's `connect`
+    /// poll classifies a teardown state *without* a `Last auth failure:`
+    /// line as Pending (restart forthcoming) and would otherwise wait
+    /// forever on a link that will never recover (zipline#28).
     #[tokio::test(start_paused = true)]
     async fn test_manual_mode_pre_auth_failure_is_terminal_not_pending() {
         LocalSet::new()
             .run_until(async {
-                let mut builder = TestAssemblyBuilder::new();
-                let mut cfg = <crate::config::Config as std::default::Default>::default();
-                cfg.auto_connect = false;
-                builder.config = Some(rcu::RcuBox::new(cfg));
-                let asm = Arc::new(create_assembly(builder));
+                let asm = keyable_assembly(false);
                 let link_id = add_adapter_peer(&asm);
 
                 // A manually started attempt is stuck in Helloing; its
                 // timeout fires (process_timeout gives up on the link).
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Helloing);
-                }
-                let logical_clock = asm
-                    .peer_table
+                asm.peer_table
                     .get(link_id)
                     .unwrap()
                     .link_state_machine
-                    .test_logical_clock();
-                asm.process_link_state_event(link_id, LinkEvent::Timeout { logical_clock })
-                    .unwrap();
+                    .test_set_state(LinkState::Helloing);
+                fire_current_timeout(&asm, link_id);
                 assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
+                    link_state_of(&asm, link_id),
                     LinkState::Closing,
                     "test precondition: the Helloing timeout initiates the close"
                 );
@@ -6125,198 +1659,53 @@ mod tests {
                 let peer = asm.peer_table.get(link_id).unwrap();
                 assert_eq!(peer.link_state_machine.get_state(), LinkState::Inactive);
                 assert!(
-                    peer.link_state_machine.get_last_auth_failure().is_some(),
+                    matches!(
+                        peer.actor_auth.last_failure(),
+                        Some(AuthFailureReason::LinkFailed(_))
+                    ),
                     "terminal idle after a pre-auth failure must carry a recorded \
                      failure reason, or ph-cli connect classifies the permanently \
-                     Inactive link as Pending and hangs until its deadline"
+                     Inactive link as Pending and hangs until its deadline; got {:?}",
+                    peer.actor_auth.last_failure()
                 );
             })
             .await
     }
 
-    /// Companion: with the default config (`auto_connect = true`) the
-    /// holddown restart still happens — today's behaviour is preserved.
+    /// The `LinkFailed` record above only fills a gap: a close after a
+    /// recorded failure keeps that (more specific) reason, and with
+    /// auto-connect ON nothing is recorded, since a restart is coming.
     #[tokio::test(start_paused = true)]
-    async fn test_restart_after_close_with_default_auto_connect() {
+    async fn test_link_failed_is_recorded_only_when_terminal_and_unexplained() {
         LocalSet::new()
             .run_until(async {
-                let mut builder = TestAssemblyBuilder::new();
-                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Closing);
-                }
-                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
-                    .unwrap();
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Inactive
-                );
-
-                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
-                    .await;
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Keying,
-                    "default config must keep the automatic holddown restart"
-                );
-            })
-            .await
-    }
-
-    /// WaitForUserAuth with an agent that never replies must fail with
-    /// `AuthFailureReason::InteractionTimeout` once
-    /// `OIDC_USER_INTERACTION_TIMEOUT` (300 s) elapses. The Error state is
-    /// transient — the same callback initiates the close — so the state
-    /// assertion accepts the close already being underway.
-    #[tokio::test(start_paused = true)]
-    async fn test_wait_for_user_auth_times_out_with_interaction_timeout() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-
-                // Agent that accepts requests but never answers them.
-                let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::WaitForInitAuth);
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    peer.link_state_machine.set_auth_agent(agent_tx);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedInitAuth((false, Some(test_challenge_payload()))),
-                )
-                .unwrap();
-
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::WaitForUserAuth
-                );
-
-                tokio::time::sleep(
-                    config::OIDC_USER_INTERACTION_TIMEOUT + Duration::from_millis(100),
-                )
-                .await;
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let state = peer.link_state_machine.get_state();
-                assert!(
-                    matches!(state, LinkState::Error | LinkState::Closing),
-                    "expected Error (or the close it initiates), got {state:?}"
-                );
-                assert_eq!(
-                    peer.link_state_machine.get_last_auth_failure(),
-                    Some(AuthFailureReason::InteractionTimeout)
-                );
-            })
-            .await
-    }
-
-    /// An advertised IdP with no registered agent and no bootstrap key must
-    /// fail authentication with `AuthFailureReason::NoAgent`.
-    #[tokio::test(start_paused = true)]
-    async fn test_no_agent_with_idp_and_no_bootstrap_fails_with_no_agent() {
-        LocalSet::new()
-            .run_until(async {
-                // Default config: no bootstrap key.
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                // Auto-connect off, failure already recorded: kept.
+                let asm = keyable_assembly(false);
                 let link_id = add_adapter_peer(&asm);
                 {
                     let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::WaitForInitAuth);
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    // no auth agent registered
+                    peer.actor_auth.record_failure(AuthFailureReason::UserDeclined);
+                    peer.link_state_machine.test_set_state(LinkState::Helloing);
                 }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedInitAuth((true, Some(test_challenge_payload()))),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let state = peer.link_state_machine.get_state();
-                assert!(
-                    matches!(state, LinkState::Error | LinkState::Closing),
-                    "expected Error (or the close it initiates), got {state:?}"
-                );
+                fire_current_timeout(&asm, link_id);
                 assert_eq!(
-                    peer.link_state_machine.get_last_auth_failure(),
-                    Some(AuthFailureReason::NoAgent)
+                    asm.peer_table.get(link_id).unwrap().actor_auth.last_failure(),
+                    Some(AuthFailureReason::UserDeclined)
                 );
-            })
-            .await
-    }
 
-    /// `LinkEvent::Start` on an Inactive link begins a fresh authentication
-    /// attempt, so it must clear the previous attempt's recorded failure:
-    /// the CLI treats a teardown state that carries a `Last auth failure`
-    /// line as that attempt's terminal outcome, so a stale reason surviving
-    /// into a restarted link would be misread as a new failure.
-    #[tokio::test(start_paused = true)]
-    async fn test_start_clears_previous_auth_failure() {
-        LocalSet::new()
-            .run_until(async {
-                // process_start (AdapterToNode) keys the link, which needs a
-                // noise keypair and a certificate exchange on the assembly.
-                let mut builder = TestAssemblyBuilder::new();
-                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-                let asm = Arc::new(create_assembly(builder));
+                // Auto-connect on: nothing recorded.
+                let asm = keyable_assembly(true);
                 let link_id = add_adapter_peer(&asm);
-
-                // A previous attempt failed and the auto-close completed.
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::WaitForUserAuth);
-                }
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::AuthenticationFailure(AuthFailureReason::UserDeclined),
-                )
-                .unwrap();
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    assert_eq!(
-                        peer.link_state_machine.get_last_auth_failure(),
-                        Some(AuthFailureReason::UserDeclined)
-                    );
-                    // Model the close completing (Closing -> Inactive).
-                    peer.link_state_machine.test_set_state(LinkState::Inactive);
-                }
-
-                // A fresh Start (manual restart or the automatic holddown
-                // restart) begins a new attempt: the stale reason must go.
-                asm.process_link_state_event(link_id, LinkEvent::Start)
-                    .unwrap();
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(peer.link_state_machine.get_state(), LinkState::Keying);
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_state(LinkState::Helloing);
+                fire_current_timeout(&asm, link_id);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
                 assert_eq!(
-                    peer.link_state_machine.get_last_auth_failure(),
-                    None,
-                    "stale auth failure survived into the new attempt"
+                    asm.peer_table.get(link_id).unwrap().actor_auth.last_failure(),
+                    None
                 );
             })
             .await
@@ -6337,12 +1726,7 @@ mod tests {
     async fn test_start_resets_zdpr_session() {
         LocalSet::new()
             .run_until(async {
-                // process_start (AdapterToNode) keys the link, which needs a
-                // noise keypair and a certificate exchange on the assembly.
-                let mut builder = TestAssemblyBuilder::new();
-                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-                let asm = Arc::new(create_assembly(builder));
+                let asm = keyable_assembly(true);
                 let link_id = add_adapter_peer(&asm);
 
                 // A previous dock attempt received the peer's first two
@@ -6358,7 +1742,6 @@ mod tests {
                         "test precondition: sequence number 0 is now a duplicate"
                     );
                     drop(recv);
-                    peer.link_state_machine.test_set_state(LinkState::Inactive);
                     peer.zdpr_generation()
                 };
 
@@ -6382,40 +1765,27 @@ mod tests {
             .await
     }
 
-    /// zipline#173 RED: a node-side link whose peer never completes the
-    /// noise handshake must not sit in Keying forever. Nothing here answers
-    /// the responder, so the link can only leave Keying by timing out; once
-    /// it does, the close path removes the peer entry altogether.
+    /// zipline#173: a node-side link whose peer never completes the noise
+    /// handshake must not sit in Keying forever. Nothing here answers the
+    /// responder, so the link can only leave Keying by timing out after
+    /// NODE_KEYING_TIMEOUT; once it does, the close path removes the peer
+    /// entry altogether.
     #[tokio::test(start_paused = true)]
     async fn test_node_link_stuck_in_keying_is_torn_down() {
         LocalSet::new()
             .run_until(async {
-                let mut builder = TestAssemblyBuilder::new();
-                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-                let asm = Arc::new(create_assembly(builder));
+                let asm = keyable_assembly(true);
                 let link_id = add_node_peer(&asm);
 
                 asm.process_link_state_event(link_id, LinkEvent::Start)
                     .unwrap();
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Keying
-                );
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Keying);
 
                 // Just before the deadline the link is still waiting.
-                let one_sec = std::time::Duration::from_secs(1);
+                let one_sec = Duration::from_secs(1);
                 tokio::time::sleep(config::NODE_KEYING_TIMEOUT - one_sec).await;
                 assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
+                    link_state_of(&asm, link_id),
                     LinkState::Keying,
                     "node link torn down before NODE_KEYING_TIMEOUT"
                 );
@@ -6423,7 +1793,6 @@ mod tests {
                 // Past the deadline plus the terminate timeout the close has
                 // completed and the peer entry is gone.
                 tokio::time::sleep(2 * one_sec + config::DEFAULT_TERMINATE_TIMEOUT).await;
-
                 assert!(
                     asm.peer_table.get(link_id).is_none(),
                     "node link that never completed keying is still in the peer table \
@@ -6443,10 +1812,7 @@ mod tests {
     async fn test_node_link_keying_done_cancels_keying_timeout() {
         LocalSet::new()
             .run_until(async {
-                let mut builder = TestAssemblyBuilder::new();
-                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-                let asm = Arc::new(create_assembly(builder));
+                let asm = keyable_assembly(true);
                 let link_id = add_node_peer(&asm);
 
                 asm.process_link_state_event(link_id, LinkEvent::Start)
@@ -6468,772 +1834,33 @@ mod tests {
             .await
     }
 
-    /// zipline#83 RED: a grant that differs from the non-empty configured
-    /// `--zpr-addr` must be refused — the FSM parks in Error (or the close it
-    /// initiates) instead of ACTIVE, the recorded failure is
-    /// `GrantedAddressMismatch` carrying both address sets, its rendered text
-    /// names the remedy (remove the `--zpr-addr` argument / `zpr_addr` config
-    /// line), and main's fatal-error watcher is signalled so the process
-    /// exits non-zero.
+    /// zipline#157: once the actor has recorded a fatal local activation
+    /// failure (`ActivationFailed`, e.g. EPERM setting the granted address),
+    /// the close that follows must NOT schedule the holddown restart: a
+    /// reconnect re-keys, re-prompts OIDC interactively, and the EPERM will
+    /// not have cleared. The link stays Inactive with the reason recorded.
+    /// (The activation failure itself is pinned in actor_auth/
+    /// actor_activation tests; this is the link-level half.)
     #[tokio::test(start_paused = true)]
-    async fn test_grant_address_mismatch_refuses_to_run() {
+    async fn test_fatal_activation_failure_suppresses_reconnect() {
         LocalSet::new()
             .run_until(async {
-                let configured: IpAddr = "fd00:1:1::1".parse().unwrap();
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let mut builder = TestAssemblyBuilder::new();
-                let mut cfg = <crate::config::Config as std::default::Default>::default();
-                cfg.zpr_addr = vec![configured];
-                builder.config = Some(rcu::RcuBox::new(cfg));
-                let asm = Arc::new(create_assembly(builder));
+                let asm = keyable_assembly(true);
                 let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .actor_auth
+                    .record_failure(AuthFailureReason::ActivationFailed(
+                        "failed to set ZPR address: EPERM".to_owned(),
+                    ));
 
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let state = peer.link_state_machine.get_state();
-                assert!(
-                    matches!(state, LinkState::Error | LinkState::Closing),
-                    "a mismatched grant must not become ACTIVE; \
-                     expected Error (or the close it initiates), got {state:?}"
-                );
-
-                let reason = peer.link_state_machine.get_last_auth_failure();
-                match &reason {
-                    Some(AuthFailureReason::GrantedAddressMismatch {
-                        requested,
-                        granted: g,
-                    }) => {
-                        assert_eq!(requested, &vec![configured]);
-                        assert_eq!(g, &vec![granted]);
-                    }
-                    other => panic!("expected GrantedAddressMismatch, got {other:?}"),
-                }
-
-                // The local ZPR address set must NOT have been replaced by
-                // the refused grant.
-                assert_eq!(
-                    asm.get_local_zpr_addrs_std(),
-                    vec![configured],
-                    "a refused grant must not overwrite the configured address"
-                );
-
-                // The fatal signal main exits on, with the remedy in the text.
-                let fatal = asm
-                    .get_fatal_error()
-                    .expect("a mismatched grant must signal a fatal error so main exits non-zero");
-                assert!(
-                    fatal.contains("--zpr-addr") && fatal.contains("zpr_addr"),
-                    "the fatal error must carry the remedy (remove the \
-                     --zpr-addr argument / zpr_addr config line); got: {fatal}"
-                );
-                assert!(
-                    fatal.contains("fd00:1:1::1") && fatal.contains("fd5a:5052:adda:1::42"),
-                    "the fatal error must name both addresses; got: {fatal}"
-                );
-            })
-            .await
-    }
-
-    /// zipline#83 companion (GREEN lock-in): an adapter with NO configured
-    /// address accepts the dynamic grant — the TUN gets the granted address,
-    /// the local ZPR address set becomes the granted set, the link goes
-    /// ACTIVE, and no fatal error is signalled.
-    #[tokio::test(start_paused = true)]
-    async fn test_grant_with_no_configured_address_is_accepted() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                // Default config: zpr_addr is empty (no --zpr-addr).
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                assert!(
-                    asm.get_local_zpr_addrs_std().is_empty(),
-                    "test precondition: no configured ZPR address"
-                );
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_state(),
-                    LinkState::Active,
-                    "a dynamic grant with no configured address must go ACTIVE"
-                );
-                assert_eq!(
-                    asm.get_local_zpr_addrs_std(),
-                    vec![granted],
-                    "the granted address must become the local ZPR address set"
-                );
-                assert_eq!(peer.link_state_machine.get_last_auth_failure(), None);
-                assert_eq!(asm.get_fatal_error(), None);
-            })
-            .await
-    }
-
-    /// zipline#83 review fix (PR #27) RED: an adapter started with NO
-    /// `--zpr-addr` accepts its first dynamic grant — and on a later
-    /// reconnect must accept a DIFFERENT dynamic grant too. The demand the
-    /// mismatch check enforces is the *startup* configuration (empty here),
-    /// not whatever the fabric happened to grant last time:
-    /// `set_local_zpr_addrs` writes each grant into `config.zpr_addr` and
-    /// teardown never restores the original empty value, so before the fix
-    /// this reconnect mistook the previous dynamic address for an
-    /// operator-configured demand and exited on a mismatch it was
-    /// explicitly configured to accept.
-    #[tokio::test(start_paused = true)]
-    async fn test_reconnect_after_dynamic_grant_accepts_different_dynamic_address() {
-        LocalSet::new()
-            .run_until(async {
-                let first: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-                let second: IpAddr = "fd5a:5052:adda:1::43".parse().unwrap();
-
-                // Default config: zpr_addr is empty (no --zpr-addr).
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                assert!(
-                    asm.get_local_zpr_addrs_std().is_empty(),
-                    "test precondition: no configured ZPR address"
-                );
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                // First connection: dynamic grant accepted.
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&first),
-                    ])),
-                )
-                .unwrap();
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    assert_eq!(
-                        peer.link_state_machine.get_state(),
-                        LinkState::Active,
-                        "the first dynamic grant must go ACTIVE"
-                    );
-                }
-                assert_eq!(asm.get_local_zpr_addrs_std(), vec![first]);
-
-                // Reconnect: back through address registration. The fabric
-                // assigns a different dynamic address this time.
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&second),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_state(),
-                    LinkState::Active,
-                    "an adapter with no configured --zpr-addr must accept a \
-                     different dynamic grant on reconnect"
-                );
-                assert_eq!(
-                    asm.get_local_zpr_addrs_std(),
-                    vec![second],
-                    "the new grant must become the local ZPR address set"
-                );
-                assert_eq!(
-                    peer.link_state_machine.get_last_auth_failure(),
-                    None,
-                    "a fabric-assigned address is not a mismatch when nothing \
-                     was demanded"
-                );
-                assert_eq!(
-                    asm.get_fatal_error(),
-                    None,
-                    "no fatal exit: the adapter was configured to accept \
-                     fabric-assigned addresses"
-                );
-            })
-            .await
-    }
-
-    /// zipline#83 companion: a grant matching the configured address is the
-    /// normal path and must stay unchanged — ACTIVE, no failure, no fatal.
-    #[tokio::test(start_paused = true)]
-    async fn test_grant_matching_configured_address_stays_active() {
-        LocalSet::new()
-            .run_until(async {
-                let configured: IpAddr = "fd00:1:1::1".parse().unwrap();
-
-                let mut builder = TestAssemblyBuilder::new();
-                let mut cfg = <crate::config::Config as std::default::Default>::default();
-                cfg.zpr_addr = vec![configured];
-                builder.config = Some(rcu::RcuBox::new(cfg));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(peer.link_state_machine.get_state(), LinkState::Active);
-                assert_eq!(peer.link_state_machine.get_last_auth_failure(), None);
-                assert_eq!(asm.get_fatal_error(), None);
-                assert_eq!(asm.get_local_zpr_addrs_std(), vec![configured]);
-            })
-            .await
-    }
-
-    /// A failed grant carries the node's ResponseCode; the link must record
-    /// the corresponding `AuthFailureReason`.
-    #[tokio::test(start_paused = true)]
-    async fn test_grant_failure_code_maps_to_reason() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-
-                for (code, expect_policy_denied, expect_unavailable) in [
-                    (ResponseCode::PolicyDenied, true, false),
-                    (ResponseCode::AuthFailed, false, false),
-                    (ResponseCode::AuthUnavailable, false, true),
-                ] {
-                    let link_id = add_adapter_peer(&asm);
-                    {
-                        let peer = asm.peer_table.get(link_id).unwrap();
-                        peer.link_state_machine
-                            .test_set_state(LinkState::RegisterAA);
-                    }
-
-                    asm.process_link_state_event(
-                        link_id,
-                        LinkEvent::ReceivedGrantZprAddressRequest(Err(code)),
-                    )
-                    .unwrap();
-
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    let reason = peer.link_state_machine.get_last_auth_failure();
-                    if expect_policy_denied {
-                        assert_eq!(reason, Some(AuthFailureReason::PolicyDenied));
-                    } else if expect_unavailable {
-                        assert_eq!(reason, Some(AuthFailureReason::AuthUnavailable));
-                    } else {
-                        assert!(
-                            matches!(reason, Some(AuthFailureReason::VisaServiceRejected(_))),
-                            "expected VisaServiceRejected, got {reason:?}"
-                        );
-                    }
-                }
-            })
-            .await
-    }
-
-    /// zipline#88 RED: an adapter accepting a *dynamic* grant (no configured
-    /// address) must install an on-link route for the whole ZPR internal
-    /// network (`fd5a:5052::/32`) on its TUN at activation, so traffic to
-    /// and from fabric-assigned (dynamic-pool) addresses has a route.
-    #[tokio::test(start_paused = true)]
-    async fn test_dynamic_grant_installs_internal_net_route() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let (tun_ctl, routes) = crate::assembly::test::RecordingTunCtl::new(false);
-                let mut builder = TestAssemblyBuilder::new();
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(peer.link_state_machine.get_state(), LinkState::Active);
-                assert!(
-                    routes
-                        .lock()
-                        .unwrap()
-                        .contains(&(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN)),
-                    "activation on a dynamic grant must install the ZPR \
-                     internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} \
-                     on the TUN; recorded routes: {:?}",
-                    routes.lock().unwrap()
-                );
-            })
-            .await
-    }
-
-    /// zipline#88 RED: the statically-addressed activation path (grant
-    /// matching the configured demand) must install the same internal-network
-    /// route — this is the peer side of the return path: a static adapter
-    /// with only its own deployment-provisioned routes has no route back to
-    /// a dynamically-addressed peer, so its replies are dropped.
-    #[tokio::test(start_paused = true)]
-    async fn test_static_grant_installs_internal_net_route() {
-        LocalSet::new()
-            .run_until(async {
-                let configured: IpAddr = "fd00:1:2::1".parse().unwrap();
-
-                let (tun_ctl, routes) = crate::assembly::test::RecordingTunCtl::new(false);
-                let mut builder = TestAssemblyBuilder::new();
-                let mut cfg = <crate::config::Config as std::default::Default>::default();
-                cfg.zpr_addr = vec![configured];
-                builder.config = Some(rcu::RcuBox::new(cfg));
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(peer.link_state_machine.get_state(), LinkState::Active);
-                assert!(
-                    routes
-                        .lock()
-                        .unwrap()
-                        .contains(&(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN)),
-                    "activation on the static-address path must install the ZPR \
-                     internal-network route {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} \
-                     on the TUN; recorded routes: {:?}",
-                    routes.lock().unwrap()
-                );
-            })
-            .await
-    }
-
-    /// zipline#88 (Q2, fail-fast leg): on a *dynamic* grant the adapter's
-    /// reachability rides entirely on fabric-installed state — nothing was
-    /// provisioned out of band — so a failed route install means the link
-    /// cannot do its job and must fail activation ASAP, exactly like a
-    /// failed `add_address`.
-    #[tokio::test(start_paused = true)]
-    async fn test_dynamic_grant_route_install_failure_is_fatal() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let (tun_ctl, _routes) = crate::assembly::test::RecordingTunCtl::new(true);
-                let mut builder = TestAssemblyBuilder::new();
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let state = peer.link_state_machine.get_state();
-                assert!(
-                    matches!(state, LinkState::Error | LinkState::Closing),
-                    "a failed internal-net route install on a dynamic grant \
-                     must fail the activation (like a failed add_address); \
-                     expected Error (or the close it initiates), got {state:?}"
-                );
-            })
-            .await
-    }
-
-    /// zipline#88 (Q2, warn-and-continue leg): on the static-address path
-    /// the deployment provisioned the TUN's addressing and routes out of
-    /// band (and functioned that way before this route existed), so a failed
-    /// route install is a warning, not a reason to refuse a link that may
-    /// work.
-    #[tokio::test(start_paused = true)]
-    async fn test_static_grant_route_install_failure_warns_and_continues() {
-        LocalSet::new()
-            .run_until(async {
-                let configured: IpAddr = "fd00:1:2::1".parse().unwrap();
-
-                let (tun_ctl, _routes) = crate::assembly::test::RecordingTunCtl::new(true);
-                let mut builder = TestAssemblyBuilder::new();
-                let mut cfg = <crate::config::Config as std::default::Default>::default();
-                cfg.zpr_addr = vec![configured];
-                builder.config = Some(rcu::RcuBox::new(cfg));
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_state(),
-                    LinkState::Active,
-                    "a statically-provisioned adapter must activate even when \
-                     the internal-net route install fails (warn and continue)"
-                );
-                assert_eq!(asm.get_fatal_error(), None);
-            })
-            .await
-    }
-
-    /// zipline#101 (fail-fast leg): on a *dynamic* grant, another live
-    /// interface already owning fd5a:5052::/32 means this adapter's route
-    /// would lose and it would activate into silence — fail the activation,
-    /// same handling as a failed add_address.
-    #[tokio::test(start_paused = true)]
-    async fn test_dynamic_grant_route_owner_conflict_is_fatal() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let (tun_ctl, routes) =
-                    crate::assembly::test::RecordingTunCtl::with_conflict("tunA");
-                let mut builder = TestAssemblyBuilder::new();
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let state = peer.link_state_machine.get_state();
-                assert!(
-                    matches!(state, LinkState::Error | LinkState::Closing),
-                    "a route-owner conflict on a dynamic grant must fail the \
-                     activation; expected Error (or the close it initiates), \
-                     got {state:?}"
-                );
-                assert!(
-                    routes.lock().unwrap().is_empty(),
-                    "no route must be installed over a conflicting owner's; \
-                     recorded routes: {:?}",
-                    routes.lock().unwrap()
-                );
-            })
-            .await
-    }
-
-    /// zipline#101 (warn-and-continue leg): on the static-address path a
-    /// route owned elsewhere is a warning, consistent with the zipline#88
-    /// ruling for a failed route install on that path.
-    #[tokio::test(start_paused = true)]
-    async fn test_static_grant_route_owner_conflict_warns_and_continues() {
-        LocalSet::new()
-            .run_until(async {
-                let configured: IpAddr = "fd00:1:2::1".parse().unwrap();
-
-                let (tun_ctl, _routes) =
-                    crate::assembly::test::RecordingTunCtl::with_conflict("tunA");
-                let mut builder = TestAssemblyBuilder::new();
-                let mut cfg = <crate::config::Config as std::default::Default>::default();
-                cfg.zpr_addr = vec![configured];
-                builder.config = Some(rcu::RcuBox::new(cfg));
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_state(),
-                    LinkState::Active,
-                    "a statically-provisioned adapter must activate despite a \
-                     route-owner conflict (warn and continue)"
-                );
-                assert_eq!(asm.get_fatal_error(), None);
-            })
-            .await
-    }
-
-    /// zipline#101 (concurrent-activation race, Codex P1 on PR #35): two
-    /// adapters activating at once each pass the pre-install probe — the
-    /// other's route is still `linkdown` (carrier down) and filtered — and
-    /// then both raise carrier, leaving both active and traffic silently
-    /// split. The claim (route + carrier) must be re-verified after it is
-    /// made visible: whichever adapter re-probes last sees the other's
-    /// carrier already up, so both cannot stay active. On a dynamic grant
-    /// a post-carrier conflict must retract the claim (carrier back down)
-    /// and fail the activation.
-    #[tokio::test(start_paused = true)]
-    async fn test_dynamic_grant_late_route_owner_conflict_backs_off() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let (tun_ctl, _routes) =
-                    crate::assembly::test::RecordingTunCtl::with_late_conflict("tunA");
-                let probes = tun_ctl.probes.clone();
-                let carriers = tun_ctl.carriers.clone();
-                let mut builder = TestAssemblyBuilder::new();
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                assert!(
-                    probes.load(std::sync::atomic::Ordering::SeqCst) >= 2,
-                    "the ownership claim must be re-verified after carrier-up \
-                     (got {} probe(s)); a single pre-install probe is the \
-                     TOCTOU window two concurrent adapters both slip through",
-                    probes.load(std::sync::atomic::Ordering::SeqCst)
-                );
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let state = peer.link_state_machine.get_state();
-                assert!(
-                    matches!(state, LinkState::Error | LinkState::Closing),
-                    "a conflict surfacing after carrier-up on a dynamic grant \
-                     must fail the activation; got {state:?}"
-                );
-                assert_eq!(
-                    carriers.lock().unwrap().last(),
-                    Some(&false),
-                    "the losing adapter must retract its carrier claim, not \
-                     leave the TUN up; carrier calls: {:?}",
-                    carriers.lock().unwrap()
-                );
-            })
-            .await
-    }
-
-    /// zipline#101: on the static-address path a conflict surfacing after
-    /// carrier-up is a warning, consistent with the zipline#88 ruling for
-    /// the pre-install probe and the route install on that path.
-    #[tokio::test(start_paused = true)]
-    async fn test_static_grant_late_route_owner_conflict_warns_and_continues() {
-        LocalSet::new()
-            .run_until(async {
-                let configured: IpAddr = "fd00:1:2::1".parse().unwrap();
-
-                let (tun_ctl, _routes) =
-                    crate::assembly::test::RecordingTunCtl::with_late_conflict("tunA");
-                let carriers = tun_ctl.carriers.clone();
-                let mut builder = TestAssemblyBuilder::new();
-                let mut cfg = <crate::config::Config as std::default::Default>::default();
-                cfg.zpr_addr = vec![configured];
-                builder.config = Some(rcu::RcuBox::new(cfg));
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&configured),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_state(),
-                    LinkState::Active,
-                    "a statically-provisioned adapter must activate despite a \
-                     late route-owner conflict (warn and continue)"
-                );
-                assert_eq!(
-                    carriers.lock().unwrap().last(),
-                    Some(&true),
-                    "the static path must leave the carrier up"
-                );
-                assert_eq!(asm.get_fatal_error(), None);
-            })
-            .await
-    }
-
-    /// zipline#157 RED (problem 1, site 1: address set): a failed
-    /// `add_address` on a dynamic grant is a LOCAL, non-transient failure
-    /// (e.g. EPERM — it will not clear on reconnect), so it must be fatal
-    /// for this connect request:
-    /// (a) the recorded failure is `ActivationFailed` naming the
-    ///     address-set failure — the durable trace showLink prints and
-    ///     ph-cli's `connect` poll reports as this attempt's terminal
-    ///     outcome, instead of a 5-minute `InteractionTimeout` from the
-    ///     next attempt's unanswered OIDC prompt;
-    /// (b) the reconnect loop hard-stops — after the close completes, the
-    ///     holddown restart must NOT re-fire `Start` even with
-    ///     `auto_connect` on (Q1 ruling: the operator re-runs
-    ///     `ph-cli connect` after fixing the host).
-    #[tokio::test(start_paused = true)]
-    async fn test_add_address_failure_is_fatal_and_suppresses_reconnect() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let (tun_ctl, _routes) =
-                    crate::assembly::test::RecordingTunCtl::with_failing_addresses();
-                let mut builder = TestAssemblyBuilder::new();
-                // Keying material so that, if the holddown restart DID
-                // fire, process_start would key the link (observed as
-                // Keying) instead of panicking on a missing keypair.
-                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let state = peer.link_state_machine.get_state();
-                assert!(
-                    matches!(state, LinkState::Error | LinkState::Closing),
-                    "a failed add_address must fail the activation; got {state:?}"
-                );
-                // (a) the failure is recorded, and names the address set.
-                match peer.link_state_machine.get_last_auth_failure() {
-                    Some(AuthFailureReason::ActivationFailed(msg)) => assert!(
-                        msg.contains("failed to set ZPR address"),
-                        "the recorded failure must name the address-set step; got: {msg}"
-                    ),
-                    other => panic!(
-                        "a failed add_address must record ActivationFailed so \
-                         ph-cli connect reports the real error, got {other:?}"
-                    ),
-                }
-
-                // (b) the close completes, and the holddown restart must
-                // NOT re-fire Start: a reconnect re-keys, re-prompts OIDC
-                // interactively, and the EPERM will not have cleared.
-                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
-                    .unwrap();
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Inactive
-                );
+                complete_close_of(&asm, link_id);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Inactive);
                 tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
                     .await;
                 assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
+                    link_state_of(&asm, link_id),
                     LinkState::Inactive,
                     "a fatal local activation failure must hard-stop the \
                      reconnect loop (zipline#157 Q1); the holddown restart \
@@ -7251,37 +1878,22 @@ mod tests {
     /// attempt (startLink), which reaches a fatal `ActivationFailed` and
     /// closes. The hard-stop branch in `complete_close` correctly declines
     /// to schedule a NEW timer — but the OLD timer is still pending, and an
-    /// unconditional `setup_restart` task would fire it, send `Start`,
-    /// clear the recorded failure, and resume the reconnect loop the fatal
-    /// stop was meant to end. The pending task must re-check the recorded
-    /// fatal failure before starting.
+    /// unconditional `setup_restart` task would fire it, send `Start`, and
+    /// resume the reconnect loop the fatal stop was meant to end. The
+    /// pending task must re-check the recorded fatal failure before
+    /// starting.
     #[tokio::test(start_paused = true)]
     async fn test_stale_restart_timer_does_not_override_fatal_stop() {
         LocalSet::new()
             .run_until(async {
-                let mut builder = TestAssemblyBuilder::new();
-                // Keying material so that, if the stale timer DID re-fire
-                // Start, process_start would key the link (observed as
-                // Keying) instead of panicking on a missing keypair.
-                builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-                builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-                let asm = Arc::new(create_assembly(builder));
+                let asm = keyable_assembly(true);
                 let link_id = add_adapter_peer(&asm);
 
                 // 1. A non-fatal close completes: `complete_close` leaves
                 //    the link Inactive and schedules the holddown restart.
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_state(LinkState::Closing);
-                }
-                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
-                    .unwrap();
+                complete_close_of(&asm, link_id);
                 assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
+                    link_state_of(&asm, link_id),
                     LinkState::Inactive,
                     "test precondition: the first close parks the link Inactive"
                 );
@@ -7292,36 +1904,22 @@ mod tests {
                 asm.process_link_state_event(link_id, LinkEvent::Start)
                     .unwrap();
                 assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
+                    link_state_of(&asm, link_id),
                     LinkState::Keying,
                     "test precondition: the manual Start begins a new attempt"
                 );
 
                 // 3. The new attempt hits a fatal local activation failure
                 //    and its close completes BEFORE the old timer expires.
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.record_auth_failure(
-                        AuthFailureReason::ActivationFailed(
-                            "failed to set ZPR address: EPERM".to_owned(),
-                        ),
-                    );
-                    peer.link_state_machine.test_set_state(LinkState::Closing);
-                }
-                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
-                    .unwrap();
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Inactive
-                );
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .actor_auth
+                    .record_failure(AuthFailureReason::ActivationFailed(
+                        "failed to set ZPR address: EPERM".to_owned(),
+                    ));
+                complete_close_of(&asm, link_id);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Inactive);
 
                 // 4. The FIRST close's restart timer expires. It must not
                 //    send Start: the link stays Inactive and the recorded
@@ -7338,344 +1936,13 @@ mod tests {
                 );
                 assert!(
                     matches!(
-                        peer.link_state_machine.get_last_auth_failure(),
+                        peer.actor_auth.last_failure(),
                         Some(AuthFailureReason::ActivationFailed(_))
                     ),
-                    "the stale restart fired Start and wiped the recorded \
-                     fatal failure"
+                    "the stale restart wiped the recorded fatal failure"
                 );
             })
             .await
-    }
-
-    /// zipline#157 RED (problem 1, site 2: dynamic-grant route install):
-    /// same classification as a failed add_address — the failure is
-    /// recorded as `ActivationFailed` naming the route install, so the
-    /// control-channel caller sees the real error. (Reconnect suppression
-    /// keys on the recorded reason and is covered by the add_address test.)
-    #[tokio::test(start_paused = true)]
-    async fn test_dynamic_route_install_failure_records_activation_failed() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let (tun_ctl, _routes) = crate::assembly::test::RecordingTunCtl::new(true);
-                let mut builder = TestAssemblyBuilder::new();
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                match peer.link_state_machine.get_last_auth_failure() {
-                    Some(AuthFailureReason::ActivationFailed(msg)) => assert!(
-                        msg.contains("internal-network route"),
-                        "the recorded failure must name the route install; got: {msg}"
-                    ),
-                    other => panic!(
-                        "a failed dynamic-grant route install must record \
-                         ActivationFailed, got {other:?}"
-                    ),
-                }
-            })
-            .await
-    }
-
-    /// zipline#157 RED (problem 1, site 3: route-owner conflict on the
-    /// pre-install probe): recorded as `ActivationFailed` naming the
-    /// conflicting interface.
-    #[tokio::test(start_paused = true)]
-    async fn test_dynamic_route_owner_conflict_records_activation_failed() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let (tun_ctl, _routes) =
-                    crate::assembly::test::RecordingTunCtl::with_conflict("tunA");
-                let mut builder = TestAssemblyBuilder::new();
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                match peer.link_state_machine.get_last_auth_failure() {
-                    Some(AuthFailureReason::ActivationFailed(msg)) => assert!(
-                        msg.contains("tunA"),
-                        "the recorded failure must name the conflicting owner; got: {msg}"
-                    ),
-                    other => panic!(
-                        "a route-owner conflict on a dynamic grant must record \
-                         ActivationFailed, got {other:?}"
-                    ),
-                }
-            })
-            .await
-    }
-
-    /// zipline#157 RED (problem 1, site 3 variant: conflict surfacing on
-    /// the post-carrier-up re-probe): same recording as the pre-install
-    /// probe — the zipline#101 concurrent-activation back-off is a
-    /// route-owner conflict and gets the same classification.
-    #[tokio::test(start_paused = true)]
-    async fn test_dynamic_late_route_owner_conflict_records_activation_failed() {
-        LocalSet::new()
-            .run_until(async {
-                let granted: IpAddr = "fd5a:5052:adda:1::42".parse().unwrap();
-
-                let (tun_ctl, _routes) =
-                    crate::assembly::test::RecordingTunCtl::with_late_conflict("tunA");
-                let mut builder = TestAssemblyBuilder::new();
-                builder.tun_ctl = Some(Box::new(tun_ctl));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::RegisterAA);
-                }
-
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedGrantZprAddressRequest(Ok(vec![
-                        zpr_utils::net_defs::IpAddress::new_from_std(&granted),
-                    ])),
-                )
-                .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                match peer.link_state_machine.get_last_auth_failure() {
-                    Some(AuthFailureReason::ActivationFailed(msg)) => assert!(
-                        msg.contains("tunA") && msg.contains("carrier-up"),
-                        "the recorded failure must name the late conflict; got: {msg}"
-                    ),
-                    other => panic!(
-                        "a late route-owner conflict on a dynamic grant must \
-                         record ActivationFailed, got {other:?}"
-                    ),
-                }
-            })
-            .await
-    }
-
-    /// zipline#157 (problem 2, investigation lock-in): a dock-link
-    /// reconnect within the token's lifetime DOES re-request interaction
-    /// from the AuthAgent — `interactive: true` on every connect attempt.
-    /// This is structural, not a dropped token: the connect path requires
-    /// the id_token's nonce to equal the hash of the node's fresh link
-    /// challenge (docs/OIDC.md, "the connect path's nonce check is
-    /// untouched"), and a refresh-grant id_token SHOULD NOT carry a nonce
-    /// (OIDC Core §12.2) — so a cached or silently-refreshed token can
-    /// never satisfy a new connect. Reusing a token across reconnects
-    /// would need a protocol/VS design change, closed as wontfix in
-    /// zipline#166 (docs/OIDC.md, "Design decisions"); this test locks in
-    /// the intended behavior.
-    #[tokio::test(start_paused = true)]
-    async fn test_reconnect_within_token_lifetime_rerequests_interaction() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, _egress_rx) = assembly_with_observable_egress();
-                let link_id = add_adapter_peer(&asm);
-                let (agent_tx, mut agent_rx) =
-                    tokio::sync::mpsc::unbounded_channel::<super::OidcCredentialRequest>();
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::WaitForInitAuth);
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    peer.link_state_machine.set_auth_agent(agent_tx);
-                }
-
-                // Attempt 1: the user completes the interactive login.
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedInitAuth((false, Some(test_challenge_payload()))),
-                )
-                .unwrap();
-                let req1 = agent_rx.recv().await.expect("attempt 1 reaches the agent");
-                assert!(req1.interactive, "a first connect is interactive");
-                let _ = req1.reply.send(Ok("STILL.VALID.TOKEN".to_string()));
-                tokio::task::yield_now().await;
-
-                // Reconnect moments later (well within the token lifetime):
-                // the link restarts and the node sends a FRESH challenge.
-                // The restart path preserves LinkData (agent, IdPs); model
-                // it by rewinding the FSM, as the admin_worker tests do.
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine
-                        .test_set_state(LinkState::WaitForInitAuth);
-                }
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::ReceivedInitAuth((
-                        false,
-                        Some(auth::ZdpInitAuthenticationPayload {
-                            nonce: [8u8; 8],
-                            ctime: 434343u64.into(),
-                            hmac: [3u8; 32],
-                        }),
-                    )),
-                )
-                .unwrap();
-                let req2 = agent_rx.recv().await.expect("attempt 2 reaches the agent");
-                assert!(
-                    req2.interactive,
-                    "a reconnect is a new connect bound to a new challenge, \
-                     so it re-requests interaction (see zipline#157 problem 2 \
-                     and the follow-up issue); a cached token cannot carry \
-                     the fresh challenge-bound nonce the connect path requires"
-                );
-            })
-            .await
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn timeout_test() {
-        LocalSet::new()
-            .run_until(async {
-                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
-                let (tx, rx) = oneshot::channel();
-
-                set_timeout(&sm, Duration::from_secs(5), tx);
-
-                tokio::time::sleep(Duration::from_secs(4)).await;
-
-                assert!(rx.is_empty());
-
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                assert!(rx.await.is_ok());
-            })
-            .await
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn timeout_explicit_cancel_test() {
-        LocalSet::new()
-            .run_until(async {
-                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
-                let (tx, rx) = oneshot::channel();
-
-                set_timeout(&sm, Duration::from_secs(5), tx);
-
-                tokio::time::sleep(Duration::from_secs(4)).await;
-
-                sm.lock().unwrap().cancel_timeout();
-
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                assert!(rx.await.is_err());
-            })
-            .await
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn timeout_implicit_cancel_test() {
-        LocalSet::new()
-            .run_until(async {
-                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
-                let (tx, rx) = oneshot::channel();
-
-                set_timeout(&sm, Duration::from_secs(5), tx);
-
-                tokio::time::sleep(Duration::from_secs(4)).await;
-
-                sm.lock().unwrap().set_state(LinkState::Keying);
-
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                assert!(rx.await.is_err());
-            })
-            .await
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn timeout_reschedule_test() {
-        LocalSet::new()
-            .run_until(async {
-                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
-                let (tx1, rx1) = oneshot::channel();
-                let (tx2, rx2) = oneshot::channel();
-
-                set_timeout(&sm, Duration::from_secs(5), tx1);
-
-                tokio::time::sleep(Duration::from_secs(4)).await;
-
-                set_timeout(&sm, Duration::from_secs(5), tx2);
-
-                tokio::time::sleep(Duration::from_secs(4)).await;
-
-                assert!(rx1.await.is_err());
-                assert!(rx2.is_empty());
-
-                tokio::time::sleep(Duration::from_secs(2)).await;
-
-                assert!(rx2.await.is_ok());
-            })
-            .await
-    }
-
-    fn set_timeout(sm: &Arc<Mutex<LinkStateMachine>>, duration: Duration, tx: oneshot::Sender<()>) {
-        let sm_cb = sm.clone();
-        sm.lock()
-            .unwrap()
-            .set_timeout_callback(duration, move |lc| {
-                if sm_cb.lock().unwrap().logical_clock != lc {
-                    return;
-                }
-                tx.send(()).unwrap();
-            });
-    }
-
-    /// Deliver a Timeout event carrying the link's CURRENT logical clock,
-    /// as the real timeout task does (zipline#113 keep-alive tests).
-    fn fire_current_timeout(asm: &Arc<Assembly>, link_id: LinkId) {
-        let clock = asm
-            .peer_table
-            .get(link_id)
-            .unwrap()
-            .link_state_machine
-            .test_logical_clock();
-        asm.process_link_state_event(
-            link_id,
-            LinkEvent::Timeout {
-                logical_clock: clock,
-            },
-        )
-        .unwrap();
-    }
-
-    fn link_state_of(asm: &Arc<Assembly>, link_id: LinkId) -> LinkState {
-        asm.peer_table
-            .get(link_id)
-            .unwrap()
-            .link_state_machine
-            .get_state()
     }
 
     /// zipline#113: one missed keep-alive echo must NOT kill an Active link.
@@ -7742,7 +2009,7 @@ mod tests {
     }
 
     /// Build a real [libnode::vsconn::VSConn] aimed at `vs_addr`, plus a
-    /// test assembly whose VS special peer is a NodeToAdapter link
+    /// test assembly whose VS special peer is an Active NodeToAdapter link
     /// (zipline#113 recovery tests). Returns the assembly, the VS link id,
     /// and the VSConn instance (run it yourself so the test owns its task).
     /// Pass a refusing address (e.g. `127.0.0.1:1`) to keep the run loop in
@@ -7761,13 +2028,13 @@ mod tests {
         );
         // Observable egress: the close path puts a Terminate on the mgmt
         // substrate queue, which must have a live receiver.
-        let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(8);
+        let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(8);
         let mut builder = TestAssemblyBuilder::new();
         builder.mgmt_substrate_egress = Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
         builder.vsconn = Some(Some(vsconn.handle()));
         let asm = Arc::new(create_assembly(builder));
         // Leak the receiver so the egress queue outlives the test body.
-        std::mem::forget(_egress_rx);
+        std::mem::forget(egress_rx);
         let link_id = add_node_peer(&asm);
         asm.peer_table
             .assign_special_name(SpecialPeerName::VisaServiceAdapter, link_id)
@@ -7880,6 +2147,24 @@ mod tests {
         addr
     }
 
+    /// Wait (up to 5 s) for the next `RunLoopStarts` lifecycle event.
+    async fn next_run_loop_start(
+        lifecycle_rx: &mut tokio::sync::broadcast::Receiver<libnode::vsconn::VSConnLifecycleEvent>,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        use libnode::vsconn::VSConnLifecycleEvent;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match lifecycle_rx.recv().await {
+                    Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("lifecycle channel died: {e:?}"),
+                }
+            }
+        })
+        .await
+    }
+
     /// zipline#113, Codex P1 on PR #40: when the VS adapter link closes on a
     /// failure (keep-alive timeout, ZDP-only failure) while the underlying
     /// Cap'n Proto TCP connection SURVIVES, leaving VSConn untouched is not
@@ -7891,8 +2176,6 @@ mod tests {
     /// fresh `RunLoopStarts` after the failure-close.
     #[tokio::test]
     async fn test_vs_link_timeout_close_restarts_vsconn_run_loop() {
-        use libnode::vsconn::VSConnLifecycleEvent;
-
         LocalSet::new()
             .run_until(async {
                 // A live TLS server, so VSConn::run reaches its command loop
@@ -7906,17 +2189,9 @@ mod tests {
                 });
 
                 // First RunLoopStarts: the run loop is up and parked.
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        match lifecycle_rx.recv().await {
-                            Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
-                            Ok(_) => continue,
-                            Err(e) => panic!("lifecycle channel died: {e:?}"),
-                        }
-                    }
-                })
-                .await
-                .expect("VSConn never reached its first RunLoopStarts");
+                next_run_loop_start(&mut lifecycle_rx)
+                    .await
+                    .expect("VSConn never reached its first RunLoopStarts");
 
                 // Keep-alive gave up on the link: close with RequestTimedOut.
                 // The TCP connection to the (held-open) TLS server survives.
@@ -7930,18 +2205,8 @@ mod tests {
                 // RunLoopStarts (preceded by RunLoopExits) has to arrive, or
                 // vs_worker stays parked and the replacement VS link's
                 // deferred authorization is never sent.
-                let restarted = tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        match lifecycle_rx.recv().await {
-                            Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
-                            Ok(_) => continue,
-                            Err(e) => panic!("lifecycle channel died: {e:?}"),
-                        }
-                    }
-                })
-                .await;
                 assert!(
-                    restarted.is_ok(),
+                    next_run_loop_start(&mut lifecycle_rx).await.is_ok(),
                     "a failure-close of the VS link with a surviving TCP \
                      connection must restart the VSConn run loop (fresh \
                      RunLoopStarts); otherwise vs_worker never re-registers \
@@ -7964,6 +2229,8 @@ mod tests {
     /// of them, so a surviving ELT entry sends on a stream id the node drops
     /// (`Unknown Stream ID`) and never triggers a fresh bind. A Pending entry
     /// orphaned by the closed link would block re-binding its flow forever.
+    /// Since #1410 the flush lives in `ActorAuthorization::link_down`, which
+    /// the link's cleanup calls; this drives the cleanup end to end.
     #[tokio::test]
     async fn test_adapter_dock_link_cleanup_flushes_elt_and_dlt() {
         use crate::adapter_tables::{DltPep, EltPep};
@@ -8027,5 +2294,151 @@ mod tests {
                 assert!(asm.dlt.get(dlt_id).is_none(), "DLT entry must be flushed");
             })
             .await
+    }
+
+    /// zipline#12: the OIDC IdPs a node advertises in HelloResponse are kept
+    /// on the adapter's link for the actor's evidence, and forgotten when
+    /// the link is cleaned up so a re-dock cannot use a stale list.
+    #[tokio::test]
+    async fn test_hello_response_oidc_idps_kept_until_cleanup() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let link_id = add_adapter_peer(&asm);
+                let idp = auth::OidcIdpInfo {
+                    issuer: "https://idp.test".to_string(),
+                    client_id: "test-client".to_string(),
+                    client_secret: None,
+                    scopes: vec!["openid".to_string()],
+                    allow_offline_access: false,
+                };
+                let peer = asm.peer_table.get(link_id).unwrap();
+                let link = &peer.link_state_machine;
+                {
+                    let mut fsm = link.locked_fsm.lock().unwrap();
+                    fsm.status = LinkStatus::Up;
+                    fsm.set_state(LinkState::Helloing);
+                }
+                link.process_hello_response(
+                    &asm,
+                    HelloResponse {
+                        status: ResponseCode::Success,
+                        aaa_address: Some(
+                            "fd5a:5052:0:aaa::1"
+                                .parse::<std::net::IpAddr>()
+                                .unwrap()
+                                .into(),
+                        ),
+                        oidc_idps: Some(vec![idp.clone()]),
+                        vs_bootstrap: false,
+                    },
+                )
+                .unwrap();
+                assert_eq!(link.oidc_idps().len(), 1);
+                assert_eq!(link.oidc_idps()[0].issuer, idp.issuer);
+
+                link.test_set_state(LinkState::Closing);
+                let _ = link.clean_up_link_state(&asm);
+                assert!(link.oidc_idps().is_empty());
+            })
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_test() {
+        LocalSet::new()
+            .run_until(async {
+                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
+                let (tx, rx) = oneshot::channel();
+
+                set_timeout(&sm, Duration::from_secs(5), tx);
+
+                tokio::time::sleep(Duration::from_secs(4)).await;
+
+                assert!(rx.is_empty());
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                assert!(rx.await.is_ok());
+            })
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_explicit_cancel_test() {
+        LocalSet::new()
+            .run_until(async {
+                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
+                let (tx, rx) = oneshot::channel();
+
+                set_timeout(&sm, Duration::from_secs(5), tx);
+
+                tokio::time::sleep(Duration::from_secs(4)).await;
+
+                sm.lock().unwrap().cancel_timeout();
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                assert!(rx.await.is_err());
+            })
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_implicit_cancel_test() {
+        LocalSet::new()
+            .run_until(async {
+                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
+                let (tx, rx) = oneshot::channel();
+
+                set_timeout(&sm, Duration::from_secs(5), tx);
+
+                tokio::time::sleep(Duration::from_secs(4)).await;
+
+                sm.lock().unwrap().set_state(LinkState::Keying);
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                assert!(rx.await.is_err());
+            })
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_reschedule_test() {
+        LocalSet::new()
+            .run_until(async {
+                let sm = Arc::new(Mutex::new(LinkStateMachine::new(1)));
+                let (tx1, rx1) = oneshot::channel();
+                let (tx2, rx2) = oneshot::channel();
+
+                set_timeout(&sm, Duration::from_secs(5), tx1);
+
+                tokio::time::sleep(Duration::from_secs(4)).await;
+
+                set_timeout(&sm, Duration::from_secs(5), tx2);
+
+                tokio::time::sleep(Duration::from_secs(4)).await;
+
+                assert!(rx1.await.is_err());
+                assert!(rx2.is_empty());
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                assert!(rx2.await.is_ok());
+            })
+            .await
+    }
+
+    fn set_timeout(sm: &Arc<Mutex<LinkStateMachine>>, duration: Duration, tx: oneshot::Sender<()>) {
+        let sm_cb = sm.clone();
+        sm.lock()
+            .unwrap()
+            .set_timeout_callback(duration, move |lc| {
+                if sm_cb.lock().unwrap().logical_clock != lc {
+                    return;
+                }
+                tx.send(()).unwrap();
+            });
     }
 }

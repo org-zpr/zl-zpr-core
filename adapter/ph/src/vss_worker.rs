@@ -109,12 +109,9 @@ pub fn process_revoke_auth(asm: &Arc<Assembly>, addrs: &[std::net::IpAddr]) -> u
         let addr = zpr_utils::net_defs::IpAddress::new_from_std(addr);
         // Only peer links dock actors; a match against a local/self address
         // is not a docked actor, so search the peer table directly.
-        let docked_link = asm.peer_table.find(|(_id, peer)| {
-            peer.link_state_machine
-                .get_actor_addresses()
-                .iter()
-                .any(|a| *a == addr)
-        });
+        let docked_link =
+            asm.peer_table
+                .find(|(_id, peer)| peer.actor_auth.owns_address(&addr));
         match docked_link {
             Some((link_id, _peer)) => {
                 let link_id = link_id.get();
@@ -157,7 +154,7 @@ pub struct RequestAuthOutcome {
 ///   resolves; a coalesced address is still counted, because re-auth for it
 ///   *is* underway).
 /// - A docked adapter's address: start the on-demand ZDP renewal on its
-///   link (zipline#122, [LinkStateWrapper::request_renewal_now]) — counted,
+///   link (zipline#122, [crate::actor_renewal::request_renewal_now]) — counted,
 ///   and coalesced onto an in-flight renewal attempt if one is outstanding
 ///   (a coalesced address is still counted: its re-auth is underway).
 /// - An unknown address: skipped and not counted.
@@ -191,12 +188,9 @@ pub fn process_request_authentication(
         }
 
         let addr_ip = zpr_utils::net_defs::IpAddress::new_from_std(addr);
-        let docked_link = asm.peer_table.find(|(_id, peer)| {
-            peer.link_state_machine
-                .get_actor_addresses()
-                .iter()
-                .any(|a| *a == addr_ip)
-        });
+        let docked_link =
+            asm.peer_table
+                .find(|(_id, peer)| peer.actor_auth.owns_address(&addr_ip));
         match docked_link {
             Some((link_id, peer)) => {
                 // A docked adapter (zipline#122, K1/K4): start the on-demand
@@ -207,15 +201,16 @@ pub fn process_request_authentication(
                 // refused — must not be acknowledged as underway (Codex
                 // review, zl-zpr-core#45).
                 let link_id = link_id.get();
-                match peer.link_state_machine.request_renewal_now(asm) {
-                    crate::link_state::RenewalStart::Accepted
-                    | crate::link_state::RenewalStart::Coalesced => {
+                drop(peer);
+                match crate::actor_renewal::request_renewal_now(asm, link_id) {
+                    crate::actor_renewal::RenewalStart::Accepted
+                    | crate::actor_renewal::RenewalStart::Coalesced => {
                         info!(target: VSS_RPC,
                             "request_auth: on-demand re-auth underway for {addr} on {}",
                             asm.formatted_link_id(link_id));
                         processed += 1;
                     }
-                    crate::link_state::RenewalStart::Ignored => {
+                    crate::actor_renewal::RenewalStart::Ignored => {
                         debug!(target: VSS_RPC,
                             "request_auth: {addr} resolves to {} but no renewal could start; not counted",
                             asm.formatted_link_id(link_id));
@@ -361,6 +356,19 @@ mod tests {
     use tokio::task::LocalSet;
     use zpr_utils::net_defs::{self, IpAddress};
 
+    /// A node-mode assembly whose own (configured) ZPR address is `own`:
+    /// a node's local addresses are its configured `zpr_addr`.
+    fn node_builder(own: IpAddr) -> TestAssemblyBuilder {
+        TestAssemblyBuilder {
+            ph_mode: Some(crate::assembly::PhMode::Node),
+            config: Some(rcu::RcuBox::new(crate::config::Config {
+                zpr_addr: vec![own],
+                ..Default::default()
+            })),
+            ..TestAssemblyBuilder::new()
+        }
+    }
+
     fn add_active_peer_with_actor(asm: &Arc<Assembly>, actor: IpAddr) -> zpr::packet_info::LinkId {
         let entry = asm.peer_table.vacant_entry().unwrap();
         let link_id = entry.key();
@@ -373,8 +381,8 @@ mod tests {
         entry.insert(ps);
         let peer = asm.peer_table.get(link_id.get()).unwrap();
         peer.link_state_machine.test_set_state(LinkState::Active);
-        peer.link_state_machine
-            .test_add_actor_address(IpAddress::new_from_std(&actor));
+        peer.actor_auth
+            .test_set_addresses(vec![IpAddress::new_from_std(&actor)]);
         link_id.get()
     }
 
@@ -392,8 +400,8 @@ mod tests {
         entry.insert(ps);
         let peer = asm.peer_table.get(link_id.get()).unwrap();
         peer.link_state_machine.test_set_state(LinkState::Active);
-        peer.link_state_machine
-            .test_add_actor_address(IpAddress::new_from_std(&actor));
+        peer.actor_auth
+            .test_set_addresses(vec![IpAddress::new_from_std(&actor)]);
         link_id.get()
     }
 
@@ -459,10 +467,9 @@ mod tests {
     async fn test_request_auth_own_address_starts_self_reauth_unknown_not_counted() {
         LocalSet::new()
             .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
                 let own: IpAddr = "10.1.1.1".parse().unwrap();
                 let unknown: IpAddr = "10.0.0.99".parse().unwrap();
-                asm.set_local_zpr_addrs([own]);
+                let asm = Arc::new(create_assembly(node_builder(own)));
 
                 let outcome = process_request_authentication(&asm, &[own, unknown]);
                 assert_eq!(
@@ -491,9 +498,8 @@ mod tests {
     async fn test_request_auth_second_own_address_in_flight_is_coalesced() {
         LocalSet::new()
             .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
                 let own: IpAddr = "10.1.1.1".parse().unwrap();
-                asm.set_local_zpr_addrs([own]);
+                let asm = Arc::new(create_assembly(node_builder(own)));
 
                 let first = process_request_authentication(&asm, &[own]);
                 assert!(first.start_self_reauth, "first request starts the re-auth");
@@ -535,13 +541,12 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
-                let mut builder = TestAssemblyBuilder::new();
+                let own: IpAddr = "10.1.1.1".parse().unwrap();
+                let docked: IpAddr = "10.9.8.7".parse().unwrap();
+                let mut builder = node_builder(own);
                 builder.mgmt_substrate_egress =
                     Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
                 let asm = Arc::new(create_assembly(builder));
-                let own: IpAddr = "10.1.1.1".parse().unwrap();
-                let docked: IpAddr = "10.9.8.7".parse().unwrap();
-                asm.set_local_zpr_addrs([own]);
                 let link_id = add_node_peer_with_actor(&asm, docked);
                 asm.visa_table
                     .write()
@@ -560,7 +565,7 @@ mod tests {
                 assert!(!outcome.start_self_reauth);
                 let peer = asm.peer_table.get(link_id).unwrap();
                 assert!(
-                    peer.link_state_machine.test_renewal_in_flight(),
+                    peer.actor_auth.renewal.test_in_flight(),
                     "the adapter's link must have a renewal in flight"
                 );
                 let pkt = egress_rx
@@ -568,8 +573,8 @@ mod tests {
                     .expect("a RenewAuthenticationRequest must go out");
                 assert_eq!(
                     pkt.body()[0],
-                    142,
-                    "expected a RenewAuthenticationRequest (142)"
+                    crate::zdp::ZdpPacketType::RenewAuthenticationRequest.0,
+                    "expected a RenewAuthenticationRequest (144)"
                 );
                 assert_eq!(
                     peer.link_state_machine.get_state(),
@@ -607,13 +612,12 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
-                let mut builder = TestAssemblyBuilder::new();
+                let own: IpAddr = "10.1.1.1".parse().unwrap();
+                let docked: IpAddr = "10.9.8.7".parse().unwrap();
+                let mut builder = node_builder(own);
                 builder.mgmt_substrate_egress =
                     Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
                 let asm = Arc::new(create_assembly(builder));
-                let own: IpAddr = "10.1.1.1".parse().unwrap();
-                let docked: IpAddr = "10.9.8.7".parse().unwrap();
-                asm.set_local_zpr_addrs([own]);
                 let link_id = add_node_peer_with_actor(&asm, docked);
                 let peer = asm.peer_table.get(link_id).unwrap();
                 // The link is being torn down: it has left Active but its
@@ -627,7 +631,7 @@ mod tests {
                 );
                 assert!(!outcome.start_self_reauth);
                 assert!(
-                    !peer.link_state_machine.test_renewal_in_flight(),
+                    !peer.actor_auth.renewal.test_in_flight(),
                     "no renewal attempt may be in flight on a non-Active link"
                 );
                 assert!(

@@ -58,6 +58,7 @@ pub fn send_hello_request(
     let mut pkt = core::new_heap_packet();
     pkt.alloc_zeroed_header::<zdp::ZdpHelloRequestHeader>();
     super::helpers::put_window_size_tlv(asm, link_id, &mut pkt);
+    tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
     tlv::TlvEncoding::new_a2a_dh_pubkey(a2a_dh_pubkey).put(&mut pkt); //add public key to the packet
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloRequest, pkt)
 }
@@ -73,6 +74,7 @@ pub fn send_hello_success_response<'a>(
     policy_id: i64,
     oidc_idps: &[auth::OidcIdpInfo],
     aaa_address: Option<IpAddress>,
+    vs_bootstrap: bool,
 ) -> Sent<'a> {
     let mut pkt = core::new_heap_packet();
     let hdr = pkt.alloc_zeroed_header::<zdp::ZdpHelloResponseHeader>();
@@ -81,6 +83,10 @@ pub fn send_hello_success_response<'a>(
     // Policy ID and version are always included, even if not SUCCESS.
     tlv::TlvEncoding::new_policy_id(policy_id).put(&mut pkt);
     tlv::TlvEncoding::new_version(assembly::VERSION).put(&mut pkt);
+    tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
+    if vs_bootstrap {
+        tlv::TlvEncoding::new_vs_bootstrap_link().put(&mut pkt);
+    }
 
     super::helpers::put_window_size_tlv(&asm, link_id, &mut pkt);
 
@@ -116,38 +122,77 @@ pub fn send_hello_success_response<'a>(
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloResponse, pkt)
 }
 
+pub fn send_hello_error_response(
+    asm: &Assembly,
+    link_id: LinkId,
+    status: zdp::ResponseCode,
+) -> Sent<'_> {
+    let mut pkt = core::new_heap_packet();
+    pkt.alloc_zeroed_header::<zdp::ZdpHelloResponseHeader>()
+        .status = status;
+    tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
+    core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloResponse, pkt)
+}
+
+pub fn send_start_authentication(asm: &Assembly, link_id: LinkId, txn: TxnId) -> Sent<'_> {
+    core::send_non_flow_txn_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::StartAuthentication,
+        txn,
+        core::new_heap_packet(),
+    )
+}
+
+pub fn send_abandon_authentication(asm: &Assembly, link_id: LinkId, txn: TxnId) -> Sent<'_> {
+    core::send_non_flow_txn_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::AbandonAuthenticationAttempt,
+        txn,
+        core::new_heap_packet(),
+    )
+}
+
 /// Send Init Authentication (NOT YET IN RFC 6)
 ///
-/// A side effect in the Hello Request handler ([handlers::handle_hello_request]).
+/// Responds to the adapter's StartAuthentication transaction, not to Hello.
 ///
-/// Message payload is ([zdp::ZdpInitAuthenticationPayload]):
+/// Message payload is ([auth::ZdpInitAuthenticationPayload]):
 ///
 /// Blake 3 hash is used in keyed-hash mode. The peer_table keeps track of a 256-bit
 /// key on each link.  It in the future it may even change it from time to time.
 /// The nonce and hash are returned in the bootstrap authentication BLOB and
 /// are checked by the node before processing.
 ///
-pub fn send_init_authentication_request(
-    asm: &Assembly,
+pub fn send_init_authentication_request<'a>(
+    asm: &'a Assembly,
     link_id: LinkId,
+    txn: TxnId,
+    status: zdp::AuthenticationStatus,
     flags: u8,
     payload: auth::ZdpInitAuthenticationPayload,
-) -> Sent<'_> {
+) -> Sent<'a> {
     debug!(target: ZDP, "{}: sending InitAuthenticationRequest, flags: {flags:x?}", asm.formatted_link_id(link_id));
 
     let mut req = core::new_heap_packet();
 
     let hdr = zdp::ZdpInitAuthenticationRequestHeader {
+        status,
         flags,
         data_len: (size_of::<auth::ZdpInitAuthenticationPayload>() as u16).into(),
     };
     hdr.write_to_buf(&mut req).unwrap();
     payload.write_to_buf(&mut req).unwrap();
+    // Upstream #1410 appends ASA TLVs here. Zipline removed the ASA TLV with
+    // the BAS/OAuthRsa client (zipline#15): OIDC IdPs are advertised in the
+    // HelloResponse instead, so Init carries no service offer.
 
-    core::send_non_flow_mgmt(
+    core::send_non_flow_txn_mgmt(
         asm,
         link_id,
         zdp::ZdpPacketType::InitAuthenticationRequest,
+        txn,
         req,
     )
 }
@@ -182,15 +227,15 @@ pub fn send_renew_authentication_request(
 
 /// Send a Renew Authentication response (zipline#66; NOT YET IN RFC 6)
 ///
-/// Adapter → node: on [zdp::ResponseCode::Success] `blob` carries the
+/// Adapter → node: on [zdp::AuthenticationStatus::Success] `blob` carries the
 /// renewed auth blob (base64-encoded JSON, same encoding as the acquire
-/// request's); on any other code it is empty. `challenge` echoes the
+/// request's); on any other status it is empty. `challenge` echoes the
 /// request's challenge bytes on every response so the node can correlate
 /// it with the attempt it answers (PR #17 review).
 pub fn send_renew_authentication_response<'a>(
     asm: &'a Assembly,
     link_id: LinkId,
-    status_code: zdp::ResponseCode,
+    status_code: zdp::AuthenticationStatus,
     challenge: &'_ [u8; 48],
     blob: &'_ [u8],
 ) -> Sent<'a> {
@@ -220,16 +265,15 @@ pub fn send_renew_authentication_response<'a>(
 /// requesting.  It will be up to the visa service to determine
 /// the correct address(es) to grant.
 ///
-/// The `blob` is for bootstrap authentcation and can be empty.
-///
-/// Once this returns the link_state should transition to RegisterAA
-/// as we wait for a grant.
+/// The blob is actor authentication evidence. The actor controller enters
+/// AcquiringAddress before sending and awaits the matching transaction's grant.
 ///
 /// ## Panics
 /// - Panics if all requested addresses are not the same IP version.
 pub fn send_acquire_zpr_address_request<'a>(
     asm: &'a Assembly,
     link_id: LinkId,
+    txn: TxnId,
     actor_addrs: &'_ [IpAddr],
     blob: Option<&'_ [u8]>,
 ) -> Sent<'a> {
@@ -270,22 +314,53 @@ pub fn send_acquire_zpr_address_request<'a>(
         }
     }
 
-    core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::AcquireZprAddress, req)
+    core::send_non_flow_txn_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::AcquireZprAddress,
+        txn,
+        req,
+    )
+}
+
+pub fn validate_acquire_zpr_address_request(
+    addresses: &[IpAddr],
+    blob: &[u8],
+) -> Result<(), auth::AuthError> {
+    if addresses.len() > 1 {
+        return Err(auth::AuthError::Rejected(
+            "only one actor address can be requested".into(),
+        ));
+    }
+    let address_len = match addresses.first() {
+        Some(IpAddr::V4(_)) => 4,
+        Some(IpAddr::V6(_)) => 16,
+        None => 0,
+    };
+    let capacity = crate::packet::Packet::max_body_size_for(config::SMALL_PACKET_BUFFER_SIZE)
+        - config::DEFAULT_MESSAGE_HEADROOM;
+    let max_blob = capacity - size_of::<zdp::ZdpAcquireZprAddressHeader>() - address_len;
+    if blob.is_empty() || blob.len() > max_blob || blob.len() > u16::MAX as usize {
+        return Err(auth::AuthError::FormatError(
+            "actor authentication evidence does not fit an Acquire request".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Send an GrantZprAddressRequest (TODO: not yet in RFC 6)
 ///
 /// All granted addresses must be same IP version.
 ///
-/// Once this returns the link_state should transition from RegisterAA
-/// to (I think) Active.
+/// Completes an actor transaction without changing the already-Active link.
 ///
 /// ## Panics
 /// - Panics if all granted addresses are not the same IP version.
 pub fn send_grant_zpr_address_request<'a>(
     asm: &'a Assembly,
     link_id: LinkId,
-    status_code: zdp::ResponseCode,
+    txn: TxnId,
+    status_code: zdp::AuthenticationStatus,
     actor_addrs: &'_ [IpAddr],
 ) -> Sent<'a> {
     debug!(target: ZDP, "{} - sending GrantZprAddressRequest, status: {status_code:?}", asm.formatted_link_id(link_id));
@@ -324,7 +399,7 @@ pub fn send_grant_zpr_address_request<'a>(
         }
     }
 
-    core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::GrantZprAddress, req)
+    core::send_non_flow_txn_mgmt(asm, link_id, zdp::ZdpPacketType::GrantZprAddress, txn, req)
 }
 
 /// send a Terminate Link or Docking Session message (TODO: document)

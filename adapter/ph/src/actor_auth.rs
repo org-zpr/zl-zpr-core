@@ -562,13 +562,7 @@ impl ActorAuthorization {
         };
         if let Err(err) = verify_evidence(&blobs, &challenge, &peer.auth_key) {
             warn!(target: LINK_STATE, "{}: actor challenge verification failed: {err}", asm.formatted_link_id(self.id));
-            return self.finish_remote(
-                asm,
-                generation,
-                txn,
-                AuthenticationStatus::Rejected,
-                None,
-            );
+            return self.finish_remote(asm, generation, txn, AuthenticationStatus::Rejected, None);
         }
         // Zipline: remember what the actor proved, for renewal (zipline#45/#122).
         if let Some(oidc) = blobs.iter().find_map(|b| match b {
@@ -793,7 +787,9 @@ fn verify_evidence(
             ));
         }
         match blob {
-            AuthBlob::SelfSigned(ss) => ss.verify_blob_challenge(key, auth::MAX_BLOB_AGE_SECONDS)?,
+            AuthBlob::SelfSigned(ss) => {
+                ss.verify_blob_challenge(key, auth::MAX_BLOB_AGE_SECONDS)?
+            }
             AuthBlob::Oidc(oidc) => {
                 oidc.verify_challenge(key)?;
             }
@@ -1340,7 +1336,8 @@ mod tests {
         );
         actor.record_failure(AuthFailureReason::VisaServiceRejected("bad token".into()));
         assert!(
-            format!("{actor}").contains("  Last auth failure: VisaServiceRejected(\"bad token\")\n"),
+            format!("{actor}")
+                .contains("  Last auth failure: VisaServiceRejected(\"bad token\")\n"),
             "{actor}"
         );
     }
@@ -1553,9 +1550,7 @@ mod tests {
                 // The rejection is sent to the adapter: keep egress open.
                 let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(8);
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-                    mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(
-                        egress_tx,
-                    )),
+                    mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
                     ..TestAssemblyBuilder::new()
                 }));
                 let link_id = add_peer(&asm, LinkType::NodeToAdapter);

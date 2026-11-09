@@ -767,11 +767,7 @@ pub mod test {
             Ok(())
         }
         /// The AAA is just another address to this double.
-        fn add_authentication_address(
-            &self,
-            addr: IpAddr,
-            prefix_len: u8,
-        ) -> std::io::Result<()> {
+        fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
             self.add_address(addr, prefix_len)
         }
         fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
@@ -1082,11 +1078,7 @@ pub mod test {
             Ok(())
         }
         /// The AAA is just another address to this double.
-        fn add_authentication_address(
-            &self,
-            addr: IpAddr,
-            prefix_len: u8,
-        ) -> std::io::Result<()> {
+        fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
             self.add_address(addr, prefix_len)
         }
         fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {

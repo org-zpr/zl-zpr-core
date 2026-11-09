@@ -43,7 +43,7 @@ pub enum ZdpPacketType {
     AbandonAuthenticationAttempt = 143,
     // Zipline-local assignments (zipline#66). Formerly 142/143; moved when
     // upstream #1410 claimed those for StartAuthentication/Abandon.
-    RenewAuthenticationRequest = 144,  // TODO: add to RFC 6 (zipline#66)
+    RenewAuthenticationRequest = 144, // TODO: add to RFC 6 (zipline#66)
     RenewAuthenticationResponse = 145, // TODO: add to RFC 6 (zipline#66)
 
     Canceled = 252, // TODO: add to RFC 17

@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zpr_utils::rsa_sign::{load_rsa_key, sign_rsa_key};
 
-
 /// When a node signs a challenge for an adapter it uses this sort of key.
 pub const AUTH_KEY_SIZE_BYTES: usize = 32; // blake3 256bit key
 
@@ -178,9 +177,6 @@ pub enum AuthError {
 
     #[error("Challenge Too Old")]
     ChallengeTooOld,
-
-    #[error("Authentication Error: {0}")]
-    AuthError(String),
 
     /// The credentials were refused outright (as opposed to a transient
     /// service failure). Actor authorization latches this (#1410).
@@ -549,7 +545,10 @@ mod test {
             let blob = BASE64_STANDARD.encode(json);
             let error = decode_blobs(&blob).unwrap_err().to_string();
             assert!(!error.contains(&blob));
-            assert!(!error.contains("private-"), "error leaked evidence: {error}");
+            assert!(
+                !error.contains("private-"),
+                "error leaked evidence: {error}"
+            );
         }
     }
 

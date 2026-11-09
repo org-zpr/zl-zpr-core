@@ -213,7 +213,10 @@ mod tests {
         let asm = assembly(&[configured], tun_ctl);
 
         match activate(&asm) {
-            Err(AuthFailureReason::GrantedAddressMismatch { requested, granted: g }) => {
+            Err(AuthFailureReason::GrantedAddressMismatch {
+                requested,
+                granted: g,
+            }) => {
                 assert_eq!(requested, vec![configured]);
                 assert_eq!(g, vec![granted()]);
             }

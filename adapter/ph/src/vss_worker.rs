@@ -109,9 +109,9 @@ pub fn process_revoke_auth(asm: &Arc<Assembly>, addrs: &[std::net::IpAddr]) -> u
         let addr = zpr_utils::net_defs::IpAddress::new_from_std(addr);
         // Only peer links dock actors; a match against a local/self address
         // is not a docked actor, so search the peer table directly.
-        let docked_link =
-            asm.peer_table
-                .find(|(_id, peer)| peer.actor_auth.owns_address(&addr));
+        let docked_link = asm
+            .peer_table
+            .find(|(_id, peer)| peer.actor_auth.owns_address(&addr));
         match docked_link {
             Some((link_id, _peer)) => {
                 let link_id = link_id.get();
@@ -188,9 +188,9 @@ pub fn process_request_authentication(
         }
 
         let addr_ip = zpr_utils::net_defs::IpAddress::new_from_std(addr);
-        let docked_link =
-            asm.peer_table
-                .find(|(_id, peer)| peer.actor_auth.owns_address(&addr_ip));
+        let docked_link = asm
+            .peer_table
+            .find(|(_id, peer)| peer.actor_auth.owns_address(&addr_ip));
         match docked_link {
             Some((link_id, peer)) => {
                 // A docked adapter (zipline#122, K1/K4): start the on-demand

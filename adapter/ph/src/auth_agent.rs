@@ -314,7 +314,10 @@ mod tests {
             AuthFailureReason::ActivationFailed("x".into()),
         ];
         for reason in transient.iter().chain(terminal.iter()) {
-            assert!(reason.is_terminal(false), "{reason:?} with auto-connect off");
+            assert!(
+                reason.is_terminal(false),
+                "{reason:?} with auto-connect off"
+            );
         }
         for reason in &transient {
             assert!(!reason.is_terminal(true), "{reason:?}");
@@ -403,7 +406,14 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<OidcCredentialRequest>();
         drop(rx);
-        let r = request_oidc_blob(&tx, idp, &challenge, true, std::time::Duration::from_secs(5)).await;
+        let r = request_oidc_blob(
+            &tx,
+            idp,
+            &challenge,
+            true,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(r.unwrap_err(), AuthFailureReason::NoAgent);
     }
 
@@ -427,9 +437,15 @@ mod tests {
             assert!(!req.interactive);
             req.reply.send(Ok("id.token.here".to_string())).unwrap();
         });
-        let blob = request_oidc_blob(&tx, idp, &challenge, false, std::time::Duration::from_secs(5))
-            .await
-            .unwrap();
+        let blob = request_oidc_blob(
+            &tx,
+            idp,
+            &challenge,
+            false,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
         assert_eq!(blob.issuer, "https://idp.test");
         assert_eq!(blob.id_token, "id.token.here");
         assert_eq!(blob.challenge, BASE64_STANDARD.encode(challenge));
@@ -479,15 +495,28 @@ mod tests {
     #[tokio::test]
     async fn test_no_agent_with_idp_fails_unless_bootstrap_fallback() {
         let asm = assembly(false);
-        let r = produce_evidence(&asm, DOCK_LINK_ID, true, Some(&challenge(1)), &[test_idp()], None)
-            .await;
+        let r = produce_evidence(
+            &asm,
+            DOCK_LINK_ID,
+            true,
+            Some(&challenge(1)),
+            &[test_idp()],
+            None,
+        )
+        .await;
         assert_eq!(r.unwrap_err(), AuthFailureReason::NoAgent);
 
         let asm = assembly(true);
-        let blobs =
-            produce_evidence(&asm, DOCK_LINK_ID, true, Some(&challenge(1)), &[test_idp()], None)
-                .await
-                .unwrap();
+        let blobs = produce_evidence(
+            &asm,
+            DOCK_LINK_ID,
+            true,
+            Some(&challenge(1)),
+            &[test_idp()],
+            None,
+        )
+        .await
+        .unwrap();
         assert!(matches!(&blobs[..], [AuthBlob::SelfSigned(_)]), "{blobs:?}");
     }
 
@@ -496,11 +525,25 @@ mod tests {
     /// `AuthUnavailable`. The BAS fallback was removed in zipline#15.
     #[tokio::test]
     async fn test_no_method_is_auth_unavailable() {
-        let r = produce_evidence(&assembly(false), DOCK_LINK_ID, true, Some(&challenge(1)), &[], None)
-            .await;
+        let r = produce_evidence(
+            &assembly(false),
+            DOCK_LINK_ID,
+            true,
+            Some(&challenge(1)),
+            &[],
+            None,
+        )
+        .await;
         assert_eq!(r.unwrap_err(), AuthFailureReason::AuthUnavailable);
-        let r = produce_evidence(&assembly(true), DOCK_LINK_ID, false, Some(&challenge(1)), &[], None)
-            .await;
+        let r = produce_evidence(
+            &assembly(true),
+            DOCK_LINK_ID,
+            false,
+            Some(&challenge(1)),
+            &[],
+            None,
+        )
+        .await;
         assert_eq!(r.unwrap_err(), AuthFailureReason::AuthUnavailable);
     }
 
@@ -514,7 +557,8 @@ mod tests {
         let (agent, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
         let started = tokio::time::Instant::now();
         let (payload, idps) = (challenge(1), [test_idp()]);
-        let attempt = produce_evidence(&asm, DOCK_LINK_ID, true, Some(&payload), &idps, Some(agent));
+        let attempt =
+            produce_evidence(&asm, DOCK_LINK_ID, true, Some(&payload), &idps, Some(agent));
         // Hold every request (and its reply sender) without answering.
         let hold = async {
             let mut held = Vec::new();

@@ -881,9 +881,10 @@ impl LinkStateWrapper {
         {
             if let Some(peer) = asm.peer_table.get(link_id) {
                 if peer.actor_auth.last_failure().is_none() {
-                    peer.actor_auth.record_failure(AuthFailureReason::LinkFailed(format!(
-                        "link failed before authentication completed ({reason:?})"
-                    )));
+                    peer.actor_auth
+                        .record_failure(AuthFailureReason::LinkFailed(format!(
+                            "link failed before authentication completed ({reason:?})"
+                        )));
                 }
             }
         }
@@ -1038,8 +1039,7 @@ impl LinkStateWrapper {
                 info!(target: LINK_STATE, "{} has fully shut down", asm.formatted_link_id(link_id));
                 if !locked_fsm.shutting_down {
                     drop(locked_fsm);
-                    if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect
-                    {
+                    if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect {
                         // With auto-connect off (zipline#28) the tether does
                         // not restart itself: it stays Inactive until the
                         // next startLink RPC (ph-cli connect / link start).
@@ -1684,12 +1684,17 @@ mod tests {
                 let link_id = add_adapter_peer(&asm);
                 {
                     let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.actor_auth.record_failure(AuthFailureReason::UserDeclined);
+                    peer.actor_auth
+                        .record_failure(AuthFailureReason::UserDeclined);
                     peer.link_state_machine.test_set_state(LinkState::Helloing);
                 }
                 fire_current_timeout(&asm, link_id);
                 assert_eq!(
-                    asm.peer_table.get(link_id).unwrap().actor_auth.last_failure(),
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .actor_auth
+                        .last_failure(),
                     Some(AuthFailureReason::UserDeclined)
                 );
 
@@ -1704,7 +1709,11 @@ mod tests {
                 fire_current_timeout(&asm, link_id);
                 assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
                 assert_eq!(
-                    asm.peer_table.get(link_id).unwrap().actor_auth.last_failure(),
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .actor_auth
+                        .last_failure(),
                     None
                 );
             })

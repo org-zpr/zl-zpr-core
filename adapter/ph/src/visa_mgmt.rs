@@ -183,17 +183,19 @@ pub fn vsapi_blobs(blobs: &[AuthBlob]) -> Result<Vec<vsapi_types::AuthBlob>, Lin
     blobs
         .iter()
         .map(|blob| match blob {
-            AuthBlob::SelfSigned(ss) => Ok(vsapi_types::AuthBlob::SS(vsapi_types::SelfSignedBlob {
-                alg: vsapi_types::ChallengeAlg::RsaSha256Pkcs1v15,
-                challenge: BASE64_STANDARD
-                    .decode(&ss.challenge)
-                    .map_err(|e| invalid("challenge", e))?,
-                cn: ss.cn.clone(),
-                timestamp: ss.ts,
-                signature: BASE64_STANDARD
-                    .decode(&ss.sig)
-                    .map_err(|e| invalid("signature", e))?,
-            })),
+            AuthBlob::SelfSigned(ss) => {
+                Ok(vsapi_types::AuthBlob::SS(vsapi_types::SelfSignedBlob {
+                    alg: vsapi_types::ChallengeAlg::RsaSha256Pkcs1v15,
+                    challenge: BASE64_STANDARD
+                        .decode(&ss.challenge)
+                        .map_err(|e| invalid("challenge", e))?,
+                    cn: ss.cn.clone(),
+                    timestamp: ss.ts,
+                    signature: BASE64_STANDARD
+                        .decode(&ss.sig)
+                        .map_err(|e| invalid("signature", e))?,
+                }))
+            }
             AuthBlob::Oidc(oidc) => {
                 let challenge: [u8; 48] = BASE64_STANDARD
                     .decode(&oidc.challenge)

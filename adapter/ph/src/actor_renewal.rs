@@ -337,8 +337,8 @@ pub fn maybe_renew(asm: &Arc<Assembly>, link_id: LinkId) {
         if SystemTime::now() < deadline || data.in_flight {
             return;
         }
-        let nothing_can_renew = data.identity.is_none()
-            || (agent.is_none() && link_type != LinkType::NodeToAdapter);
+        let nothing_can_renew =
+            data.identity.is_none() || (agent.is_none() && link_type != LinkType::NodeToAdapter);
         if nothing_can_renew {
             if !data.no_agent_warned {
                 data.no_agent_warned = true;
@@ -417,11 +417,13 @@ pub fn maybe_renew(asm: &Arc<Assembly>, link_id: LinkId) {
                 return;
             }
         };
-        let blobs = vec![zpr::vsapi_types::AuthBlob::Oidc(zpr::vsapi_types::OidcBlob {
-            issuer: identity.idp.issuer,
-            id_token,
-            nonce: identity.nonce,
-        })];
+        let blobs = vec![zpr::vsapi_types::AuthBlob::Oidc(
+            zpr::vsapi_types::OidcBlob {
+                issuer: identity.idp.issuer,
+                id_token,
+                nonce: identity.nonce,
+            },
+        )];
         submit_reauthorize(&task_asm, link_id, uid, blobs).await;
     });
 }
@@ -1028,7 +1030,14 @@ mod tests {
     async fn settle(asm: &Arc<Assembly>, link_id: LinkId) {
         for _ in 0..50 {
             tokio::task::yield_now().await;
-            if !asm.peer_table.get(link_id).unwrap().actor_auth.renewal.test_in_flight() {
+            if !asm
+                .peer_table
+                .get(link_id)
+                .unwrap()
+                .actor_auth
+                .renewal
+                .test_in_flight()
+            {
                 return;
             }
         }
@@ -1076,7 +1085,13 @@ mod tests {
     /// this recorded failure. Any verification failure would have recorded a
     /// different one.
     fn assert_reached_reauthorize(asm: &Arc<Assembly>, link_id: LinkId) {
-        match asm.peer_table.get(link_id).unwrap().actor_auth.last_failure() {
+        match asm
+            .peer_table
+            .get(link_id)
+            .unwrap()
+            .actor_auth
+            .last_failure()
+        {
             Some(AuthFailureReason::AgentError(msg)) => assert!(
                 msg.contains("no visa service connection"),
                 "expected the reauthorize-step failure, got: {msg}"
@@ -1087,7 +1102,13 @@ mod tests {
 
     /// Assert the node recorded an AgentError whose text contains `needle`.
     fn assert_agent_error(asm: &Arc<Assembly>, link_id: LinkId, needle: &str) {
-        match asm.peer_table.get(link_id).unwrap().actor_auth.last_failure() {
+        match asm
+            .peer_table
+            .get(link_id)
+            .unwrap()
+            .actor_auth
+            .last_failure()
+        {
             Some(AuthFailureReason::AgentError(msg)) => assert!(
                 msg.contains(needle),
                 "expected an AgentError containing {needle:?}, got: {msg}"
@@ -1103,9 +1124,15 @@ mod tests {
     fn test_renewal_lead_clamps_to_half_lifetime() {
         let configured = Duration::from_secs(300);
         // Long lifetime: the configured lead stands.
-        assert_eq!(renewal_lead(configured, Duration::from_secs(3600)), configured);
+        assert_eq!(
+            renewal_lead(configured, Duration::from_secs(3600)),
+            configured
+        );
         // Lifetime of exactly 2x the lead: still the configured lead.
-        assert_eq!(renewal_lead(configured, Duration::from_secs(600)), configured);
+        assert_eq!(
+            renewal_lead(configured, Duration::from_secs(600)),
+            configured
+        );
         // Short lifetime: clamped to half.
         assert_eq!(
             renewal_lead(configured, Duration::from_secs(120)),
@@ -1196,7 +1223,11 @@ mod tests {
     #[test]
     fn test_authenticated_namespaces_round_trip() {
         let state = RenewalState::new();
-        assert_eq!(state.namespaces(), None, "no namespace set before authentication");
+        assert_eq!(
+            state.namespaces(),
+            None,
+            "no namespace set before authentication"
+        );
         let set: BTreeSet<auth::AuthNamespace> =
             [auth::AuthNamespace::Device, auth::AuthNamespace::User].into();
         state.set_namespaces(set.clone());
@@ -1264,9 +1295,17 @@ mod tests {
 
                 // Adapter-side link, Active: wrong link type.
                 let adapter_link = add_adapter_peer(&asm);
-                assert_eq!(request_renewal_now(&asm, adapter_link), RenewalStart::Ignored);
+                assert_eq!(
+                    request_renewal_now(&asm, adapter_link),
+                    RenewalStart::Ignored
+                );
                 assert!(
-                    !asm.peer_table.get(adapter_link).unwrap().actor_auth.renewal.test_in_flight(),
+                    !asm.peer_table
+                        .get(adapter_link)
+                        .unwrap()
+                        .actor_auth
+                        .renewal
+                        .test_in_flight(),
                     "an adapter-side link must not start an on-demand renewal"
                 );
 
@@ -1274,7 +1313,12 @@ mod tests {
                 let node_link = add_peer(&asm, LinkType::NodeToAdapter, LinkState::Helloing);
                 assert_eq!(request_renewal_now(&asm, node_link), RenewalStart::Ignored);
                 assert!(
-                    !asm.peer_table.get(node_link).unwrap().actor_auth.renewal.test_in_flight(),
+                    !asm.peer_table
+                        .get(node_link)
+                        .unwrap()
+                        .actor_auth
+                        .renewal
+                        .test_in_flight(),
                     "a non-Active link must not start an on-demand renewal"
                 );
 
@@ -1380,7 +1424,10 @@ mod tests {
                 assert_eq!(pkt.metadata().egress_link_id, link_id);
                 let (status, echoed, blobs) = decode_response(&pkt);
                 assert_eq!(status, AuthenticationStatus::Success);
-                assert_eq!(echoed, challenge, "the response must echo the request's challenge");
+                assert_eq!(
+                    echoed, challenge,
+                    "the response must echo the request's challenge"
+                );
                 match &blobs[..] {
                     [AuthBlob::Oidc(oidc)] => {
                         assert_eq!(oidc.id_token, "renewed-id-token");
@@ -1394,7 +1441,11 @@ mod tests {
                     other => panic!("expected one OIDC blob, got {other:?}"),
                 }
                 assert_eq!(
-                    asm.peer_table.get(link_id).unwrap().link_state_machine.get_state(),
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
                     LinkState::Active
                 );
             })
@@ -1421,7 +1472,11 @@ mod tests {
                 assert_eq!(echoed, test_challenge_payload().challenge_bytes());
                 assert!(blobs.is_empty());
                 assert_eq!(
-                    asm.peer_table.get(link_id).unwrap().link_state_machine.get_state(),
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
                     LinkState::Active,
                     "answering must not perturb the link"
                 );
@@ -1498,7 +1553,8 @@ mod tests {
     async fn test_adapter_renew_request_device_only_answers_with_ss_no_agent() {
         LocalSet::new()
             .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress(Some(bootstrap_config()));
+                let (asm, mut egress_rx) =
+                    assembly_with_observable_egress(Some(bootstrap_config()));
                 let link_id = add_adapter_peer(&asm);
                 asm.peer_table
                     .get(link_id)
@@ -1538,7 +1594,8 @@ mod tests {
     async fn test_adapter_renew_request_ss_oidc_without_agent_answers_retryable() {
         LocalSet::new()
             .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress(Some(bootstrap_config()));
+                let (asm, mut egress_rx) =
+                    assembly_with_observable_egress(Some(bootstrap_config()));
                 let link_id = add_adapter_peer(&asm);
                 {
                     let peer = asm.peer_table.get(link_id).unwrap();
@@ -1571,7 +1628,8 @@ mod tests {
     async fn test_adapter_renew_request_ss_oidc_with_agent_answers_both_legs() {
         LocalSet::new()
             .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress(Some(bootstrap_config()));
+                let (asm, mut egress_rx) =
+                    assembly_with_observable_egress(Some(bootstrap_config()));
                 let link_id = add_adapter_peer(&asm);
                 let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
                 {
@@ -1642,8 +1700,9 @@ mod tests {
 
                 // The due tick sends the request and stashes the challenge.
                 maybe_renew(&asm, link_id);
-                let challenge =
-                    request_challenge(&try_recv_egress(&mut egress_rx).expect("request must be sent"));
+                let challenge = request_challenge(
+                    &try_recv_egress(&mut egress_rx).expect("request must be sent"),
+                );
 
                 // The adapter answers with a blob bound to that challenge.
                 let blob = auth::encode_blobs(&[oidc_blob(
@@ -1690,16 +1749,20 @@ mod tests {
                 maybe_renew(&asm, link_id);
                 // The outstanding challenge, echoed by the (well-behaved)
                 // adapter on its response header.
-                let outstanding =
-                    request_challenge(&try_recv_egress(&mut egress_rx).expect("request must be sent"));
+                let outstanding = request_challenge(
+                    &try_recv_egress(&mut egress_rx).expect("request must be sent"),
+                );
 
                 // A blob correctly HMAC'd with this link's auth key but
                 // bound to a DIFFERENT challenge.
                 let other =
                     auth::ZdpInitAuthenticationPayload::new(&[42u8; auth::AUTH_KEY_SIZE_BYTES])
                         .challenge_bytes();
-                let blob =
-                    auth::encode_blobs(&[oidc_blob("https://idp.test", "renewed-id-token", &other)]);
+                let blob = auth::encode_blobs(&[oidc_blob(
+                    "https://idp.test",
+                    "renewed-id-token",
+                    &other,
+                )]);
                 receive_renew_response(&asm, link_id, outstanding, Ok(blob)).unwrap();
 
                 let peer = asm.peer_table.get(link_id).unwrap();
@@ -1708,7 +1771,11 @@ mod tests {
                     "a rejected response must clear in-flight so the next tick retries"
                 );
                 assert_agent_error(&asm, link_id, "different challenge");
-                assert_eq!(peer.link_state_machine.get_state(), LinkState::Active, "link must stay Active");
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Active,
+                    "link must stay Active"
+                );
                 assert_eq!(
                     peer.actor_auth.renewal.auth_expires(),
                     expires,
@@ -1735,8 +1802,9 @@ mod tests {
                 };
 
                 maybe_renew(&asm, link_id);
-                let outstanding =
-                    request_challenge(&try_recv_egress(&mut egress_rx).expect("request must be sent"));
+                let outstanding = request_challenge(
+                    &try_recv_egress(&mut egress_rx).expect("request must be sent"),
+                );
                 receive_renew_response(
                     &asm,
                     link_id,
@@ -1800,12 +1868,18 @@ mod tests {
                 let challenge_b = renewal
                     .test_challenge()
                     .expect("attempt B must stash its challenge");
-                assert_ne!(challenge_a, challenge_b, "attempts must mint fresh challenges");
+                assert_ne!(
+                    challenge_a, challenge_b,
+                    "attempts must mint fresh challenges"
+                );
 
                 // A's DELAYED response arrives while B is in flight. Its
                 // blob is well-formed and HMAC-valid — just bound to A.
-                let blob_a =
-                    auth::encode_blobs(&[oidc_blob("https://idp.test", "stale-id-token", &challenge_a)]);
+                let blob_a = auth::encode_blobs(&[oidc_blob(
+                    "https://idp.test",
+                    "stale-id-token",
+                    &challenge_a,
+                )]);
                 receive_renew_response(&asm, link_id, challenge_a, Ok(blob_a)).unwrap();
 
                 // The stale response must be discarded: B stays in flight.
@@ -1827,7 +1901,12 @@ mod tests {
                 drop(peer);
                 settle(&asm, link_id).await;
                 assert!(
-                    !asm.peer_table.get(link_id).unwrap().actor_auth.renewal.test_in_flight(),
+                    !asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .actor_auth
+                        .renewal
+                        .test_in_flight(),
                     "B's valid response must complete the attempt"
                 );
                 assert_reached_reauthorize(&asm, link_id);
@@ -1854,8 +1933,9 @@ mod tests {
                 }
 
                 request_renewal_now(&asm, link_id);
-                let challenge =
-                    request_challenge(&try_recv_egress(&mut egress_rx).expect("request must be sent"));
+                let challenge = request_challenge(
+                    &try_recv_egress(&mut egress_rx).expect("request must be sent"),
+                );
 
                 // Only the OIDC leg comes back: {User} != {Device, User}.
                 let blob = auth::encode_blobs(&[oidc_blob(
@@ -1871,7 +1951,11 @@ mod tests {
                     "a rejected response must clear in-flight so the next tick retries"
                 );
                 assert_agent_error(&asm, link_id, "namespace");
-                assert_eq!(peer.link_state_machine.get_state(), LinkState::Active, "link must stay Active");
+                assert_eq!(
+                    peer.link_state_machine.get_state(),
+                    LinkState::Active,
+                    "link must stay Active"
+                );
             })
             .await
     }
@@ -1893,8 +1977,9 @@ mod tests {
                     .set_namespaces([auth::AuthNamespace::Device].into());
 
                 request_renewal_now(&asm, link_id);
-                let outstanding =
-                    request_challenge(&try_recv_egress(&mut egress_rx).expect("request must be sent"));
+                let outstanding = request_challenge(
+                    &try_recv_egress(&mut egress_rx).expect("request must be sent"),
+                );
 
                 // An SS blob whose embedded challenge is a DIFFERENT one,
                 // HMAC-valid with this link's auth key.
@@ -1922,20 +2007,24 @@ mod tests {
                 let link_id = add_node_peer(&asm);
                 {
                     let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.actor_auth.test_set_addresses(vec![net_defs::IpAddress::new_from_std(
-                        &"10.9.8.7".parse::<IpAddr>().unwrap(),
-                    )]);
+                    peer.actor_auth
+                        .test_set_addresses(vec![net_defs::IpAddress::new_from_std(
+                            &"10.9.8.7".parse::<IpAddr>().unwrap(),
+                        )]);
                     peer.actor_auth
                         .renewal
                         .set_namespaces([auth::AuthNamespace::Device].into());
                 }
 
                 request_renewal_now(&asm, link_id);
-                let challenge =
-                    request_challenge(&try_recv_egress(&mut egress_rx).expect("request must be sent"));
+                let challenge = request_challenge(
+                    &try_recv_egress(&mut egress_rx).expect("request must be sent"),
+                );
 
                 // The adapter signs the outstanding challenge.
-                let ss = bootstrap().authenticate_blob(&payload_of(&challenge)).unwrap();
+                let ss = bootstrap()
+                    .authenticate_blob(&payload_of(&challenge))
+                    .unwrap();
                 let blob = auth::encode_blobs(&[AuthBlob::SelfSigned(ss)]);
                 receive_renew_response(&asm, link_id, challenge, Ok(blob)).unwrap();
                 settle(&asm, link_id).await;
@@ -1962,9 +2051,10 @@ mod tests {
                 let link_id = add_node_peer(&asm);
                 {
                     let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.actor_auth.test_set_addresses(vec![net_defs::IpAddress::new_from_std(
-                        &"10.9.8.7".parse::<IpAddr>().unwrap(),
-                    )]);
+                    peer.actor_auth
+                        .test_set_addresses(vec![net_defs::IpAddress::new_from_std(
+                            &"10.9.8.7".parse::<IpAddr>().unwrap(),
+                        )]);
                     peer.actor_auth.renewal.set_namespaces(
                         [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
                     );
@@ -1972,10 +2062,13 @@ mod tests {
                 }
 
                 request_renewal_now(&asm, link_id);
-                let challenge =
-                    request_challenge(&try_recv_egress(&mut egress_rx).expect("request must be sent"));
+                let challenge = request_challenge(
+                    &try_recv_egress(&mut egress_rx).expect("request must be sent"),
+                );
 
-                let ss = bootstrap().authenticate_blob(&payload_of(&challenge)).unwrap();
+                let ss = bootstrap()
+                    .authenticate_blob(&payload_of(&challenge))
+                    .unwrap();
                 let blob = auth::encode_blobs(&[
                     AuthBlob::SelfSigned(ss),
                     oidc_blob("https://idp.test", "renewed-id-token", &challenge),
@@ -2039,7 +2132,9 @@ mod tests {
                     renewal.data.lock().unwrap().in_flight = true;
                 }
 
-                let ss = bootstrap().authenticate_blob(&payload_of(&challenge)).unwrap();
+                let ss = bootstrap()
+                    .authenticate_blob(&payload_of(&challenge))
+                    .unwrap();
                 let blob = auth::encode_blobs(&[
                     AuthBlob::SelfSigned(ss),
                     oidc_blob("https://idp.test", "renewed-id-token", &challenge),
@@ -2049,7 +2144,14 @@ mod tests {
 
                 // Reaching the reauthorize step proves the SS leg's
                 // 150-second-old challenge was NOT rejected as too old.
-                assert!(!asm.peer_table.get(link_id).unwrap().actor_auth.renewal.test_in_flight());
+                assert!(
+                    !asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .actor_auth
+                        .renewal
+                        .test_in_flight()
+                );
                 assert_reached_reauthorize(&asm, link_id);
             })
             .await
@@ -2120,8 +2222,9 @@ mod tests {
                 }
 
                 request_renewal_now(&asm, link_id);
-                let challenge =
-                    request_challenge(&try_recv_egress(&mut egress_rx).expect("request must be sent"));
+                let challenge = request_challenge(
+                    &try_recv_egress(&mut egress_rx).expect("request must be sent"),
+                );
 
                 // Both blobs echo the correct challenge; only the first names
                 // the pinned issuer. The second must not ride along.
@@ -2150,13 +2253,8 @@ mod tests {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
                 let link_id = add_node_peer(&asm);
 
-                receive_renew_response(
-                    &asm,
-                    link_id,
-                    [3u8; 48],
-                    Ok("not-even-base64".to_string()),
-                )
-                .unwrap();
+                receive_renew_response(&asm, link_id, [3u8; 48], Ok("not-even-base64".to_string()))
+                    .unwrap();
 
                 let peer = asm.peer_table.get(link_id).unwrap();
                 assert!(
@@ -2311,7 +2409,14 @@ mod tests {
                 // The agent hangs: hold the request (and its reply sender)
                 // without ever answering.
                 let hung_req = agent_rx.try_recv().expect("agent must be called");
-                assert!(asm.peer_table.get(link_id).unwrap().actor_auth.renewal.test_in_flight());
+                assert!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .actor_auth
+                        .renewal
+                        .test_in_flight()
+                );
 
                 // Well past the bounded attempt timeout, but well short of
                 // the 300 s bridge bound the review flagged.
@@ -2359,16 +2464,19 @@ mod tests {
                 let link_id = add_adapter_peer(&asm);
                 let current_uid = asm.peer_table.get(link_id).unwrap().actor_auth.renewal.uid;
                 let token = |id_token: &str| {
-                    vec![zpr::vsapi_types::AuthBlob::Oidc(zpr::vsapi_types::OidcBlob {
-                        issuer: "https://idp.test".to_string(),
-                        id_token: id_token.to_string(),
-                        nonce: test_identity().nonce,
-                    })]
+                    vec![zpr::vsapi_types::AuthBlob::Oidc(
+                        zpr::vsapi_types::OidcBlob {
+                            issuer: "https://idp.test".to_string(),
+                            id_token: id_token.to_string(),
+                            nonce: test_identity().nonce,
+                        },
+                    )]
                 };
 
                 // A stale task from the closed PREVIOUS occupant of this id
                 // delivers a renewed credential for the old actor.
-                submit_reauthorize(&asm, link_id, current_uid.wrapping_add(1), token("stale")).await;
+                submit_reauthorize(&asm, link_id, current_uid.wrapping_add(1), token("stale"))
+                    .await;
                 {
                     let peer = asm.peer_table.get(link_id).unwrap();
                     assert!(
@@ -2422,7 +2530,9 @@ mod tests {
                 tokio::task::yield_now().await;
                 let req = agent_rx.try_recv().expect("agent must be called");
                 req.reply
-                    .send(Err(AuthFailureReason::IdpUnreachable("refresh failed".to_string())))
+                    .send(Err(AuthFailureReason::IdpUnreachable(
+                        "refresh failed".to_string(),
+                    )))
                     .unwrap();
                 settle(&asm, link_id).await;
                 {

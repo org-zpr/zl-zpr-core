@@ -6,9 +6,7 @@
 #![allow(dead_code)]
 
 use crate::auth_agent::{AuthAgentHandle, AuthFailureReason, OidcCredentialRequest};
-use crate::link_state::{
-    LinkEvent, LinkState,
-};
+use crate::link_state::{LinkEvent, LinkState};
 use crate::logging;
 use crate::logging::{levels, targets};
 use crate::prelude::*;
@@ -1321,8 +1319,7 @@ mod test {
                 );
 
                 // Attempt 2 (challenge B) is now waiting for the user.
-                let attempt_2 =
-                    spawn_produce_evidence(&asm, link_id, challenge_payload(2), handle);
+                let attempt_2 = spawn_produce_evidence(&asm, link_id, challenge_payload(2), handle);
                 assert!(
                     wait_for(5_000, || pending.borrow().len() == 2).await,
                     "agent never saw attempt 2's call"
@@ -1807,7 +1804,13 @@ mod test {
                 let response = request.send().promise.await.unwrap();
                 assert!(
                     matches!(
-                        response.get().unwrap().get_result().unwrap().which().unwrap(),
+                        response
+                            .get()
+                            .unwrap()
+                            .get_result()
+                            .unwrap()
+                            .which()
+                            .unwrap(),
                         cli::success_or_error::Which::Success(_)
                     ),
                     "startLink on an Active link with a rejected actor must succeed"
@@ -1817,7 +1820,10 @@ mod test {
                 let peer = asm.peer_table.get(link_id).unwrap();
                 assert_eq!(peer.link_state_machine.get_state(), LinkState::Active);
                 assert_eq!(peer.actor_auth.last_failure(), None);
-                assert!(!asm.actor_rejected.load(std::sync::atomic::Ordering::Acquire));
+                assert!(
+                    !asm.actor_rejected
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
                 assert_eq!(
                     peer.actor_auth.state(),
                     crate::actor_auth::ActorState::RequestingAuthentication,
@@ -1951,11 +1957,7 @@ mod test {
             Ok(())
         }
         /// The AAA is just another address to this double.
-        fn add_authentication_address(
-            &self,
-            addr: IpAddr,
-            prefix_len: u8,
-        ) -> std::io::Result<()> {
+        fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
             self.add_address(addr, prefix_len)
         }
         fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
@@ -2014,7 +2016,12 @@ mod test {
                 .get(DOCK_LINK_ID)
                 .unwrap()
                 .actor_auth
-                .test_set_addresses(zpr_addr.iter().map(zpr_utils::net_defs::IpAddress::new_from_std).collect());
+                .test_set_addresses(
+                    zpr_addr
+                        .iter()
+                        .map(zpr_utils::net_defs::IpAddress::new_from_std)
+                        .collect(),
+                );
         }
 
         LocalSet::new()

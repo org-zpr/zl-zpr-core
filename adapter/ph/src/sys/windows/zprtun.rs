@@ -23,7 +23,7 @@
 use crate::sys::dad;
 use crate::sys::linux_route;
 use crate::sys::wait::{WaitHandle, Waitable};
-use crate::zprtun::ZprTunError;
+use crate::zprtun::{ZprTunError, effective_tun_mtu};
 use std::net::{IpAddr, Ipv6Addr};
 use std::process::Command;
 use std::sync::Arc;
@@ -119,13 +119,43 @@ impl ZprTun {
         let adapter = wintun::Adapter::create(&wintun, &name, TUNNEL_TYPE, None)?;
         let session = Arc::new(adapter.start_session(RING_CAPACITY)?);
 
-        Ok(vec![ZprTun {
+        let tun = ZprTun {
             _wintun: wintun,
             adapter,
             session,
             name,
             mtx: std::sync::Mutex::new(()),
-        }])
+        };
+        // A Wintun adapter comes up at MTU 65535, far above what the overlay
+        // carries; the adapter is fresh every start, so set it
+        // unconditionally (zl-zipline#214).
+        tun.set_mtu(effective_tun_mtu(None))?;
+        Ok(vec![tun])
+    }
+
+    /// Set the IPv6 MTU of the adapter with
+    /// `netsh interface ipv6 set subinterface <if> mtu=<mtu> store=active`.
+    ///
+    /// `wintun::Adapter::set_mtu` is not used: it sets only the IPv4
+    /// subinterface, and the ZPR overlay is IPv6. `store=active` because
+    /// the adapter is deleted on exit, so nothing should persist. A
+    /// failure is an error: an adapter above the overlay MTU silently drops
+    /// large packets, which is worse than refusing to start
+    /// (zl-zipline#214).
+    fn set_mtu(&self, mtu: u16) -> std::io::Result<()> {
+        let _mtx = self.lock()?;
+        let mtu_arg = format!("mtu={mtu}");
+        let output = self
+            .netsh(&["set", "subinterface", &self.name, &mtu_arg, "store=active"])
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(format!(
+                "netsh failed to set MTU {mtu} on {}: {}",
+                self.name,
+                netsh_output_text(&output)
+            )));
+        }
+        Ok(())
     }
 
     /// Receive one packet from the Wintun ring without blocking.

@@ -10,7 +10,7 @@ use tracing::*;
 
 use crate::logging::targets::NET_OS;
 use crate::sys::linux_route;
-use crate::zprtun::ZprTunError;
+use crate::zprtun::{ZprTunError, tun_mtu_to_apply};
 
 const COMMAND_IP: &str = "/usr/sbin/ip";
 
@@ -78,9 +78,56 @@ impl ZprTun {
             .build()
             .or_else(|e| Err(ZprTunError::PlatformError(e.to_string())))?;
 
-        //let tun_ifname = String::from(tok_tun_devs[0].name());
+        // The MTU belongs to the interface, so one read and at most one set
+        // covers every queue. tokio-tun's own `mtu()` builder option is not
+        // used: it sets the MTU unconditionally, which fails with EPERM when
+        // an unprivileged ph attaches to a pre-provisioned `tun_if`, even
+        // one already at a fitting MTU (zl-zipline#214).
+        let current_mtu = tok_tun_devs[0]
+            .mtu()
+            .map_err(|e| ZprTunError::PlatformError(format!("cannot read TUN MTU: {e}")))?;
+        let current_mtu = u32::try_from(current_mtu).map_err(|_| {
+            ZprTunError::PlatformError(format!("kernel reported invalid TUN MTU {current_mtu}"))
+        })?;
 
-        Ok(tok_tun_devs.into_iter().map(ZprTun::from).collect())
+        let devs: Vec<Self> = tok_tun_devs.into_iter().map(ZprTun::from).collect();
+        if let Some(mtu) = tun_mtu_to_apply(current_mtu) {
+            devs[0].set_mtu(mtu)?;
+        }
+        Ok(devs)
+    }
+
+    /// Set the MTU of this TUN device with `ip link set dev <if> mtu <mtu>`.
+    ///
+    /// Called once at creation (see [`tun_mtu_to_apply`]). A failure is an
+    /// error, not a warning: a device above the overlay MTU silently drops
+    /// large packets, which is worse than refusing to start (zl-zipline#214).
+    fn set_mtu(&self, mtu: u16) -> std::io::Result<()> {
+        let mtx = self
+            .mtx
+            .lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Mutex lock failed"))?;
+        let mut c = Command::new(COMMAND_IP);
+        c.arg("link")
+            .arg("set")
+            .arg("dev")
+            .arg(&self.ifname)
+            .arg("mtu")
+            .arg(mtu.to_string());
+        debug!(target: NET_OS, "{:?}", c);
+        let output = c.output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "{COMMAND_IP} failed to set MTU {mtu} on {}: {}",
+                    self.ifname,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+        drop(mtx);
+        Ok(())
     }
 
     /// The interface name of this TUN device, as the kernel reports it
@@ -408,6 +455,80 @@ mod tests {
         }
     }
 
+    /// Run the test `test_fn` (a function in this module) again in a child
+    /// process inside a fresh `unshare -Ur -n` user+net namespace, where it
+    /// may create TUN devices, and assert that it passed there.
+    ///
+    /// Returns `false` without running anything when the host has no
+    /// `/dev/net/tun` or no unprivileged user+net namespaces, so the caller
+    /// skips. The child sees [`IN_NETNS_ENV`] set and runs the real check.
+    fn run_in_child_netns(test_fn: &str) -> bool {
+        if !Path::new("/dev/net/tun").exists() {
+            eprintln!("SKIP: /dev/net/tun is not available");
+            return false;
+        }
+        match Command::new("unshare").args(["-Ur", "-n", "true"]).status() {
+            Ok(status) if status.success() => {}
+            other => {
+                eprintln!("SKIP: unprivileged user+net namespaces are not available: {other:?}");
+                return false;
+            }
+        }
+
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let name = format!("{module}::{test_fn}");
+        let exe = std::env::current_exe().expect("current_exe");
+        let out = Command::new("unshare")
+            .args(["-Ur", "-n"])
+            .arg(exe)
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(IN_NETNS_ENV, "1")
+            .output()
+            .expect("run the test in unshare -Ur -n");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "namespaced child failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
+            out.status
+        );
+        true
+    }
+
+    /// True in the child process that [`run_in_child_netns`] started.
+    fn in_child_netns() -> bool {
+        std::env::var_os(IN_NETNS_ENV).is_some()
+    }
+
+    /// The kernel's current MTU of interface `ifname`, from
+    /// `ip -o link show` (sysfs would show the host namespace's interfaces,
+    /// since `unshare -n` does not remount /sys).
+    fn interface_mtu(ifname: &str) -> u32 {
+        let out = Command::new(COMMAND_IP)
+            .args(["-o", "link", "show", "dev", ifname])
+            .output()
+            .expect("run ip link show");
+        assert!(out.status.success(), "ip link show {ifname} failed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut words = text.split_whitespace();
+        words
+            .find(|w| *w == "mtu")
+            .and_then(|_| words.next())
+            .expect("no mtu in ip link show output")
+            .parse()
+            .expect("parse the interface MTU")
+    }
+
+    /// Run `ip <args>` in the test namespace and assert that it succeeded.
+    fn ip(args: &[&str]) {
+        let status = Command::new(COMMAND_IP)
+            .args(args)
+            .status()
+            .expect("run ip");
+        assert!(status.success(), "ip {args:?} failed: {status}");
+    }
+
     /// The device ph opens must deliver the 4-byte packet-information
     /// header iff ph's framing expects it (`zprtun::TUN_HAS_PI`). tokio-tun
     /// 0.15 sets IFF_NO_PI unless the builder asks for packet info, and only
@@ -415,7 +536,7 @@ mod tests {
     /// namespace and reads a packet from it (zipline#204).
     #[tokio::test]
     async fn tun_builder_packet_info_matches_tun_has_pi() {
-        if std::env::var_os(IN_NETNS_ENV).is_some() {
+        if in_child_netns() {
             let packet_info = device_delivers_packet_info().await;
             assert_eq!(
                 packet_info,
@@ -426,38 +547,7 @@ mod tests {
             );
             return;
         }
-
-        if !Path::new("/dev/net/tun").exists() {
-            eprintln!("SKIP: /dev/net/tun is not available");
-            return;
-        }
-        match Command::new("unshare").args(["-Ur", "-n", "true"]).status() {
-            Ok(status) if status.success() => {}
-            other => {
-                eprintln!("SKIP: unprivileged user+net namespaces are not available: {other:?}");
-                return;
-            }
-        }
-
-        // Run this same test in a child inside a fresh user+net namespace.
-        let module = module_path!();
-        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-        let name = format!("{module}::tun_builder_packet_info_matches_tun_has_pi");
-        let exe = std::env::current_exe().expect("current_exe");
-        let out = Command::new("unshare")
-            .args(["-Ur", "-n"])
-            .arg(exe)
-            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-            .env(IN_NETNS_ENV, "1")
-            .output()
-            .expect("run the test in unshare -Ur -n");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success() && stdout.contains("test result: ok. 1 passed"),
-            "namespaced child failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
-            out.status
-        );
+        run_in_child_netns("tun_builder_packet_info_matches_tun_has_pi");
     }
 
     /// The interface name ph opened must be reported back unchanged, both by
@@ -467,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn configured_tun_name_round_trips() {
         const IFNAME: &str = "zpr202test";
-        if std::env::var_os(IN_NETNS_ENV).is_some() {
+        if in_child_netns() {
             let devs = ZprTun::new_mq(Some(IFNAME.to_string()), 1, None)
                 .expect("open a TUN device in the test namespace");
             assert_eq!(devs.len(), 1);
@@ -477,36 +567,49 @@ mod tests {
             assert_eq!(crate::tun_ctl::TunCtl::name(&tun_ctl), IFNAME);
             return;
         }
+        run_in_child_netns("configured_tun_name_round_trips");
+    }
 
-        if !Path::new("/dev/net/tun").exists() {
-            eprintln!("SKIP: /dev/net/tun is not available");
+    /// zl-zipline#214: a TUN device ph creates comes up at the kernel
+    /// default of 1500, above the overlay's 1480-byte limit, and packets
+    /// over the limit are dropped without an ICMPv6 Packet Too Big. ph must
+    /// lower it to `DEFAULT_TUN_MTU`.
+    #[tokio::test]
+    async fn new_tun_gets_overlay_mtu() {
+        const IFNAME: &str = "zpr214new";
+        if in_child_netns() {
+            let _devs = ZprTun::new_mq(Some(IFNAME.to_string()), 2, None)
+                .expect("open a TUN device in the test namespace");
+            assert_eq!(
+                interface_mtu(IFNAME),
+                u32::from(crate::zprtun::DEFAULT_TUN_MTU)
+            );
             return;
         }
-        match Command::new("unshare").args(["-Ur", "-n", "true"]).status() {
-            Ok(status) if status.success() => {}
-            other => {
-                eprintln!("SKIP: unprivileged user+net namespaces are not available: {other:?}");
-                return;
-            }
-        }
+        run_in_child_netns("new_tun_gets_overlay_mtu");
+    }
 
-        let module = module_path!();
-        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-        let name = format!("{module}::configured_tun_name_round_trips");
-        let exe = std::env::current_exe().expect("current_exe");
-        let out = Command::new("unshare")
-            .args(["-Ur", "-n"])
-            .arg(exe)
-            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
-            .env(IN_NETNS_ENV, "1")
-            .output()
-            .expect("run the test in unshare -Ur -n");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success() && stdout.contains("test result: ok. 1 passed"),
-            "namespaced child failed ({}):\n--- stdout\n{stdout}\n--- stderr\n{stderr}",
-            out.status
-        );
+    /// zl-zipline#214: a pre-provisioned TUN whose operator chose an MTU
+    /// below the overlay MTU keeps it; ph only ever lowers the MTU.
+    #[tokio::test]
+    async fn preprovisioned_smaller_mtu_is_kept() {
+        const IFNAME: &str = "zpr214pre";
+        if in_child_netns() {
+            ip(&[
+                "tuntap",
+                "add",
+                "name",
+                IFNAME,
+                "mode",
+                "tun",
+                "multi_queue",
+            ]);
+            ip(&["link", "set", IFNAME, "mtu", "1300"]);
+            let _devs = ZprTun::new_mq(Some(IFNAME.to_string()), 2, None)
+                .expect("attach to the pre-provisioned TUN device");
+            assert_eq!(interface_mtu(IFNAME), 1300);
+            return;
+        }
+        run_in_child_netns("preprovisioned_smaller_mtu_is_kept");
     }
 }

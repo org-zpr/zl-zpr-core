@@ -23,9 +23,6 @@ pub const DEFAULT_TUN_MTU: u16 = 1400;
 /// and unit-tested from any host. macOS applies it at creation; Linux goes
 /// through [`tun_mtu_to_apply`]; Windows sets it on the fresh Wintun
 /// adapter (zl-zipline#214).
-// Windows uses this from the Wintun arm (plan p12 t30); until then it is
-// dead code there.
-#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub fn effective_tun_mtu(requested: Option<u16>) -> u16 {
     requested.unwrap_or(DEFAULT_TUN_MTU)
 }

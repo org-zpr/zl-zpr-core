@@ -80,6 +80,11 @@ pub struct Assembly {
 
     pub visa_table: std::sync::RwLock<visa_table::VisaTable>, // Only for nodes
 
+    /// The links the visa service last pushed with `setTopology`. Its
+    /// `peer_cn`s are the peers this Zode accepts on Zode links
+    /// (zl-zipline#220); NodeToNode link start (#222) reads it too.
+    pub topology: std::sync::RwLock<Vec<zpr::vsapi_types::Link>>,
+
     // Used to intercept packets that are unencrypted but still have ZDP headers
     pub capture_queue: Capture,
     pub capture_worker: CaptureWorker,
@@ -165,6 +170,20 @@ pub enum SelfAddressError {
 }
 
 impl Assembly {
+    /// Is `cn` the certificate CN of a peer this Zode was told to link with
+    /// (zl-zipline#220)? True only for a non-empty CN that equals some
+    /// `peer_cn` in the stored topology; an empty `peer_cn` (a sender that
+    /// predates peerCn) matches nothing. #222 adds configured initial links.
+    pub fn peer_cn_allowed(&self, cn: &str) -> bool {
+        !cn.is_empty()
+            && self
+                .topology
+                .read()
+                .unwrap()
+                .iter()
+                .any(|link| link.peer_cn == cn)
+    }
+
     pub fn get_uptime(&self) -> std::time::Duration {
         std::time::Instant::now().duration_since(self.system_start_time)
     }
@@ -1494,6 +1513,7 @@ pub mod test {
             actor_output_requeue,
             vsconn,
             visa_table,
+            topology: Default::default(),
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
             deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),

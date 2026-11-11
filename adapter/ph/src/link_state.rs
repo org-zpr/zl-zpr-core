@@ -626,6 +626,19 @@ impl LinkStateWrapper {
             }
         }
 
+        // zl-zipline#220: a Zode link must lead to a peer this Zode was told
+        // to link with; anything else is closed before Hello.
+        if self.link_type == LinkType::NodeToNode {
+            let peer_cn = peer_state.verified_peer_cn();
+            if !peer_cn.as_deref().is_some_and(|cn| asm.peer_cn_allowed(cn)) {
+                warn!(target: LINK_STATE, "{} peer certificate CN {peer_cn:?} is not in this Zode's topology; closing", asm.formatted_link_id(link_id));
+                drop(sa);
+                drop(peer_state);
+                drop(locked_fsm);
+                return self.initiate_close(asm, TerminateReason::Reset);
+            }
+        }
+
         debug!(target: LINK_STATE, "{} finished keying.  Starting hello", asm.formatted_link_id(link_id));
 
         locked_fsm.set_state(LinkState::Helloing);
@@ -1276,6 +1289,32 @@ impl Display for LinkData {
     }
 }
 
+/// Close every keyed Zode link whose verified peer CN this Zode no longer
+/// expects (zl-zipline#220). Called after each topology update, so removing
+/// a Zode from the topology ends its links without a revocation list.
+pub fn close_zode_links_outside_topology(asm: &Arc<Assembly>) {
+    let mut to_close = Vec::new();
+    asm.peer_table.for_each(|(link_id, peer)| {
+        let fsm = &peer.link_state_machine;
+        if fsm.get_link_type() == LinkType::NodeToNode
+            && matches!(fsm.get_state(), LinkState::Helloing | LinkState::Active)
+            && !peer
+                .verified_peer_cn()
+                .is_some_and(|cn| asm.peer_cn_allowed(&cn))
+        {
+            to_close.push(link_id.get());
+        }
+    });
+    for link_id in to_close {
+        warn!(target: LINK_STATE, "{} peer left this Zode's topology; closing", asm.formatted_link_id(link_id));
+        if let Err(e) =
+            asm.process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Reset))
+        {
+            warn!(target: LINK_STATE, "{} close after topology update failed: {e}", asm.formatted_link_id(link_id));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1538,6 +1577,63 @@ mod tests {
             config: Some(rcu::RcuBox::new(cfg)),
             ..TestAssemblyBuilder::new()
         }))
+    }
+
+    /// A keyable assembly whose stored topology names `peer_cns` (zl-zipline#220).
+    fn zode_assembly(peer_cns: &[&str]) -> Arc<Assembly> {
+        use crate::peer_table::test::topology_link;
+        let asm = keyable_assembly(true);
+        *asm.topology.write().unwrap() = peer_cns.iter().map(|cn| topology_link(cn)).collect();
+        asm
+    }
+
+    /// zl-zipline#220: a Zode link whose verified certificate CN is not in
+    /// this Zode's topology is closed at KeyingDone and never says Hello.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_link_cn_outside_topology_is_closed_at_keying_done() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = zode_assembly(&["relay.zpr"]);
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "stranger.zpr",
+                    LinkState::Keying,
+                );
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+            })
+            .await
+    }
+
+    /// zl-zipline#220: a Zode link whose verified CN is in the topology
+    /// proceeds to Hello.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_link_cn_in_topology_proceeds_to_hello() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = zode_assembly(&["relay.zpr"]);
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "relay.zpr",
+                    LinkState::Keying,
+                );
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+            })
+            .await
+    }
+
+    /// zl-zipline#220: an empty `peer_cn` (a sender that predates peerCn)
+    /// never authorises a peer, and neither does an empty certificate CN.
+    #[tokio::test]
+    async fn test_empty_peer_cn_never_matches() {
+        let asm = zode_assembly(&[""]);
+        assert!(!asm.peer_cn_allowed(""));
+        let asm = zode_assembly(&["relay.zpr"]);
+        assert!(asm.peer_cn_allowed("relay.zpr"));
+        assert!(!asm.peer_cn_allowed(""));
     }
 
     /// The current FSM state of `link_id`.

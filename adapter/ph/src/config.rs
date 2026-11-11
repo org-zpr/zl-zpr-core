@@ -238,6 +238,13 @@ pub struct Config {
     /// on a link is `min(this, remaining_lifetime / 2)`.
     pub auth_renewal_lead: std::time::Duration,
 
+    /// Node only — whether this node carries other nodes' traffic, that is,
+    /// accepts forward-only visas (zl-zipline#219, Zodes plan §5.7, §5.9).
+    /// Off by default: with it off, a forward-only visa from the visa
+    /// service is refused and logged. Configured via `forwarding` in the
+    /// `[node]` config section or `ph node --forwarding`.
+    pub forwarding: bool,
+
     /// Security testing for A2A Pubkeys
     #[cfg(feature = "enable-security-testing")]
     pub security_testing_mangle_forwarded_pings: bool,
@@ -600,6 +607,9 @@ impl Config {
             if let Some(lead_seconds) = config.auth_renewal_lead_seconds {
                 self.auth_renewal_lead = std::time::Duration::from_secs(lead_seconds);
             }
+            if let Some(forwarding) = config.forwarding {
+                self.forwarding = forwarding;
+            }
         }
         Ok(())
     }
@@ -724,6 +734,7 @@ impl Default for Config {
             socket_owner: None,
             control_path_derived: true,
             auth_renewal_lead: DEFAULT_AUTH_RENEWAL_LEAD,
+            forwarding: false,
             #[cfg(feature = "enable-security-testing")]
             security_testing_mangle_forwarded_pings: false,
             #[cfg(feature = "enable-security-testing")]
@@ -766,6 +777,10 @@ pub struct NodeConfigSection {
     /// How far ahead of an actor's authentication expiry the node starts
     /// attempting silent renewal, in seconds (zipline#45). Default 300.
     pub auth_renewal_lead_seconds: Option<u64>,
+
+    /// Whether this node accepts forward-only visas, i.e. carries other
+    /// nodes' traffic (zl-zipline#219). Default false. A relay sets it.
+    pub forwarding: Option<bool>,
 }
 
 // Global section is shared by nodes and adapters.
@@ -1065,6 +1080,25 @@ mod test {
         let mut config = Config::default();
         config.set_from_node(&file_config.node).unwrap();
         assert_eq!(config.auth_renewal_lead, DEFAULT_AUTH_RENEWAL_LEAD);
+    }
+
+    /// `forwarding` in the `[node]` section turns on forward-only visas;
+    /// absent, forwarding stays off (zl-zipline#219).
+    #[test]
+    fn test_node_config_forwarding() {
+        assert!(!Config::default().forwarding);
+
+        let parse = |node_section: &str| {
+            let toml_str =
+                format!("[global]\nself_addr = \"10.0.0.1:5000\"\n\n[node]\n{node_section}\n");
+            let file_config: NodeConfig = toml::from_str(&toml_str).unwrap();
+            let mut config = Config::default();
+            config.set_from_node(&file_config.node).unwrap();
+            config.forwarding
+        };
+        assert!(parse("forwarding = true"));
+        assert!(!parse("forwarding = false"));
+        assert!(!parse("auth_renewal_lead_seconds = 60"));
     }
 
     #[test]

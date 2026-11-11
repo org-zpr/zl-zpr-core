@@ -89,6 +89,7 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             config_file,
             auth_private_key,
             advertised_substrate_addr,
+            forwarding,
             common,
         } => {
             ph_mode = PhMode::Node;
@@ -113,6 +114,11 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             // Command line overrides the config file.
             if let Some(advertised) = advertised_substrate_addr {
                 config.set_advertised_substrate_addr(&advertised)?;
+            }
+            // An omitted flag preserves the config file value (or the
+            // default, false).
+            if let Some(forwarding) = forwarding {
+                config.forwarding = forwarding;
             }
         }
     }
@@ -934,6 +940,48 @@ mod test {
             }
             other => panic!("expected ParseError, got: {:?}", other),
         }
+    }
+
+    // CLI --forwarding wins over [node] forwarding in either direction, and an
+    // omitted flag keeps the config file value (zl-zipline#219).
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_node_forwarding_cli_overrides_config() {
+        let ca_file = TempFile::touch();
+        let cert_file = TempFile::touch();
+        let pk_file = TempFile::touch();
+
+        let tomltxt = r#"
+        [global]
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
+        control_path = "/tmp/control.sock"
+        self_addr = "10.0.0.1:12345"
+        zpr_addr = [ "10.0.0.1" ]
+
+        [node]
+        forwarding = true
+        "#
+        .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
+        .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
+        .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
+        let tmpfile = TempFile::new_toml(&tomltxt);
+        let config_path = tmpfile.get_path().to_str().unwrap();
+
+        let (_, config) = argparse(Some(vec!["ph", "node", "-c", config_path])).unwrap();
+        assert!(config.forwarding, "the config file turns forwarding on");
+
+        let (_, config) = argparse(Some(vec![
+            "ph",
+            "node",
+            "-c",
+            config_path,
+            "--forwarding",
+            "false",
+        ]))
+        .unwrap();
+        assert!(!config.forwarding, "--forwarding false overrides the file");
     }
 
     #[test]

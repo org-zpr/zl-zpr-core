@@ -36,6 +36,8 @@ pub enum VisaTableError {
     DestNotFound(IpAddress),
     #[error("Failed to insert visa into table")]
     InsertError,
+    #[error("Visa {0} is forward-only and forwarding is off on this node")]
+    ForwardingDisabled(VisaId),
 }
 
 /// Struct that holds an instance of a visa local to a Node
@@ -44,7 +46,12 @@ pub struct Visa {
     // TODO add methods so that these don't have to be made pub
     pub visa: vsapi_types::Visa,
     streams: Vec<ForwardingEntry>,
-    pub ftuple: VsapiFiveTuple,
+    /// The flow the visa admits, from its dock PEP. `None` for a
+    /// forward-only visa, which has no dock PEP: it only carries an
+    /// already-bound stream from one node link to the next, so it must
+    /// never match a new flow (zl-zipline#219).
+    pub ftuple: Option<VsapiFiveTuple>,
+    /// The forwarding PEP's next hop, or UNSPECIFIED if the visa has none.
     pub next_hop: IpAddress,
 }
 
@@ -89,22 +96,43 @@ impl PartialEq for VisaTimeout {
 impl Eq for VisaTimeout {}
 
 impl Visa {
-    pub fn new(visa: vsapi_types::Visa) -> Self {
-        if visa.visa_type != vsapi_types::VisaType::Full {
-            panic!("Forward only visas not yet supported")
-        }
-        let ftuple = visa.dock_pep.as_ref().unwrap().get_five_tuple();
+    /// Wrap a visa from the visa service, checking that its shape matches
+    /// its type. The visa service is a trust boundary, so a malformed visa
+    /// is an error, never a panic:
+    ///
+    /// - a full visa must have a dock PEP; its forwarding PEP is optional
+    ///   (an ingress node has one, an egress node does not);
+    /// - a forward-only visa must have no dock PEP, and a forwarding PEP
+    ///   with a specified next hop.
+    pub fn new(visa: vsapi_types::Visa) -> Result<Self, VisaTableError> {
+        let ftuple = match visa.visa_type {
+            vsapi_types::VisaType::Full => {
+                let Some(dock_pep) = visa.dock_pep.as_ref() else {
+                    return Err(VisaTableError::ParseError("dock_pep"));
+                };
+                Some(dock_pep.get_five_tuple())
+            }
+            vsapi_types::VisaType::ForwardOnly => {
+                if visa.dock_pep.is_some() {
+                    return Err(VisaTableError::ParseError("dock_pep"));
+                }
+                match visa.fwd_pep.as_ref() {
+                    Some(fwd_pep) if !fwd_pep.next_hop.is_unspecified() => None,
+                    _ => return Err(VisaTableError::ParseError("fwd_pep")),
+                }
+            }
+        };
         let next_hop = visa
             .fwd_pep
             .as_ref()
             .map(|p| p.next_hop.into())
             .unwrap_or_default();
-        Self {
+        Ok(Self {
             visa,
             streams: Vec::new(),
             ftuple,
             next_hop,
-        }
+        })
     }
 
     /// Remove all forwarding entries associated with this visa.
@@ -142,15 +170,17 @@ impl Visa {
     //
     // Visa may have wildcards.  Eg, a visa with zero for a source port will match
     // any traffic five_tuple source port value.
+    //
+    // A forward-only visa matches no traffic.
     pub fn match_traffic(&self, five_tuple: &FiveTuple) -> bool {
-        self.get_tc().classify_5t(five_tuple)
+        self.get_tc().is_some_and(|tc| tc.classify_5t(five_tuple))
     }
 
-    pub fn get_tc(&self) -> tc::Ip5TupleTc {
-        if self.visa.visa_type != vsapi_types::VisaType::Full {
-            panic!("Forward only visas not yet supported")
-        }
-        tc::Ip5TupleTc::new(self.visa.dock_pep.as_ref().unwrap().get_five_tuple().into())
+    /// The traffic classifier for the flow this visa admits, which an
+    /// adapter needs to bind it. `None` for a forward-only visa: it has no
+    /// flow, so it can only join two node links.
+    pub fn get_tc(&self) -> Option<tc::Ip5TupleTc> {
+        self.ftuple.map(|ftuple| tc::Ip5TupleTc::new(ftuple.into()))
     }
 
     /// Get the ingress A2A DH public key from the visa, if present.
@@ -181,12 +211,6 @@ impl Visa {
             }
             None => false,
         }
-    }
-}
-
-impl HasFiveTuple for Visa {
-    fn get_five_tuple(&self) -> VsapiFiveTuple {
-        self.ftuple
     }
 }
 
@@ -259,8 +283,7 @@ impl VisaTable {
             .insert_visa(vs2node)
             .expect("Failed to insert visa->node visa into table");
 
-        visa_table.lookup_table = FiveTupleLookupTable::new();
-        visa_table.lookup_table.add_hash_to_table(&visa_table.table);
+        visa_table.rebuild_lookup_table();
 
         visa_table
     }
@@ -272,19 +295,22 @@ impl VisaTable {
         let expiration = DateTime::from(visa.expires);
 
         info!(target: VISA_MGMT,
-            "Visa inserted into VisaTable ID: {visa_id}, Expiration: {}",
-            expiration.format("%y-%m-%d %H:%M:%S"));
+            "Visa inserted into VisaTable ID: {visa_id}, Type: {:?}, Expiration: {}",
+            visa.visa_type, expiration.format("%y-%m-%d %H:%M:%S"));
 
-        let visa = Visa::new(visa);
+        let visa = Visa::new(visa)?;
 
         let timeout = VisaTimeout {
             id: visa_id,
             expiration: expiration,
         };
-        let _ = self.table.insert(visa_id, visa.clone());
+        // Only a visa with a five-tuple goes in the lookup table: a
+        // forward-only visa must never match a new flow.
+        if let Some(ftuple) = visa.ftuple {
+            self.lookup_table.insert_visa(visa_id, ftuple);
+        }
+        let _ = self.table.insert(visa_id, visa);
         self.timeout_queue.push(timeout);
-
-        self.lookup_table.insert_visa(visa_id, visa);
 
         Ok(visa_id)
     }
@@ -324,8 +350,7 @@ impl VisaTable {
         let withdrawn = self
             .revoke_no_rebuild(peer_table, visa_id)
             .unwrap_or_default();
-        self.lookup_table = FiveTupleLookupTable::new();
-        self.lookup_table.add_hash_to_table(&self.table);
+        self.rebuild_lookup_table();
 
         Ok(withdrawn)
     }
@@ -357,8 +382,7 @@ impl VisaTable {
                 withdrawn.extend(entries);
             }
         }
-        self.lookup_table = FiveTupleLookupTable::new();
-        self.lookup_table.add_hash_to_table(&self.table);
+        self.rebuild_lookup_table();
         withdrawn
     }
 
@@ -416,10 +440,23 @@ impl VisaTable {
                     withdrawn.extend(entries);
                 }
             }
-            self.lookup_table = FiveTupleLookupTable::new();
-            self.lookup_table.add_hash_to_table(&self.table);
+            self.rebuild_lookup_table();
         }
         withdrawn
+    }
+
+    /// Rebuild the five-tuple lookup table from the visas in the table.
+    ///
+    /// Only visas with a five-tuple are added: a forward-only visa has none
+    /// and must never match a new flow (zl-zipline#219).
+    fn rebuild_lookup_table(&mut self) {
+        let five_tuples: HashMap<VisaId, VsapiFiveTuple> = self
+            .table
+            .iter()
+            .filter_map(|(visa_id, visa)| visa.ftuple.map(|ftuple| (*visa_id, ftuple)))
+            .collect();
+        self.lookup_table = FiveTupleLookupTable::new();
+        self.lookup_table.add_hash_to_table(&five_tuples);
     }
 
     fn revoke_no_rebuild(
@@ -443,11 +480,15 @@ impl VisaTable {
             .get(&visa_id)
             .ok_or(VisaTableError::NotFound(visa_id))?;
 
-        if visa.next_hop == IpAddress::UNSPECIFIED {
-            Ok(IpAddress::from(visa.ftuple.dest_addr.clone()))
-        } else {
-            Ok(visa.next_hop)
+        if visa.next_hop != IpAddress::UNSPECIFIED {
+            return Ok(visa.next_hop);
         }
+        // No forwarding PEP: the flow ends at its destination. `Visa::new`
+        // guarantees a forward-only visa has a next hop, so only a full
+        // visa (which always has a five-tuple) gets here.
+        visa.ftuple
+            .map(|ftuple| IpAddress::from(ftuple.dest_addr))
+            .ok_or(VisaTableError::ParseError("fwd_pep"))
     }
 
     pub fn unlink_forwarding_entry(
@@ -538,6 +579,198 @@ pub mod tests {
             vsapi_types::KeySet::default(),
             None,
         )
+    }
+
+    /// Create a forward-only vsapi_types::Visa, as the visa service issues to
+    /// an intermediary node on a path: no dock PEP, and a forwarding PEP
+    /// naming the next node (zl-zipline#219).
+    pub fn new_vsapi_visa_forward_only(
+        issuer_id: u64,
+        expires: SystemTime,
+        next_hop: IpAddr,
+    ) -> vsapi_types::Visa {
+        vsapi_types::Visa {
+            issuer_id,
+            config: 1,
+            expires,
+            visa_type: vsapi_types::VisaType::ForwardOnly,
+            dock_pep: None,
+            fwd_pep: Some(vsapi_types::FwdPep {
+                next_hop,
+                style: vsapi_types::FwdPepStyle::OneWay,
+            }),
+            cons: None,
+        }
+    }
+
+    /// A ZPR address used as the next hop of forward-only visas in tests.
+    fn next_hop_addr() -> IpAddr {
+        "fd5a:5052:8::99".parse().unwrap()
+    }
+
+    /// A five-tuple for a TCP flow, used to probe the lookup table.
+    fn tcp_tuple(src: &str, dst: &str, dst_port: u16) -> FiveTuple {
+        FiveTuple {
+            src_address: IpAddress::new_from_std_v6(&src.parse().unwrap()),
+            dst_address: IpAddress::new_from_std_v6(&dst.parse().unwrap()),
+            l3_type: L3Type::Ipv6,
+            l4_protocol: ip_number::TCP,
+            src_port: 20345,
+            dst_port,
+        }
+    }
+
+    /// Add a dummy peer to the assembly's peer table and return its link ID.
+    fn add_dummy_peer(asm: &Assembly, last_octet: u8) -> LinkId {
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let key = entry.key();
+        entry
+            .insert(create_dummy_peer_state(
+                key,
+                LinkType::Internal,
+                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, last_octet)), 443),
+                net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 4, last_octet)),
+            ))
+            .get()
+    }
+
+    /// Insert a full TCP visa client -> service:80 that the lookup table
+    /// must keep matching while forward-only visas come and go.
+    fn insert_full_visa(visa_table: &mut VisaTable, visa_id: u64) -> FiveTuple {
+        let client: Ipv6Addr = "fd5a:5052:8::1".parse().unwrap();
+        let service: Ipv6Addr = "fd5a:5052:8::10".parse().unwrap();
+        let expires_ms = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+            + Duration::from_secs(3600))
+        .as_millis() as i64;
+        let visa = make_tcp_visa(visa_id, &client, 0, &service, 80, 100, expires_ms);
+        visa_table.insert_visa(visa).unwrap();
+        tcp_tuple("fd5a:5052:8::1", "fd5a:5052:8::10", 80)
+    }
+
+    /// A forward-only visa is stored and resolves to its forwarding PEP's
+    /// next hop, but it has no five-tuple, so it must never match a new
+    /// flow -- not even one that would match an all-wildcard visa.
+    #[test]
+    fn test_forward_only_visa_is_stored_but_never_matches_traffic() {
+        let mut visa_table = VisaTable::new();
+        let visa_id = visa_table
+            .insert_visa(new_vsapi_visa_forward_only(
+                5000,
+                never_expires(),
+                next_hop_addr(),
+            ))
+            .expect("a well-formed forward-only visa must be accepted");
+
+        assert!(visa_table.table.contains_key(&visa_id));
+        assert_eq!(
+            visa_table.get_visa_next_hop_addr(visa_id).unwrap(),
+            IpAddress::new_from_std(&next_hop_addr())
+        );
+        assert_eq!(visa_table.match_traffic(&FiveTuple::default()), None);
+        assert_eq!(
+            visa_table.match_traffic(&tcp_tuple("fd5a:5052:8::1", "fd5a:5052:8::99", 80)),
+            None
+        );
+        assert!(visa_table.table[&visa_id].get_tc().is_none());
+    }
+
+    /// Revocation, expiry and link loss remove a forward-only visa and
+    /// withdraw its forwarding entries. Each removal rebuilds the lookup
+    /// table, which must still match the surviving full visa.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_forward_only_visa_removal_paths() {
+        let mut builder = TestAssemblyBuilder::new();
+        builder.visa_table = Some(VisaTable::new());
+        let asm = Arc::new(create_assembly(builder));
+        let link_a = add_dummy_peer(&asm, 1);
+        let peer_a = asm.peer_table.get(link_a).unwrap();
+        let mut visa_table = asm.visa_table.write().unwrap();
+        let full_tuple = insert_full_visa(&mut visa_table, 4000);
+
+        // Insert a forward-only visa with one forwarding entry on link A.
+        let mut add_fwd_only = |visa_id: VisaId, expires: SystemTime| {
+            visa_table
+                .insert_visa(new_vsapi_visa_forward_only(
+                    visa_id,
+                    expires,
+                    next_hop_addr(),
+                ))
+                .unwrap();
+            let tether = peer_a
+                .pft
+                .insert(PftPep {
+                    next_hop: ForwardingEntry(link_a, 1),
+                    visa_id,
+                })
+                .unwrap();
+            visa_table
+                .link_forwarding_entry(visa_id, ForwardingEntry(link_a, tether))
+                .unwrap();
+            tether
+        };
+        let tether_revoked = add_fwd_only(5001, never_expires());
+        let _ = add_fwd_only(5002, ALREADY_EXPIRED);
+        let _ = add_fwd_only(5003, never_expires());
+        assert_eq!(peer_a.pft.len(), 3);
+
+        // Revocation returns the withdrawn entry.
+        let withdrawn = visa_table.revoke(&asm.peer_table, 5001).unwrap();
+        assert!(withdrawn == vec![ForwardingEntry(link_a, tether_revoked)]);
+        assert!(!visa_table.table.contains_key(&5001));
+        assert_eq!(visa_table.match_traffic(&full_tuple), Some(4000));
+
+        // Expiry.
+        visa_table.handle_expirations(&asm.peer_table);
+        assert!(!visa_table.table.contains_key(&5002));
+        assert_eq!(visa_table.match_traffic(&full_tuple), Some(4000));
+
+        // Link loss.
+        visa_table.revoke_for_link(link_a, &asm.peer_table);
+        assert!(!visa_table.table.contains_key(&5003));
+        assert_eq!(visa_table.match_traffic(&full_tuple), Some(4000));
+        assert_eq!(peer_a.pft.len(), 0);
+    }
+
+    /// A visa whose shape does not match its type is refused with an error,
+    /// never a panic: these come from the visa service, a trust boundary.
+    #[test]
+    fn test_malformed_visas_are_refused() {
+        let mut visa_table = VisaTable::new();
+
+        let mut full_without_dock = new_vsapi_visa_tcp_default(6001, never_expires());
+        full_without_dock.dock_pep = None;
+
+        let mut fwd_only_without_fwd =
+            new_vsapi_visa_forward_only(6002, never_expires(), next_hop_addr());
+        fwd_only_without_fwd.fwd_pep = None;
+
+        let fwd_only_unspecified_next_hop =
+            new_vsapi_visa_forward_only(6003, never_expires(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+
+        let mut fwd_only_with_dock = new_vsapi_visa_tcp_default(6004, never_expires());
+        fwd_only_with_dock.visa_type = vsapi_types::VisaType::ForwardOnly;
+        fwd_only_with_dock.fwd_pep = Some(vsapi_types::FwdPep {
+            next_hop: next_hop_addr(),
+            style: vsapi_types::FwdPepStyle::OneWay,
+        });
+
+        for visa in [
+            full_without_dock,
+            fwd_only_without_fwd,
+            fwd_only_unspecified_next_hop,
+            fwd_only_with_dock,
+        ] {
+            let id = visa.issuer_id;
+            assert!(
+                matches!(
+                    visa_table.insert_visa(visa),
+                    Err(VisaTableError::ParseError(_))
+                ),
+                "visa {id} must be refused"
+            );
+        }
+        assert!(visa_table.table.is_empty());
+        assert!(visa_table.timeout_queue.is_empty());
     }
 
     #[test]

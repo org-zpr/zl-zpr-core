@@ -235,24 +235,49 @@ pub async fn actor_disconnect(asm: Arc<Assembly>, addr: IpAddress) {
 /// a policy-declared peer node that has not linked up yet -- and the egress
 /// link is resolved again at forwarding time (see [get_egress_link_for_visa]),
 /// so the visa becomes usable once the link comes up.
+///
+/// A forward-only visa makes this node carry other nodes' traffic. It is
+/// refused with [VisaTableError::ForwardingDisabled], and logged, unless the
+/// node's `forwarding` setting is on (zl-zipline#219, Zodes plan §5.9). The
+/// visa service's non-transit routing is the primary check; this one is
+/// defence in depth, and it catches a misconfigured relay early.
+///
+/// This is the single entry point for visas from the visa service, pushed or
+/// pulled. A visa whose shape does not match its type is refused with
+/// [VisaTableError::ParseError].
+///
+/// [VisaTableError::ForwardingDisabled]: visa_table::VisaTableError::ForwardingDisabled
+/// [VisaTableError::ParseError]: visa_table::VisaTableError::ParseError
 pub fn insert_visa(
     asm: &Assembly,
     visa: vsapi_types::Visa,
 ) -> Result<VisaId, visa_table::VisaTableError> {
-    if visa.visa_type != vsapi_types::VisaType::Full {
-        panic!("Forward only visas not yet supported")
-    }
-    let dest_addr = visa.dock_pep.as_ref().unwrap().dest_addr;
+    // The forwarding PEP's next hop if there is one, else the flow's
+    // destination. Either may be missing in a malformed visa, which the
+    // visa table refuses below.
     let next_hop = visa
         .fwd_pep
         .as_ref()
         .map(|p| p.next_hop)
-        .unwrap_or(dest_addr);
-    if asm.find_egress_link(next_hop.into()).is_none() {
+        .or_else(|| visa.dock_pep.as_ref().map(|d| d.dest_addr));
+
+    if visa.visa_type == vsapi_types::VisaType::ForwardOnly && !asm.config.get().forwarding {
         warn!(target: VISA_MGMT,
-            "visa {}: no egress link to next hop {next_hop} yet; storing it anyway", visa.issuer_id);
+            "visa {}: refusing forward-only visa to next hop {next_hop:?}: forwarding is off on this node",
+            visa.issuer_id);
+        return Err(visa_table::VisaTableError::ForwardingDisabled(
+            visa.issuer_id,
+        ));
     }
+
     let visa_id = asm.visa_table.write().unwrap().insert_visa(visa)?;
+
+    if let Some(next_hop) = next_hop
+        && asm.find_egress_link(next_hop.into()).is_none()
+    {
+        warn!(target: VISA_MGMT,
+            "visa {visa_id}: no egress link to next hop {next_hop} yet; storing it anyway");
+    }
     Ok(visa_id)
 }
 
@@ -337,6 +362,48 @@ mod tests {
             get_egress_link_for_visa(&asm, inserted),
             Err(visa_table::VisaTableError::DestNotFound(_))
         ));
+    }
+
+    /// A Node-mode assembly with an empty visa table and the given
+    /// `forwarding` setting.
+    fn assembly_with_forwarding(forwarding: bool) -> Arc<Assembly> {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        let mut builder = TestAssemblyBuilder::new();
+        builder.ph_mode = Some(crate::assembly::PhMode::Node);
+        builder.visa_table = Some(visa_table::VisaTable::new());
+        builder.config = Some(rcu::RcuBox::new(crate::config::Config {
+            forwarding,
+            ..Default::default()
+        }));
+        Arc::new(create_assembly(builder))
+    }
+
+    /// With `forwarding` off, a forward-only visa from the visa service is
+    /// refused and the table is left unchanged; with it on, the visa is
+    /// stored (zl-zipline#219, plan §5.9).
+    #[test]
+    fn test_insert_forward_only_visa_obeys_forwarding_setting() {
+        use crate::visa_table::tests::{never_expires, new_vsapi_visa_forward_only};
+        let next_hop: IpAddr = "fd5a:5052:8::99".parse().unwrap();
+
+        let asm = assembly_with_forwarding(false);
+        let refused = insert_visa(
+            &asm,
+            new_vsapi_visa_forward_only(7001, never_expires(), next_hop),
+        );
+        assert!(matches!(
+            refused,
+            Err(visa_table::VisaTableError::ForwardingDisabled(7001))
+        ));
+        assert!(asm.visa_table.read().unwrap().table.is_empty());
+
+        let asm = assembly_with_forwarding(true);
+        let stored = insert_visa(
+            &asm,
+            new_vsapi_visa_forward_only(7002, never_expires(), next_hop),
+        );
+        assert_eq!(stored.unwrap(), 7002);
+        assert!(asm.visa_table.read().unwrap().table.contains_key(&7002));
     }
 
     /// Explicit denials are terminal and kept distinct from service failures

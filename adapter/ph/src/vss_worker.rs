@@ -85,7 +85,16 @@ pub fn process_visaop(asm: &Arc<Assembly>, op: VisaOp) -> Result<(), visa_table:
         VisaOp::Grant(visa) => {
             let visa_id = visa.issuer_id;
             debug!(target: VISA_MGMT, "received pushed visa, id={visa_id}");
-            let _vid = visa_mgmt::insert_visa(asm, visa)?;
+            match visa_mgmt::insert_visa(asm, visa) {
+                Ok(_) => {}
+                // A forward-only visa on a node with forwarding off is
+                // dropped (insert_visa has logged it) but the op still
+                // counts as processed: failing the push would make the VS
+                // retry it and block every visa queued behind it
+                // (zl-zipline#219).
+                Err(visa_table::VisaTableError::ForwardingDisabled(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         VisaOp::RevokeVisaId(id) => {
             debug!(target: VISA_MGMT, "received pushed revocation, id={id}");
@@ -355,6 +364,41 @@ mod tests {
     use std::net::IpAddr;
     use tokio::task::LocalSet;
     use zpr_utils::net_defs::{self, IpAddress};
+
+    /// With `forwarding` off, a pushed forward-only visa is refused and
+    /// dropped, but the op is still acked so the visa service's push queue
+    /// keeps flowing; the next op in the batch is processed
+    /// (zl-zipline#219, g26 q3).
+    #[test]
+    fn test_pushed_forward_only_visa_is_dropped_and_acked_when_forwarding_off() {
+        use crate::visa_table::tests::{
+            never_expires, new_vsapi_visa_forward_only, new_vsapi_visa_tcp_default,
+        };
+        let mut builder = node_builder("10.1.1.1".parse().unwrap());
+        builder.visa_table = Some(visa_table::VisaTable::new());
+        let asm = Arc::new(create_assembly(builder));
+        assert!(!asm.config.get().forwarding);
+
+        let next_hop: IpAddr = "fd5a:5052:8::99".parse().unwrap();
+        let fwd_only = VisaOp::Grant(new_vsapi_visa_forward_only(8001, never_expires(), next_hop));
+        let full = VisaOp::Grant(new_vsapi_visa_tcp_default(8002, never_expires()));
+
+        assert!(
+            process_visaop(&asm, fwd_only).is_ok(),
+            "a refused push is acked"
+        );
+        assert!(process_visaop(&asm, full).is_ok());
+
+        let table = asm.visa_table.read().unwrap();
+        assert!(
+            !table.table.contains_key(&8001),
+            "the refused visa is not stored"
+        );
+        assert!(
+            table.table.contains_key(&8002),
+            "later ops are still processed"
+        );
+    }
 
     /// A node-mode assembly whose own (configured) ZPR address is `own`:
     /// a node's local addresses are its configured `zpr_addr`.

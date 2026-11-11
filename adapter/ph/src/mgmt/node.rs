@@ -264,12 +264,12 @@ async fn visa_request_task(
             let visa_id = match visa_mgmt::insert_visa(&asm, visa) {
                 Ok(vid) => vid,
 
-                Err(VisaTableError::ParseError(field)) => {
-                    error!(target: FLOW_MGMT, "Could not parse visa: {field}");
+                // A malformed visa, or a forward-only visa while forwarding
+                // is off: refuse the bind rather than panic.
+                Err(e) => {
+                    error!(target: FLOW_MGMT, "could not install visa: {e}");
                     return requested_visa_denied(&asm, ingress_link_id, txn_id);
                 }
-
-                Err(e) => panic!("Got unexpected error type {e}"),
             };
 
             asm.counters.management[ManagementCounterType::VisaRequestSuccess].increment();
@@ -378,12 +378,12 @@ async fn visa_push_request_task(
             match visa_mgmt::insert_visa(&asm, visa) {
                 Ok(_vid) => (),
 
-                Err(VisaTableError::ParseError(field)) => {
-                    error!(target: FLOW_MGMT, "Could not parse visa: {field}");
+                // A malformed visa, or a forward-only visa while forwarding
+                // is off: refuse the bind rather than panic.
+                Err(e) => {
+                    error!(target: FLOW_MGMT, "could not install visa {req_visa_id}: {e}");
                     return requested_visa_denied(&asm, ingress_link_id, txn_id);
                 }
-
-                Err(e) => panic!("Got unexpected error type {e}"),
             };
 
             asm.counters.management[ManagementCounterType::VisaRequestSuccess].increment();
@@ -428,6 +428,28 @@ fn requested_visa_granted(
         return requested_visa_denied(asm, ingress_link_id, txn_id);
     };
 
+    // An adapter binds by traffic classifier, which a forward-only visa does
+    // not have: such a visa can only join two node links. Refuse an adapter
+    // requestor here, before a stream is requested from the next hop --
+    // refusing later would leave the stream the next hop grants allocated.
+    // (A next-hop adapter is refused below.)
+    let ingress_is_adapter = asm
+        .peer_table
+        .get(ingress_link_id.get())
+        .is_some_and(|peer| matches!(peer.peer_type(), PeerType::Adapter));
+    let forward_only = asm
+        .visa_table
+        .read()
+        .unwrap()
+        .table
+        .get(&visa_id)
+        .is_some_and(|visa| visa.get_tc().is_none());
+    if ingress_is_adapter && forward_only {
+        error!(target: FLOW_MGMT, "visa {visa_id} is forward-only but its requestor {} is an adapter",
+            asm.formatted_link_id(ingress_link_id.get()));
+        return requested_visa_denied(asm, ingress_link_id, txn_id);
+    }
+
     // adapter next-hops require the TC; node next-hops require the visa ID
     let tc;
     let peer_a2a_dh_pubkey;
@@ -446,7 +468,14 @@ fn requested_visa_granted(
                 // Route is no longer valid
                 return requested_visa_denied(asm, ingress_link_id, txn_id);
             };
-            tc = Some(visa.get_tc());
+            // An adapter binds by traffic classifier, which a forward-only
+            // visa does not have: it can only join two node links.
+            let Some(visa_tc) = visa.get_tc() else {
+                error!(target: FLOW_MGMT, "visa {visa_id} is forward-only but its next hop {} is an adapter",
+                    asm.formatted_link_id(egress_link_id.get()));
+                return requested_visa_denied(asm, ingress_link_id, txn_id);
+            };
+            tc = Some(visa_tc);
             peer_a2a_dh_pubkey = visa.get_ingress_a2a_dh_pubkey(); // Egress adapter needs ingress adapter's pubkey for DH
         }
 
@@ -591,7 +620,7 @@ fn requested_tether_granted(
         return;
     };
 
-    // Link the PFT entry into the visa (while holding the lock on the PFT entry).
+    // Look up the visa (while holding the lock on the PFT entry).
 
     let mut visa_table = asm.visa_table.write().unwrap();
 
@@ -601,11 +630,6 @@ fn requested_tether_granted(
         requested_visa_denied(asm, ingress_link_id, txn_id);
         return;
     };
-
-    visa.link_forwarding_entry(ForwardingEntry(
-        ingress_link_id.get(),
-        ingress_tether_entry.key(),
-    ));
 
     // Retrieve the traffic classifier from the visa.
 
@@ -620,7 +644,15 @@ fn requested_tether_granted(
         }
 
         PeerType::Adapter => {
-            tc = Some(visa.get_tc());
+            // A forward-only visa has no traffic classifier. An adapter
+            // requestor is refused in requested_visa_granted before the
+            // next-hop bind; this guard only keeps that invariant panic-free.
+            let Some(visa_tc) = visa.get_tc() else {
+                error!(target: FLOW_MGMT, "visa {visa_id} is forward-only but its requestor {} is an adapter",
+                    asm.formatted_link_id(ingress_link_id.get()));
+                return requested_visa_denied(asm, ingress_link_id, txn_id);
+            };
+            tc = Some(visa_tc);
             peer_a2a_dh_pubkey = visa.get_egress_a2a_dh_pubkey(); // Ingress adapter needs egress adapter's pubkey for DH
         }
 
@@ -630,6 +662,13 @@ fn requested_tether_granted(
             return requested_visa_denied(asm, ingress_link_id, txn_id);
         }
     }
+
+    // Only now that the bind will go ahead, link the PFT entry into the
+    // visa, so a refused bind leaves no stale forwarding entry behind.
+    visa.link_forwarding_entry(ForwardingEntry(
+        ingress_link_id.get(),
+        ingress_tether_entry.key(),
+    ));
 
     drop(visa_table);
 
@@ -888,4 +927,241 @@ pub fn unbind_stream(asm: &Arc<Assembly>, ingress_link_id: NonZero<LinkId>, stre
 
     // Issue unbind request to next hop
     requests::send_unbind_egress_stream_request(asm, pft_pep.next_hop.0, stream_id).enqueue();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assembly::PhMode;
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+    use crate::link_state::LinkType;
+    use crate::packet::Packet;
+    use crate::packet_queue;
+    use crate::peer_table::test::create_dummy_peer_state;
+    use crate::queues::MgmtSubstrateEgress;
+    use crate::visa_table::VisaTable;
+    use crate::visa_table::tests::{never_expires, new_vsapi_visa_forward_only};
+    use crate::zdp;
+    use std::net::{IpAddr, Ipv4Addr};
+    use zerocopy::FromBytes;
+    use zpr::packet_info::SubstrateAddr;
+    use zpr_utils::net_defs::{self, IpAddress};
+
+    /// The forward-only visa every test in this module binds.
+    const VISA_ID: VisaId = 9000;
+
+    /// The ZPR address the forward-only visa names as its next hop.
+    const NEXT_HOP: &str = "fd5a:5052:8::99";
+
+    type EgressRx = packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>;
+
+    /// Build a middle node: a Node-mode assembly whose management egress we
+    /// can read back, an upstream peer of type `upstream` on link A, and a
+    /// downstream peer of type `downstream` on link B that owns [NEXT_HOP]
+    /// (so `find_egress_link` resolves the visa's next hop to link B). The
+    /// forward-only visa [VISA_ID] is already in the visa table.
+    ///
+    /// Returns (asm, egress queue receiver, link A, link B).
+    fn middle_node(
+        upstream: LinkType,
+        downstream: LinkType,
+    ) -> (Arc<Assembly>, EgressRx, LinkId, LinkId) {
+        let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
+        let mut builder = TestAssemblyBuilder::new();
+        builder.ph_mode = Some(PhMode::Node);
+        builder.visa_table = Some(VisaTable::new());
+        builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
+        let asm = Arc::new(create_assembly(builder));
+
+        let link_a = add_peer(&asm, upstream, 1);
+        let link_b = add_peer(&asm, downstream, 2);
+        let next_hop: IpAddr = NEXT_HOP.parse().unwrap();
+        asm.peer_table
+            .get(link_b)
+            .unwrap()
+            .actor_auth
+            .test_set_addresses(vec![IpAddress::new_from_std(&next_hop)]);
+
+        asm.visa_table
+            .write()
+            .unwrap()
+            .insert_visa(new_vsapi_visa_forward_only(
+                VISA_ID,
+                never_expires(),
+                next_hop,
+            ))
+            .unwrap();
+        (asm, egress_rx, link_a, link_b)
+    }
+
+    /// Add a dummy peer of the given link type and return its link ID.
+    fn add_peer(asm: &Assembly, link_type: LinkType, last_octet: u8) -> LinkId {
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let key = entry.key();
+        entry
+            .insert(create_dummy_peer_state(
+                key,
+                link_type,
+                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, last_octet)), 5000),
+                net_defs::ScopedIpAddr::V4(Ipv4Addr::new(10, 0, 1, last_octet)),
+            ))
+            .get()
+    }
+
+    /// Take the next management packet off the egress queue, if any.
+    fn try_recv_packet(rx: &mut EgressRx) -> Option<Packet> {
+        let buf = vec![0u8; config::PACKET_BUFFER_SIZE].into_boxed_slice();
+        match rx.try_recv(buf) {
+            Ok(pkt) => Some(pkt),
+            Err(packet_queue::TryRecvError::Empty(_)) => None,
+            Err(err) => panic!("unexpected queue error: {err:?}"),
+        }
+    }
+
+    /// A per-flow transaction management packet, decoded: its type, its
+    /// per-flow stream ID and its payload.
+    struct MgmtPacket {
+        packet_type: zdp::ZdpPacketType,
+        stream_id: StreamId,
+        payload: Vec<u8>,
+    }
+
+    /// Decode the headers `core::send_per_flow_txn_mgmt` writes: base,
+    /// management, per-flow, transaction, then the payload.
+    fn decode_per_flow_txn(pkt: &Packet) -> MgmtPacket {
+        let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+        let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+        let (per_flow_hdr, rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
+        let (_txn_hdr, rest) = zdp::ZdpTransactionHeader::ref_from_prefix(rest).unwrap();
+        MgmtPacket {
+            packet_type: base_hdr.packet_type,
+            stream_id: per_flow_hdr.stream_id.into(),
+            payload: rest.to_vec(),
+        }
+    }
+
+    /// The middle node of a path binds a forward-only visa from one node link
+    /// to the next (zl-zipline#219): a StreamIdRequest from the upstream node
+    /// produces a StreamIdRequest for the same visa to the next hop; the next
+    /// hop's grant installs a PFT entry on the upstream link pointing at the
+    /// next hop's stream, and the upstream node gets its stream ID back.
+    /// Revoking the visa then removes that entry.
+    #[tokio::test]
+    async fn test_middle_node_binds_forward_only_visa_between_node_links() {
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let upstream_txn: TxnId = 7;
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), upstream_txn, VISA_ID);
+
+        // The next hop is asked for a stream for the same visa.
+        let pkt = try_recv_packet(&mut egress_rx).expect("a StreamIdRequest to the next hop");
+        assert_eq!(pkt.metadata().egress_link_id, link_b);
+        let req = decode_per_flow_txn(&pkt);
+        assert_eq!(req.packet_type, zdp::ZdpPacketType::StreamIdRequest);
+        let (body, _) = zdp::ZdpStreamIdRequest::ref_from_prefix(&req.payload).unwrap();
+        let requested_visa: VisaId = body.visa_id.into();
+        assert_eq!(requested_visa, VISA_ID);
+
+        // The next hop grants stream 42.
+        let egress_txn = asm
+            .peer_table
+            .get(link_b)
+            .unwrap()
+            .node_state
+            .awaiting_next_hop_bind_table
+            .iter()
+            .next()
+            .expect("the next-hop bind is outstanding")
+            .key()
+            .clone();
+        let next_hop_stream: StreamId = 42;
+        install_tether(
+            &asm,
+            NonZero::new(link_b).unwrap(),
+            &egress_txn,
+            next_hop_stream,
+        )
+        .unwrap();
+
+        // The upstream node gets a success response naming its stream...
+        let pkt = try_recv_packet(&mut egress_rx).expect("a StreamIdResponse upstream");
+        assert_eq!(pkt.metadata().egress_link_id, link_a);
+        let rsp = decode_per_flow_txn(&pkt);
+        assert_eq!(rsp.packet_type, zdp::ZdpPacketType::StreamIdResponse);
+        let (rsp_hdr, _) = zdp::ZdpStreamIdResponseHeader::ref_from_prefix(&rsp.payload).unwrap();
+        assert_eq!(rsp_hdr.status_code, zdp::ResponseCode::Success);
+        let upstream_stream = rsp.stream_id;
+
+        // ...and its stream forwards to the next hop's stream on link B.
+        let pep = asm
+            .peer_table
+            .get(link_a)
+            .unwrap()
+            .pft
+            .inspect(upstream_stream, |pep| (pep.next_hop.clone(), pep.visa_id))
+            .expect("a PFT entry for the upstream stream");
+        assert!(pep == (ForwardingEntry(link_b, next_hop_stream), VISA_ID));
+
+        // Revoking the visa removes the upstream stream's PFT entry, which
+        // shows the entry was linked into the visa. (Sending the withdrawal
+        // itself is covered by the assembly tests.)
+        visa_mgmt::handle_revocation(&asm, VISA_ID).unwrap();
+        assert_eq!(asm.peer_table.get(link_a).unwrap().pft.len(), 0);
+        assert!(!asm.visa_table.read().unwrap().table.contains_key(&VISA_ID));
+    }
+
+    /// A forward-only visa has no traffic classifier, so it cannot bind to an
+    /// adapter. The bind is refused with an error response upstream instead
+    /// of a panic, and nothing is sent to the adapter.
+    #[tokio::test]
+    async fn test_forward_only_visa_toward_adapter_is_refused() {
+        let (asm, mut egress_rx, link_a, _link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToAdapter);
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+
+        let pkt = try_recv_packet(&mut egress_rx).expect("an error response upstream");
+        assert_eq!(pkt.metadata().egress_link_id, link_a);
+        let rsp = decode_per_flow_txn(&pkt);
+        assert_eq!(rsp.packet_type, zdp::ZdpPacketType::StreamIdResponse);
+        let (rsp_hdr, _) = zdp::ZdpStreamIdResponseHeader::ref_from_prefix(&rsp.payload).unwrap();
+        assert_ne!(rsp_hdr.status_code, zdp::ResponseCode::Success);
+        assert!(
+            try_recv_packet(&mut egress_rx).is_none(),
+            "nothing goes to the adapter"
+        );
+    }
+
+    /// An adapter cannot bind a forward-only visa either: it binds by traffic
+    /// classifier. The bind must be refused BEFORE a stream is requested from
+    /// the next hop, or the stream the next hop grants is never released
+    /// (Codex review on zl-zpr-core#100).
+    #[tokio::test]
+    async fn test_forward_only_visa_from_adapter_is_refused_before_next_hop_bind() {
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToAdapter, LinkType::NodeToNode);
+
+        requested_visa_granted(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+
+        let pkt = try_recv_packet(&mut egress_rx).expect("an error response to the adapter");
+        assert_eq!(pkt.metadata().egress_link_id, link_a);
+        let (base_hdr, _) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+        assert_eq!(
+            base_hdr.packet_type,
+            zdp::ZdpPacketType::BindActorAddressResponse
+        );
+        assert!(
+            try_recv_packet(&mut egress_rx).is_none(),
+            "no stream may be requested from the next hop"
+        );
+        assert!(
+            asm.peer_table
+                .get(link_b)
+                .unwrap()
+                .node_state
+                .awaiting_next_hop_bind_table
+                .is_empty()
+        );
+    }
 }

@@ -199,6 +199,12 @@ pub enum Command {
         #[arg(long, value_name = "ADDR:PORT")]
         advertised_substrate_addr: Option<String>,
 
+        /// Whether this node carries other nodes' traffic, i.e. accepts
+        /// forward-only visas. Off by default. Overrides the `forwarding`
+        /// key in the `[node]` section of the config file.
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        forwarding: Option<bool>,
+
         #[command(flatten)]
         common: CommonArgs,
     },

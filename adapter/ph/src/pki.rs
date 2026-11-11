@@ -118,6 +118,13 @@ pub fn public_key(cert: &Certificate) -> &SubjectPublicKeyInfoOwned {
     cert.tbs_certificate().subject_public_key_info()
 }
 
+/// Is `now` inside the certificate's validity window (notBefore through
+/// notAfter, inclusive)?
+pub fn is_valid_at(cert: &Certificate, now: std::time::SystemTime) -> bool {
+    let validity = cert.tbs_certificate().validity();
+    validity.not_before.to_system_time() <= now && now <= validity.not_after.to_system_time()
+}
+
 /// Verify a certificate's signature against the presumed issuer's
 /// public key
 pub fn verify(cert: &Certificate, key: &SubjectPublicKeyInfoOwned) -> Result<bool, ParseError> {
@@ -234,16 +241,17 @@ const OID_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112"
 
 #[cfg(test)]
 struct NoiseCertProfile {
-    name: Name,
+    issuer: Name,
+    subject: Name,
 }
 
 #[cfg(test)]
 impl BuilderProfile for NoiseCertProfile {
     fn get_issuer(&self, _subject: &Name) -> Name {
-        self.name.clone()
+        self.issuer.clone()
     }
     fn get_subject(&self) -> Name {
-        self.name.clone()
+        self.subject.clone()
     }
 
     fn build_extensions(
@@ -265,19 +273,85 @@ pub fn generate_self_signed_noise_cert(
     cn: &str,
     keypair: &NoiseKeypair,
 ) -> Result<Certificate, Box<dyn std::error::Error>> {
-    if cn.is_empty() {
-        return Err("CN (common name) must be non-empty".into());
+    let mut seed = [0u8; 32];
+    aws_lc_rs::rand::fill(&mut seed)?;
+    let signer = EdSigningKey::from_bytes(&seed);
+    let name = Name::from_str(&format!("CN={cn}"))?;
+    build_noise_cert(
+        cn,
+        keypair,
+        name,
+        &signer,
+        Validity::from_now(Duration::from_hours(365 * 24))?,
+    )
+}
+
+/// A throwaway Ed25519 certificate authority for tests (zl-zipline#220):
+/// the checked-in test certificates have expired, and Zode links refuse
+/// expired certificates.
+#[cfg(test)]
+pub struct TestCa {
+    pub cert: Certificate,
+    name: Name,
+    signer: EdSigningKey,
+}
+
+#[cfg(test)]
+impl TestCa {
+    /// A new self-signed CA named `CN=<cn>`, valid for a year from now.
+    pub fn new(cn: &str) -> Self {
+        let mut seed = [0u8; 32];
+        aws_lc_rs::rand::fill(&mut seed).unwrap();
+        let signer = EdSigningKey::from_bytes(&seed);
+        let name = Name::from_str(&format!("CN={cn}")).unwrap();
+        let spki = SubjectPublicKeyInfoOwned {
+            algorithm: AlgorithmIdentifierOwned {
+                oid: OID_ED25519,
+                parameters: None,
+            },
+            subject_public_key: BitString::from_bytes(signer.verifying_key().as_bytes()).unwrap(),
+        };
+        let profile = NoiseCertProfile {
+            issuer: name.clone(),
+            subject: name.clone(),
+        };
+        let validity = Validity::from_now(Duration::from_hours(365 * 24)).unwrap();
+        let builder =
+            CertificateBuilder::new(profile, random_serial().unwrap(), validity, spki).unwrap();
+        let cert = builder.build::<_, EdSignature>(&signer).unwrap();
+        TestCa { cert, name, signer }
     }
 
-    let name = Name::from_str(&format!("CN={cn}"))?;
+    /// A certificate for `keypair`'s noise key, named `CN=<cn>` and signed
+    /// by this CA, valid over `validity`.
+    pub fn issue(&self, cn: &str, keypair: &NoiseKeypair, validity: Validity) -> Certificate {
+        build_noise_cert(cn, keypair, self.name.clone(), &self.signer, validity).unwrap()
+    }
+}
 
+/// A random positive 16-byte certificate serial number.
+#[cfg(test)]
+fn random_serial() -> Result<SerialNumber, Box<dyn std::error::Error>> {
     let mut serial_bytes = [0u8; 16];
     aws_lc_rs::rand::fill(&mut serial_bytes)?;
     serial_bytes[0] &= 0x7f;
-    let serial = SerialNumber::new(&serial_bytes)?;
+    Ok(SerialNumber::new(&serial_bytes)?)
+}
 
-    let validity = Validity::from_now(Duration::from_hours(365 * 24))?;
-
+/// Build a certificate binding `cn` to `keypair`'s noise public key, issued
+/// by `issuer` and signed with `signer`.
+#[cfg(test)]
+fn build_noise_cert(
+    cn: &str,
+    keypair: &NoiseKeypair,
+    issuer: Name,
+    signer: &EdSigningKey,
+    validity: Validity,
+) -> Result<Certificate, Box<dyn std::error::Error>> {
+    if cn.is_empty() {
+        return Err("CN (common name) must be non-empty".into());
+    }
+    let subject = Name::from_str(&format!("CN={cn}"))?;
     let spki = SubjectPublicKeyInfoOwned {
         algorithm: AlgorithmIdentifierOwned {
             oid: OID_X25519,
@@ -285,20 +359,15 @@ pub fn generate_self_signed_noise_cert(
         },
         subject_public_key: BitString::from_bytes(&keypair.public)?,
     };
-
-    let mut seed = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut seed)?;
-
-    let signer = EdSigningKey::from_bytes(&seed);
-
-    let mut builder = CertificateBuilder::new(NoiseCertProfile { name }, serial, validity, spki)?;
-
+    let mut builder = CertificateBuilder::new(
+        NoiseCertProfile { issuer, subject },
+        random_serial()?,
+        validity,
+        spki,
+    )?;
     let key_usage = KeyUsage(KeyUsages::DigitalSignature | KeyUsages::KeyEncipherment);
     builder.add_extension((false, &key_usage))?;
-
-    let cert = builder.build::<_, EdSignature>(&signer)?;
-
-    Ok(cert)
+    Ok(builder.build::<_, EdSignature>(signer)?)
 }
 
 #[cfg(test)]
@@ -392,8 +461,16 @@ n5ystfC9RDOzkrR8ICLvoWBQ52ctmNH3oWs1p1DT3uL6k3QMnNlejIkUqAY51aI=
             },
             subject_public_key: BitString::from_bytes(verifying.as_bytes()).unwrap(),
         };
-        let builder =
-            CertificateBuilder::new(NoiseCertProfile { name }, serial, validity, spki).unwrap();
+        let builder = CertificateBuilder::new(
+            NoiseCertProfile {
+                issuer: name.clone(),
+                subject: name,
+            },
+            serial,
+            validity,
+            spki,
+        )
+        .unwrap();
         let cert = builder.build::<_, EdSignature>(&signer).unwrap();
 
         // The correct Ed25519 key verifies the signature.

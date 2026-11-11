@@ -581,6 +581,21 @@ impl LinkStateWrapper {
             ));
         };
 
+        // zl-zipline#220: a Zode link must lead to a peer this Zode was told
+        // to link with; anything else is closed before Hello. This runs
+        // before the certificate block below so a rejected peer never
+        // claims a special-peer name.
+        if self.link_type == LinkType::NodeToNode {
+            let peer_cn = peer_state.verified_peer_cn();
+            if !peer_cn.as_deref().is_some_and(|cn| asm.peer_cn_allowed(cn)) {
+                warn!(target: LINK_STATE, "{} peer certificate CN {peer_cn:?} is not in this Zode's topology; closing", asm.formatted_link_id(link_id));
+                drop(sa);
+                drop(peer_state);
+                drop(locked_fsm);
+                return self.initiate_close(asm, TerminateReason::Reset);
+            }
+        }
+
         if let Some(ref peer_cert) = sa.peer_cert {
             let cert = peer_cert.get_cert();
             let is_verified = peer_cert.is_verified();
@@ -623,19 +638,6 @@ impl LinkStateWrapper {
                         }
                     }
                 }
-            }
-        }
-
-        // zl-zipline#220: a Zode link must lead to a peer this Zode was told
-        // to link with; anything else is closed before Hello.
-        if self.link_type == LinkType::NodeToNode {
-            let peer_cn = peer_state.verified_peer_cn();
-            if !peer_cn.as_deref().is_some_and(|cn| asm.peer_cn_allowed(cn)) {
-                warn!(target: LINK_STATE, "{} peer certificate CN {peer_cn:?} is not in this Zode's topology; closing", asm.formatted_link_id(link_id));
-                drop(sa);
-                drop(peer_state);
-                drop(locked_fsm);
-                return self.initiate_close(asm, TerminateReason::Reset);
             }
         }
 
@@ -1621,6 +1623,31 @@ mod tests {
                 asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
                     .unwrap();
                 assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+            })
+            .await
+    }
+
+    /// zl-zipline#220 review: a CA-verified Zode outside the topology that
+    /// presents the visa service's DN must not claim the VisaServiceAdapter
+    /// special-peer slot before the CN check closes its link.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_link_outside_topology_claims_no_special_name() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = zode_assembly(&["relay.zpr"]);
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    zpr::dn::VISA_SERVICE_CN,
+                    LinkState::Keying,
+                );
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+                assert_eq!(
+                    asm.peer_table
+                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
+                    None
+                );
             })
             .await
     }

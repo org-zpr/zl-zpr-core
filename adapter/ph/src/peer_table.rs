@@ -163,6 +163,14 @@ impl PeerState {
     }
 
     /// Return a reference to the transport SA if there is an SA on the link, and if it is established.
+    /// The CN of the peer's certificate if keying verified it against our CA,
+    /// else `None` (zl-zipline#220).
+    pub fn verified_peer_cn(&self) -> Option<String> {
+        let sa = self.get_established_transport_association()?;
+        let cert = sa.peer_cert.as_ref().filter(|c| c.is_verified())?;
+        cert.common_name()
+    }
+
     pub fn get_established_transport_association(
         &self,
     ) -> Option<RcuOptionGuard<'_, KmTransportSA>> {
@@ -595,6 +603,56 @@ pub mod test {
             zdpr_retry_timer_reset: Notify::new(),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),
+        }
+    }
+
+    /// Insert a Zode-to-Zode (NodeToNode) peer whose established SA holds a
+    /// verified certificate with common name `cn`, with its link in `state`
+    /// (zl-zipline#220 tests).
+    #[allow(dead_code)]
+    pub fn insert_zode_peer_with_verified_cn(
+        asm: &crate::assembly::Assembly,
+        cn: &str,
+        state: crate::link_state::LinkState,
+    ) -> LinkId {
+        use crate::km::{PeerCertificate, ZPIPair};
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let link_id = entry.key();
+        let peer = create_dummy_peer_state(
+            link_id,
+            LinkType::NodeToNode,
+            SubstrateAddr::from(([127, 0, 0, 1], 9700 + link_id.get() as u16)),
+            ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+        );
+        let link_id = entry.insert(peer).get();
+        let keypair = crate::km_noise::NoiseKeypair::generate();
+        let cert = crate::pki::generate_self_signed_noise_cert(cn, &keypair).unwrap();
+        let mut sa = KmTransportSA::new_with_zpis(ZPIPair::new(1, 2), ZPIPair::new(3, 4));
+        sa.peer_cert = Some(PeerCertificate::Verified(cert));
+        asm.peer_table
+            .set_security_association(link_id, sa)
+            .unwrap();
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_set_state(state);
+        link_id
+    }
+
+    /// A topology link to a peer Zode whose certificate must carry `peer_cn`.
+    #[allow(dead_code)]
+    pub fn topology_link(peer_cn: &str) -> zpr::vsapi_types::Link {
+        zpr::vsapi_types::Link {
+            link_id: format!("link-{peer_cn}"),
+            peer: zpr::vsapi_types::SockAddr {
+                addr: std::net::IpAddr::from([127, 0, 0, 9]),
+                port: 5000,
+            },
+            role: zpr::vsapi_types::LinkRole::Active,
+            visas: Vec::new(),
+            zpr_addr: std::net::IpAddr::from([0xfd5a, 0x5052, 0, 0, 0, 0, 0, 9]),
+            peer_cn: peer_cn.to_owned(),
         }
     }
 }

@@ -346,12 +346,15 @@ fn process_configuration(asm: &Arc<Assembly>, params: Vec<Param>) -> ConfigureRe
     Ok(())
 }
 
-/// Placeholder. Links not yet acted on.
-fn process_topology(_asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
-    info!(target: VSS_RPC, "received topology update with {} links (not yet implemented)", links.len());
+/// Store the topology the visa service pushed and close Zode links to peers
+/// that left it (zl-zipline#220). Starting links from it is zl-zipline#222.
+fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
+    info!(target: VSS_RPC, "received topology update with {} links", links.len());
     for (i, link) in links.iter().enumerate() {
-        info!(target: VSS_RPC, "[link {i}]-> peer {:?}, zpr addr {}", link.peer, link.zpr_addr);
+        info!(target: VSS_RPC, "[link {i}]-> peer {:?}, zpr addr {}, peer cn {:?}", link.peer, link.zpr_addr, link.peer_cn);
     }
+    *asm.topology.write().unwrap() = links;
+    crate::link_state::close_zode_links_outside_topology(asm);
     Ok(())
 }
 
@@ -402,6 +405,34 @@ mod tests {
 
     /// A node-mode assembly whose own (configured) ZPR address is `own`:
     /// a node's local addresses are its configured `zpr_addr`.
+    /// zl-zipline#220: a topology update that drops a peer's CN closes its
+    /// live Zode link; links to peers still in the topology stay up.
+    #[tokio::test]
+    async fn test_topology_update_closes_zode_link_whose_cn_left() {
+        use crate::peer_table::test::{insert_zode_peer_with_verified_cn, topology_link};
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(node_builder("10.1.1.1".parse().unwrap())));
+                process_topology(&asm, vec![topology_link("a.zpr"), topology_link("b.zpr")])
+                    .unwrap();
+                let a = insert_zode_peer_with_verified_cn(&asm, "a.zpr", LinkState::Active);
+                let b = insert_zode_peer_with_verified_cn(&asm, "b.zpr", LinkState::Active);
+
+                process_topology(&asm, vec![topology_link("a.zpr")]).unwrap();
+
+                let state = |id| {
+                    asm.peer_table
+                        .get(id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state()
+                };
+                assert_eq!(state(a), LinkState::Active);
+                assert_eq!(state(b), LinkState::Closing);
+            })
+            .await
+    }
+
     fn node_builder(own: IpAddr) -> TestAssemblyBuilder {
         TestAssemblyBuilder {
             ph_mode: Some(crate::assembly::PhMode::Node),

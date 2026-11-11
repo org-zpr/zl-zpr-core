@@ -236,6 +236,30 @@ pub fn add_node_link(
     add_noise_link(asm, link_id, noise)
 }
 
+/// Creates a new KeyManager for a link between two Zodes and starts its state machine (zl-zipline#220).
+///
+/// Unlike the adapter/node pair above, both ends verify: each requires the
+/// peer to present a certificate signed by our CA whose key is the peer's
+/// Noise static key. A Zode without a CA certificate cannot start the link.
+///
+/// - `link_id` is the link to the peer Zode; it must already have a peer_table entry.
+/// - `initiate` is true on the end that dialed the link.
+// The NodeToNode link start that calls this arrives with zl-zipline#222,
+// which knows which end dialed.
+#[allow(dead_code)]
+pub fn add_zode_link(
+    asm: &Assembly,
+    link_id: LinkId,
+    initiate: bool,
+    recv_zpis: ZPIPair,
+    local_noise_key: NoiseKeypair,
+    certx: KmCertExchange,
+) -> Result<(), KmSetupError> {
+    let noise = KmNoise::new_zode(initiate, local_noise_key, recv_zpis, certx)
+        .map_err(KmSetupError::InitializationError)?;
+    add_noise_link(asm, link_id, noise)
+}
+
 /// Remove all state for this link, invalidating the SA and stopping the Key Manager.
 pub async fn drop_link(asm: &Arc<Assembly>, link_id: LinkId) {
     // If present in state, turn off the SA.

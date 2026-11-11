@@ -529,6 +529,7 @@ fn main() -> ExitCode {
         visa_table: std::sync::RwLock::new(visa_table::VisaTable::new_with_vs_visas(
             &node_zpr_addr,
         )),
+        topology: Default::default(),
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),

@@ -428,6 +428,28 @@ fn requested_visa_granted(
         return requested_visa_denied(asm, ingress_link_id, txn_id);
     };
 
+    // An adapter binds by traffic classifier, which a forward-only visa does
+    // not have: such a visa can only join two node links. Refuse an adapter
+    // requestor here, before a stream is requested from the next hop --
+    // refusing later would leave the stream the next hop grants allocated.
+    // (A next-hop adapter is refused below.)
+    let ingress_is_adapter = asm
+        .peer_table
+        .get(ingress_link_id.get())
+        .is_some_and(|peer| matches!(peer.peer_type(), PeerType::Adapter));
+    let forward_only = asm
+        .visa_table
+        .read()
+        .unwrap()
+        .table
+        .get(&visa_id)
+        .is_some_and(|visa| visa.get_tc().is_none());
+    if ingress_is_adapter && forward_only {
+        error!(target: FLOW_MGMT, "visa {visa_id} is forward-only but its requestor {} is an adapter",
+            asm.formatted_link_id(ingress_link_id.get()));
+        return requested_visa_denied(asm, ingress_link_id, txn_id);
+    }
+
     // adapter next-hops require the TC; node next-hops require the visa ID
     let tc;
     let peer_a2a_dh_pubkey;
@@ -622,8 +644,9 @@ fn requested_tether_granted(
         }
 
         PeerType::Adapter => {
-            // An adapter binds by traffic classifier, which a forward-only
-            // visa does not have: it can only join two node links.
+            // A forward-only visa has no traffic classifier. An adapter
+            // requestor is refused in requested_visa_granted before the
+            // next-hop bind; this guard only keeps that invariant panic-free.
             let Some(visa_tc) = visa.get_tc() else {
                 error!(target: FLOW_MGMT, "visa {visa_id} is forward-only but its requestor {} is an adapter",
                     asm.formatted_link_id(ingress_link_id.get()));
@@ -933,13 +956,16 @@ mod tests {
     type EgressRx = packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>;
 
     /// Build a middle node: a Node-mode assembly whose management egress we
-    /// can read back, an upstream node peer on link A, and a downstream peer
-    /// of type `downstream` on link B that owns [NEXT_HOP] (so
-    /// `find_egress_link` resolves the visa's next hop to link B). The
+    /// can read back, an upstream peer of type `upstream` on link A, and a
+    /// downstream peer of type `downstream` on link B that owns [NEXT_HOP]
+    /// (so `find_egress_link` resolves the visa's next hop to link B). The
     /// forward-only visa [VISA_ID] is already in the visa table.
     ///
     /// Returns (asm, egress queue receiver, link A, link B).
-    fn middle_node(downstream: LinkType) -> (Arc<Assembly>, EgressRx, LinkId, LinkId) {
+    fn middle_node(
+        upstream: LinkType,
+        downstream: LinkType,
+    ) -> (Arc<Assembly>, EgressRx, LinkId, LinkId) {
         let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
         let mut builder = TestAssemblyBuilder::new();
         builder.ph_mode = Some(PhMode::Node);
@@ -947,7 +973,7 @@ mod tests {
         builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
         let asm = Arc::new(create_assembly(builder));
 
-        let link_a = add_peer(&asm, LinkType::NodeToNode, 1);
+        let link_a = add_peer(&asm, upstream, 1);
         let link_b = add_peer(&asm, downstream, 2);
         let next_hop: IpAddr = NEXT_HOP.parse().unwrap();
         asm.peer_table
@@ -1022,7 +1048,8 @@ mod tests {
     /// Revoking the visa then removes that entry.
     #[tokio::test]
     async fn test_middle_node_binds_forward_only_visa_between_node_links() {
-        let (asm, mut egress_rx, link_a, link_b) = middle_node(LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
         let upstream_txn: TxnId = 7;
 
         request_stream(&asm, NonZero::new(link_a).unwrap(), upstream_txn, VISA_ID);
@@ -1089,7 +1116,8 @@ mod tests {
     /// of a panic, and nothing is sent to the adapter.
     #[tokio::test]
     async fn test_forward_only_visa_toward_adapter_is_refused() {
-        let (asm, mut egress_rx, link_a, _link_b) = middle_node(LinkType::NodeToAdapter);
+        let (asm, mut egress_rx, link_a, _link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToAdapter);
 
         request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
 
@@ -1102,6 +1130,38 @@ mod tests {
         assert!(
             try_recv_packet(&mut egress_rx).is_none(),
             "nothing goes to the adapter"
+        );
+    }
+
+    /// An adapter cannot bind a forward-only visa either: it binds by traffic
+    /// classifier. The bind must be refused BEFORE a stream is requested from
+    /// the next hop, or the stream the next hop grants is never released
+    /// (Codex review on zl-zpr-core#100).
+    #[tokio::test]
+    async fn test_forward_only_visa_from_adapter_is_refused_before_next_hop_bind() {
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToAdapter, LinkType::NodeToNode);
+
+        requested_visa_granted(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+
+        let pkt = try_recv_packet(&mut egress_rx).expect("an error response to the adapter");
+        assert_eq!(pkt.metadata().egress_link_id, link_a);
+        let (base_hdr, _) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+        assert_eq!(
+            base_hdr.packet_type,
+            zdp::ZdpPacketType::BindActorAddressResponse
+        );
+        assert!(
+            try_recv_packet(&mut egress_rx).is_none(),
+            "no stream may be requested from the next hop"
+        );
+        assert!(
+            asm.peer_table
+                .get(link_b)
+                .unwrap()
+                .node_state
+                .awaiting_next_hop_bind_table
+                .is_empty()
         );
     }
 }

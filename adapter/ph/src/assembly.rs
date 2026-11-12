@@ -23,6 +23,7 @@ use rcu;
 use std::collections::HashMap;
 use std::fmt::{Error, Formatter};
 use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::num::NonZero;
 use std::result::Result;
 use std::sync::{Arc, Mutex};
@@ -689,26 +690,101 @@ impl Assembly {
         Ok(peer_id)
     }
 
+    /// Dial a Zode at substrate address `addr` (zl-zipline#222), using the
+    /// local interface address the kernel would pick for it.
+    pub fn dial_zode(self: &Arc<Self>, addr: SocketAddr) -> Result<NonZero<LinkId>, String> {
+        // Probe from our IP with an ephemeral port: our substrate sockets
+        // already hold the configured port.
+        let probe_from = SocketAddr::new(self.config.get().self_addr.ip(), 0);
+        let local = crate::sys::substrate::resolve_local_addr(probe_from, addr)
+            .map_err(|e| format!("cannot route to {addr}: {e}"))?;
+        self.start_zode_link(&addr, &local.scoped_ip(), true)
+            .map_err(|e| format!("cannot start a link to {addr}: {e}"))
+    }
+
     /// Dial every configured initial link (zl-zipline#222). Called once at
     /// startup; a dialed link redials on its own after a close.
     pub fn dial_initial_links(self: &Arc<Self>) {
-        let self_addr = self.config.get().self_addr;
         for link in self.config.get().initial_links.clone() {
-            // The local interface address the kernel would use for this
-            // peer: probe from our IP with an ephemeral port, since our
-            // substrate sockets already hold the configured port.
-            let probe_from = std::net::SocketAddr::new(self_addr.ip(), 0);
-            let interface_addr = match crate::sys::substrate::resolve_local_addr(
-                probe_from, link.addr,
-            ) {
-                Ok(local) => local.scoped_ip(),
-                Err(e) => {
-                    error!(target: PEER_MGMT, "cannot route to initial link {} at {}: {e}", link.cn, link.addr);
-                    continue;
+            if let Err(e) = self.dial_zode(link.addr) {
+                error!(target: PEER_MGMT, "initial link {}: {e}", link.cn);
+            }
+        }
+    }
+
+    /// The CN of this Zode's own link certificate, if it has one.
+    pub fn own_cn(&self) -> Option<String> {
+        self.certx.as_ref().and_then(|c| c.local_cn())
+    }
+
+    /// The ZPR address the stored topology gives the Zode whose certificate
+    /// CN is `cn` (zl-zipline#222). A peer's address comes only from here,
+    /// never from anything it says itself.
+    pub fn topology_zpr_addr(&self, cn: &str) -> Option<IpAddress> {
+        if cn.is_empty() {
+            return None;
+        }
+        self.topology
+            .read()
+            .unwrap()
+            .iter()
+            .find(|link| link.peer_cn == cn)
+            .map(|link| IpAddress::new_from_std(&link.zpr_addr))
+    }
+
+    /// A live (Helloing or Active) Zode link, other than `except`, whose
+    /// verified peer CN is `cn`.
+    pub fn live_zode_link_for_cn(&self, cn: &str, except: LinkId) -> Option<LinkId> {
+        self.peer_table
+            .find(|(id, peer)| {
+                let fsm = &peer.link_state_machine;
+                id.get() != except
+                    && fsm.get_link_type() == LinkType::NodeToNode
+                    && matches!(
+                        fsm.get_state(),
+                        crate::link_state::LinkState::Helloing
+                            | crate::link_state::LinkState::Active
+                    )
+                    && peer.verified_peer_cn().as_deref() == Some(cn)
+            })
+            .map(|(id, _peer)| id.get())
+    }
+
+    /// Bring this Zode's links in line with the stored topology
+    /// (zl-zipline#222): refresh each live Zode link's peer ZPR address
+    /// from it, and dial every topology peer this Zode has no link to yet.
+    /// A link to a peer that already reached us is kept; links to peers
+    /// that left are closed separately, by
+    /// [crate::link_state::close_zode_links_outside_topology].
+    pub fn start_topology_links(self: &Arc<Self>) {
+        self.peer_table.for_each(|(_id, peer)| {
+            let fsm = &peer.link_state_machine;
+            if fsm.get_link_type() == LinkType::NodeToNode {
+                if let Some(cn) = peer.verified_peer_cn() {
+                    fsm.set_zode_peer_addr(self.topology_zpr_addr(&cn));
                 }
-            };
-            if let Err(e) = self.start_zode_link(&link.addr, &interface_addr, true) {
-                error!(target: PEER_MGMT, "cannot start initial link {} at {}: {e}", link.cn, link.addr);
+            }
+        });
+
+        let links = self.topology.read().unwrap().clone();
+        for link in links {
+            let addr = SocketAddr::from(link.peer.clone());
+            if link.peer_cn.is_empty() || addr.ip().is_unspecified() || addr.port() == 0 {
+                continue;
+            }
+            let already_linked = self.live_zode_link_for_cn(&link.peer_cn, 0).is_some()
+                || self
+                    .peer_table
+                    .find(|(_id, peer)| {
+                        peer.link_state_machine.get_link_type() == LinkType::NodeToNode
+                            && peer.substrate_addr == addr
+                    })
+                    .is_some();
+            if already_linked {
+                continue;
+            }
+            if let Err(e) = self.dial_zode(addr) {
+                error!(target: PEER_MGMT, "topology link {} ({}): {e}", link.link_id, link.peer_cn);
             }
         }
     }
@@ -724,11 +800,14 @@ impl Assembly {
             return Some(NonZero::new(LOCAL_ACTOR_LINK_ID).unwrap());
         }
 
-        // Check peer actor addresses to see if one of them matches
+        // Check peer actor addresses to see if one of them matches, then
+        // peer Zodes by the ZPR address their topology entry gives them
+        // (zl-zipline#222).
         self.peer_table
             .find(|(_id, peer)| {
                 peer.actor_auth.owns_address(&actor_addr)
                     || peer.link_state_machine.aaa_address() == Some(actor_addr)
+                    || peer.link_state_machine.zode_peer_addr() == Some(actor_addr)
             })
             .map(|(id, _peer)| id)
     }
@@ -1498,6 +1577,27 @@ pub mod test {
                 );
             })
             .await
+    }
+
+    /// A node-mode Zode assembly that can start Zode links (zl-zipline#222):
+    /// a Noise keypair and a certificate named `own_cn` issued by a test CA
+    /// it also trusts. Its topology starts empty.
+    #[cfg(test)]
+    pub fn zode_assembly_with_ca(own_cn: &str) -> Arc<Assembly> {
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let keypair = km_noise::NoiseKeypair::generate();
+        let window =
+            x509_cert::time::Validity::from_now(std::time::Duration::from_secs(24 * 3600)).unwrap();
+        let certx = KmCertExchange::new(
+            Some(ca.issue(own_cn, &keypair, window)),
+            Some(ca.cert.clone()),
+        );
+        Arc::new(create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(PhMode::Node),
+            self_noise_keypair: Some(keypair),
+            certx: Some(certx),
+            ..TestAssemblyBuilder::new()
+        }))
     }
 
     #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness

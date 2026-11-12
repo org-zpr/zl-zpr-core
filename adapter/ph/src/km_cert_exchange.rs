@@ -66,6 +66,11 @@ impl KmCertExchange {
         }
     }
 
+    /// The CN of our own certificate, if we have one.
+    pub fn local_cn(&self) -> Option<String> {
+        self.local_cert.as_ref().and_then(crate::pki::common_name)
+    }
+
     /// Like [KmCertExchange::new] but takes the contents of the various PEM files.
     #[allow(dead_code)]
     pub fn new_from_pem(cert_pem: &str, authority_cert_pem: &str) -> Result<Self, ParseError> {

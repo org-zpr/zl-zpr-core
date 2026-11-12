@@ -346,8 +346,9 @@ fn process_configuration(asm: &Arc<Assembly>, params: Vec<Param>) -> ConfigureRe
     Ok(())
 }
 
-/// Store the topology the visa service pushed and close Zode links to peers
-/// that left it (zl-zipline#220). Starting links from it is zl-zipline#222.
+/// Store the topology the visa service pushed, close Zode links to peers
+/// that left it (zl-zipline#220), and start links to new peers
+/// (zl-zipline#222).
 fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
     info!(target: VSS_RPC, "received topology update with {} links", links.len());
     for (i, link) in links.iter().enumerate() {
@@ -355,6 +356,8 @@ fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyRespons
     }
     *asm.topology.write().unwrap() = links;
     crate::link_state::close_zode_links_outside_topology(asm);
+    // zl-zipline#222: refresh peer addresses and dial new topology peers.
+    asm.start_topology_links();
     Ok(())
 }
 
@@ -401,6 +404,97 @@ mod tests {
             table.table.contains_key(&8002),
             "later ops are still processed"
         );
+    }
+
+    /// The NodeToNode links in the peer table: (link id, substrate address,
+    /// dialed by us).
+    fn zode_links(
+        asm: &Arc<Assembly>,
+    ) -> Vec<(zpr::packet_info::LinkId, std::net::SocketAddr, bool)> {
+        let mut links = Vec::new();
+        asm.peer_table.for_each(|(id, peer)| {
+            if peer.link_state_machine.get_link_type() == LinkType::NodeToNode {
+                links.push((
+                    id.get(),
+                    peer.substrate_addr,
+                    peer.link_state_machine.is_zode_dialer(),
+                ));
+            }
+        });
+        links
+    }
+
+    /// zl-zipline#222: a topology update dials each named peer this Zode
+    /// has no link to.
+    #[tokio::test]
+    async fn test_topology_dials_new_peer() {
+        use crate::peer_table::test::topology_link;
+        LocalSet::new()
+            .run_until(async {
+                let asm = crate::assembly::test::zode_assembly_with_ca("a.zpr");
+                let entry = topology_link("b.zpr");
+                let peer_addr = std::net::SocketAddr::from(entry.peer.clone());
+                process_topology(&asm, vec![entry]).unwrap();
+                let links = zode_links(&asm);
+                assert_eq!(links.len(), 1);
+                let (link_id, addr, dialer) = links[0];
+                assert_eq!(addr, peer_addr);
+                assert!(dialer);
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    LinkState::Keying
+                );
+            })
+            .await
+    }
+
+    /// zl-zipline#222: a peer already linked (here it reached us first) is
+    /// not dialed again, and its link learns its ZPR address from the
+    /// topology.
+    #[tokio::test]
+    async fn test_topology_keeps_existing_link_and_sets_its_addr() {
+        use crate::peer_table::test::{insert_zode_peer_with_verified_cn, topology_link};
+        LocalSet::new()
+            .run_until(async {
+                let asm = crate::assembly::test::zode_assembly_with_ca("a.zpr");
+                let existing = insert_zode_peer_with_verified_cn(&asm, "b.zpr", LinkState::Active);
+                let entry = topology_link("b.zpr");
+                let topo_addr = net_defs::IpAddress::new_from_std(&entry.zpr_addr);
+                process_topology(&asm, vec![entry]).unwrap();
+                let links = zode_links(&asm);
+                assert_eq!(links.len(), 1, "no second link: {links:?}");
+                assert_eq!(links[0].0, existing);
+                assert_eq!(
+                    asm.peer_table
+                        .get(existing)
+                        .unwrap()
+                        .link_state_machine
+                        .zode_peer_addr(),
+                    Some(topo_addr)
+                );
+            })
+            .await
+    }
+
+    /// zl-zipline#222: an entry with no peer CN, or no dialable address, is
+    /// not dialed.
+    #[tokio::test]
+    async fn test_topology_skips_entries_it_cannot_dial() {
+        use crate::peer_table::test::topology_link;
+        LocalSet::new()
+            .run_until(async {
+                let asm = crate::assembly::test::zode_assembly_with_ca("a.zpr");
+                let no_cn = topology_link("");
+                let mut no_addr = topology_link("c.zpr");
+                no_addr.peer.addr = std::net::IpAddr::from([0, 0, 0, 0]);
+                process_topology(&asm, vec![no_cn, no_addr]).unwrap();
+                assert!(zode_links(&asm).is_empty());
+            })
+            .await
     }
 
     /// A node-mode assembly whose own (configured) ZPR address is `own`:

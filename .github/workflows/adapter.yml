@@ -42,7 +42,7 @@ env:
   # rule (docs/BUILD.md, zl-zipline#254): when the visa service changes in a
   # way core CI needs, cut the next v0.22.0-zodes.N pre-release from its
   # feature/zodes and move this pin to it.
-  VISA_SERVICE_RELEASE: v0.22.0-zodes.1
+  VISA_SERVICE_RELEASE: v0.22.0-zodes.2
 
 jobs:
   # Build and upload ph

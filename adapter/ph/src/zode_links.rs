@@ -33,6 +33,7 @@ use crate::link_state::{LinkEvent, LinkType, ZodeEnd};
 use crate::prelude::*;
 use crate::zdp::TerminateReason;
 use crate::zode_link_record::{Action, Event, Kind, LinkRecord, Timer, system_jitter};
+use libnode::error::VSApiError;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
@@ -504,7 +505,7 @@ pub const REPORT_COALESCE: std::time::Duration = std::time::Duration::from_milli
 pub async fn run_link_state_reporter<F, Fut>(asm: Arc<Assembly>, send: F)
 where
     F: Fn(Vec<zpr::vsapi_types::LinkStateReport>) -> Fut,
-    Fut: std::future::Future<Output = Result<(), libnode::error::VSApiError>>,
+    Fut: std::future::Future<Output = Result<(), VSApiError>>,
 {
     loop {
         asm.zode_links.report_wakeup.notified().await;
@@ -525,9 +526,16 @@ where
             Ok(()) => {
                 info!(target: LINK_STATE, "reported Zode link states to the visa service: [{}]", summary.join(", "))
             }
-            // Without a VS-API session the send fails locally; the session's
-            // (re)connect asks for a report again.
-            Err(e) => warn!(target: LINK_STATE, "link-state report not sent: {e}"),
+            // No VS-API session (always the case on a Zode other than the
+            // visa service's own until zl-zipline#252): VSConn refuses the
+            // call locally, so nothing goes on the wire. The session's
+            // (re)connect asks for a fresh report.
+            Err(e @ (VSApiError::ConnClosed | VSApiError::CommandFailed(_))) => {
+                debug!(target: LINK_STATE, "link-state report not sent, no VS-API session: {e}")
+            }
+            // The call reached the visa service and failed: worth a warning.
+            // The next change or reconnect sends a fresh snapshot.
+            Err(e) => warn!(target: LINK_STATE, "link-state report failed: {e}"),
         }
     }
 }
@@ -1372,12 +1380,13 @@ mod tests {
                 let log = sent.clone();
                 tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |reports| {
                     log.borrow_mut().push(reports);
-                    async { Err(libnode::error::VSApiError::ConnClosed) }
+                    async { Err(VSApiError::ConnClosed) }
                 }));
 
                 set_topology(&asm, vec![peer("b", "fd5a::9", 7139)]);
-                for (port, n) in [(7239, 1), (7240, 2), (7241, 3)] {
-                    let _ = n;
+                // Three answered links from b in a row (each replaces the
+                // last, rule 5): one burst of changes.
+                for port in [7239, 7240, 7241] {
                     answered_up(&asm, "b", port);
                 }
                 tokio::time::sleep(REPORT_COALESCE * 3).await;

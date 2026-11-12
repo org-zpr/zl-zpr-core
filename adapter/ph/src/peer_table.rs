@@ -648,11 +648,21 @@ pub mod test {
         cn: &str,
         state: crate::link_state::LinkState,
     ) -> LinkId {
+        insert_peer_with_verified_cn(asm, LinkType::NodeToNode, cn, state)
+    }
+
+    /// [insert_zode_peer_with_verified_cn] for a peer of any `link_type`.
+    pub fn insert_peer_with_verified_cn(
+        asm: &crate::assembly::Assembly,
+        link_type: LinkType,
+        cn: &str,
+        state: crate::link_state::LinkState,
+    ) -> LinkId {
         let entry = asm.peer_table.vacant_entry().unwrap();
         let link_id = entry.key();
         let peer = create_dummy_peer_state(
             link_id,
-            LinkType::NodeToNode,
+            link_type,
             SubstrateAddr::from(([127, 0, 0, 1], 9700 + link_id.get() as u16)),
             ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
         );

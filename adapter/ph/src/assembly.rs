@@ -717,6 +717,10 @@ impl Assembly {
 
     /// Dial this Zode's initial link, if it has one (zl-zipline#250): the
     /// relay it reaches the network through. Called once at startup.
+    ///
+    /// This is one attempt. Redialing with backoff after a failed attempt or
+    /// a lost link (ZODE_LINKS.md rule 11) is the per-link record's job,
+    /// which the core-lifecycle part of #250 adds on top of this.
     pub fn dial_initial_link(self: &Arc<Self>) {
         let config = self.config.get();
         let Some(link) = config.initial_link.clone() else {

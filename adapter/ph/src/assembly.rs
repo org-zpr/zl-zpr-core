@@ -775,11 +775,7 @@ impl Assembly {
                 let fsm = &peer.link_state_machine;
                 id.get() != except
                     && fsm.get_link_type() == LinkType::NodeToNode
-                    && matches!(
-                        fsm.get_state(),
-                        crate::link_state::LinkState::Helloing
-                            | crate::link_state::LinkState::Active
-                    )
+                    && fsm.is_live()
                     && peer.verified_peer_cn().as_deref() == Some(cn)
             })
             .map(|(id, _peer)| id.get())
@@ -812,6 +808,12 @@ impl Assembly {
             crate::bootstrap_handoff::send(self, link_id);
         }
 
+        self.dial_topology_peers();
+    }
+
+    /// Dial every topology peer this Zode has no link to, live or dialing,
+    /// by CN or by address (zl-zipline#222).
+    pub fn dial_topology_peers(self: &Arc<Self>) {
         let links = self.topology.read().unwrap().clone();
         for link in links {
             let addr = SocketAddr::from(link.peer.clone());
@@ -853,7 +855,10 @@ impl Assembly {
             .find(|(_id, peer)| {
                 peer.actor_auth.owns_address(&actor_addr)
                     || peer.link_state_machine.aaa_address() == Some(actor_addr)
-                    || peer.link_state_machine.zode_peer_addr() == Some(actor_addr)
+                    // A closed Zode link keeps its address while it waits
+                    // to redial; only a live one is a next hop.
+                    || (peer.link_state_machine.zode_peer_addr() == Some(actor_addr)
+                        && peer.link_state_machine.is_live())
             })
             .map(|(id, _peer)| id)
     }

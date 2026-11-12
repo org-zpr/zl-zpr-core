@@ -389,14 +389,21 @@ pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> Handl
 
 /// Handle a BootstrapVisas message (zl-zipline#222): the relay handing this
 /// joining Zode its own VSAPI bootstrap visas. Refused unless every check in
-/// [crate::bootstrap_handoff::accept] passes.
+/// [crate::bootstrap_handoff::accept] passes. A refusal installs nothing and
+/// is logged, but leaves the link up: the relay repeats its hand-off after
+/// topology updates, and a joiner that already has its session refuses
+/// every repeat.
 pub async fn handle_bootstrap_visas(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
+    use crate::bootstrap_handoff::{HandoffError, accept, decode};
     let link_id = pkt.metadata().ingress_link_id;
-    let accepted = crate::bootstrap_handoff::decode(pkt.body())
-        .and_then(|visas| crate::bootstrap_handoff::accept(asm, link_id, visas));
-    if let Err(e) = accepted {
-        warn!(target: ZDP, "{}: refused bootstrap visa hand-off: {e}", asm.formatted_link_id(link_id));
-        return Err(HandleMgmtError::MessageNotPermitted);
+    match decode(pkt.body()).and_then(|visas| accept(asm, link_id, visas)) {
+        Ok(()) => {}
+        Err(HandoffError::SessionUp) => {
+            debug!(target: ZDP, "{}: ignored bootstrap visa hand-off: VS-API session is up", asm.formatted_link_id(link_id));
+        }
+        Err(e) => {
+            warn!(target: ZDP, "{}: refused bootstrap visa hand-off: {e}", asm.formatted_link_id(link_id));
+        }
     }
     Ok(())
 }
@@ -1261,6 +1268,19 @@ mod test {
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::mgmt::core;
     use zpr_ext::zerocopy::IntoBytesExt;
+
+    /// zl-zipline#222 (Copilot review on zl-zpr-core#104): a refused
+    /// bootstrap-visa hand-off installs nothing but is not a link error --
+    /// the relay repeats hand-offs after topology updates, and a joiner with
+    /// a session refuses them -- so the handler must not fail (which would
+    /// close the link).
+    #[tokio::test]
+    async fn test_refused_bootstrap_handoff_does_not_fail_the_link() {
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let mut pkt = core::new_heap_packet();
+        pkt.put(&[1u8, 0, 9][..]);
+        assert!(handle_bootstrap_visas(&asm, pkt).await.is_ok());
+    }
 
     /// A HelloResponse carrying an OIDC_IDP TLV must yield a
     /// ReceivedHelloResponse event carrying the decoded IdP list.

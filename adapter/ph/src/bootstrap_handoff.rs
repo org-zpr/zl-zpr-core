@@ -17,8 +17,9 @@
 //!
 //! The joiner trusts the hand-off only as far as it has to. It accepts one
 //! only when all of these hold:
-//! - it arrives on an Active Zode link whose verified certificate CN is one
-//!   of this Zode's configured initial links (its relay);
+//! - it arrives on a keyed (Helloing or Active) Zode link whose verified
+//!   certificate CN is one of this Zode's configured initial links (its
+//!   relay);
 //! - this Zode has no VS-API session yet;
 //! - it carries at most [MAX_HANDOFF_VISAS] visas;
 //! - each visa is exactly this Zode's VSAPI flow: a full TCP visa from one
@@ -50,8 +51,8 @@ pub const MAX_HANDOFF_VISAS: usize = 2;
 pub enum HandoffError {
     #[error("hand-off is not on a Zode link")]
     NotZodeLink,
-    #[error("hand-off arrived before Hello completed")]
-    NotActive,
+    #[error("hand-off arrived before keying completed")]
+    NotKeyed,
     #[error("hand-off is not from one of this Zode's initial links")]
     NotInitialLink,
     #[error("this Zode already has a VS-API session")]
@@ -150,8 +151,11 @@ pub fn accept(asm: &Arc<Assembly>, link_id: LinkId, visas: Vec<Visa>) -> Result<
     if fsm.get_link_type() != LinkType::NodeToNode {
         return Err(HandoffError::NotZodeLink);
     }
-    if fsm.get_state() != LinkState::Active {
-        return Err(HandoffError::NotActive);
+    // The peer's CN is verified at keying. The relay sends once its side is
+    // Active, which can reach us before its HelloResponse does, so a
+    // Helloing link is as good as an Active one here.
+    if !matches!(fsm.get_state(), LinkState::Helloing | LinkState::Active) {
+        return Err(HandoffError::NotKeyed);
     }
     let from_initial_link = peer.verified_peer_cn().is_some_and(|cn| {
         asm.config
@@ -413,21 +417,31 @@ mod tests {
             .await
     }
 
-    /// A hand-off that arrives while Hello is still under way is refused.
+    /// The relay sends the hand-off once its side is Active, and ZDP-R may
+    /// deliver it before this side has the HelloResponse (Copilot review on
+    /// zl-zpr-core#104). The peer's CN was verified at keying, so a
+    /// hand-off on a Helloing link is accepted; one before keying finishes
+    /// is refused.
     #[tokio::test]
-    async fn test_refuses_before_hello_completes() {
+    async fn test_accepts_while_helloing_refuses_before_keying() {
         LocalSet::new()
             .run_until(async {
                 let (asm, link) = joiner("relay.zpr");
-                asm.peer_table
-                    .get(link)
-                    .unwrap()
-                    .link_state_machine
-                    .test_set_state(LinkState::Helloing);
+                let fsm = |asm: &Arc<Assembly>, state| {
+                    asm.peer_table
+                        .get(link)
+                        .unwrap()
+                        .link_state_machine
+                        .test_set_state(state)
+                };
+                fsm(&asm, LinkState::Keying);
                 assert_eq!(
                     accept(&asm, link, vsapi_pair()),
-                    Err(HandoffError::NotActive)
+                    Err(HandoffError::NotKeyed)
                 );
+                fsm(&asm, LinkState::Helloing);
+                accept(&asm, link, vsapi_pair()).unwrap();
+                assert!(installed(&asm, 9001) && installed(&asm, 9002));
             })
             .await
     }

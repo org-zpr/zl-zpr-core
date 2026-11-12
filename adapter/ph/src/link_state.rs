@@ -249,6 +249,10 @@ pub struct LinkStateWrapper {
     /// from the topology entry whose `peer_cn` is the peer's verified CN.
     /// Never from Hello (gap 5). Used to find the link for a next hop.
     zode_peer_addr: rcu::RcuBox<Option<IpAddress>>,
+    /// NodeToNode only (zl-zipline#222): this dialed link lost a
+    /// crossed-dial election, so it is dropped when its close completes
+    /// instead of redialing into the same loss.
+    zode_retired: AtomicBool,
     /// Internal links _may_ be associated with another internal link
     /// representing its remote side.
     pub internal_peer_id: Option<NonZero<LinkId>>,
@@ -271,6 +275,7 @@ impl LinkStateWrapper {
             aaa_address: rcu::RcuBox::new(None),
             zode_dialer: AtomicBool::new(false),
             zode_peer_addr: rcu::RcuBox::new(None),
+            zode_retired: AtomicBool::new(false),
             locked_fsm: Mutex::new(lsm),
             locked_data: Mutex::new(LinkData::new()),
             internal_peer_id: None,
@@ -309,6 +314,18 @@ impl LinkStateWrapper {
     /// Record the peer Zode's ZPR address from the topology (zl-zipline#222).
     pub fn set_zode_peer_addr(&self, addr: Option<IpAddress>) {
         self.zode_peer_addr.write(addr);
+    }
+
+    /// Retire this Zode link: it lost a crossed-dial election, so when its
+    /// close completes it is dropped, never redialed (zl-zipline#222).
+    pub fn retire_zode_link(&self) {
+        self.zode_retired.store(true, Ordering::Release);
+    }
+
+    /// Is this link keyed and not closing: Helloing or Active? A Zode link
+    /// in any other state is not a usable link to its peer (zl-zipline#222).
+    pub fn is_live(&self) -> bool {
+        matches!(self.get_state(), LinkState::Helloing | LinkState::Active)
     }
 
     /// Did this Zode dial this NodeToNode link? Always false for other link
@@ -680,6 +697,19 @@ impl LinkStateWrapper {
                 drop(locked_fsm);
                 return self.initiate_close(asm, TerminateReason::Reset);
             };
+            // zl-zipline#222: on a link this Zode dialed, the peer must be
+            // the Zode it dialed -- the CN its initial link or topology entry
+            // gives that address -- not just any allowed Zode.
+            if self.is_zode_dialer() {
+                let expected = asm.expected_zode_cn(&peer_state.substrate_addr);
+                if expected.as_deref() != Some(peer_cn.as_str()) {
+                    warn!(target: LINK_STATE, "{} dialed {expected:?} but the peer is {peer_cn:?}; closing", asm.formatted_link_id(link_id));
+                    drop(sa);
+                    drop(peer_state);
+                    drop(locked_fsm);
+                    return self.initiate_close(asm, TerminateReason::Reset);
+                }
+            }
             // zl-zipline#222: the peer's ZPR address comes from the
             // topology entry for its verified CN, never from Hello (gap 5).
             self.set_zode_peer_addr(asm.topology_zpr_addr(&peer_cn));
@@ -697,6 +727,7 @@ impl LinkStateWrapper {
                     losing_duplicate = Some(other);
                 } else {
                     info!(target: LINK_STATE, "{} duplicates a link to {peer_cn}; closing", asm.formatted_link_id(link_id));
+                    self.retire_zode_link();
                     drop(sa);
                     drop(peer_state);
                     drop(locked_fsm);
@@ -774,6 +805,9 @@ impl LinkStateWrapper {
         drop(locked_fsm);
         if let Some(other) = losing_duplicate {
             info!(target: LINK_STATE, "{} duplicates {}; closing it", asm.formatted_link_id(other), asm.formatted_link_id(link_id));
+            if let Some(peer) = asm.peer_table.get(other) {
+                peer.link_state_machine.retire_zode_link();
+            }
             if let Err(e) =
                 asm.process_link_state_event(other, LinkEvent::Close(TerminateReason::Reset))
             {
@@ -1184,12 +1218,18 @@ impl LinkStateWrapper {
             }
             // zl-zipline#222: a Zode link this Zode dialed is redialed only
             // while its address still belongs to a topology entry or an
-            // initial link. Once a topology update removes its peer, redialing
-            // would only key, fail the CN check and close again, forever.
-            (LinkState::Closing, LinkType::NodeToNode) if !self.zode_dial_still_wanted(asm) => {
-                info!(target: LINK_STATE, "{} left the topology; not redialing", asm.formatted_link_id(link_id));
+            // initial link, and only if it did not lose a crossed-dial
+            // election. Otherwise redialing would only key, fail the CN check
+            // or lose again, and close, forever. If the peer moved to a new
+            // topology address, it is dialed there instead.
+            (LinkState::Closing, LinkType::NodeToNode)
+                if self.zode_retired.load(Ordering::Acquire)
+                    || !self.zode_dial_still_wanted(asm) =>
+            {
+                info!(target: LINK_STATE, "{} retired or left the topology; not redialing", asm.formatted_link_id(link_id));
                 drop(locked_fsm);
                 asm.drop_peer(link_id);
+                asm.dial_topology_peers();
                 return;
             }
             (LinkState::Closing, _) => {
@@ -1897,6 +1937,8 @@ mod tests {
                 );
                 let peer = asm.peer_table.get(link_id).unwrap();
                 peer.link_state_machine.set_zode_dialer(true);
+                // We dialed relay.zpr's topology address.
+                point_topology_at(&asm, "relay.zpr", peer.substrate_addr);
                 drop(peer);
                 asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
                     .unwrap();
@@ -2057,14 +2099,143 @@ mod tests {
     }
 
     /// Insert a Zode link to `cn` in `state`, dialed by us or not.
+    /// Insert a Zode link to `cn` in `state`. A dialed one is also made the
+    /// link this Zode would dial for `cn`: the topology entry for `cn`, if
+    /// any, is pointed at its substrate address.
     fn insert_zode_link(asm: &Arc<Assembly>, cn: &str, state: LinkState, dialer: bool) -> LinkId {
         let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(asm, cn, state);
-        asm.peer_table
-            .get(link_id)
-            .unwrap()
-            .link_state_machine
-            .set_zode_dialer(dialer);
+        let peer = asm.peer_table.get(link_id).unwrap();
+        peer.link_state_machine.set_zode_dialer(dialer);
+        if dialer {
+            point_topology_at(asm, cn, peer.substrate_addr);
+        }
         link_id
+    }
+
+    /// Point the topology entry for `cn` at substrate address `addr`.
+    fn point_topology_at(asm: &Assembly, cn: &str, addr: SubstrateAddr) {
+        for link in asm.topology.write().unwrap().iter_mut() {
+            if link.peer_cn == cn {
+                link.peer = zpr::vsapi_types::SockAddr {
+                    addr: addr.ip(),
+                    port: addr.port(),
+                };
+            }
+        }
+    }
+
+    /// zl-zipline#222 (Copilot review on zl-zpr-core#104): on a link this
+    /// Zode dialed, the peer must be the Zode it dialed -- the CN the
+    /// topology or initial link gives that address -- not merely some
+    /// allowed Zode.
+    #[tokio::test(start_paused = true)]
+    async fn test_dialed_zode_link_to_another_allowed_cn_is_closed_at_keying_done() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = zode_assembly(&["relay-a.zpr", "relay-b.zpr"]);
+                // We dialed relay-a's address; relay-b answers.
+                let link_id = insert_zode_link(&asm, "relay-b.zpr", LinkState::Keying, true);
+                let addr = asm.peer_table.get(link_id).unwrap().substrate_addr;
+                point_topology_at(&asm, "relay-b.zpr", "127.0.0.9:5000".parse().unwrap());
+                point_topology_at(&asm, "relay-a.zpr", addr);
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+                // (The expected CN proceeds to Hello:
+                // test_dialing_zode_says_hello_after_keying.)
+            })
+            .await
+    }
+
+    /// zl-zipline#222 (Copilot review on zl-zpr-core#104): the dialed link
+    /// that loses a crossed-dial election is retired -- dropped when its
+    /// close completes -- instead of redialing, losing again, and so on.
+    #[tokio::test(start_paused = true)]
+    async fn test_losing_dialed_duplicate_is_retired_not_redialed() {
+        use crate::peer_table::test::topology_link;
+        LocalSet::new()
+            .run_until(async {
+                // We are "c.zpr" > "b.zpr": b's dial (our answered link) wins.
+                // Our dialed link loses when the answered one keys...
+                let asm = crate::assembly::test::zode_assembly_with_ca("c.zpr");
+                *asm.topology.write().unwrap() = vec![topology_link("b.zpr")];
+                let dialed = insert_zode_link(&asm, "b.zpr", LinkState::Active, true);
+                let answered = insert_zode_link(&asm, "b.zpr", LinkState::Keying, false);
+                asm.process_link_state_event(answered, LinkEvent::KeyingDone)
+                    .unwrap();
+                complete_close_of(&asm, dialed);
+                assert!(asm.peer_table.get(dialed).is_none(), "loser retired");
+
+                // ...and when it keys after the answered one is up.
+                let asm = crate::assembly::test::zode_assembly_with_ca("c.zpr");
+                *asm.topology.write().unwrap() = vec![topology_link("b.zpr")];
+                insert_zode_link(&asm, "b.zpr", LinkState::Active, false);
+                let dialed = insert_zode_link(&asm, "b.zpr", LinkState::Keying, true);
+                asm.process_link_state_event(dialed, LinkEvent::KeyingDone)
+                    .unwrap();
+                complete_close_of(&asm, dialed);
+                assert!(asm.peer_table.get(dialed).is_none(), "loser retired");
+            })
+            .await
+    }
+
+    /// zl-zipline#222 (Copilot review on zl-zpr-core#104): a closed Zode
+    /// link keeps its recorded peer address while it waits to redial; the
+    /// next hop must resolve to the live link to that address, not to it.
+    #[tokio::test(start_paused = true)]
+    async fn test_next_hop_lookup_skips_a_closed_zode_link() {
+        use crate::peer_table::test::topology_link;
+        LocalSet::new()
+            .run_until(async {
+                let asm = crate::assembly::test::zode_assembly_with_ca("c.zpr");
+                *asm.topology.write().unwrap() = vec![topology_link("b.zpr")];
+                let addr = IpAddress::new_from_std(&topology_link("b.zpr").zpr_addr);
+                let closed = insert_zode_link(&asm, "b.zpr", LinkState::Inactive, true);
+                let live = insert_zode_link(&asm, "b.zpr", LinkState::Active, false);
+                for link in [closed, live] {
+                    asm.peer_table
+                        .get(link)
+                        .unwrap()
+                        .link_state_machine
+                        .set_zode_peer_addr(Some(addr));
+                }
+                assert_eq!(asm.find_egress_link(addr).map(|l| l.get()), Some(live));
+            })
+            .await
+    }
+
+    /// zl-zipline#222 (Codex review on zl-zpr-core#104): when a topology
+    /// update moves a peer to a new address, the old dialed link is dropped
+    /// on close and the peer is dialed at its new address.
+    #[tokio::test(start_paused = true)]
+    async fn test_dropped_dial_redials_peer_at_its_new_topology_address() {
+        use crate::peer_table::test::topology_link;
+        LocalSet::new()
+            .run_until(async {
+                let asm = crate::assembly::test::zode_assembly_with_config(
+                    "zb",
+                    <config::Config as std::default::Default>::default(),
+                );
+                *asm.topology.write().unwrap() = vec![topology_link("relay")];
+                let new_sa = std::net::SocketAddr::from(topology_link("relay").peer);
+                let old_sa: std::net::SocketAddr = "127.0.0.9:6000".parse().unwrap();
+                let iface = zpr_utils::net_defs::ScopedIpAddr::V4(
+                    std::net::Ipv4Addr::new(127, 0, 0, 1).into(),
+                );
+                let old = asm.start_zode_link(&old_sa, &iface, true).unwrap().get();
+
+                complete_close_of(&asm, old);
+
+                assert!(asm.peer_table.get(old).is_none());
+                let mut dialed = Vec::new();
+                asm.peer_table.for_each(|(_id, peer)| {
+                    if peer.link_state_machine.is_zode_dialer() {
+                        dialed.push(peer.substrate_addr);
+                    }
+                });
+                assert_eq!(dialed, vec![new_sa]);
+            })
+            .await
     }
 
     /// zl-zipline#222: when a crossed dial finishes keying, the losing link

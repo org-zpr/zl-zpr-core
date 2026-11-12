@@ -108,6 +108,9 @@ pub async fn launch(
                 match vs_handle.register_vss(vss_addr).await {
                     Ok(ops) => {
                         info!(target: STARTUP, "registered VSS, received {} pending visa ops", ops.len());
+                        // A fresh VS-API session gets a fresh link-state
+                        // snapshot (zl-zipline#250).
+                        asm.zode_links.request_report();
                         for op in ops {
                             if let Err(e) = vss_worker::process_visaop(&asm, op) {
                                 error!(target: STARTUP, "failed to process initial visa op from VS: {e:?}");
@@ -377,7 +380,7 @@ mod tests {
         fail_registers: u32,
         fail_notify_disconnect: bool,
         window: Duration,
-    ) -> (bool, Rc<RefCell<FakeVsState>>) {
+    ) -> (bool, Rc<RefCell<FakeVsState>>, Arc<Assembly>) {
         let (vs_addr, state) = spawn_fake_vs(fail_registers, fail_notify_disconnect).await;
 
         let mut vsconn = VSConn::new(
@@ -395,10 +398,11 @@ mod tests {
         });
 
         let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let worker_asm = asm.clone();
         let node_zpr_addr: IpAddr = "fd5a:5052:3000::2".parse().unwrap();
         let vss_addr: SocketAddr = "[fd5a:5052:3000::2]:8183".parse().unwrap();
         let worker = tokio::task::spawn_local(launch(
-            asm,
+            worker_asm,
             node_zpr_addr,
             vss_addr,
             vs_handle,
@@ -415,9 +419,30 @@ mod tests {
         })
         .await
         .is_ok();
+        // The worker asks for a link-state report right after registering.
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while !asm.zode_links.report_pending() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
 
         worker.abort();
-        (registered, state)
+        (registered, state, asm)
+    }
+
+    /// zl-zipline#250: every VS-API (re)connect, once registered, asks for a
+    /// fresh link-state report.
+    #[tokio::test]
+    async fn test_registration_requests_a_link_state_report() {
+        LocalSet::new()
+            .run_until(async {
+                let (registered, _, asm) =
+                    run_worker_until_registered(0, false, Duration::from_secs(20)).await;
+                assert!(registered);
+                assert!(asm.zode_links.report_pending());
+            })
+            .await;
     }
 
     /// zipline#167 defect 2: a failed VSS registration must leave the VS
@@ -430,7 +455,7 @@ mod tests {
     async fn test_failed_register_vss_leaves_connection_reconnectable() {
         LocalSet::new()
             .run_until(async {
-                let (registered, state) =
+                let (registered, state, _) =
                     run_worker_until_registered(1, false, Duration::from_secs(20)).await;
                 assert!(
                     registered,
@@ -455,7 +480,7 @@ mod tests {
     async fn test_failed_register_vss_with_failed_disconnect_does_not_kill_node() {
         LocalSet::new()
             .run_until(async {
-                let (registered, state) =
+                let (registered, state, _) =
                     run_worker_until_registered(1, true, Duration::from_secs(20)).await;
                 assert!(
                     registered,

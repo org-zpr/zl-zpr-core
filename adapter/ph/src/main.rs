@@ -874,6 +874,16 @@ fn main() -> ExitCode {
         ));
 
         js.spawn_local(vss_worker::launch(asm.clone(), vss_outq));
+
+        // Report Zode link states to the visa service (zl-zipline#250).
+        let report_handle = asm.vsconn.as_ref().unwrap().clone();
+        js.spawn_local(crate::zode_links::run_link_state_reporter(
+            asm.clone(),
+            move |reports| {
+                let handle = report_handle.clone();
+                async move { handle.report_link_states(reports).await }
+            },
+        ));
     }
 
     //

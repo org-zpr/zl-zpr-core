@@ -64,6 +64,20 @@ pub const DEFAULT_TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// fresh link for it.
 pub const NODE_KEYING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long either end of a Zode link may stay in `Keying` before it closes
+/// the link (zl-zipline#250). A real handshake takes one round trip.
+///
+/// Every per-attempt bound on a Zode link fits inside the owner's link-up
+/// window (ZODE_LINKS.md rule 6, 5 s): this plus [ZODE_HELLO_TIMEOUT] is 4 s,
+/// so an attempt has ended on its own by the time the window does.
+pub const ZODE_KEYING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long either end of a Zode link may stay in `Helloing` before it
+/// closes the link (zl-zipline#250). Covers a few ZDP-R retransmissions
+/// ([DEFAULT_ZDPR_RETRY_TIMER]) of the dialer's HelloRequest. See
+/// [ZODE_KEYING_TIMEOUT] for how the two fit the link-up window.
+pub const ZODE_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub const DEFAULT_VSS_PORT: u16 = 8183;
 
 /// Visa service minimum visa ID value. Values below this are reserved.

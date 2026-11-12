@@ -244,9 +244,6 @@ pub fn add_node_link(
 ///
 /// - `link_id` is the link to the peer Zode; it must already have a peer_table entry.
 /// - `initiate` is true on the end that dialed the link.
-// The NodeToNode link start that calls this arrives with zl-zipline#222,
-// which knows which end dialed.
-#[allow(dead_code)]
 pub fn add_zode_link(
     asm: &Assembly,
     link_id: LinkId,

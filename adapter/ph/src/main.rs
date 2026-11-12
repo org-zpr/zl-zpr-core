@@ -703,6 +703,10 @@ fn main() -> ExitCode {
                 }
                 return ExitCode::FAILURE;
             }
+
+            // Dial the configured initial link (zl-zipline#250): the relay
+            // this Zode reaches the network through.
+            asm.dial_initial_link();
         }
     }
 

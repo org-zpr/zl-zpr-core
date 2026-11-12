@@ -6,7 +6,7 @@ use crate::flow_control::FlowControl;
 use crate::km_cert_exchange::KmCertExchange;
 use crate::km_multiplexor::KmState;
 use crate::km_noise;
-use crate::link_state::{LinkEvent, LinkStateError, LinkType};
+use crate::link_state::{LinkEvent, LinkStateError, LinkType, ZodeEnd};
 use crate::mgmt;
 use crate::mgmt_processor_worker;
 use crate::peer_table;
@@ -32,7 +32,7 @@ use tracing_subscriber::{Layer, Registry, filter, fmt, reload};
 use x25519_dalek::ReusableSecret;
 use zpr::addrs::{VISA_SERVICE_ADDR, ZPRNET_PREFIX_LEN};
 use zpr::vsapi_types::{AuthServicesList, ConnectRequest};
-use zpr_utils::net_defs::{IpAddress, ScopedIpAddr};
+use zpr_utils::net_defs::{IpAddress, ScopedIpAddr, SocketAddrExt};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PhMode {
@@ -650,6 +650,71 @@ impl Assembly {
         }
 
         return Ok(peer_id);
+    }
+
+    /// Add a Zode-to-Zode link to `peer` and start it (zl-zipline#250).
+    /// `end` says whether this Zode dialed it, and for which CN, or answers
+    /// a peer's dial. A link that fails to start leaves no peer entry.
+    pub fn start_zode_link(
+        self: &Arc<Self>,
+        peer: &SubstrateAddr,
+        interface_addr: &ScopedIpAddr,
+        end: ZodeEnd,
+    ) -> Result<NonZero<LinkId>, PeerInsertError> {
+        debug!(target: PEER_MGMT, "Starting Zode link with {peer} on {interface_addr} as {end:?}");
+        let peer_id = self.add_peer(LinkType::NodeToNode, peer, interface_addr)?;
+        self.start_added_zode_link(peer_id, end)?;
+        info!(target: PEER_MGMT, "Started Zode link with {peer}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
+        Ok(peer_id)
+    }
+
+    /// Set the Zode end of the just-added link `peer_id` and fire `Start`.
+    /// On failure the peer entry is dropped, so nothing of the link remains.
+    fn start_added_zode_link(
+        self: &Arc<Self>,
+        peer_id: NonZero<LinkId>,
+        end: ZodeEnd,
+    ) -> Result<(), PeerInsertError> {
+        let started = match self.peer_table.get(peer_id.get()) {
+            Some(peer) => peer.link_state_machine.set_zode_end(end).and_then(|()| {
+                peer.link_state_machine
+                    .process_event(self, LinkEvent::Start)
+            }),
+            None => return Ok(()),
+        };
+        if let Err(e) = started {
+            error!(target: PEER_MGMT, "{} failed to start: {e}.  Dropping it", self.formatted_link_id(peer_id.get()));
+            self.drop_peer(peer_id.get());
+            return Err(PeerInsertError::FailedToStart(e.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Dial this Zode's initial link, if it has one (zl-zipline#250): the
+    /// relay it reaches the network through. Called once at startup.
+    pub fn dial_initial_link(self: &Arc<Self>) {
+        let config = self.config.get();
+        let Some(link) = config.initial_link.clone() else {
+            return;
+        };
+        // The local address the kernel uses to reach the relay is the
+        // interface address its packets will arrive on. Probe from our IP
+        // with an ephemeral port: the substrate sockets hold our port.
+        let probe_from = std::net::SocketAddr::new(config.self_addr.ip(), 0);
+        let interface_addr = match crate::sys::substrate::resolve_local_addr(probe_from, link.addr)
+        {
+            Ok(local) => local.scoped_ip(),
+            Err(e) => {
+                error!(target: PEER_MGMT, "cannot route to initial link {} at {}: {e}", link.cn, link.addr);
+                return;
+            }
+        };
+        let end = ZodeEnd::Dialer {
+            peer_cn: link.cn.clone(),
+        };
+        if let Err(e) = self.start_zode_link(&link.addr, &interface_addr, end) {
+            error!(target: PEER_MGMT, "cannot start initial link {} at {}: {e}", link.cn, link.addr);
+        }
     }
 
     /// Temporary? function to find a link based on the actor address
@@ -1440,6 +1505,60 @@ pub mod test {
     }
 
     #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness
+    /// Link keys for a test Zode named `cn`: a Noise keypair and a
+    /// certificate exchange that holds a certificate for it from `ca` and
+    /// trusts `ca` (zl-zipline#250).
+    #[cfg(test)]
+    pub fn zode_link_keys(ca: &crate::pki::TestCa, cn: &str) -> (NoiseKeypair, KmCertExchange) {
+        let keypair = NoiseKeypair::generate();
+        let validity =
+            x509_cert::time::Validity::from_now(std::time::Duration::from_secs(3600)).unwrap();
+        let certx = KmCertExchange::new(
+            Some(ca.issue(cn, &keypair, validity)),
+            Some(ca.cert.clone()),
+        );
+        (keypair, certx)
+    }
+
+    /// zl-zipline#250: a Zode with an initial link dials it at startup, as
+    /// the dialer expecting the relay's CN.
+    #[cfg(test)]
+    #[tokio::test(start_paused = true)]
+    async fn test_dial_initial_link_starts_a_dialed_zode_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let ca = crate::pki::TestCa::new("zode-ca");
+                let (keypair, certx) = zode_link_keys(&ca, "b.zpr");
+                let mut cfg = config::Config::default();
+                cfg.zpr_addr = vec!["fd5a:5052::2".parse().unwrap()];
+                cfg.self_addr = "127.0.0.1:0".parse().unwrap();
+                cfg.initial_link =
+                    Some(config::InitialLink::parse_cli("relay.zpr@127.0.0.1:7010").unwrap());
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+                    ph_mode: Some(PhMode::Node),
+                    self_noise_keypair: Some(keypair),
+                    certx: Some(certx),
+                    config: Some(rcu::RcuBox::new(cfg)),
+                    ..TestAssemblyBuilder::new()
+                }));
+                asm.dial_initial_link();
+                let (_, peer) = asm
+                    .peer_table
+                    .find(|(_, p)| p.substrate_addr == SubstrateAddr::from(([127, 0, 0, 1], 7010)))
+                    .expect("the initial link was dialed");
+                let fsm = &peer.link_state_machine;
+                assert_eq!(fsm.get_link_type(), LinkType::NodeToNode);
+                assert_eq!(fsm.get_state(), crate::link_state::LinkState::Keying);
+                assert_eq!(
+                    fsm.zode_end(),
+                    Some(&crate::link_state::ZodeEnd::Dialer {
+                        peer_cn: "relay.zpr".to_owned()
+                    })
+                );
+            })
+            .await
+    }
+
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {
         let ph_mode = builder.ph_mode.unwrap_or(PhMode::Adapter);
         let topology_config = builder.topology_config.unwrap_or_default();

@@ -3,7 +3,7 @@
 use super::core;
 use crate::counters::{ManagementCounterType, ManagementCounters};
 use crate::km_multiplexor;
-use crate::link_state::LinkType;
+use crate::link_state::{LinkType, ZodeEnd};
 use crate::prelude::*;
 use crate::queues;
 use crate::zdp;
@@ -39,10 +39,15 @@ pub fn dispatch_mgmt_packet_with_addr(
                 .unwrap_or_zero();
 
             if ingress_link_id == LINK_ID_UNKNOWN {
-                let Some(i_link_id) = asm
-                    .start_tether(&peer_sa, &interface_addr, LinkType::NodeToAdapter, true)
-                    .ok()
-                else {
+                // A dialing Zode marks its first handshake message
+                // (zl-zipline#250); anything else docks as an adapter.
+                let started = match inbound_link_type(km_noise_message(pkt.body())) {
+                    LinkType::NodeToNode => {
+                        asm.start_zode_link(&peer_sa, &interface_addr, ZodeEnd::Answerer)
+                    }
+                    _ => asm.start_tether(&peer_sa, &interface_addr, LinkType::NodeToAdapter, true),
+                };
+                let Some(i_link_id) = started.ok() else {
                     core::count_event(asm, ManagementCounterType::UnknownPeer);
                     return;
                 };
@@ -57,6 +62,28 @@ pub fn dispatch_mgmt_packet_with_addr(
             core::count_event(asm, ManagementCounterType::UnknownPeer);
             return;
         }
+    }
+}
+
+/// The link type for a new inbound link whose first key-management message
+/// is `km_msg` (zl-zipline#250): a Zode link when it opens a Zode handshake,
+/// an adapter dock otherwise.
+fn inbound_link_type(km_msg: &[u8]) -> LinkType {
+    if crate::km_noise::starts_zode_handshake(km_msg) {
+        LinkType::NodeToNode
+    } else {
+        LinkType::NodeToAdapter
+    }
+}
+
+/// The Noise message carried in `km_body` (a KM header and its payload), or
+/// an empty slice if the header is malformed or not Noise.
+fn km_noise_message(km_body: &[u8]) -> &[u8] {
+    match zdp::ZdpKeyManagementHeader::ref_from_prefix(km_body) {
+        Ok((hdr, rest)) if hdr.is_noise() => {
+            &rest[..usize::from(hdr.message_length.get()).min(rest.len())]
+        }
+        _ => &[],
     }
 }
 
@@ -313,6 +340,94 @@ mod test {
     use std::net::Ipv4Addr;
     use std::num::NonZero;
     use std::sync::Arc;
+
+    /// A key-management packet carrying the Noise message `km_msg`, as the
+    /// fastpath hands it to the dispatcher (ZDP base header first).
+    fn km_packet(km_msg: &[u8]) -> Packet {
+        let mut pkt = core::new_heap_packet();
+        let km_hdr = pkt.alloc_zeroed_header::<zdp::ZdpKeyManagementHeader>();
+        km_hdr.message_type = KM_ID_NOISE.into();
+        km_hdr.message_length = (km_msg.len() as u16).into();
+        pkt.put(km_msg);
+        pkt.alloc_zeroed_header::<zdp::ZdpBaseHeader>().packet_type =
+            zdp::ZdpPacketType::KeyManagement;
+        pkt
+    }
+
+    /// The first Noise message of a Zode's handshake and of an adapter's.
+    fn first_messages() -> (bytes::Bytes, bytes::Bytes) {
+        use crate::km::KeyManagerStateMachine;
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let (kp, certx) = crate::assembly::test::zode_link_keys(&ca, "a.zpr");
+        let mut zode =
+            crate::km_noise::KmNoise::new_zode(true, kp, crate::km::ZPIPair::new(1, 2), certx)
+                .unwrap();
+        let mut adapter = crate::km_noise::KmNoise::new(
+            true,
+            true,
+            None,
+            crate::km::ZPIPair::new(1, 2),
+            KmCertExchange::new(None, Some(ca.cert.clone())),
+        )
+        .unwrap();
+        (
+            zode.reset().unwrap().unwrap(),
+            adapter.reset().unwrap().unwrap(),
+        )
+    }
+
+    /// zl-zipline#250: a node creates a Zode link for an unknown peer whose
+    /// first handshake message carries the Zode marker, and an adapter
+    /// dock for anything else.
+    #[test]
+    fn test_inbound_link_type_from_first_handshake_message() {
+        let (zode_msg0, adapter_msg0) = first_messages();
+        assert_eq!(inbound_link_type(&zode_msg0), LinkType::NodeToNode);
+        assert_eq!(inbound_link_type(&adapter_msg0), LinkType::NodeToAdapter);
+        assert_eq!(inbound_link_type(&[]), LinkType::NodeToAdapter);
+    }
+
+    /// zl-zipline#250: dispatching a marked first message from an unknown
+    /// address creates a NodeToNode link with this Zode as the answerer;
+    /// an unmarked one still docks an adapter.
+    #[tokio::test(flavor = "local")]
+    async fn test_unknown_peer_marked_handshake_creates_zode_link() {
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let (kp, certx) = crate::assembly::test::zode_link_keys(&ca, "relay.zpr");
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(crate::assembly::PhMode::Node),
+            self_noise_keypair: Some(kp),
+            certx: Some(certx),
+            ..TestAssemblyBuilder::new()
+        }));
+        let (zode_msg0, adapter_msg0) = first_messages();
+        let intf_addr = net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 1).into());
+        let zode_sa = SubstrateAddr::from(([127, 0, 0, 1], 4001));
+        let adapter_sa = SubstrateAddr::from(([127, 0, 0, 1], 4002));
+
+        dispatch_mgmt_packet_with_addr(&asm, zode_sa, intf_addr, &mut km_packet(&zode_msg0));
+        dispatch_mgmt_packet_with_addr(&asm, adapter_sa, intf_addr, &mut km_packet(&adapter_msg0));
+
+        let link_type_at = |sa| {
+            let id = asm.peer_table.lookup_peer(&sa, &intf_addr).unwrap();
+            asm.peer_table
+                .get(id.get())
+                .unwrap()
+                .link_state_machine
+                .get_link_type()
+        };
+        assert_eq!(link_type_at(zode_sa), LinkType::NodeToNode);
+        assert_eq!(link_type_at(adapter_sa), LinkType::NodeToAdapter);
+        let id = asm.peer_table.lookup_peer(&zode_sa, &intf_addr).unwrap();
+        assert_eq!(
+            asm.peer_table
+                .get(id.get())
+                .unwrap()
+                .link_state_machine
+                .zode_end(),
+            Some(&crate::link_state::ZodeEnd::Answerer)
+        );
+    }
 
     // Ensure that this old issue is fixed:
     // https://github.com/org-zpr/zpr-core/issues/929

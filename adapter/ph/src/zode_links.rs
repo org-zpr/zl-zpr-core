@@ -497,6 +497,10 @@ pub fn apply_topology(asm: &Arc<Assembly>) {
 /// sends, so a burst of link changes goes out as one snapshot.
 pub const REPORT_COALESCE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// The most snapshots the reporter queues behind a send that is still in
+/// flight. Past it, the newest snapshot replaces the last queued one.
+pub const REPORT_QUEUE_MAX: usize = 32;
+
 /// Send this Zode's link-state snapshot whenever one is asked for
 /// ([ZodeLinkTable::request_report]), with `send` (in production,
 /// `VSConnHandle::report_link_states`). Requests within [REPORT_COALESCE] of
@@ -514,9 +518,11 @@ where
     F: Fn(Vec<zpr::vsapi_types::LinkStateReport>) -> Fut,
     Fut: std::future::Future<Output = Result<(), VSApiError>>,
 {
-    // ponytail: unbounded, but it only grows by one snapshot per coalesced
-    // burst of link changes while a send is in flight.
-    let (queue_tx, mut queue_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Both loops run on this one task (`join!` below), so a RefCell is
+    // enough. `queued` wakes the sender; a wake-up sent while it is busy is
+    // kept as a permit, so none is lost.
+    let queue = std::cell::RefCell::new(VecDeque::new());
+    let queued = tokio::sync::Notify::new();
 
     let take_snapshots = async {
         loop {
@@ -527,15 +533,32 @@ where
                 .report_pending
                 .swap(false, std::sync::atomic::Ordering::AcqRel)
             {
-                // The receiver lives as long as this function, so the send
-                // cannot fail.
-                let _ = queue_tx.send(asm.zode_links.snapshot());
+                let snapshot = asm.zode_links.snapshot();
+                let mut queue = queue.borrow_mut();
+                // ponytail: a stall longer than REPORT_QUEUE_MAX snapshots
+                // merges the newest changes into the last queued snapshot,
+                // so transitions inside that tail can be lost. Bounded
+                // memory wins over that corner; each send is bounded by the
+                // RPC timeout, so only a long run of stalls gets there.
+                if queue.len() >= REPORT_QUEUE_MAX {
+                    queue.pop_back();
+                }
+                queue.push_back(snapshot);
+                drop(queue);
+                queued.notify_one();
             }
         }
     };
 
     let send_snapshots = async {
-        while let Some(snapshot) = queue_rx.recv().await {
+        loop {
+            // Take the next snapshot without holding the borrow across the
+            // await below.
+            let next = queue.borrow_mut().pop_front();
+            let Some(snapshot) = next else {
+                queued.notified().await;
+                continue;
+            };
             let summary: Vec<String> = snapshot
                 .iter()
                 .map(|r| format!("{}={:?}", r.peer_cn, r.state))
@@ -1436,6 +1459,40 @@ mod tests {
                     state: Reported::Failed,
                 }];
                 assert_eq!(*sent.borrow(), vec![failed.clone(), Vec::new(), failed]);
+            })
+            .await
+    }
+
+    /// While a send is stalled, the queue of snapshots taken meanwhile is
+    /// bounded: past [REPORT_QUEUE_MAX] the newest snapshot replaces the
+    /// last queued one, so a long stall cannot grow memory without limit
+    /// (core#107 review).
+    #[tokio::test(start_paused = true)]
+    async fn test_reporter_queue_is_bounded_while_a_send_stalls() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let sent = std::rc::Rc::new(std::cell::Cell::new(0usize));
+                let release = std::rc::Rc::new(tokio::sync::Notify::new());
+                let (count, gate) = (sent.clone(), release.clone());
+                tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |_| {
+                    count.set(count.get() + 1);
+                    let wait = (count.get() == 1).then(|| gate.clone());
+                    async move {
+                        if let Some(gate) = wait {
+                            gate.notified().await;
+                        }
+                        Ok(())
+                    }
+                }));
+
+                for _ in 0..(REPORT_QUEUE_MAX * 3) {
+                    asm.zode_links.request_report();
+                    tokio::time::sleep(REPORT_COALESCE * 2).await;
+                }
+                release.notify_one();
+                tokio::time::sleep(REPORT_COALESCE * 2).await;
+                assert_eq!(sent.get(), 1 + REPORT_QUEUE_MAX);
             })
             .await
     }

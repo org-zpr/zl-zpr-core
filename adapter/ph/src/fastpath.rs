@@ -993,6 +993,19 @@ fn decrypt(
         Some(state) => {
             match state.get_established_transport_association() {
                 Some(ref transport_sa) => {
+                    // A Zode link never re-keys, so ZPI 0 on an established
+                    // one can only be a new handshake from the same address:
+                    // the peer restarted on its fixed port (ZODE_LINKS.md
+                    // rule 5, zl-zipline#250). Let it through as a null
+                    // packet. ZPI 0 may carry only key management (checked
+                    // by the caller), and the dispatcher keys it on a link
+                    // of its own, leaving this one untouched.
+                    if zpi_hdr.zpi == ZPI_0
+                        && state.link_state_machine.get_link_type()
+                            == crate::link_state::LinkType::NodeToNode
+                    {
+                        return decrypt_null(pkt);
+                    }
                     // We've found a matching security association; use it to decrypt.
                     return decrypt_with_sa(asm, zpi_hdr, &transport_sa, pkt);
                 }
@@ -1184,6 +1197,45 @@ mod test {
         assert!(res.is_ok());
 
         assert!(pkt.body().len() == orig_len); // did remove checksum
+    }
+
+    /// A ZPI 0 (null) packet arriving on `link_id`, as the fastpath sees it.
+    fn null_packet_on(link_id: LinkId) -> Packet {
+        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
+        pkt.put(&[ZPI_0][..]);
+        pkt.put(&b"a key-management message"[..]);
+        encrypt_null(&mut pkt);
+        pkt.metadata_mut().ingress_link_id = link_id;
+        pkt
+    }
+
+    /// zl-zipline#250, gate g78 q5: a Zode link never re-keys, so a ZPI 0
+    /// packet arriving on an established Zode link is a new handshake from
+    /// the same address and passes the fastpath (as a null packet, which
+    /// may only carry key management). On an adapter link with an SA, ZPI 0
+    /// is still refused.
+    #[tokio::test(flavor = "local")]
+    async fn test_zpi_0_on_established_link_passes_only_for_zode_links() {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        let asm = create_assembly(TestAssemblyBuilder::new());
+        let zode = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        let adapter = crate::peer_table::test::insert_peer_with_verified_cn(
+            &asm,
+            crate::link_state::LinkType::NodeToAdapter,
+            "c.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        let zpi = zdp::ZdpZpiHeader { zpi: ZPI_0 };
+
+        assert!(decrypt(&asm, zpi, &mut null_packet_on(zode)).is_ok());
+        assert!(matches!(
+            decrypt(&asm, zpi, &mut null_packet_on(adapter)),
+            Err(DecryptError::UnknownZpi)
+        ));
     }
 
     #[test]

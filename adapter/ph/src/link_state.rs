@@ -86,17 +86,29 @@ pub enum LinkStateError {
     InvalidOperation(String),
     #[error("Link {0} does not exist in peer table")]
     NotFound(LinkId),
-    #[error("This operation is not supported yet")]
-    OperationNotSupportedYet,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum LinkType {
     Internal,
     AdapterToNode,
-    #[allow(dead_code)]
-    NodeToNode, // Currently unsupported
+    /// A link between two Zodes (zl-zipline#220, #250). Both ends verify the
+    /// other's CA-signed certificate, the dialer says Hello, and neither end
+    /// hands out an AAA address. Which end this Zode is lives in [ZodeEnd].
+    NodeToNode,
     NodeToAdapter,
+}
+
+/// Which end of a Zode (NodeToNode) link this Zode is (zl-zipline#250). Set
+/// once, before the link starts; see [LinkStateWrapper::set_zode_end].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ZodeEnd {
+    /// This Zode dialed the link. Keying is accepted only if the peer's
+    /// verified certificate carries `peer_cn`, the CN it dialed for.
+    Dialer { peer_cn: String },
+    /// The peer dialed this Zode. Keying is accepted only under the
+    /// acceptance rules (ZODE_LINKS.md rules 3 and 4).
+    Answerer,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -241,6 +253,8 @@ pub struct LinkStateWrapper {
     // Shared with the FSM so every state transition publishes fastpath readiness.
     ready: Arc<AtomicBool>,
     aaa_address: rcu::RcuBox<Option<IpAddress>>,
+    /// NodeToNode only: which end of the link this Zode is (zl-zipline#250).
+    zode_end: std::sync::OnceLock<ZodeEnd>,
     /// Internal links _may_ be associated with another internal link
     /// representing its remote side.
     pub internal_peer_id: Option<NonZero<LinkId>>,
@@ -263,6 +277,7 @@ impl LinkStateWrapper {
             aaa_address: rcu::RcuBox::new(None),
             locked_fsm: Mutex::new(lsm),
             locked_data: Mutex::new(LinkData::new()),
+            zode_end: std::sync::OnceLock::new(),
             internal_peer_id: None,
         }
     }
@@ -283,6 +298,30 @@ impl LinkStateWrapper {
 
     pub fn get_link_type(&self) -> LinkType {
         self.link_type
+    }
+
+    /// Record which end of a Zode link this Zode is (zl-zipline#250). Only
+    /// for a NodeToNode link, and only once: the end never changes.
+    pub fn set_zode_end(&self, end: ZodeEnd) -> Result<(), LinkStateError> {
+        if self.link_type != LinkType::NodeToNode {
+            return Err(LinkStateError::InvalidOperation(format!(
+                "a {:?} link has no Zode end",
+                self.link_type
+            )));
+        }
+        self.zode_end.set(end).map_err(|_| {
+            LinkStateError::InvalidOperation("the Zode end of a link is set only once".into())
+        })
+    }
+
+    /// Which end of this Zode link this Zode is; `None` for other link types.
+    pub fn zode_end(&self) -> Option<&ZodeEnd> {
+        self.zode_end.get()
+    }
+
+    /// Whether this is a Zode link this Zode dialed.
+    pub fn is_zode_dialer(&self) -> bool {
+        matches!(self.zode_end(), Some(ZodeEnd::Dialer { .. }))
     }
 
     /// Read the assigned AAA without taking the link-data mutex.
@@ -312,6 +351,15 @@ impl LinkStateWrapper {
         self.locked_fsm.lock().unwrap().set_state(state);
     }
 
+    /// Test-only: put the link in Keying as `Start` does (status Up),
+    /// without handing it to a key manager.
+    #[cfg(test)]
+    pub fn test_set_keying(&self) {
+        let mut fsm = self.locked_fsm.lock().unwrap();
+        fsm.status = LinkStatus::Up;
+        fsm.set_state(LinkState::Keying);
+    }
+
     /// Test-only: bring the link Up and Active (so `is_ready()` holds)
     /// without walking keying and Hello.
     #[cfg(test)]
@@ -330,11 +378,23 @@ impl LinkStateWrapper {
 
     fn process_hello_request(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let locked_fsm = self.locked_fsm.lock().unwrap();
-        if self.link_type != LinkType::NodeToAdapter || locked_fsm.state != LinkState::Helloing {
+        let zode_answerer = self.zode_end() == Some(&ZodeEnd::Answerer);
+        if !(self.link_type == LinkType::NodeToAdapter || zode_answerer)
+            || locked_fsm.state != LinkState::Helloing
+        {
             return Err(LinkStateError::UnexpectedTransition(
                 locked_fsm.state,
                 "ReceivedHelloRequest",
             ));
+        }
+        if zode_answerer {
+            // zl-zipline#250: a Zode link carries no AAA address, no identity
+            // providers and no bootstrap flag. The peer is known by its
+            // CN-checked certificate, and its ZPR address comes from the
+            // topology, never from Hello.
+            mgmt::requests::send_hello_success_response(asm, self.id, 0, &[], None, false)
+                .enqueue();
+            return self.run_active(asm, locked_fsm);
         }
         let is_vs = asm
             .peer_table
@@ -380,11 +440,29 @@ impl LinkStateWrapper {
             return self.initiate_close(asm, TerminateReason::Other);
         }
         let locked_fsm = self.locked_fsm.lock().unwrap();
-        if self.link_type != LinkType::AdapterToNode || locked_fsm.state != LinkState::Helloing {
+        if !(self.link_type == LinkType::AdapterToNode || self.is_zode_dialer())
+            || locked_fsm.state != LinkState::Helloing
+        {
             return Err(LinkStateError::UnexpectedTransition(
                 locked_fsm.state,
                 "ReceivedHelloResponse",
             ));
+        }
+        if self.link_type == LinkType::NodeToNode {
+            // zl-zipline#250 (gaps 5 and 6): a Zode answers Hello with
+            // nothing an adapter dock would get. A peer that offers an AAA
+            // address, identity providers or the visa-service bootstrap flag
+            // is not behaving as a Zode, so the link is refused.
+            if response.aaa_address.is_some()
+                || response.oidc_idps.is_some()
+                || response.vs_bootstrap
+            {
+                warn!(target: LINK_STATE, "{}: refusing a Zode HelloResponse that carries an AAA address, identity providers or the bootstrap flag; closing",
+                    asm.formatted_link_id(self.id));
+                drop(locked_fsm);
+                return self.initiate_close(asm, TerminateReason::Other);
+            }
+            return self.run_active(asm, locked_fsm);
         }
         if response.aaa_address.is_none() && !response.vs_bootstrap {
             return Err(LinkStateError::InvalidOperation(
@@ -530,9 +608,40 @@ impl LinkStateWrapper {
                 Ok(())
             }
             LinkType::NodeToNode => {
-                error!(target: LINK_STATE, "Error: Node to node not supported yet");
-                locked_fsm.set_state(LinkState::Error);
-                Err(LinkStateError::OperationNotSupportedYet)
+                // zl-zipline#250: the dialer initiates keying, and both ends
+                // demand a CA-signed certificate (#220). A Zode without link
+                // keys or a CA certificate fails closed.
+                let Some(end) = self.zode_end() else {
+                    error!(target: LINK_STATE, "{} is a Zode link with no Zode end set; cannot start it", asm.formatted_link_id(link_id));
+                    locked_fsm.set_state(LinkState::Error);
+                    return Err(LinkStateError::InvalidOperation("Zode end not set".into()));
+                };
+                let dialer = matches!(end, ZodeEnd::Dialer { .. });
+                // The ZPIs this end asks its peer to use: the same split as
+                // an adapter (the dialer) and a node (the answerer).
+                let zpis = if dialer {
+                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 5, 6)
+                } else {
+                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4)
+                };
+                let (Some(keypair), Some(certx)) =
+                    (asm.self_noise_keypair.clone(), asm.certx.clone())
+                else {
+                    error!(target: LINK_STATE, "{} has no link keys; cannot start a Zode link", asm.formatted_link_id(link_id));
+                    locked_fsm.set_state(LinkState::Error);
+                    return Err(LinkStateError::InvalidOperation("no link keys".into()));
+                };
+                if let Err(e) =
+                    km_multiplexor::add_zode_link(asm, link_id, dialer, zpis, keypair, certx)
+                {
+                    error!(target: LINK_STATE, "{} cannot start a Zode link: {e:?}", asm.formatted_link_id(link_id));
+                    locked_fsm.set_state(LinkState::Error);
+                    return Err(LinkStateError::InvalidOperation(format!("{e:?}")));
+                }
+                // Bound keying on both ends: a dialer whose peer never
+                // answers, and an answerer whose dialer went away.
+                self.set_timeout(asm, &mut locked_fsm, config::ZODE_KEYING_TIMEOUT);
+                Ok(())
             }
             LinkType::NodeToAdapter => {
                 km_multiplexor::add_node_link(
@@ -581,18 +690,32 @@ impl LinkStateWrapper {
             ));
         };
 
-        // zl-zipline#220: a Zode link must lead to a peer this Zode was told
-        // to link with; anything else is closed before Hello. This runs
-        // before the certificate block below so a rejected peer never
-        // claims a special-peer name.
+        // zl-zipline#220, #250: a Zode link is checked once the peer's CN
+        // is known, and refused with a logged reason. This runs before the
+        // certificate block below so a refused peer never claims a
+        // special-peer name.
+        //
+        // An inbound Zode link that passes replaces any established link to
+        // the same peer (ZODE_LINKS.md rule 5), once the guards below are
+        // released.
+        let mut replaces_links_to: Option<String> = None;
         if self.link_type == LinkType::NodeToNode {
             let peer_cn = peer_state.verified_peer_cn();
-            if !peer_cn.as_deref().is_some_and(|cn| asm.peer_cn_allowed(cn)) {
-                warn!(target: LINK_STATE, "{} peer certificate CN {peer_cn:?} is not in this Zode's topology; closing", asm.formatted_link_id(link_id));
+            let verdict = match self.zode_end() {
+                Some(end) => crate::zode_links::check_keyed_peer(asm, end, peer_cn.as_deref())
+                    .map_err(|refusal| refusal.to_string()),
+                None => Err("Zode end not set".to_string()),
+            };
+            if let Err(reason) = verdict {
+                warn!(target: LINK_STATE, "{} refusing Zode link with peer CN {peer_cn:?}: {reason}; closing", asm.formatted_link_id(link_id));
                 drop(sa);
                 drop(peer_state);
                 drop(locked_fsm);
                 return self.initiate_close(asm, TerminateReason::Reset);
+            }
+            info!(target: LINK_STATE, "{} accepted Zode link with peer CN {peer_cn:?}", asm.formatted_link_id(link_id));
+            if self.zode_end() == Some(&ZodeEnd::Answerer) {
+                replaces_links_to = peer_cn;
             }
         }
 
@@ -619,7 +742,13 @@ impl LinkStateWrapper {
                 }
             };
 
-            if !is_verified {
+            if self.link_type == LinkType::NodeToNode {
+                // Special peers are adapters (the visa service's); a Zode
+                // link never claims a special-peer name (zl-zipline#250).
+                for name in special_peers::special_peer_names_from_subject_der(&subject_der) {
+                    warn!(target: LINK_STATE, "{} is a Zode link whose certificate claims special peer name {name:?}; ignoring", asm.formatted_link_id(link_id));
+                }
+            } else if !is_verified {
                 for name in special_peers::special_peer_names_from_subject_der(&subject_der) {
                     warn!(
                         target: LINK_STATE,
@@ -641,20 +770,32 @@ impl LinkStateWrapper {
             }
         }
 
+        drop(sa);
+        drop(peer_state);
+
         debug!(target: LINK_STATE, "{} finished keying.  Starting hello", asm.formatted_link_id(link_id));
 
         locked_fsm.set_state(LinkState::Helloing);
 
-        // IF this is an adapter, it's expected to issue the hello
-        if self.link_type == LinkType::AdapterToNode {
+        // An adapter, or the Zode that dialed a Zode link, issues the hello
+        if self.link_type == LinkType::AdapterToNode || self.is_zode_dialer() {
             // Grab public key from keypair to send in hello request
             let pubkey = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
             mgmt::requests::send_hello_request(asm, self.id, pubkey).enqueue();
-            self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
+            self.set_timeout(asm, &mut locked_fsm, hello_timeout(self.link_type));
             debug!(
                 target: LINK_STATE,
                 "{} sent HelloRequest.  Waiting for other side to respond.", asm.formatted_link_id(link_id)
             );
+        } else if self.link_type == LinkType::NodeToNode {
+            // The answering Zode waits for the dialer's HelloRequest, and
+            // bounds the wait so a peer that keys and goes quiet cannot hold
+            // the link open (zl-zipline#250).
+            self.set_timeout(asm, &mut locked_fsm, config::ZODE_HELLO_TIMEOUT);
+        }
+        drop(locked_fsm);
+        if let Some(peer_cn) = replaces_links_to {
+            crate::zode_links::replace_established_links(asm, link_id, &peer_cn);
         }
         // Otherwise we are a node so wait for an adapter to reach out
         Ok(())
@@ -699,7 +840,8 @@ impl LinkStateWrapper {
 
         // handle the timeout...
         match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::Helloing) => {
+            (LinkType::AdapterToNode, LinkState::Helloing)
+            | (LinkType::NodeToNode, LinkState::Keying | LinkState::Helloing) => {
                 // Timeout here means we give up on the link.
                 error!(target: LINK_STATE, "{}: timed out in state {:?}", asm.formatted_link_id(self.id), locked_fsm.state);
                 locked_fsm.set_state(LinkState::Error);
@@ -1042,7 +1184,11 @@ impl LinkStateWrapper {
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
 
         match (locked_fsm.state, self.link_type) {
-            (LinkState::Closing, LinkType::NodeToAdapter) | (LinkState::Resetting, _) => {
+            // zl-zipline#250: a closed Zode link drops its peer entry on
+            // both ends, which clears everything tied to it (ZODE_LINKS.md
+            // rule 9). It never restarts itself: only its owner redials.
+            (LinkState::Closing, LinkType::NodeToAdapter | LinkType::NodeToNode)
+            | (LinkState::Resetting, _) => {
                 // Clear whole peer out
                 drop(locked_fsm);
                 asm.drop_peer(link_id);
@@ -1112,6 +1258,19 @@ impl LinkStateWrapper {
     /// Instead of transitioning, the state machine will be destroyed
     /// Sends a Terminate Indication
     pub async fn reset(&self, asm: &Arc<Assembly>) {
+        let _ = self.begin_reset(asm).join_all().await;
+    }
+
+    /// Drop this Zode link because a newly accepted link to the same peer
+    /// replaces it (ZODE_LINKS.md rule 5). Its state is cleared now; its
+    /// key manager and peer entry go when the returned cleanup completes.
+    pub fn drop_replaced(&self, asm: &Arc<Assembly>) {
+        self.begin_reset(asm).detach_all();
+    }
+
+    /// Start a reset: tell the peer, enter Resetting and clear the link's
+    /// state. Returns the cleanup tasks, which end with the peer dropped.
+    fn begin_reset(&self, asm: &Arc<Assembly>) -> tokio::task::JoinSet<()> {
         let link_id = self.id;
         info!(target: LINK_STATE,
             "Resetting {} from state {:?}",
@@ -1128,7 +1287,7 @@ impl LinkStateWrapper {
             TerminateReason::Reset,
         )
         .enqueue();
-        let _ = self.clean_up_link_state(asm).join_all().await;
+        self.clean_up_link_state(asm)
     }
 
     /// Handle a terminate link acknowledgement.
@@ -1232,6 +1391,17 @@ impl LinkStateWrapper {
     }
 }
 
+/// The Hello timeout for the end that sends the HelloRequest: Zode links are
+/// bounded by [config::ZODE_HELLO_TIMEOUT] (zl-zipline#250), adapter links by
+/// [config::LINK_HELLO_TIMEOUT].
+fn hello_timeout(link_type: LinkType) -> Duration {
+    if link_type == LinkType::NodeToNode {
+        config::ZODE_HELLO_TIMEOUT
+    } else {
+        config::LINK_HELLO_TIMEOUT
+    }
+}
+
 /// zipline#157: whether the link's actor recorded a fatal local activation
 /// failure, which suppresses automatic reconnects.
 fn fatal_activation_failure(asm: &Assembly, link_id: LinkId) -> bool {
@@ -1291,19 +1461,21 @@ impl Display for LinkData {
     }
 }
 
-/// Close every keyed Zode link whose verified peer CN this Zode no longer
-/// expects (zl-zipline#220). Called after each topology update, so removing
-/// a Zode from the topology ends its links without a revocation list.
+/// Close every keyed Zode link that the acceptance rules would now refuse
+/// (zl-zipline#220, #250). Called after each topology update, so removing a
+/// Zode from the topology ends the links it dialed to this Zode without a
+/// revocation list.
 pub fn close_zode_links_outside_topology(asm: &Arc<Assembly>) {
     let mut to_close = Vec::new();
     asm.peer_table.for_each(|(link_id, peer)| {
         let fsm = &peer.link_state_machine;
-        if fsm.get_link_type() == LinkType::NodeToNode
-            && matches!(fsm.get_state(), LinkState::Helloing | LinkState::Active)
-            && !peer
-                .verified_peer_cn()
-                .is_some_and(|cn| asm.peer_cn_allowed(&cn))
-        {
+        let keyed = fsm.get_link_type() == LinkType::NodeToNode
+            && matches!(fsm.get_state(), LinkState::Helloing | LinkState::Active);
+        let refused = |end: &ZodeEnd| {
+            crate::zode_links::check_keyed_peer(asm, end, peer.verified_peer_cn().as_deref())
+                .is_err()
+        };
+        if keyed && fsm.zode_end().is_none_or(refused) {
             to_close.push(link_id.get());
         }
     });
@@ -1581,10 +1753,14 @@ mod tests {
         }))
     }
 
-    /// A keyable assembly whose stored topology names `peer_cns` (zl-zipline#220).
+    /// A keyable assembly whose stored topology names `peer_cns`
+    /// (zl-zipline#220), each of which owns its link to this Zode.
     fn zode_assembly(peer_cns: &[&str]) -> Arc<Assembly> {
         use crate::peer_table::test::topology_link;
         let asm = keyable_assembly(true);
+        let mut cfg = (*asm.config.get()).clone();
+        cfg.zpr_addr = vec!["fd5a:5052::10".parse().unwrap()];
+        asm.config.write(cfg);
         *asm.topology.write().unwrap() = peer_cns.iter().map(|cn| topology_link(cn)).collect();
         asm
     }
@@ -1596,11 +1772,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = zode_assembly(&["relay.zpr"]);
-                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
-                    &asm,
-                    "stranger.zpr",
-                    LinkState::Keying,
-                );
+                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, "stranger.zpr");
                 asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
                     .unwrap();
                 assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
@@ -1615,11 +1787,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = zode_assembly(&["relay.zpr"]);
-                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
-                    &asm,
-                    "relay.zpr",
-                    LinkState::Keying,
-                );
+                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, "relay.zpr");
                 asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
                     .unwrap();
                 assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
@@ -1635,11 +1803,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = zode_assembly(&["relay.zpr"]);
-                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
-                    &asm,
-                    zpr::dn::VISA_SERVICE_CN,
-                    LinkState::Keying,
-                );
+                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, zpr::dn::VISA_SERVICE_CN);
                 asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
                     .unwrap();
                 assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
@@ -1652,15 +1816,474 @@ mod tests {
             .await
     }
 
-    /// zl-zipline#220: an empty `peer_cn` (a sender that predates peerCn)
-    /// never authorises a peer, and neither does an empty certificate CN.
-    #[tokio::test]
-    async fn test_empty_peer_cn_never_matches() {
-        let asm = zode_assembly(&[""]);
-        assert!(!asm.peer_cn_allowed(""));
-        let asm = zode_assembly(&["relay.zpr"]);
-        assert!(asm.peer_cn_allowed("relay.zpr"));
-        assert!(!asm.peer_cn_allowed(""));
+    /// The substrate egress queue a Zode test assembly sends through.
+    type EgressRx = crate::packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>;
+
+    /// A Zode test assembly in node mode with ZPR address `fd5a:5052::10`,
+    /// above the `fd5a:5052::9` of [crate::peer_table::test::topology_link],
+    /// so a topology peer owns its link to it; link keys for `self_cn` signed
+    /// by a fresh test CA; and an egress queue the test can read
+    /// (zl-zipline#250).
+    fn zode_keys_assembly(self_cn: &str) -> (Arc<Assembly>, EgressRx) {
+        let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(64);
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let (keypair, certx) = crate::assembly::test::zode_link_keys(&ca, self_cn);
+        let mut cfg = <config::Config as std::default::Default>::default();
+        cfg.zpr_addr = vec!["fd5a:5052::10".parse().unwrap()];
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(crate::assembly::PhMode::Node),
+            self_noise_keypair: Some(keypair),
+            certx: Some(certx),
+            config: Some(rcu::RcuBox::new(cfg)),
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        (asm, egress_rx)
+    }
+
+    /// The ZDP packet types waiting in the egress queue, oldest first.
+    async fn sent_packet_types(egress: &mut EgressRx) -> Vec<crate::zdp::ZdpPacketType> {
+        use zerocopy::FromBytes;
+        tokio::task::yield_now().await;
+        let mut types = Vec::new();
+        loop {
+            let buf = vec![0u8; config::PACKET_BUFFER_SIZE].into_boxed_slice();
+            let Ok(pkt) = egress.try_recv(buf) else {
+                return types;
+            };
+            let (hdr, _) = crate::zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+            types.push(hdr.packet_type);
+        }
+    }
+
+    /// A Zode link in Keying whose established SA holds a verified
+    /// certificate for `peer_cn`, as if keying had just finished, with this
+    /// Zode at `end` of it.
+    fn zode_link_keyed(asm: &Arc<Assembly>, end: ZodeEnd, peer_cn: &str) -> LinkId {
+        let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            asm,
+            peer_cn,
+            LinkState::Keying,
+        );
+        let peer = asm.peer_table.get(link_id).unwrap();
+        peer.link_state_machine.set_zode_end(end).unwrap();
+        peer.link_state_machine.test_set_keying();
+        link_id
+    }
+
+    /// The dialer end of a Zode link to `peer_cn`.
+    fn dialer(peer_cn: &str) -> ZodeEnd {
+        ZodeEnd::Dialer {
+            peer_cn: peer_cn.to_owned(),
+        }
+    }
+
+    /// A successful HelloResponse with the given extras.
+    fn hello_response(
+        aaa_address: Option<IpAddress>,
+        oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
+        vs_bootstrap: bool,
+    ) -> LinkEvent {
+        LinkEvent::ReceivedHelloResponse {
+            status: ResponseCode::Success,
+            aaa_address,
+            oidc_idps,
+            vs_bootstrap,
+        }
+    }
+
+    /// zl-zipline#250: a Zode link starts keying on either end when this
+    /// Zode has CA-signed link keys. The dialer's key manager initiates.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_link_start_enters_keying_on_both_ends() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let iface =
+                    zpr_utils::net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+                let dialed = asm
+                    .start_zode_link(
+                        &SubstrateAddr::from(([127, 0, 0, 1], 7001)),
+                        &iface,
+                        dialer("b.zpr"),
+                    )
+                    .unwrap()
+                    .get();
+                let answered = asm
+                    .start_zode_link(
+                        &SubstrateAddr::from(([127, 0, 0, 1], 7002)),
+                        &iface,
+                        ZodeEnd::Answerer,
+                    )
+                    .unwrap()
+                    .get();
+                for link_id in [dialed, answered] {
+                    assert_eq!(link_state_of(&asm, link_id), LinkState::Keying);
+                    assert_eq!(
+                        asm.peer_table
+                            .get(link_id)
+                            .unwrap()
+                            .link_state_machine
+                            .get_link_type(),
+                        LinkType::NodeToNode
+                    );
+                }
+                assert!(
+                    asm.peer_table
+                        .get(dialed)
+                        .unwrap()
+                        .link_state_machine
+                        .is_zode_dialer()
+                );
+            })
+            .await
+    }
+
+    /// zl-zipline#250 (#220 g41 q4): a Zode without a CA certificate starts
+    /// no Zode link: the start fails closed and leaves no peer entry.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_link_start_without_ca_fails_closed() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = keyable_assembly(true);
+                let before = asm.peer_table.len();
+                let iface =
+                    zpr_utils::net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+                assert!(
+                    asm.start_zode_link(
+                        &SubstrateAddr::from(([127, 0, 0, 1], 7003)),
+                        &iface,
+                        dialer("b.zpr"),
+                    )
+                    .is_err()
+                );
+                assert_eq!(asm.peer_table.len(), before);
+            })
+            .await
+    }
+
+    /// zl-zipline#250: the dialer says Hello after keying, goes Active on
+    /// the answer, and starts keep-alives. Nothing AAA-related is set up.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_dialer_walks_keying_hello_active() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress) = zode_keys_assembly("a.zpr");
+                let link_id = zode_link_keyed(&asm, dialer("b.zpr"), "b.zpr");
+
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+                assert_eq!(
+                    sent_packet_types(&mut egress).await,
+                    vec![crate::zdp::ZdpPacketType::HelloRequest],
+                    "the dialer sends the HelloRequest"
+                );
+
+                asm.process_link_state_event(link_id, hello_response(None, None, false))
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Active);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert!(peer.link_state_machine.is_ready());
+                assert!(peer.link_state_machine.aaa_address().is_none());
+            })
+            .await
+    }
+
+    /// zl-zipline#250 (gaps 5 and 6): a HelloResponse on a Zode link that
+    /// carries an AAA address, identity providers or the visa-service
+    /// bootstrap flag is refused, and the link closes.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_dialer_refuses_adapter_hello_response() {
+        LocalSet::new()
+            .run_until(async {
+                let aaa = IpAddress::new_from_std(&"fd5a:5052:9::1".parse().unwrap());
+                let idp = auth::OidcIdpInfo {
+                    issuer: "https://idp.test".to_string(),
+                    client_id: "c".to_string(),
+                    client_secret: None,
+                    scopes: Vec::new(),
+                    allow_offline_access: false,
+                };
+                for response in [
+                    hello_response(Some(aaa), None, false),
+                    hello_response(None, None, true),
+                    hello_response(None, Some(vec![idp.clone()]), false),
+                ] {
+                    let (asm, _egress) = zode_keys_assembly("a.zpr");
+                    let link_id = zode_link_keyed(&asm, dialer("b.zpr"), "b.zpr");
+                    asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                        .unwrap();
+                    asm.process_link_state_event(link_id, response).unwrap();
+                    assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+                }
+            })
+            .await
+    }
+
+    /// zl-zipline#250: the answerer waits for the dialer's HelloRequest,
+    /// answers it with no AAA address, and goes Active.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_answerer_walks_keying_hello_active() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress) = zode_keys_assembly("a.zpr");
+                *asm.topology.write().unwrap() =
+                    vec![crate::peer_table::test::topology_link("b.zpr")];
+                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+                assert!(
+                    sent_packet_types(&mut egress).await.is_empty(),
+                    "the answerer does not say Hello first"
+                );
+
+                asm.process_link_state_event(link_id, LinkEvent::ReceivedHelloRequest)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Active);
+                assert_eq!(
+                    sent_packet_types(&mut egress).await,
+                    vec![crate::zdp::ZdpPacketType::HelloResponse]
+                );
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert!(peer.link_state_machine.is_ready());
+                assert!(peer.link_state_machine.aaa_address().is_none());
+            })
+            .await
+    }
+
+    /// zl-zipline#250: a HelloRequest is the dialer's to send; a dialer
+    /// that receives one refuses it.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_dialer_refuses_hello_request() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let link_id = zode_link_keyed(&asm, dialer("b.zpr"), "b.zpr");
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert!(
+                    asm.process_link_state_event(link_id, LinkEvent::ReceivedHelloRequest)
+                        .is_err()
+                );
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+            })
+            .await
+    }
+
+    /// zl-zipline#250: keying is bounded on both ends of a Zode link by
+    /// ZODE_KEYING_TIMEOUT; a link still keying then closes.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_keying_timeout_closes_the_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let iface =
+                    zpr_utils::net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+                let answered = asm
+                    .start_zode_link(
+                        &SubstrateAddr::from(([127, 0, 0, 1], 7004)),
+                        &iface,
+                        ZodeEnd::Answerer,
+                    )
+                    .unwrap()
+                    .get();
+                let dialed = asm
+                    .start_zode_link(
+                        &SubstrateAddr::from(([127, 0, 0, 1], 7005)),
+                        &iface,
+                        dialer("b.zpr"),
+                    )
+                    .unwrap()
+                    .get();
+                tokio::time::sleep(config::ZODE_KEYING_TIMEOUT - Duration::from_millis(100)).await;
+                assert_eq!(link_state_of(&asm, answered), LinkState::Keying);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                for link_id in [answered, dialed] {
+                    assert_ne!(
+                        asm.peer_table
+                            .get(link_id)
+                            .map(|p| p.link_state_machine.get_state()),
+                        Some(LinkState::Keying),
+                        "a Zode link must not outlive its keying bound"
+                    );
+                }
+            })
+            .await
+    }
+
+    /// zl-zipline#250: the Hello exchange is bounded on both ends of a Zode
+    /// link by ZODE_HELLO_TIMEOUT.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_hello_timeout_closes_the_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                *asm.topology.write().unwrap() =
+                    vec![crate::peer_table::test::topology_link("c.zpr")];
+                let dialed = zode_link_keyed(&asm, dialer("b.zpr"), "b.zpr");
+                let answered = zode_link_keyed(&asm, ZodeEnd::Answerer, "c.zpr");
+                for link_id in [dialed, answered] {
+                    asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                        .unwrap();
+                    assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+                    fire_current_timeout(&asm, link_id);
+                    assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+                }
+            })
+            .await
+    }
+
+    /// zl-zipline#250: a closed Zode link drops its peer entry on either
+    /// end and never restarts itself: only the link's owner redials.
+    #[tokio::test(start_paused = true)]
+    async fn test_closed_zode_link_drops_its_peer_entry() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let dialed = zode_link_keyed(&asm, dialer("b.zpr"), "b.zpr");
+                let answered = zode_link_keyed(&asm, ZodeEnd::Answerer, "c.zpr");
+                for link_id in [dialed, answered] {
+                    complete_close_of(&asm, link_id);
+                    assert!(asm.peer_table.get(link_id).is_none());
+                }
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN * 2).await;
+                assert!(asm.peer_table.get(dialed).is_none());
+            })
+            .await
+    }
+
+    /// The NodeToNode links whose verified peer CN is `cn`.
+    fn zode_links_to(asm: &Arc<Assembly>, cn: &str) -> Vec<LinkId> {
+        let mut links = Vec::new();
+        asm.peer_table.for_each(|(id, peer)| {
+            if peer.link_state_machine.get_link_type() == LinkType::NodeToNode
+                && peer.verified_peer_cn().as_deref() == Some(cn)
+            {
+                links.push(id.get());
+            }
+        });
+        links
+    }
+
+    /// Let spawned link cleanup (key manager shutdown, CloseDone) run.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Review round 1: a Zode link never claims a special-peer name, even
+    /// when it is accepted and its certificate carries the visa service's
+    /// DN; special peers are adapters.
+    #[tokio::test(start_paused = true)]
+    async fn test_accepted_zode_link_claims_no_special_name() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                *asm.topology.write().unwrap() = vec![crate::peer_table::test::topology_link(
+                    zpr::dn::VISA_SERVICE_CN,
+                )];
+                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, zpr::dn::VISA_SERVICE_CN);
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+                assert_eq!(
+                    asm.peer_table
+                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
+                    None
+                );
+            })
+            .await
+    }
+
+    /// Rule 5: an accepted inbound link from a peer that already has an
+    /// established link replaces it. The old link's id is dropped from the
+    /// peer table and its key-management state, and exactly one link
+    /// remains.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_inbound_link_replaces_established_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                *asm.topology.write().unwrap() =
+                    vec![crate::peer_table::test::topology_link("b.zpr")];
+                let old = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+                asm.peer_table
+                    .get(old)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_active();
+                let new = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+
+                asm.process_link_state_event(new, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, new), LinkState::Helloing);
+                settle().await;
+                assert!(asm.peer_table.get(old).is_none(), "the old link is gone");
+                assert!(asm.peer_table.clone_km_manager(old).is_none());
+                assert_eq!(zode_links_to(&asm, "b.zpr"), vec![new]);
+            })
+            .await
+    }
+
+    /// Rule 5 does not apply to a refused link: an inbound link that fails
+    /// rule 3 leaves the established link alone.
+    #[tokio::test(start_paused = true)]
+    async fn test_refused_zode_link_does_not_replace_established_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let old = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+                asm.peer_table
+                    .get(old)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_active();
+                // b.zpr has left the topology: a new link from it is refused.
+                let new = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+                asm.process_link_state_event(new, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, new), LinkState::Closing);
+                settle().await;
+                assert_eq!(link_state_of(&asm, old), LinkState::Active);
+            })
+            .await
+    }
+
+    /// The walkthrough "the higher-address Zode dials anyway": the
+    /// lower-address Zode owns the link, so it refuses the dial after
+    /// keying, and no second link can form.
+    #[tokio::test(start_paused = true)]
+    async fn test_higher_address_zode_dialing_anyway_is_refused() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                // This Zode is fd5a:5052::10; the peer is higher.
+                *asm.topology.write().unwrap() = vec![crate::peer_table::test::topology_link_at(
+                    "b.zpr",
+                    "fd5a:5052::20".parse().unwrap(),
+                )];
+                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+            })
+            .await
+    }
+
+    /// A dialer refuses a peer whose verified CN is not the one it dialed.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_dialer_refuses_a_different_cn() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let link_id = zode_link_keyed(&asm, dialer("relay.zpr"), "impostor.zpr");
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+            })
+            .await
     }
 
     /// The current FSM state of `link_id`.

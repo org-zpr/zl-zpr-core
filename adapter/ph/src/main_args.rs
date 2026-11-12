@@ -205,6 +205,19 @@ pub enum Command {
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         forwarding: Option<bool>,
 
+        /// This Zode's initial link: the relay it dials at startup, as
+        /// CN@IP:PORT (IPv6 in square brackets, e.g.
+        /// relay.zpr@[2001:db8::1]:5000). CN is the relay's certificate CN.
+        /// At most one. Overrides `[node.initial_link]` in the config file.
+        #[arg(long, value_name = "CN@IP:PORT")]
+        initial_link: Option<String>,
+
+        /// Whether this Zode is a relay: it never dials, and accepts a link
+        /// from any peer in its topology. Off by default. Overrides the
+        /// `relay` key in the `[node]` section of the config file.
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        relay: Option<bool>,
+
         #[command(flatten)]
         common: CommonArgs,
     },

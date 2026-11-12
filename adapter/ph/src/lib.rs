@@ -60,6 +60,7 @@ pub mod zdp;
 pub mod zdp_ll;
 pub mod zdpr;
 pub mod zdpr_worker;
+pub mod zode_links;
 pub mod zprtun;
 
 #[cfg(test)]

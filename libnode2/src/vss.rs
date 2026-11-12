@@ -580,22 +580,7 @@ impl v1::v_s_s_handle::Server for VSSHandleImpl {
         debug!(target: VSS_RPC, "set_topology called by {}", self.remote);
 
         let params_rdr = params.get()?;
-        let links_rdr = params_rdr.get_links()?;
-
-        let mut links = Vec::new();
-        for link_rdr in links_rdr.iter() {
-            match Link::try_from(link_rdr) {
-                Ok(l) => links.push(l),
-                Err(e) => {
-                    warn!(target: VSS_RPC, "received invalid Link from vs: {}", e);
-                    let res_builder = results.get().init_res();
-                    let mut err_builder = res_builder.init_error();
-                    ApiResponseError::new_code_msg(ErrorCode::ParamError, "failed to parse a Link")
-                        .write_to(&mut err_builder);
-                    return Ok(()); // Exit early with error
-                }
-            }
-        }
+        let links = decode_topology_links(params_rdr.get_links()?);
 
         let (resp_tx, resp_rx) = oneshot::channel();
         let result = self
@@ -607,5 +592,107 @@ impl v1::v_s_s_handle::Server for VSSHandleImpl {
             .await;
         write_api_result(result, results.get().init_res());
         Ok(())
+    }
+}
+
+/// Decode the links of a `setTopology` call (zl-zipline#250). A link that
+/// fails to decode, for example one without a `zprAddr` or with an empty
+/// `peerCn`, is rejected and logged with its `linkId` if readable, and the
+/// rest are kept. The call still answers `ok`: the rejection is this node's
+/// own decision, and the visa service keeps its view.
+fn decode_topology_links(links_rdr: capnp::struct_list::Reader<'_, v1::link::Owned>) -> Vec<Link> {
+    let mut links = Vec::with_capacity(links_rdr.len() as usize);
+    for link_rdr in links_rdr.iter() {
+        match Link::try_from(link_rdr) {
+            Ok(link) => links.push(link),
+            Err(e) => {
+                let link_id = link_rdr
+                    .get_link_id()
+                    .ok()
+                    .and_then(|t| t.to_string().ok())
+                    .unwrap_or_else(|| "<unreadable>".to_string());
+                warn!(target: VSS_RPC, "rejecting topology link {link_id:?} from the visa service: {e}");
+            }
+        }
+    }
+    links
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write one wire `Link` to `peer_cn` into `b`; `zpr_addr` and
+    /// `peer_cn` are left unset or empty when `None`/empty.
+    fn write_link(
+        mut b: v1::link::Builder<'_>,
+        link_id: &str,
+        zpr_addr: Option<IpAddr>,
+        peer_cn: &str,
+    ) {
+        b.set_link_id(link_id);
+        {
+            let mut peer = b.reborrow().init_peer();
+            peer.set_port(5000);
+            let ip: IpAddr = "10.2.0.9".parse().unwrap();
+            ip.write_to(&mut peer.init_addr());
+        }
+        b.set_role(v1::LinkRole::Active);
+        b.reborrow().init_visas(0);
+        if let Some(addr) = zpr_addr {
+            addr.write_to(&mut b.reborrow().init_zpr_addr());
+        }
+        b.set_peer_cn(peer_cn);
+    }
+
+    /// Decode a `setTopology` link list built from (link id, zprAddr, peerCn).
+    fn decode(links: &[(&str, Option<&str>, &str)]) -> Vec<Link> {
+        let mut msg = capnp::message::Builder::new_default();
+        let params = msg.init_root::<v1::v_s_s_handle::set_topology_params::Builder>();
+        let mut list = params.init_links(links.len() as u32);
+        for (i, (id, addr, cn)) in links.iter().enumerate() {
+            write_link(
+                list.reborrow().get(i as u32),
+                id,
+                addr.map(|a| a.parse().unwrap()),
+                cn,
+            );
+        }
+        let reader = msg
+            .get_root_as_reader::<v1::v_s_s_handle::set_topology_params::Reader>()
+            .unwrap();
+        decode_topology_links(reader.get_links().unwrap())
+    }
+
+    /// zl-zipline#250: a link without a `zprAddr` is rejected and logged,
+    /// and the rest of the topology is applied.
+    #[test]
+    fn set_topology_skips_a_link_without_zpr_addr() {
+        let links = decode(&[
+            ("l1", Some("fd5a::1"), "a"),
+            ("l2", None, "b"),
+            ("l3", Some("fd5a::3"), "c"),
+        ]);
+        let ids: Vec<&str> = links.iter().map(|l| l.link_id.as_str()).collect();
+        assert_eq!(ids, vec!["l1", "l3"]);
+    }
+
+    /// zl-zipline#250: the same for a link with an empty `peerCn`.
+    #[test]
+    fn set_topology_skips_a_link_with_empty_peer_cn() {
+        let links = decode(&[
+            ("l1", Some("fd5a::1"), "a"),
+            ("l2", Some("fd5a::2"), ""),
+            ("l3", Some("fd5a::3"), "c"),
+        ]);
+        let ids: Vec<&str> = links.iter().map(|l| l.link_id.as_str()).collect();
+        assert_eq!(ids, vec!["l1", "l3"]);
+    }
+
+    /// zl-zipline#250: when every link is bad, an empty topology is applied
+    /// (which then closes every topology link, rule 12).
+    #[test]
+    fn set_topology_with_only_bad_links_is_empty() {
+        assert!(decode(&[("l1", None, "a"), ("l2", Some("fd5a::2"), "")]).is_empty());
     }
 }

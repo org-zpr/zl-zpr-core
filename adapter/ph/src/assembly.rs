@@ -1529,7 +1529,6 @@ pub mod test {
             .await
     }
 
-    #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness
     /// Link keys for a test Zode named `cn`: a Noise keypair and a
     /// certificate exchange that holds a certificate for it from `ca` and
     /// trusts `ca` (zl-zipline#250).
@@ -1584,6 +1583,7 @@ pub mod test {
             .await
     }
 
+    #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {
         let ph_mode = builder.ph_mode.unwrap_or(PhMode::Adapter);
         let topology_config = builder.topology_config.unwrap_or_default();

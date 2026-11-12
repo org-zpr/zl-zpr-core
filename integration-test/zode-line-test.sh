@@ -56,6 +56,9 @@ function run_leg() {
       zode_ping zpr-zb zb "$ZC_ZPR_ADDR" || RESULT=1
       zode_ping zpr-zc zc "$ZB_ZPR_ADDR" || RESULT=1
       assert_no_log relay.log "$REFUSAL" "the relay refuses no forward-only visa" || RESULT=1
+      # Gap 7: the relay binds the forward-only visas only for their
+      # previous hop, zb or zc; the pings show it accepted them.
+      assert_no_log relay.log "$GAP7_REFUSAL" "the relay refuses no StreamIdRequest" || RESULT=1
     else
       zode_no_ping zpr-zb zb "$ZC_ZPR_ADDR" || RESULT=1
       assert_log relay.log "$REFUSAL" "the relay refuses and logs the forward-only visa" || RESULT=1

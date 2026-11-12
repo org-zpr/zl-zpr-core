@@ -249,6 +249,10 @@ function wait_registered() {
   echo "assertion OK: $2 registered with the visa service"
 }
 
+# What ph logs when it refuses a StreamIdRequest from a link that is not the
+# visa's previous hop (gap 7, zl-zipline#222; mgmt/node.rs).
+GAP7_REFUSAL="refusing StreamIdRequest from .*: not the visa's previous hop"
+
 # Assert that log $1 matches the extended regex $2, with $3 as the message.
 function assert_log() {
   if grep -qE -- "$2" "$1"; then

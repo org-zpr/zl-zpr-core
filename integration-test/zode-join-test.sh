@@ -53,6 +53,15 @@ if [[ "$PASS" == 0 ]]; then
   # W4: zb's application traffic reaches zc, across the relay.
   zode_ping zpr-zb zb "$ZC_ZPR_ADDR" || PASS=1
   zode_ping zpr-zc zc "$ZB_ZPR_ADDR" || PASS=1
+
+  # Gap 7: each Zode on these paths binds a stream only for its visa's
+  # previous hop. The pings above crossed the relay, so every StreamIdRequest
+  # they needed passed that check; none may have been refused. (A request
+  # from a link that is not the previous hop is refused in the ph unit
+  # tests: no Zode here sends one.)
+  for LOG in relay.log zb.log zc.log; do
+    assert_no_log "$LOG" "$GAP7_REFUSAL" "no StreamIdRequest refused in $LOG" || PASS=1
+  done
 fi
 
 zode_report "$PASS"

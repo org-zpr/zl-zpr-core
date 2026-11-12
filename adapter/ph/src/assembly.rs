@@ -298,6 +298,12 @@ impl Assembly {
                 }
             });
             join_set.join_all().await;
+            // Zode links were reset with the rest, which drops their visas.
+            // Dial the ones this Zode still wants again, with fresh state: a
+            // joiner's initial link is its only path to the visa service
+            // (zl-zipline#222).
+            self.dial_initial_links();
+            self.dial_topology_peers();
         }
     }
 
@@ -1573,6 +1579,51 @@ pub mod test {
     /// `process::exit(0)`, which skips destructors, so on Windows an
     /// unwired teardown orphans the Wintun adapter and its netsh
     /// address/route state until a later startup reaps them.
+    /// zl-zipline#222 (Copilot review on zl-zpr-core#104): a visa-service
+    /// OutOfSync reset drops every peer, Zode links included, to drop their
+    /// visas; the Zode then dials its initial links (and topology peers)
+    /// again with fresh state, or a joiner would lose its only path to the
+    /// visa service for good.
+    #[tokio::test(start_paused = true)]
+    async fn test_reset_after_out_of_sync_redials_initial_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut cfg = <config::Config as std::default::Default>::default();
+                cfg.self_addr = "127.0.0.1:5000".parse().unwrap();
+                cfg.initial_links =
+                    vec![config::InitialLink::new("relay", "127.0.0.9:5000").unwrap()];
+                // The reset sends a Terminate: keep the egress queue open.
+                let (egress_tx, _egress_rx) = packet_queue::packet_queue(64);
+                let asm = zode_assembly_with_builder(
+                    "zb",
+                    cfg,
+                    TestAssemblyBuilder {
+                        mgmt_substrate_egress: Some(MgmtSubstrateEgress::new(egress_tx)),
+                        ..TestAssemblyBuilder::new()
+                    },
+                );
+                asm.dial_initial_links();
+                let relay: SocketAddr = "127.0.0.9:5000".parse().unwrap();
+                let first = asm
+                    .peer_table
+                    .find(|(_id, peer)| peer.substrate_addr == relay)
+                    .map(|(id, _peer)| id)
+                    .expect("dialed");
+
+                asm.disconnect_adapters().await;
+
+                let again = asm
+                    .peer_table
+                    .find(|(_id, peer)| peer.substrate_addr == relay)
+                    .map(|(id, _peer)| id);
+                assert!(
+                    again.is_some_and(|id| id != first),
+                    "a fresh link to the relay"
+                );
+            })
+            .await
+    }
+
     /// Copilot review on zl-zpr-core#104: the route probe keeps the
     /// configured address's IPv6 scope ID and changes only the port, or a
     /// link-local `self_addr` could never dial a Zode.
@@ -1723,6 +1774,17 @@ pub mod test {
     /// [zode_assembly_with_ca] with the node configuration `cfg`.
     #[cfg(test)]
     pub fn zode_assembly_with_config(own_cn: &str, cfg: config::Config) -> Arc<Assembly> {
+        zode_assembly_with_builder(own_cn, cfg, TestAssemblyBuilder::new())
+    }
+
+    /// [zode_assembly_with_config], starting from `builder` (for example one
+    /// with an open management egress queue).
+    #[cfg(test)]
+    pub fn zode_assembly_with_builder(
+        own_cn: &str,
+        cfg: config::Config,
+        builder: TestAssemblyBuilder,
+    ) -> Arc<Assembly> {
         let ca = crate::pki::TestCa::new("zode-ca");
         let keypair = km_noise::NoiseKeypair::generate();
         let window =
@@ -1736,7 +1798,7 @@ pub mod test {
             self_noise_keypair: Some(keypair),
             certx: Some(certx),
             config: Some(rcu::RcuBox::new(cfg)),
-            ..TestAssemblyBuilder::new()
+            ..builder
         }))
     }
 

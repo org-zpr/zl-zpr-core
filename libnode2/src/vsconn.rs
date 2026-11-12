@@ -22,8 +22,7 @@ use crate::logging::targets::VS_RPC;
 
 use zpr::vsapi_types::{
     ConnectRequest, ConnectType, Connection, DisconnectNotice, LinkStateReport, Param,
-    ReauthRequest, VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse,
-    pname,
+    ReauthRequest, VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse, pname,
 };
 use zpr::write_to::WriteTo;
 

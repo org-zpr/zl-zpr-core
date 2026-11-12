@@ -316,6 +316,13 @@ impl LinkStateWrapper {
         self.zode_peer_addr.write(addr);
     }
 
+    /// Cancel any pending FSM timeout. Called when the peer is dropped: its
+    /// link ID may be reused at once, and a stale timer must not reach the
+    /// new link.
+    pub fn cancel_timeout(&self) {
+        self.locked_fsm.lock().unwrap().cancel_timeout();
+    }
+
     /// Retire this Zode link: it lost a crossed-dial election, so when its
     /// close completes it is dropped, never redialed (zl-zipline#222).
     pub fn retire_zode_link(&self) {
@@ -2175,6 +2182,38 @@ mod tests {
                     .unwrap();
                 complete_close_of(&asm, dialed);
                 assert!(asm.peer_table.get(dialed).is_none(), "loser retired");
+            })
+            .await
+    }
+
+    /// Arm `link_id`'s FSM timeout the way the state machine does.
+    fn arm_timeout(asm: &Arc<Assembly>, link_id: LinkId, duration: std::time::Duration) {
+        let peer = asm.peer_table.get(link_id).unwrap();
+        let fsm = &peer.link_state_machine;
+        fsm.test_set_state(LinkState::Keying);
+        let mut locked = fsm.locked_fsm.lock().unwrap();
+        fsm.set_timeout(asm, &mut locked, duration);
+    }
+
+    /// Copilot review on zl-zpr-core#104: a cancelled FSM timeout never
+    /// fires. `Assembly::drop_peer` cancels a dropped peer's timeout this
+    /// way, so a stale timer cannot reach a later link that reuses its ID
+    /// with a matching logical clock (a crossed dial replaced by an
+    /// answering link).
+    #[tokio::test(start_paused = true)]
+    async fn test_cancelled_timeout_does_not_fire() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = keyable_assembly(true);
+                let link = add_peer(&asm, LinkType::NodeToNode, 9950);
+                arm_timeout(&asm, link, std::time::Duration::from_secs(1));
+                asm.peer_table
+                    .get(link)
+                    .unwrap()
+                    .link_state_machine
+                    .cancel_timeout();
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                assert_eq!(link_state_of(&asm, link), LinkState::Keying);
             })
             .await
     }

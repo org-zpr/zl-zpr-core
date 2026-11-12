@@ -34,7 +34,6 @@ use crate::assembly::Assembly;
 use crate::link_state::{LinkState, LinkType};
 use crate::mgmt::core;
 use crate::prelude::*;
-use crate::visa_mgmt;
 use crate::zdp;
 use bytes::{Buf, BufMut};
 use std::net::IpAddr;
@@ -61,6 +60,8 @@ pub enum HandoffError {
     TooMany(usize),
     #[error("visa {0} is not this Zode's VSAPI flow")]
     WrongShape(u64),
+    #[error("visa {0} would replace a different installed visa")]
+    IdCollision(u64),
     #[error("malformed hand-off message")]
     Malformed,
 }
@@ -178,19 +179,41 @@ pub fn accept(asm: &Arc<Assembly>, link_id: LinkId, visas: Vec<Visa>) -> Result<
         return Err(HandoffError::WrongShape(bad.issuer_id));
     }
 
-    for visa in visas {
-        if fsm.zode_peer_addr().is_none() {
-            if let Some(fwd) = &visa.fwd_pep {
-                fsm.set_zode_peer_addr(Some(IpAddress::new_from_std(&fwd.next_hop)));
-            }
+    // Check and install under one visa-table lock, all or nothing. A visa
+    // whose ID is already installed is skipped if identical -- a repeat
+    // keeps the installed visa and its stream bindings -- and refuses the
+    // whole hand-off if it differs: the relay must never replace a visa
+    // this Zode holds. (The shape check above admits only full TCP visas,
+    // so the forwarding-off refusal in visa_mgmt::insert_visa never
+    // applies here.)
+    {
+        let mut table = asm.visa_table.write().unwrap();
+        if let Some(clash) = visas.iter().find(|visa| {
+            table
+                .table
+                .get(&visa.issuer_id)
+                .is_some_and(|installed| installed.visa != **visa)
+        }) {
+            return Err(HandoffError::IdCollision(clash.issuer_id));
         }
-        let visa_id = visa.issuer_id;
-        match visa_mgmt::insert_visa(asm, visa) {
-            Ok(_) => {
-                info!(target: VISA_MGMT, "{} installed handed-off bootstrap visa {visa_id}", asm.formatted_link_id(link_id))
+        for visa in visas {
+            if fsm.zode_peer_addr().is_none() {
+                if let Some(fwd) = &visa.fwd_pep {
+                    fsm.set_zode_peer_addr(Some(IpAddress::new_from_std(&fwd.next_hop)));
+                }
             }
-            Err(e) => {
-                warn!(target: VISA_MGMT, "{} could not install handed-off bootstrap visa {visa_id}: {e:?}", asm.formatted_link_id(link_id))
+            let visa_id = visa.issuer_id;
+            if table.table.contains_key(&visa_id) {
+                debug!(target: VISA_MGMT, "{} handed-off bootstrap visa {visa_id} already installed", asm.formatted_link_id(link_id));
+                continue;
+            }
+            match table.insert_visa(visa) {
+                Ok(_) => {
+                    info!(target: VISA_MGMT, "{} installed handed-off bootstrap visa {visa_id}", asm.formatted_link_id(link_id))
+                }
+                Err(e) => {
+                    warn!(target: VISA_MGMT, "{} could not install handed-off bootstrap visa {visa_id}: {e:?}", asm.formatted_link_id(link_id))
+                }
             }
         }
     }
@@ -413,6 +436,54 @@ mod tests {
                         "nothing installed for wrong visa {id}"
                     );
                 }
+            })
+            .await
+    }
+
+    /// Copilot review on zl-zpr-core#104: a hand-off visa whose ID belongs
+    /// to a different installed visa is refused, and nothing of that
+    /// hand-off is installed. An identical repeat (the relay re-sends after
+    /// a topology update while our session is down) keeps the installed
+    /// visa and its stream bindings rather than replacing it.
+    #[tokio::test]
+    async fn test_refuses_id_collision_and_keeps_bindings_on_repeat() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link) = joiner("relay.zpr");
+                let other = tcp_visa(9001, OWN, 0, "fd5a:5052::77", 80, None);
+                asm.visa_table
+                    .write()
+                    .unwrap()
+                    .insert_visa(other.clone())
+                    .unwrap();
+                assert_eq!(
+                    accept(&asm, link, vsapi_pair()),
+                    Err(HandoffError::IdCollision(9001))
+                );
+                assert_eq!(asm.visa_table.read().unwrap().table[&9001].visa, other);
+                assert!(!installed(&asm, 9002), "all or nothing");
+
+                let (asm, link) = joiner("relay.zpr");
+                accept(&asm, link, vsapi_pair()).unwrap();
+                let entry = zpr::packet_info::ForwardingEntry(link, 7);
+                asm.visa_table
+                    .write()
+                    .unwrap()
+                    .table
+                    .get_mut(&9001)
+                    .unwrap()
+                    .link_forwarding_entry(entry.clone());
+                accept(&asm, link, vsapi_pair()).unwrap();
+                assert!(
+                    asm.visa_table
+                        .write()
+                        .unwrap()
+                        .table
+                        .get_mut(&9001)
+                        .unwrap()
+                        .unlink_forwarding_entry(&entry),
+                    "the repeat kept the stream binding"
+                );
             })
             .await
     }

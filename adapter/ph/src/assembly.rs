@@ -75,6 +75,9 @@ pub struct Assembly {
     /// True while this node has a VS-API session (zl-zipline#222). A
     /// joining Zode accepts a bootstrap-visa hand-off only while it is false.
     pub vs_session_up: std::sync::atomic::AtomicBool,
+    /// A retry of [Assembly::dial_initial_links] is scheduled
+    /// (zl-zipline#222).
+    pub initial_dial_retry_pending: std::sync::atomic::AtomicBool,
     pub deferred_vs_connect: Mutex<Option<(LinkId, IpAddress, ConnectRequest)>>, // present only on nodes, the VS adapter's connect request and self-granted address, held until the node has VSAPI access
     /// Node only (zipline#121): true while an in-place self re-authentication
     /// against the visa service is in flight. A VSS `requestAuthentication`
@@ -555,6 +558,11 @@ impl Assembly {
             // dying link's own entries are skipped — that peer is gone.
             self.withdraw_streams(withdrawn, Some(link_id));
         }
+        // Its link ID may be reused at once (a crossed dial replaced by an
+        // answering link); a pending timeout must not reach the new link.
+        if let Some(peer) = self.peer_table.get(link_id) {
+            peer.link_state_machine.cancel_timeout();
+        }
         self.peer_table.remove(link_id);
         info!(target: PEER_MGMT, "Removed peer {}", self.formatted_link_id(link_id));
     }
@@ -696,9 +704,7 @@ impl Assembly {
     /// Dial a Zode at substrate address `addr` (zl-zipline#222), using the
     /// local interface address the kernel would pick for it.
     pub fn dial_zode(self: &Arc<Self>, addr: SocketAddr) -> Result<NonZero<LinkId>, String> {
-        // Probe from our IP with an ephemeral port: our substrate sockets
-        // already hold the configured port.
-        let probe_from = SocketAddr::new(self.config.get().self_addr.ip(), 0);
+        let probe_from = route_probe_addr(self.config.get().self_addr);
         let local = crate::sys::substrate::resolve_local_addr(probe_from, addr)
             .map_err(|e| format!("cannot route to {addr}: {e}"))?;
         self.start_zode_link(&addr, &local.scoped_ip(), true)
@@ -710,7 +716,12 @@ impl Assembly {
     /// answered closes: a Zode that lost a crossed dial to its relay answers
     /// on the initial link's address, and must dial again when that link
     /// ends. A dialed link redials on its own after a close.
+    ///
+    /// A dial that fails before any link exists (no route to the relay yet)
+    /// leaves nothing to redial, so it schedules one retry of all initial
+    /// links after the link holddown; at most one retry is pending at a time.
     pub fn dial_initial_links(self: &Arc<Self>) {
+        let mut failed = false;
         for link in self.config.get().initial_links.clone() {
             let linked = self
                 .peer_table
@@ -720,8 +731,22 @@ impl Assembly {
                 continue;
             }
             if let Err(e) = self.dial_zode(link.addr) {
-                error!(target: PEER_MGMT, "initial link {}: {e}", link.cn);
+                error!(target: PEER_MGMT, "initial link {}: {e}; retrying", link.cn);
+                failed = true;
             }
+        }
+        if failed
+            && !self
+                .initial_dial_retry_pending
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let asm = self.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN).await;
+                asm.initial_dial_retry_pending
+                    .store(false, std::sync::atomic::Ordering::Release);
+                asm.dial_initial_links();
+            });
         }
     }
 
@@ -878,6 +903,15 @@ impl Assembly {
     pub fn formatted_link_id(&self, link_id: LinkId) -> impl std::fmt::Display {
         std::fmt::from_fn(move |f| self.format_link_id(link_id, f))
     }
+}
+
+/// The address to probe routes from: the configured self address, IPv6
+/// scope ID included, with an ephemeral port, since our substrate sockets
+/// already hold the configured port.
+fn route_probe_addr(self_addr: SocketAddr) -> SocketAddr {
+    let mut probe = self_addr;
+    probe.set_port(0);
+    probe
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
@@ -1539,6 +1573,54 @@ pub mod test {
     /// `process::exit(0)`, which skips destructors, so on Windows an
     /// unwired teardown orphans the Wintun adapter and its netsh
     /// address/route state until a later startup reaps them.
+    /// Copilot review on zl-zpr-core#104: the route probe keeps the
+    /// configured address's IPv6 scope ID and changes only the port, or a
+    /// link-local `self_addr` could never dial a Zode.
+    #[test]
+    fn test_route_probe_addr_keeps_the_scope_id() {
+        let configured: SocketAddr = "[fe80::1%3]:5000".parse().unwrap();
+        let probe = route_probe_addr(configured);
+        assert_eq!(probe, "[fe80::1%3]:0".parse::<SocketAddr>().unwrap());
+        let SocketAddr::V6(v6) = probe else {
+            panic!("an IPv6 probe address")
+        };
+        assert_eq!(v6.scope_id(), 3);
+    }
+
+    /// zl-zipline#222 (Copilot review on zl-zpr-core#104): an initial link
+    /// that cannot be dialed at all (no route yet) leaves no link to redial,
+    /// so the Zode retries its initial links after the holddown.
+    #[tokio::test(start_paused = true)]
+    async fn test_undialable_initial_link_is_retried() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut cfg = <config::Config as std::default::Default>::default();
+                cfg.self_addr = "127.0.0.1:5000".parse().unwrap();
+                // An IPv6 relay from an IPv4 self address: no route.
+                cfg.initial_links =
+                    vec![config::InitialLink::new("relay", "[fd00::9]:5000").unwrap()];
+                let asm = zode_assembly_with_config("zb", cfg);
+                asm.dial_initial_links();
+                assert!(asm.peer_table.find(|_| true).is_none());
+
+                // The route appears (here: the relay is reachable over IPv4).
+                let mut cfg = (*asm.config.get()).clone();
+                cfg.initial_links =
+                    vec![config::InitialLink::new("relay", "127.0.0.9:5000").unwrap()];
+                asm.config.write(cfg);
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN * 2).await;
+
+                let relay: SocketAddr = "127.0.0.9:5000".parse().unwrap();
+                assert!(
+                    asm.peer_table
+                        .find(|(_id, peer)| peer.substrate_addr == relay)
+                        .is_some(),
+                    "the retry dialed the relay"
+                );
+            })
+            .await
+    }
+
     #[tokio::test]
     async fn test_shutdown_tears_down_tun() {
         tokio::task::LocalSet::new()
@@ -1735,6 +1817,7 @@ pub mod test {
             topology: Default::default(),
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
             vs_session_up: std::sync::atomic::AtomicBool::new(false),
+            initial_dial_retry_pending: std::sync::atomic::AtomicBool::new(false),
             deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
             capture_queue,

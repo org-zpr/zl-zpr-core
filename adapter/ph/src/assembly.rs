@@ -728,8 +728,10 @@ impl Assembly {
         };
         // The local address the kernel uses to reach the relay is the
         // interface address its packets will arrive on. Probe from our IP
-        // with an ephemeral port: the substrate sockets hold our port.
-        let probe_from = std::net::SocketAddr::new(config.self_addr.ip(), 0);
+        // with an ephemeral port: the substrate sockets hold our port. Keep
+        // the rest of the address, including an IPv6 scope.
+        let mut probe_from = config.self_addr;
+        probe_from.set_port(0);
         let interface_addr = match crate::sys::substrate::resolve_local_addr(probe_from, link.addr)
         {
             Ok(local) => local.scoped_ip(),

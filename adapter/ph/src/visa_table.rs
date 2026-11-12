@@ -288,6 +288,21 @@ impl VisaTable {
         visa_table
     }
 
+    /// The visa table a node starts with (zl-zipline#222). A node with no
+    /// initial links reaches a visa service docked on itself, so it grants
+    /// itself the two VS-API visas ([VisaTable::new_with_vs_visas]). A
+    /// joining Zode (one with initial links) starts empty: its VS-API visas
+    /// are the visa service's own copies, handed off by its relay
+    /// ([crate::bootstrap_handoff]). Self-granted ones would match the same
+    /// flow with no next hop and send it nowhere.
+    pub fn initial_for_node(node_addr: &IpAddr, has_initial_links: bool) -> Self {
+        if has_initial_links {
+            Self::new()
+        } else {
+            Self::new_with_vs_visas(node_addr)
+        }
+    }
+
     /// Insert a visa from the Visa Service into the Visa Table
     pub fn insert_visa(&mut self, visa: vsapi_types::Visa) -> Result<VisaId, VisaTableError> {
         let visa_id = visa.issuer_id;
@@ -541,6 +556,15 @@ fn make_tcp_visa(
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    /// zl-zipline#222: a joining Zode (initial links configured) starts with
+    /// no self-granted VS-API visas; a node without initial links keeps them.
+    #[test]
+    fn test_initial_visa_table_for_joiner_is_empty() {
+        let addr: IpAddr = "fd5a:5052::b".parse().unwrap();
+        assert!(VisaTable::initial_for_node(&addr, true).table.is_empty());
+        assert_eq!(VisaTable::initial_for_node(&addr, false).table.len(), 2);
+    }
 
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::forwarding_tables::PftPep;

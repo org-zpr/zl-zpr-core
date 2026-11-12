@@ -1329,6 +1329,7 @@ mod test {
                     dock_pep: None,
                     fwd_pep: None,
                     cons: None,
+                    prev_hop: None,
                 };
                 let mut pkt = core::new_heap_packet();
                 zdp::ZdpHelloResponseHeader {

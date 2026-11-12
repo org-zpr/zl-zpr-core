@@ -277,15 +277,21 @@ mod tests {
                 style: zpr::vsapi_types::FwdPepStyle::OneWay,
             }),
             cons: None,
+            prev_hop: None,
         }
     }
 
-    /// The two visas the visa service mints for a joiner at `OWN`.
+    /// The two visas the visa service mints for a joiner at `OWN`. The
+    /// joiner is the egress of the reply, so its copy of the reply visa names
+    /// the relay as previous hop (zl-zipline#245); the round trip below
+    /// shows the hand-off keeps it, which gap 7 needs.
     fn vsapi_pair() -> Vec<Visa> {
         let vs = VISA_SERVICE_ADDR.to_string();
+        let mut reply = tcp_visa(9002, &vs, VISA_SERVICE_PORT, OWN, 0, None);
+        reply.prev_hop = Some(RELAY.parse().unwrap());
         vec![
             tcp_visa(9001, OWN, 0, &vs, VISA_SERVICE_PORT, Some(RELAY)),
-            tcp_visa(9002, &vs, VISA_SERVICE_PORT, OWN, 0, None),
+            reply,
         ]
     }
 

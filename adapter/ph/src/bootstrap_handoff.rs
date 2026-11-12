@@ -188,6 +188,15 @@ pub fn accept(asm: &Arc<Assembly>, link_id: LinkId, visas: Vec<Visa>) -> Result<
     // applies here.)
     {
         let mut table = asm.visa_table.write().unwrap();
+        // Two visas of one hand-off sharing an ID would install only one.
+        if let Some(clash) = visas.iter().enumerate().find_map(|(i, visa)| {
+            visas[..i]
+                .iter()
+                .any(|earlier| earlier.issuer_id == visa.issuer_id)
+                .then_some(visa.issuer_id)
+        }) {
+            return Err(HandoffError::IdCollision(clash));
+        }
         if let Some(clash) = visas.iter().find(|visa| {
             table
                 .table
@@ -196,12 +205,16 @@ pub fn accept(asm: &Arc<Assembly>, link_id: LinkId, visas: Vec<Visa>) -> Result<
         }) {
             return Err(HandoffError::IdCollision(clash.issuer_id));
         }
-        for visa in visas {
-            if fsm.zode_peer_addr().is_none() {
-                if let Some(fwd) = &visa.fwd_pep {
-                    fsm.set_zode_peer_addr(Some(IpAddress::new_from_std(&fwd.next_hop)));
-                }
+        // Before its first topology the joiner knows its relay's address
+        // only from the forward visa's next hop, which the relay chose: it
+        // applies to these visas alone (see LinkStateWrapper).
+        if fsm.zode_peer_addr().is_none() {
+            if let Some(fwd) = visas.iter().find_map(|visa| visa.fwd_pep.as_ref()) {
+                let ids = visas.iter().map(|visa| visa.issuer_id as VisaId).collect();
+                fsm.set_zode_peer_addr_from_handoff(IpAddress::new_from_std(&fwd.next_hop), ids);
             }
+        }
+        for visa in visas {
             let visa_id = visa.issuer_id;
             if table.table.contains_key(&visa_id) {
                 debug!(target: VISA_MGMT, "{} handed-off bootstrap visa {visa_id} already installed", asm.formatted_link_id(link_id));
@@ -266,6 +279,7 @@ mod tests {
     use super::*;
     use crate::config::InitialLink;
     use crate::peer_table::test::{insert_zode_peer_with_verified_cn, topology_link};
+    use crate::visa_mgmt;
     use std::time::{Duration, SystemTime};
     use tokio::task::LocalSet;
     use zpr::vsapi_types::{DockPep, EndpointT, FwdPep, KeySet, TcpUdpPep};
@@ -347,7 +361,10 @@ mod tests {
     }
 
     /// The joiner installs its VSAPI pair from its relay, and learns the
-    /// relay's ZPR address from the forward visa's next hop.
+    /// relay's ZPR address from the forward visa's next hop -- for those
+    /// bootstrap visas only (Copilot review on zl-zpr-core#104): the relay
+    /// chose that address, so it routes nothing else until a topology
+    /// gives the link its address.
     #[tokio::test]
     async fn test_accepts_vsapi_pair_from_initial_link() {
         LocalSet::new()
@@ -356,15 +373,42 @@ mod tests {
                 accept(&asm, link, vsapi_pair()).unwrap();
                 assert!(installed(&asm, 9001) && installed(&asm, 9002));
                 let relay = IpAddress::new_from_std(&RELAY.parse().unwrap());
-                assert_eq!(
+                let fsm_addr = |asm: &Arc<Assembly>, visa_id| {
                     asm.peer_table
                         .get(link)
                         .unwrap()
                         .link_state_machine
-                        .zode_peer_addr(),
-                    Some(relay)
+                        .zode_peer_addr_for(visa_id)
+                };
+                assert_eq!(fsm_addr(&asm, 9001), Some(relay));
+                assert_eq!(fsm_addr(&asm, 9002), Some(relay));
+                assert_eq!(fsm_addr(&asm, 4242), None, "not a bootstrap visa");
+                assert_eq!(
+                    visa_mgmt::get_egress_link_for_visa(&asm, 9001)
+                        .ok()
+                        .map(|l| l.get()),
+                    Some(link)
                 );
-                assert_eq!(asm.find_egress_link(relay).map(|l| l.get()), Some(link));
+                assert_eq!(asm.find_egress_link(relay), None, "no general route");
+
+                // A visa that is not a handed-off one finds no route there.
+                let other = tcp_visa(4242, OWN, 0, "fd5a:5052::77", 80, Some(RELAY));
+                asm.visa_table.write().unwrap().insert_visa(other).unwrap();
+                assert!(visa_mgmt::get_egress_link_for_visa(&asm, 4242).is_err());
+
+                // The topology's address for the relay applies to every visa.
+                asm.peer_table
+                    .get(link)
+                    .unwrap()
+                    .link_state_machine
+                    .set_zode_peer_addr(Some(relay));
+                assert_eq!(fsm_addr(&asm, 4242), Some(relay));
+                assert_eq!(
+                    visa_mgmt::get_egress_link_for_visa(&asm, 4242)
+                        .ok()
+                        .map(|l| l.get()),
+                    Some(link)
+                );
             })
             .await
     }
@@ -462,6 +506,17 @@ mod tests {
                 );
                 assert_eq!(asm.visa_table.read().unwrap().table[&9001].visa, other);
                 assert!(!installed(&asm, 9002), "all or nothing");
+
+                // Two different visas with one ID in a single hand-off
+                // (Codex review on zl-zpr-core#104): refused, none installed.
+                let (asm, link) = joiner("relay.zpr");
+                let mut pair = vsapi_pair();
+                pair[1].issuer_id = 9001;
+                assert_eq!(
+                    accept(&asm, link, pair),
+                    Err(HandoffError::IdCollision(9001))
+                );
+                assert!(!installed(&asm, 9001), "all or nothing");
 
                 let (asm, link) = joiner("relay.zpr");
                 accept(&asm, link, vsapi_pair()).unwrap();

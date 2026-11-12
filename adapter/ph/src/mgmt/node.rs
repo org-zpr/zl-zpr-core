@@ -402,15 +402,22 @@ async fn visa_push_request_task(
     }
 }
 
-/// Is the peer Zode on `link_id` the visa's previous hop `prev_hop`? True
-/// only when both the previous hop and the link's recorded peer ZPR address
-/// are known and equal.
-fn is_previous_hop(asm: &Assembly, link_id: NonZero<LinkId>, prev_hop: Option<IpAddr>) -> bool {
+/// Is the peer Zode on `link_id` the previous hop `prev_hop` of visa
+/// `visa_id`? True only when both the previous hop and the link's recorded
+/// peer ZPR address for that visa are known and equal. (A provisional
+/// hand-off address applies only to the handed-off visas.)
+fn is_previous_hop(
+    asm: &Assembly,
+    link_id: NonZero<LinkId>,
+    visa_id: VisaId,
+    prev_hop: Option<IpAddr>,
+) -> bool {
     let Some(prev_hop) = prev_hop else {
         return false;
     };
     asm.peer_table.get(link_id.get()).is_some_and(|peer| {
-        peer.link_state_machine.zode_peer_addr() == Some(IpAddress::new_from_std(&prev_hop))
+        peer.link_state_machine.zode_peer_addr_for(visa_id)
+            == Some(IpAddress::new_from_std(&prev_hop))
     })
 }
 
@@ -474,7 +481,7 @@ fn requested_visa_granted(
     // claims. A visa without a previous hop (ingress or single-node) is
     // never bound this way (operator, pd gate g65 q2).
     if matches!(ingress_peer_type, PeerType::Node)
-        && !is_previous_hop(asm, ingress_link_id, prev_hop)
+        && !is_previous_hop(asm, ingress_link_id, visa_id, prev_hop)
     {
         error!(target: FLOW_MGMT,
             "visa {visa_id}: refusing StreamIdRequest from {}: not the visa's previous hop {prev_hop:?}",
@@ -1213,6 +1220,33 @@ mod tests {
         request_stream(&asm, NonZero::new(link_c).unwrap(), 7, VISA_ID);
 
         assert_stream_id_refused(&mut egress_rx, link_c);
+    }
+
+    /// Gap 7 (Copilot review on zl-zpr-core#104): a joiner's relay link
+    /// whose address came from the bootstrap hand-off -- an address the
+    /// relay chose -- is the previous hop only for the handed-off visas,
+    /// until a topology gives it an address.
+    #[tokio::test]
+    async fn test_hand_off_address_is_previous_hop_only_for_bootstrap_visas() {
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let prev_hop = IpAddress::new_from_std(&PREV_HOP.parse().unwrap());
+        let hand_off = |visas: Vec<VisaId>| {
+            asm.peer_table
+                .get(link_a)
+                .unwrap()
+                .link_state_machine
+                .set_zode_peer_addr_from_handoff(prev_hop, visas)
+        };
+        hand_off(vec![1, 2]);
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+        assert_stream_id_refused(&mut egress_rx, link_a);
+
+        hand_off(vec![VISA_ID]);
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 8, VISA_ID);
+        let pkt = try_recv_packet(&mut egress_rx).expect("a StreamIdRequest to the next hop");
+        assert_eq!(pkt.metadata().egress_link_id, link_b);
     }
 
     /// Gap 7: a visa without a previous hop (an ingress or single-node visa)

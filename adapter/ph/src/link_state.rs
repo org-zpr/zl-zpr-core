@@ -249,6 +249,12 @@ pub struct LinkStateWrapper {
     /// from the topology entry whose `peer_cn` is the peer's verified CN.
     /// Never from Hello (gap 5). Used to find the link for a next hop.
     zode_peer_addr: rcu::RcuBox<Option<IpAddress>>,
+    /// NodeToNode only (zl-zipline#222): `Some(visa IDs)` while
+    /// [Self::zode_peer_addr] is the provisional one a joiner took from its
+    /// relay's bootstrap hand-off. The relay chose that address, so it
+    /// applies only to the handed-off visas; `None` once a topology gives
+    /// the address.
+    zode_handoff_visas: rcu::RcuBox<Option<Vec<VisaId>>>,
     /// NodeToNode only (zl-zipline#222): this dialed link lost a
     /// crossed-dial election, so it is dropped when its close completes
     /// instead of redialing into the same loss.
@@ -275,6 +281,7 @@ impl LinkStateWrapper {
             aaa_address: rcu::RcuBox::new(None),
             zode_dialer: AtomicBool::new(false),
             zode_peer_addr: rcu::RcuBox::new(None),
+            zode_handoff_visas: rcu::RcuBox::new(None),
             zode_retired: AtomicBool::new(false),
             locked_fsm: Mutex::new(lsm),
             locked_data: Mutex::new(LinkData::new()),
@@ -312,8 +319,37 @@ impl LinkStateWrapper {
     }
 
     /// Record the peer Zode's ZPR address from the topology (zl-zipline#222).
+    /// It applies to every visa.
     pub fn set_zode_peer_addr(&self, addr: Option<IpAddress>) {
+        self.zode_handoff_visas.write(None);
         self.zode_peer_addr.write(addr);
+    }
+
+    /// Record a provisional peer address from a bootstrap hand-off
+    /// (zl-zipline#222): it applies only to the handed-off `visas`, until
+    /// [Self::set_zode_peer_addr] records one from the topology.
+    pub fn set_zode_peer_addr_from_handoff(&self, addr: IpAddress, visas: Vec<VisaId>) {
+        self.zode_handoff_visas.write(Some(visas));
+        self.zode_peer_addr.write(Some(addr));
+    }
+
+    /// The peer Zode's ZPR address as it applies to any visa: the one from
+    /// the topology, never a provisional hand-off address.
+    pub fn zode_topology_addr(&self) -> Option<IpAddress> {
+        if self.zode_handoff_visas.get().is_some() {
+            return None;
+        }
+        self.zode_peer_addr()
+    }
+
+    /// The peer Zode's ZPR address as it applies to visa `visa_id`: the
+    /// topology's, or a provisional hand-off address if `visa_id` is one of
+    /// the handed-off visas.
+    pub fn zode_peer_addr_for(&self, visa_id: VisaId) -> Option<IpAddress> {
+        match &*self.zode_handoff_visas.get() {
+            Some(visas) if !visas.contains(&visa_id) => None,
+            _ => self.zode_peer_addr(),
+        }
     }
 
     /// Cancel any pending FSM timeout. Called when the peer is dropped: its

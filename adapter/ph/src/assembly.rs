@@ -75,9 +75,9 @@ pub struct Assembly {
     /// True while this node has a VS-API session (zl-zipline#222). A
     /// joining Zode accepts a bootstrap-visa hand-off only while it is false.
     pub vs_session_up: std::sync::atomic::AtomicBool,
-    /// A retry of [Assembly::dial_initial_links] is scheduled
-    /// (zl-zipline#222).
-    pub initial_dial_retry_pending: std::sync::atomic::AtomicBool,
+    /// A retry of failed Zode dials is scheduled ([Assembly::retry_dials],
+    /// zl-zipline#222).
+    pub dial_retry_pending: std::sync::atomic::AtomicBool,
     pub deferred_vs_connect: Mutex<Option<(LinkId, IpAddress, ConnectRequest)>>, // present only on nodes, the VS adapter's connect request and self-granted address, held until the node has VSAPI access
     /// Node only (zipline#121): true while an in-place self re-authentication
     /// against the visa service is in flight. A VSS `requestAuthentication`
@@ -722,10 +722,7 @@ impl Assembly {
     /// answered closes: a Zode that lost a crossed dial to its relay answers
     /// on the initial link's address, and must dial again when that link
     /// ends. A dialed link redials on its own after a close.
-    ///
-    /// A dial that fails before any link exists (no route to the relay yet)
-    /// leaves nothing to redial, so it schedules one retry of all initial
-    /// links after the link holddown; at most one retry is pending at a time.
+    /// A dial that cannot start schedules a retry ([Assembly::retry_dials]).
     pub fn dial_initial_links(self: &Arc<Self>) {
         let mut failed = false;
         for link in self.config.get().initial_links.clone() {
@@ -741,19 +738,31 @@ impl Assembly {
                 failed = true;
             }
         }
-        if failed
-            && !self
-                .initial_dial_retry_pending
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            let asm = self.clone();
-            tokio::task::spawn_local(async move {
-                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN).await;
-                asm.initial_dial_retry_pending
-                    .store(false, std::sync::atomic::Ordering::Release);
-                asm.dial_initial_links();
-            });
+        if failed {
+            self.retry_dials();
         }
+    }
+
+    /// A Zode dial that fails before any link exists (no route to the peer
+    /// yet) leaves no link to redial, so schedule one retry of the initial
+    /// links and topology peers after the link holddown (zl-zipline#222).
+    /// At most one retry is pending at a time; a retry that fails again
+    /// schedules the next.
+    fn retry_dials(self: &Arc<Self>) {
+        if self
+            .dial_retry_pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let asm = self.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN).await;
+            asm.dial_retry_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+            asm.dial_initial_links();
+            asm.dial_topology_peers();
+        });
     }
 
     /// The certificate CN this Zode expects of the Zode at substrate address
@@ -863,7 +872,8 @@ impl Assembly {
                 continue;
             }
             if let Err(e) = self.dial_zode(addr) {
-                error!(target: PEER_MGMT, "topology link {} ({}): {e}", link.link_id, link.peer_cn);
+                error!(target: PEER_MGMT, "topology link {} ({}): {e}; retrying", link.link_id, link.peer_cn);
+                self.retry_dials();
             }
         }
     }
@@ -888,10 +898,28 @@ impl Assembly {
                     || peer.link_state_machine.aaa_address() == Some(actor_addr)
                     // A closed Zode link keeps its address while it waits
                     // to redial; only a live one is a next hop.
-                    || (peer.link_state_machine.zode_peer_addr() == Some(actor_addr)
+                    || (peer.link_state_machine.zode_topology_addr() == Some(actor_addr)
                         && peer.link_state_machine.is_live())
             })
             .map(|(id, _peer)| id)
+    }
+
+    /// [Assembly::find_egress_link] for visa `visa_id`: also a live Zode
+    /// link whose provisional hand-off address applies to that visa
+    /// (zl-zipline#222).
+    pub fn find_egress_link_for_visa(
+        &self,
+        actor_addr: IpAddress,
+        visa_id: VisaId,
+    ) -> Option<NonZero<LinkId>> {
+        self.find_egress_link(actor_addr).or_else(|| {
+            self.peer_table
+                .find(|(_id, peer)| {
+                    peer.link_state_machine.zode_peer_addr_for(visa_id) == Some(actor_addr)
+                        && peer.link_state_machine.is_live()
+                })
+                .map(|(id, _peer)| id)
+        })
     }
 
     // Formats link IDs for display purposes
@@ -1638,6 +1666,39 @@ pub mod test {
         assert_eq!(v6.scope_id(), 3);
     }
 
+    /// zl-zipline#222 (Codex review on zl-zpr-core#104): a topology peer
+    /// that cannot be dialed at all (no route yet) is retried after the
+    /// holddown too, not left until the next topology update.
+    #[tokio::test(start_paused = true)]
+    async fn test_undialable_topology_peer_is_retried() {
+        use crate::peer_table::test::topology_link;
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let mut cfg = <config::Config as std::default::Default>::default();
+                cfg.self_addr = "127.0.0.1:5000".parse().unwrap();
+                let asm = zode_assembly_with_config("zb", cfg);
+                let mut link = topology_link("zc");
+                // An IPv6 peer from an IPv4 self address: no route.
+                link.peer.addr = "fd00::9".parse().unwrap();
+                *asm.topology.write().unwrap() = vec![link];
+                asm.dial_topology_peers();
+                assert!(asm.peer_table.find(|_| true).is_none());
+
+                // The route appears (here: the peer is reachable over IPv4).
+                *asm.topology.write().unwrap() = vec![topology_link("zc")];
+                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN * 2).await;
+
+                let peer = SocketAddr::from(topology_link("zc").peer);
+                assert!(
+                    asm.peer_table
+                        .find(|(_id, p)| p.substrate_addr == peer)
+                        .is_some(),
+                    "the retry dialed the peer"
+                );
+            })
+            .await
+    }
+
     /// zl-zipline#222 (Copilot review on zl-zpr-core#104): an initial link
     /// that cannot be dialed at all (no route yet) leaves no link to redial,
     /// so the Zode retries its initial links after the holddown.
@@ -1879,7 +1940,7 @@ pub mod test {
             topology: Default::default(),
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
             vs_session_up: std::sync::atomic::AtomicBool::new(false),
-            initial_dial_retry_pending: std::sync::atomic::AtomicBool::new(false),
+            dial_retry_pending: std::sync::atomic::AtomicBool::new(false),
             deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
             capture_queue,

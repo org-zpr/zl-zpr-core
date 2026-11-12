@@ -36,7 +36,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  VISA_SERVICE_RELEASE: v0.21.2
+  # The visa service the integration scripts run against. On feature/zodes
+  # this is a feature pre-release cut from the visa service's feature/zodes
+  # (v0.21.2 sends no Link.peerCn, so it cannot drive Zode links). Re-cut
+  # rule (docs/BUILD.md, zl-zipline#254): when the visa service changes in a
+  # way core CI needs, cut the next v0.22.0-zodes.N pre-release from its
+  # feature/zodes and move this pin to it.
+  VISA_SERVICE_RELEASE: v0.22.0-zodes.1
 
 jobs:
   # Build and upload ph

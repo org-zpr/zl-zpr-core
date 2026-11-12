@@ -1216,11 +1216,15 @@ impl LinkStateWrapper {
             // zl-zipline#222: a Zode link this Zode answered is the
             // dialer's to restore; drop it like an adapter dock.
             (LinkState::Closing, LinkType::NodeToNode) if !self.is_zode_dialer() => {
-                // Clear whole peer out; if it was on an initial link's
-                // address, dial that again (zl-zipline#222).
+                // Clear whole peer out; then dial what this Zode still
+                // wants and has no link to -- an initial link's address it
+                // answered on, or a topology peer the closing link kept it
+                // from dialing (zl-zipline#222). A dial that crosses the
+                // peer's own redial is settled by the lower-CN rule.
                 drop(locked_fsm);
                 asm.drop_peer(link_id);
                 asm.dial_initial_links();
+                asm.dial_topology_peers();
                 return;
             }
             // zl-zipline#222: a Zode link this Zode dialed is redialed only
@@ -2239,6 +2243,39 @@ mod tests {
                         .set_zode_peer_addr(Some(addr));
                 }
                 assert_eq!(asm.find_egress_link(addr).map(|l| l.get()), Some(live));
+            })
+            .await
+    }
+
+    /// zl-zipline#222 (Codex review on zl-zpr-core#104): when an answered
+    /// Zode link is dropped, the Zode dials any topology peer it has no link
+    /// to -- here a peer the topology now puts at that link's address, which
+    /// the closing link kept it from dialing.
+    #[tokio::test(start_paused = true)]
+    async fn test_dropped_answered_link_dials_topology_peer_at_its_address() {
+        use crate::peer_table::test::topology_link;
+        LocalSet::new()
+            .run_until(async {
+                let asm = crate::assembly::test::zode_assembly_with_config(
+                    "zb",
+                    <config::Config as std::default::Default>::default(),
+                );
+                *asm.topology.write().unwrap() = vec![topology_link("zc")];
+                let sa = std::net::SocketAddr::from(topology_link("zc").peer);
+                let iface = zpr_utils::net_defs::ScopedIpAddr::V4(
+                    std::net::Ipv4Addr::new(127, 0, 0, 1).into(),
+                );
+                let answered = asm.start_zode_link(&sa, &iface, false).unwrap().get();
+
+                complete_close_of(&asm, answered);
+
+                let mut dialed = Vec::new();
+                asm.peer_table.for_each(|(_id, peer)| {
+                    if peer.link_state_machine.is_zode_dialer() {
+                        dialed.push(peer.substrate_addr);
+                    }
+                });
+                assert_eq!(dialed, vec![sa]);
             })
             .await
     }

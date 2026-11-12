@@ -292,7 +292,7 @@ pub fn get_egress_link_for_visa(
         .read()
         .unwrap()
         .get_visa_next_hop_addr(visa_id)?;
-    let Some(link_id) = asm.find_egress_link_for_visa(addr, visa_id) else {
+    let Some(link_id) = asm.find_egress_link(addr) else {
         return Err(visa_table::VisaTableError::DestNotFound(addr));
     };
     Ok(link_id)

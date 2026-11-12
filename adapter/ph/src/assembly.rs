@@ -833,11 +833,13 @@ impl Assembly {
             let fsm = &peer.link_state_machine;
             if fsm.get_link_type() == LinkType::NodeToNode {
                 if let Some(cn) = peer.verified_peer_cn() {
-                    // An initial link's relay may not be in the topology
-                    // yet; keep the address the hand-off gave it until it is.
-                    if let Some(addr) = self.topology_zpr_addr(&cn) {
-                        fsm.set_zode_peer_addr(Some(addr));
-                    }
+                    // The topology is authoritative for every link: it
+                    // replaces a joiner's hand-off address for its relay,
+                    // which the relay chose, and clears it if the topology
+                    // does not name the relay. Only before the first
+                    // topology, when initial links are the only links
+                    // allowed, does the hand-off address stand.
+                    fsm.set_zode_peer_addr(self.topology_zpr_addr(&cn));
                     keyed_zode_links.push(id.get());
                 }
             }
@@ -898,28 +900,10 @@ impl Assembly {
                     || peer.link_state_machine.aaa_address() == Some(actor_addr)
                     // A closed Zode link keeps its address while it waits
                     // to redial; only a live one is a next hop.
-                    || (peer.link_state_machine.zode_topology_addr() == Some(actor_addr)
+                    || (peer.link_state_machine.zode_peer_addr() == Some(actor_addr)
                         && peer.link_state_machine.is_live())
             })
             .map(|(id, _peer)| id)
-    }
-
-    /// [Assembly::find_egress_link] for visa `visa_id`: also a live Zode
-    /// link whose provisional hand-off address applies to that visa
-    /// (zl-zipline#222).
-    pub fn find_egress_link_for_visa(
-        &self,
-        actor_addr: IpAddress,
-        visa_id: VisaId,
-    ) -> Option<NonZero<LinkId>> {
-        self.find_egress_link(actor_addr).or_else(|| {
-            self.peer_table
-                .find(|(_id, peer)| {
-                    peer.link_state_machine.zode_peer_addr_for(visa_id) == Some(actor_addr)
-                        && peer.link_state_machine.is_live()
-                })
-                .map(|(id, _peer)| id)
-        })
     }
 
     // Formats link IDs for display purposes

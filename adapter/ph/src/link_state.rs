@@ -86,16 +86,16 @@ pub enum LinkStateError {
     InvalidOperation(String),
     #[error("Link {0} does not exist in peer table")]
     NotFound(LinkId),
-    #[error("This operation is not supported yet")]
-    OperationNotSupportedYet,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum LinkType {
     Internal,
     AdapterToNode,
-    #[allow(dead_code)]
-    NodeToNode, // Currently unsupported
+    /// A link between two Zodes (zl-zipline#220, #222): both ends verify
+    /// the other's certificate, and the peer's CN must be in this Zode's
+    /// topology or initial links.
+    NodeToNode,
     NodeToAdapter,
 }
 
@@ -241,6 +241,10 @@ pub struct LinkStateWrapper {
     // Shared with the FSM so every state transition publishes fastpath readiness.
     ready: Arc<AtomicBool>,
     aaa_address: rcu::RcuBox<Option<IpAddress>>,
+    /// NodeToNode only (zl-zipline#222): true on the Zode that dialed the
+    /// link. The dialer initiates keying, says Hello, and redials after a
+    /// close; the answering Zode responds and drops the link on close.
+    zode_dialer: AtomicBool,
     /// Internal links _may_ be associated with another internal link
     /// representing its remote side.
     pub internal_peer_id: Option<NonZero<LinkId>>,
@@ -261,6 +265,7 @@ impl LinkStateWrapper {
             link_type: new_link_type,
             ready: lsm.ready.clone(),
             aaa_address: rcu::RcuBox::new(None),
+            zode_dialer: AtomicBool::new(false),
             locked_fsm: Mutex::new(lsm),
             locked_data: Mutex::new(LinkData::new()),
             internal_peer_id: None,
@@ -283,6 +288,18 @@ impl LinkStateWrapper {
 
     pub fn get_link_type(&self) -> LinkType {
         self.link_type
+    }
+
+    /// Mark a NodeToNode link as dialed by this Zode (zl-zipline#222). Set
+    /// before the link is started; see [LinkStateWrapper::is_zode_dialer].
+    pub fn set_zode_dialer(&self, dialer: bool) {
+        self.zode_dialer.store(dialer, Ordering::Release);
+    }
+
+    /// Did this Zode dial this NodeToNode link? Always false for other link
+    /// types.
+    pub fn is_zode_dialer(&self) -> bool {
+        self.link_type == LinkType::NodeToNode && self.zode_dialer.load(Ordering::Acquire)
     }
 
     /// Read the assigned AAA without taking the link-data mutex.
@@ -330,11 +347,24 @@ impl LinkStateWrapper {
 
     fn process_hello_request(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let locked_fsm = self.locked_fsm.lock().unwrap();
-        if self.link_type != LinkType::NodeToAdapter || locked_fsm.state != LinkState::Helloing {
+        let expected_type = matches!(
+            self.link_type,
+            LinkType::NodeToAdapter | LinkType::NodeToNode
+        );
+        if !expected_type || locked_fsm.state != LinkState::Helloing || self.is_zode_dialer() {
             return Err(LinkStateError::UnexpectedTransition(
                 locked_fsm.state,
                 "ReceivedHelloRequest",
             ));
+        }
+        if self.link_type == LinkType::NodeToNode {
+            // zl-zipline#222: a Zode link carries no AAA address, no
+            // identity providers and no bootstrap flag; the peer is
+            // identified by its CN-checked certificate, and its ZPR address
+            // comes from the topology, never from Hello.
+            mgmt::requests::send_hello_success_response(asm, self.id, 0, &[], None, false)
+                .enqueue();
+            return self.run_active(asm, locked_fsm);
         }
         let is_vs = asm
             .peer_table
@@ -380,11 +410,21 @@ impl LinkStateWrapper {
             return self.initiate_close(asm, TerminateReason::Other);
         }
         let locked_fsm = self.locked_fsm.lock().unwrap();
-        if self.link_type != LinkType::AdapterToNode || locked_fsm.state != LinkState::Helloing {
+        let expected_type = self.link_type == LinkType::AdapterToNode || self.is_zode_dialer();
+        if !expected_type || locked_fsm.state != LinkState::Helloing {
             return Err(LinkStateError::UnexpectedTransition(
                 locked_fsm.state,
                 "ReceivedHelloResponse",
             ));
+        }
+        if self.link_type == LinkType::NodeToNode {
+            // zl-zipline#222: nothing a peer says about itself in Hello is
+            // used on a Zode link (gaps 5 and 6).
+            if response.aaa_address.is_some() || response.vs_bootstrap {
+                warn!(target: LINK_STATE, "{}: ignoring AAA address / bootstrap flag in a Zode HelloResponse",
+                    asm.formatted_link_id(self.id));
+            }
+            return self.run_active(asm, locked_fsm);
         }
         if response.aaa_address.is_none() && !response.vs_bootstrap {
             return Err(LinkStateError::InvalidOperation(
@@ -530,9 +570,33 @@ impl LinkStateWrapper {
                 Ok(())
             }
             LinkType::NodeToNode => {
-                error!(target: LINK_STATE, "Error: Node to node not supported yet");
-                locked_fsm.set_state(LinkState::Error);
-                Err(LinkStateError::OperationNotSupportedYet)
+                // zl-zipline#222: the dialer initiates keying; both ends
+                // demand a CA-signed certificate (#220). A Zode without a CA
+                // certificate cannot start one, and fails closed.
+                let dialer = self.is_zode_dialer();
+                let zpis = if dialer {
+                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 5, 6)
+                } else {
+                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4)
+                };
+                let (Some(keypair), Some(certx)) =
+                    (asm.self_noise_keypair.clone(), asm.certx.clone())
+                else {
+                    error!(target: LINK_STATE, "{} has no Noise key or certificate exchange; cannot start a Zode link", asm.formatted_link_id(link_id));
+                    locked_fsm.set_state(LinkState::Error);
+                    return Err(LinkStateError::InvalidOperation("no link keys".into()));
+                };
+                if let Err(e) =
+                    km_multiplexor::add_zode_link(asm, link_id, dialer, zpis, keypair, certx)
+                {
+                    error!(target: LINK_STATE, "{} cannot start a Zode link: {e:?}", asm.formatted_link_id(link_id));
+                    locked_fsm.set_state(LinkState::Error);
+                    return Err(LinkStateError::InvalidOperation(format!("{e:?}")));
+                }
+                // Bound the wait for keying on both ends: a dialer whose
+                // peer never answers, and an answerer whose dialer goes away.
+                self.set_timeout(asm, &mut locked_fsm, config::NODE_KEYING_TIMEOUT);
+                Ok(())
             }
             LinkType::NodeToAdapter => {
                 km_multiplexor::add_node_link(
@@ -645,8 +709,8 @@ impl LinkStateWrapper {
 
         locked_fsm.set_state(LinkState::Helloing);
 
-        // IF this is an adapter, it's expected to issue the hello
-        if self.link_type == LinkType::AdapterToNode {
+        // An adapter, or the Zode that dialed a Zode link, issues the hello
+        if self.link_type == LinkType::AdapterToNode || self.is_zode_dialer() {
             // Grab public key from keypair to send in hello request
             let pubkey = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
             mgmt::requests::send_hello_request(asm, self.id, pubkey).enqueue();
@@ -656,7 +720,12 @@ impl LinkStateWrapper {
                 "{} sent HelloRequest.  Waiting for other side to respond.", asm.formatted_link_id(link_id)
             );
         }
-        // Otherwise we are a node so wait for an adapter to reach out
+        // Otherwise we wait for the peer's HelloRequest. On a Zode link that
+        // wait is bounded too, so a peer that keys and goes quiet cannot
+        // hold the link open (zl-zipline#222).
+        else if self.link_type == LinkType::NodeToNode {
+            self.set_timeout(asm, &mut locked_fsm, config::LINK_HELLO_TIMEOUT);
+        }
         Ok(())
     }
 
@@ -699,7 +768,8 @@ impl LinkStateWrapper {
 
         // handle the timeout...
         match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::Helloing) => {
+            (LinkType::AdapterToNode | LinkType::NodeToNode, LinkState::Helloing)
+            | (LinkType::NodeToNode, LinkState::Keying) => {
                 // Timeout here means we give up on the link.
                 error!(target: LINK_STATE, "{}: timed out in state {:?}", asm.formatted_link_id(self.id), locked_fsm.state);
                 locked_fsm.set_state(LinkState::Error);
@@ -1043,6 +1113,14 @@ impl LinkStateWrapper {
 
         match (locked_fsm.state, self.link_type) {
             (LinkState::Closing, LinkType::NodeToAdapter) | (LinkState::Resetting, _) => {
+                // Clear whole peer out
+                drop(locked_fsm);
+                asm.drop_peer(link_id);
+                return;
+            }
+            // zl-zipline#222: a Zode link this Zode answered is the
+            // dialer's to restore; drop it like an adapter dock.
+            (LinkState::Closing, LinkType::NodeToNode) if !self.is_zode_dialer() => {
                 // Clear whole peer out
                 drop(locked_fsm);
                 asm.drop_peer(link_id);
@@ -1661,6 +1739,159 @@ mod tests {
         let asm = zode_assembly(&["relay.zpr"]);
         assert!(asm.peer_cn_allowed("relay.zpr"));
         assert!(!asm.peer_cn_allowed(""));
+    }
+
+    /// A keyable Zode assembly with no topology yet, but with an initial
+    /// link to `relay_cn` (zl-zipline#222).
+    fn zode_assembly_with_initial_link(relay_cn: &str) -> Arc<Assembly> {
+        let asm = keyable_assembly(true);
+        let mut cfg = (*asm.config.get()).clone();
+        cfg.initial_links = vec![config::InitialLink::new(relay_cn, "10.9.9.9:5000").unwrap()];
+        asm.config.write(cfg);
+        asm
+    }
+
+    /// zl-zipline#222: an initial link's CN is accepted on a Zode link
+    /// before any topology arrives, and a topology update that does not
+    /// name it does not close that link.
+    #[tokio::test]
+    async fn test_initial_link_cn_is_allowed_and_kept_without_topology() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = zode_assembly_with_initial_link("relay.zpr");
+                assert!(asm.peer_cn_allowed("relay.zpr"));
+                assert!(!asm.peer_cn_allowed("stranger.zpr"));
+
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "relay.zpr",
+                    LinkState::Active,
+                );
+                close_zode_links_outside_topology(&asm);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Active);
+            })
+            .await
+    }
+
+    /// zl-zipline#222 (#220 g41 q4): a Zode without a CA certificate starts
+    /// no Zode link; the link fails closed instead of keying.
+    #[tokio::test]
+    async fn test_zode_link_start_without_ca_fails_closed() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = keyable_assembly(true);
+                let link_id = add_peer(&asm, LinkType::NodeToNode, 9800);
+                assert!(
+                    asm.process_link_state_event(link_id, LinkEvent::Start)
+                        .is_err()
+                );
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Error);
+            })
+            .await
+    }
+
+    /// zl-zipline#222: the Zode that dialed says Hello after keying and
+    /// waits for the answer under a timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_dialing_zode_says_hello_after_keying() {
+        LocalSet::new()
+            .run_until(async {
+                use crate::peer_table::test::topology_link;
+                // Keep the egress queue open so the HelloRequest can be sent.
+                let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+                    mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+                    ..TestAssemblyBuilder::new()
+                }));
+                *asm.topology.write().unwrap() = vec![topology_link("relay.zpr")];
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "relay.zpr",
+                    LinkState::Keying,
+                );
+                let peer = asm.peer_table.get(link_id).unwrap();
+                peer.link_state_machine.set_zode_dialer(true);
+                drop(peer);
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+                tokio::task::yield_now().await;
+                let buf = vec![0u8; config::PACKET_BUFFER_SIZE].into_boxed_slice();
+                assert!(
+                    egress_rx.try_recv(buf).is_ok(),
+                    "the dialer sent its HelloRequest"
+                );
+
+                // No answer: the Hello times out and the link closes.
+                fire_current_timeout(&asm, link_id);
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+            })
+            .await
+    }
+
+    /// zl-zipline#222: the answering Zode goes Active on a HelloRequest
+    /// without allocating an AAA address or a visa-service bootstrap flag.
+    #[tokio::test]
+    async fn test_zode_hello_request_activates_without_aaa() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let zode = hello_link(LinkType::NodeToNode);
+                zode.process_hello_request(&asm).unwrap();
+                assert!(zode.is_ready());
+                assert!(zode.aaa_address().is_none());
+            })
+            .await
+    }
+
+    /// zl-zipline#222: on a Zode link an AAA address or bootstrap flag in a
+    /// HelloResponse is ignored; the link goes Active without them.
+    #[tokio::test]
+    async fn test_zode_hello_response_ignores_aaa_and_bootstrap() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let zode = hello_link(LinkType::NodeToNode);
+                zode.set_zode_dialer(true);
+                zode.process_hello_response(
+                    &asm,
+                    HelloResponse {
+                        status: ResponseCode::Success,
+                        aaa_address: Some(IpAddress::new_from_std(
+                            &"fd5a:5052:9::1".parse().unwrap(),
+                        )),
+                        oidc_idps: None,
+                        vs_bootstrap: true,
+                    },
+                )
+                .unwrap();
+                assert!(zode.is_ready());
+                assert!(zode.aaa_address().is_none());
+            })
+            .await
+    }
+
+    /// zl-zipline#222: a Zode link this Zode answered is dropped when it
+    /// closes (the dialer reconnects); one it dialed waits and redials.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_link_close_drops_answerer_and_redials_dialer() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = keyable_assembly(true);
+                let answered = add_peer(&asm, LinkType::NodeToNode, 9850);
+                complete_close_of(&asm, answered);
+                assert!(asm.peer_table.get(answered).is_none());
+
+                let dialed = add_peer(&asm, LinkType::NodeToNode, 9900);
+                asm.peer_table
+                    .get(dialed)
+                    .unwrap()
+                    .link_state_machine
+                    .set_zode_dialer(true);
+                complete_close_of(&asm, dialed);
+                assert_eq!(link_state_of(&asm, dialed), LinkState::Inactive);
+            })
+            .await
     }
 
     /// The current FSM state of `link_id`.

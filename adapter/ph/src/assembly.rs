@@ -32,6 +32,7 @@ use tracing_subscriber::{Layer, Registry, filter, fmt, reload};
 use x25519_dalek::ReusableSecret;
 use zpr::addrs::{VISA_SERVICE_ADDR, ZPRNET_PREFIX_LEN};
 use zpr::vsapi_types::{AuthServicesList, ConnectRequest};
+use zpr_utils::net_defs::SocketAddrExt;
 use zpr_utils::net_defs::{IpAddress, ScopedIpAddr};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -173,15 +174,23 @@ impl Assembly {
     /// Is `cn` the certificate CN of a peer this Zode was told to link with
     /// (zl-zipline#220)? True only for a non-empty CN that equals some
     /// `peer_cn` in the stored topology; an empty `peer_cn` (a sender that
-    /// predates peerCn) matches nothing. #222 adds configured initial links.
+    /// predates peerCn) matches nothing. A configured initial link's CN is
+    /// accepted too, so a Zode can link to its relay before any topology
+    /// arrives (zl-zipline#222).
     pub fn peer_cn_allowed(&self, cn: &str) -> bool {
         !cn.is_empty()
-            && self
+            && (self
                 .topology
                 .read()
                 .unwrap()
                 .iter()
                 .any(|link| link.peer_cn == cn)
+                || self
+                    .config
+                    .get()
+                    .initial_links
+                    .iter()
+                    .any(|link| link.cn == cn))
     }
 
     pub fn get_uptime(&self) -> std::time::Duration {
@@ -650,6 +659,58 @@ impl Assembly {
         }
 
         return Ok(peer_id);
+    }
+
+    /// Add and start a Zode-to-Zode link to `peer` (zl-zipline#222).
+    /// `dial` is true when this Zode initiates it (an initial link or a
+    /// topology peer) and false for a link a dialing Zode opened to us.
+    pub fn start_zode_link(
+        self: &Arc<Self>,
+        peer: &SubstrateAddr,
+        interface_addr: &ScopedIpAddr,
+        dial: bool,
+    ) -> Result<NonZero<LinkId>, PeerInsertError> {
+        debug!(target: PEER_MGMT, "Starting Zode link with {peer} on {interface_addr} (dial: {dial})");
+        let peer_id = self.add_peer(LinkType::NodeToNode, peer, interface_addr)?;
+        let Some(state) = self.peer_table.get(peer_id.get()) else {
+            return Ok(peer_id);
+        };
+        state.link_state_machine.set_zode_dialer(dial);
+        if let Err(e) = state
+            .link_state_machine
+            .process_event(self, LinkEvent::Start)
+        {
+            error!(target: PEER_MGMT, "{} failed to start: {e}.  Resetting", self.formatted_link_id(peer_id.get()));
+            drop(state);
+            self.drop_peer(peer_id.get());
+            return Err(PeerInsertError::FailedToStart(e.to_string()));
+        }
+        info!(target: PEER_MGMT, "Started Zode link with {peer}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
+        Ok(peer_id)
+    }
+
+    /// Dial every configured initial link (zl-zipline#222). Called once at
+    /// startup; a dialed link redials on its own after a close.
+    pub fn dial_initial_links(self: &Arc<Self>) {
+        let self_addr = self.config.get().self_addr;
+        for link in self.config.get().initial_links.clone() {
+            // The local interface address the kernel would use for this
+            // peer: probe from our IP with an ephemeral port, since our
+            // substrate sockets already hold the configured port.
+            let probe_from = std::net::SocketAddr::new(self_addr.ip(), 0);
+            let interface_addr = match crate::sys::substrate::resolve_local_addr(
+                probe_from, link.addr,
+            ) {
+                Ok(local) => local.scoped_ip(),
+                Err(e) => {
+                    error!(target: PEER_MGMT, "cannot route to initial link {} at {}: {e}", link.cn, link.addr);
+                    continue;
+                }
+            };
+            if let Err(e) = self.start_zode_link(&link.addr, &interface_addr, true) {
+                error!(target: PEER_MGMT, "cannot start initial link {} at {}: {e}", link.cn, link.addr);
+            }
+        }
     }
 
     /// Temporary? function to find a link based on the actor address

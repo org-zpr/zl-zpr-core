@@ -90,6 +90,7 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             auth_private_key,
             advertised_substrate_addr,
             forwarding,
+            initial_link,
             common,
         } => {
             ph_mode = PhMode::Node;
@@ -119,6 +120,10 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             // default, false).
             if let Some(forwarding) = forwarding {
                 config.forwarding = forwarding;
+            }
+            // Any --initial-link replaces the config file's list.
+            if !initial_link.is_empty() {
+                config.initial_links = initial_link;
             }
         }
     }
@@ -982,6 +987,54 @@ mod test {
         ]))
         .unwrap();
         assert!(!config.forwarding, "--forwarding false overrides the file");
+    }
+
+    // CLI --initial-link replaces the [[node.initial_link]] list, and an
+    // omitted flag keeps the config file's list (zl-zipline#222).
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_node_initial_link_cli_overrides_config() {
+        let ca_file = TempFile::touch();
+        let cert_file = TempFile::touch();
+        let pk_file = TempFile::touch();
+
+        let tomltxt = r#"
+        [global]
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
+        control_path = "/tmp/control.sock"
+        self_addr = "10.0.0.1:12345"
+        zpr_addr = [ "10.0.0.1" ]
+
+        [node]
+        [[node.initial_link]]
+        addr = "10.0.0.9:5000"
+        cn = "relay.zpr"
+        "#
+        .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
+        .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
+        .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
+        let tmpfile = TempFile::new_toml(&tomltxt);
+        let config_path = tmpfile.get_path().to_str().unwrap();
+
+        let (_, config) = argparse(Some(vec!["ph", "node", "-c", config_path])).unwrap();
+        let cns: Vec<&str> = config.initial_links.iter().map(|l| l.cn.as_str()).collect();
+        assert_eq!(cns, ["relay.zpr"], "the config file's list is kept");
+
+        let (_, config) = argparse(Some(vec![
+            "ph",
+            "node",
+            "-c",
+            config_path,
+            "--initial-link",
+            "a.zpr@10.0.0.10:5000",
+            "--initial-link",
+            "b.zpr@10.0.0.11:5000",
+        ]))
+        .unwrap();
+        let cns: Vec<&str> = config.initial_links.iter().map(|l| l.cn.as_str()).collect();
+        assert_eq!(cns, ["a.zpr", "b.zpr"], "--initial-link replaces the list");
     }
 
     #[test]

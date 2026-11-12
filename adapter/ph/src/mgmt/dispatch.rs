@@ -39,10 +39,13 @@ pub fn dispatch_mgmt_packet_with_addr(
                 .unwrap_or_zero();
 
             if ingress_link_id == LINK_ID_UNKNOWN {
-                let Some(i_link_id) = asm
-                    .start_tether(&peer_sa, &interface_addr, LinkType::NodeToAdapter, true)
-                    .ok()
-                else {
+                // A dialing Zode marks its first handshake message
+                // (zl-zipline#222); anything else docks as an adapter.
+                let started = match inbound_link_type(km_noise_message(pkt.body())) {
+                    LinkType::NodeToNode => asm.start_zode_link(&peer_sa, &interface_addr, false),
+                    _ => asm.start_tether(&peer_sa, &interface_addr, LinkType::NodeToAdapter, true),
+                };
+                let Some(i_link_id) = started.ok() else {
                     core::count_event(asm, ManagementCounterType::UnknownPeer);
                     return;
                 };
@@ -57,6 +60,28 @@ pub fn dispatch_mgmt_packet_with_addr(
             core::count_event(asm, ManagementCounterType::UnknownPeer);
             return;
         }
+    }
+}
+
+/// The link type for a new inbound link whose first key-management message
+/// is `km_msg` (zl-zipline#222): a Zode link when it opens a Zode handshake,
+/// an adapter dock otherwise.
+fn inbound_link_type(km_msg: &[u8]) -> LinkType {
+    if crate::km_noise::starts_zode_handshake(km_msg) {
+        LinkType::NodeToNode
+    } else {
+        LinkType::NodeToAdapter
+    }
+}
+
+/// The key-management message carried in `km_body` (a KM header and its
+/// payload), or an empty slice if the header is malformed or not Noise.
+fn km_noise_message(km_body: &[u8]) -> &[u8] {
+    match zdp::ZdpKeyManagementHeader::ref_from_prefix(km_body) {
+        Ok((hdr, rest)) if hdr.is_noise() => {
+            &rest[..usize::from(hdr.message_length).min(rest.len())]
+        }
+        _ => &[],
     }
 }
 
@@ -313,6 +338,43 @@ mod test {
     use std::net::Ipv4Addr;
     use std::num::NonZero;
     use std::sync::Arc;
+
+    /// zl-zipline#222: a node creates a Zode link for an unknown peer whose
+    /// first handshake message carries the Zode marker, and an adapter
+    /// dock for anything else.
+    #[test]
+    fn test_inbound_link_type_from_first_handshake_message() {
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let kp = NoiseKeypair::generate();
+        let window = {
+            let now = std::time::SystemTime::now();
+            x509_cert::time::Validity::new(
+                x509_cert::time::Time::try_from(now - std::time::Duration::from_secs(60)).unwrap(),
+                x509_cert::time::Time::try_from(now + std::time::Duration::from_secs(3600))
+                    .unwrap(),
+            )
+        };
+        let certx =
+            KmCertExchange::new(Some(ca.issue("a.zpr", &kp, window)), Some(ca.cert.clone()));
+        let mut zode =
+            crate::km_noise::KmNoise::new_zode(true, kp, crate::km::ZPIPair::new(1, 2), certx)
+                .unwrap();
+        let mut adapter = crate::km_noise::KmNoise::new(
+            true,
+            true,
+            None,
+            crate::km::ZPIPair::new(1, 2),
+            KmCertExchange::new(None, Some(ca.cert.clone())),
+        )
+        .unwrap();
+        use crate::km::KeyManagerStateMachine;
+        let zode_msg0 = zode.reset().unwrap().unwrap();
+        let adapter_msg0 = adapter.reset().unwrap().unwrap();
+
+        assert_eq!(inbound_link_type(&zode_msg0), LinkType::NodeToNode);
+        assert_eq!(inbound_link_type(&adapter_msg0), LinkType::NodeToAdapter);
+        assert_eq!(inbound_link_type(&[]), LinkType::NodeToAdapter);
+    }
 
     // Ensure that this old issue is fixed:
     // https://github.com/org-zpr/zpr-core/issues/929

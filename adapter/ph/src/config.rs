@@ -245,6 +245,14 @@ pub struct Config {
     /// `[node]` config section or `ph node --forwarding`.
     pub forwarding: bool,
 
+    /// Node only — the links this Zode starts at startup, before the visa
+    /// service has pushed any topology (zl-zipline#222, Zodes plan §5.5).
+    /// An endpoint's initial link is its relay. Each peer's certificate CN
+    /// is accepted on a Zode link alongside the topology's. Configured via
+    /// `[[node.initial_link]]` in the config file or repeated
+    /// `ph node --initial-link CN@IP:PORT`.
+    pub initial_links: Vec<InitialLink>,
+
     /// Security testing for A2A Pubkeys
     #[cfg(feature = "enable-security-testing")]
     pub security_testing_mangle_forwarded_pings: bool,
@@ -610,6 +618,12 @@ impl Config {
             if let Some(forwarding) = config.forwarding {
                 self.forwarding = forwarding;
             }
+            if let Some(links) = &config.initial_link {
+                self.initial_links = links
+                    .iter()
+                    .map(|l| InitialLink::new(&l.cn, &l.addr))
+                    .collect::<Result<_, _>>()?;
+            }
         }
         Ok(())
     }
@@ -735,6 +749,7 @@ impl Default for Config {
             control_path_derived: true,
             auth_renewal_lead: DEFAULT_AUTH_RENEWAL_LEAD,
             forwarding: false,
+            initial_links: Vec::new(),
             #[cfg(feature = "enable-security-testing")]
             security_testing_mangle_forwarded_pings: false,
             #[cfg(feature = "enable-security-testing")]
@@ -781,6 +796,53 @@ pub struct NodeConfigSection {
     /// Whether this node accepts forward-only visas, i.e. carries other
     /// nodes' traffic (zl-zipline#219). Default false. A relay sets it.
     pub forwarding: Option<bool>,
+
+    /// Links started at startup, before any topology (zl-zipline#222).
+    /// Each is a TOML `[[node.initial_link]]` table with `addr` and `cn`.
+    pub initial_link: Option<Vec<InitialLinkSection>>,
+}
+
+/// One `[[node.initial_link]]` table in the node config file.
+#[derive(Deserialize, Debug, Clone)]
+pub struct InitialLinkSection {
+    /// The peer's substrate address, a literal `"IP:port"`.
+    pub addr: String,
+    /// The CN the peer's certificate must carry.
+    pub cn: String,
+}
+
+/// A link a Zode starts at startup, before the visa service has pushed any
+/// topology (zl-zipline#222, Zodes plan §5.5): the substrate address to dial
+/// and the certificate CN the peer must present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialLink {
+    pub addr: SocketAddr,
+    pub cn: String,
+}
+
+impl InitialLink {
+    /// Build an initial link from a CN and a literal `IP:port`. The CN must
+    /// be non-empty and the address must be dialable (not unspecified, not
+    /// port 0).
+    pub fn new(cn: &str, addr: &str) -> Result<Self, ArgsError> {
+        if cn.is_empty() {
+            return Err(ArgsError::ParseError(format!(
+                "initial link {addr:?} has an empty cn"
+            )));
+        }
+        Ok(InitialLink {
+            addr: parse_dialable_addr("initial link addr", addr)?,
+            cn: cn.to_string(),
+        })
+    }
+
+    /// Parse the command-line form `CN@IP:PORT`.
+    pub fn parse_cli(s: &str) -> Result<Self, ArgsError> {
+        let (cn, addr) = s.split_once('@').ok_or_else(|| {
+            ArgsError::ParseError(format!("initial link {s:?} is not of the form CN@IP:PORT"))
+        })?;
+        InitialLink::new(cn, addr)
+    }
 }
 
 // Global section is shared by nodes and adapters.
@@ -911,20 +973,26 @@ fn check_file_exists(desc: &str, path: &Path) -> Result<(), ArgsError> {
 /// the advertised value must be the concrete address itself. Unspecified IPs
 /// (e.g. `0.0.0.0`) and port 0 are rejected: the value is what peers dial.
 fn resolve_advertised_addr(addr_str: &str) -> Result<SocketAddr, ArgsError> {
+    parse_dialable_addr("advertised_substrate_addr", addr_str)
+}
+
+/// Parse `addr_str` as a literal `IP:port` that a peer can dial: not an
+/// unspecified address and not port 0. `field` names the setting in errors.
+fn parse_dialable_addr(field: &str, addr_str: &str) -> Result<SocketAddr, ArgsError> {
     let resolved: SocketAddr = addr_str.parse().map_err(|e| {
         ArgsError::ParseError(format!(
-            "advertised_substrate_addr {addr_str:?} is not a literal IP:port \
+            "{field} {addr_str:?} is not a literal IP:port \
              (IPv6 in square brackets, e.g. \"[2001:db8::1]:5000\"): {e}"
         ))
     })?;
     if resolved.ip().is_unspecified() {
         return Err(ArgsError::ParseError(format!(
-            "advertised_substrate_addr {addr_str:?} is an unspecified address; peers cannot dial it"
+            "{field} {addr_str:?} is an unspecified address; peers cannot dial it"
         )));
     }
     if resolved.port() == 0 {
         return Err(ArgsError::ParseError(format!(
-            "advertised_substrate_addr {addr_str:?} has port 0; peers cannot dial it"
+            "{field} {addr_str:?} has port 0; peers cannot dial it"
         )));
     }
     Ok(resolved)
@@ -1099,6 +1167,67 @@ mod test {
         assert!(parse("forwarding = true"));
         assert!(!parse("forwarding = false"));
         assert!(!parse("auth_renewal_lead_seconds = 60"));
+    }
+
+    /// `[[node.initial_link]]` entries become the Zode's initial links
+    /// (zl-zipline#222); none configured means none.
+    #[test]
+    fn test_node_config_initial_links() {
+        assert!(Config::default().initial_links.is_empty());
+
+        let toml_str = r#"
+            [global]
+            self_addr = "10.0.0.1:5000"
+
+            [node]
+            [[node.initial_link]]
+            addr = "203.0.113.7:5000"
+            cn = "relay.zpr"
+
+            [[node.initial_link]]
+            addr = "[2001:db8::1]:5001"
+            cn = "relay2.zpr"
+            "#;
+        let file_config: NodeConfig = toml::from_str(toml_str).unwrap();
+        let mut config = Config::default();
+        config.set_from_node(&file_config.node).unwrap();
+        assert_eq!(
+            config.initial_links,
+            vec![
+                InitialLink {
+                    addr: "203.0.113.7:5000".parse().unwrap(),
+                    cn: "relay.zpr".to_string(),
+                },
+                InitialLink {
+                    addr: "[2001:db8::1]:5001".parse().unwrap(),
+                    cn: "relay2.zpr".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// An initial link needs a CN and an address a Zode can dial.
+    #[test]
+    fn test_initial_link_validation() {
+        assert!(InitialLink::new("relay.zpr", "203.0.113.7:5000").is_ok());
+        assert!(InitialLink::new("", "203.0.113.7:5000").is_err());
+        assert!(InitialLink::new("relay.zpr", "0.0.0.0:5000").is_err());
+        assert!(InitialLink::new("relay.zpr", "203.0.113.7:0").is_err());
+        assert!(InitialLink::new("relay.zpr", "relay.example:5000").is_err());
+    }
+
+    /// The command-line form is `CN@IP:PORT`.
+    #[test]
+    fn test_initial_link_parse_cli() {
+        assert_eq!(
+            InitialLink::parse_cli("relay.zpr@203.0.113.7:5000").unwrap(),
+            InitialLink {
+                addr: "203.0.113.7:5000".parse().unwrap(),
+                cn: "relay.zpr".to_string(),
+            }
+        );
+        assert!(InitialLink::parse_cli("203.0.113.7:5000").is_err());
+        assert!(InitialLink::parse_cli("@203.0.113.7:5000").is_err());
     }
 
     #[test]

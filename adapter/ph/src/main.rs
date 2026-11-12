@@ -703,6 +703,11 @@ fn main() -> ExitCode {
                 }
                 return ExitCode::FAILURE;
             }
+
+            // Dial the configured initial links (zl-zipline#222): an
+            // endpoint's link to its relay, which carries its first
+            // visa-service traffic before any topology exists.
+            asm.dial_initial_links();
         }
     }
 

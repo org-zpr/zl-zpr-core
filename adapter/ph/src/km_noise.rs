@@ -54,6 +54,23 @@ const MSG_BUF_SIZE: usize = 4096;
 /// a handshake response within this time.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Plaintext payload a dialing Zode puts in the first Noise XX message of a
+/// Zode-to-Zode link (zl-zipline#222). The node it reaches reads it before
+/// any link exists, to create a Zode link instead of an adapter dock. Noise
+/// mixes this payload into the handshake hash, so a marker changed in
+/// transit makes the handshake fail; an attacker gains nothing by adding
+/// it, because a Zode link then demands a CA-signed certificate whose CN is
+/// in the topology.
+pub const ZODE_HANDSHAKE_MARKER: &[u8] = b"ZODE1";
+
+/// Is `noise_msg` the first message of a Zode handshake? The first Noise XX
+/// message is the initiator's ephemeral public key followed by its
+/// plaintext payload, which for a Zode is exactly [ZODE_HANDSHAKE_MARKER].
+pub fn starts_zode_handshake(noise_msg: &[u8]) -> bool {
+    noise_msg.len() == NOISE_KEY_LEN + ZODE_HANDSHAKE_MARKER.len()
+        && noise_msg.ends_with(ZODE_HANDSHAKE_MARKER)
+}
+
 const NOISE_NONCE_LEN: usize = 8;
 pub const NOISE_PADLEN: usize = 16 + NOISE_NONCE_LEN; // 16 byte tag + 8 byte nonce
 
@@ -252,6 +269,9 @@ impl KmNoise {
                     return Err(KmError::CertExchangeError);
                 }
             };
+        } else if self.msg_nr == 0 && self.strict && self.initiate {
+            // A dialing Zode announces a Zode link (zl-zipline#222).
+            payload_buf.put_slice(ZODE_HANDSHAKE_MARKER);
         }
 
         let mut buf = BytesMut::zeroed(MSG_BUF_SIZE);
@@ -1439,6 +1459,35 @@ mod test {
             Some("b.zpr")
         );
         assert!(r.peer_cert.is_some_and(|c| c.is_verified()));
+    }
+
+    /// A Zode that dials marks its first handshake message, so the node it
+    /// reaches can tell a Zode link from an adapter dock before keying
+    /// (zl-zipline#222).
+    #[test]
+    fn test_zode_initiator_marks_first_message() {
+        let ca = pki::TestCa::new("zode-ca");
+        let mut initiator = zode_end(true, &ca, &ca, "a.zpr", valid_now());
+        let msg0 = initiator.reset().unwrap().unwrap();
+        assert!(starts_zode_handshake(&msg0));
+    }
+
+    /// An adapter's first handshake message carries no marker, so it is
+    /// still docked as an adapter.
+    #[test]
+    fn test_adapter_initiator_first_message_is_unmarked() {
+        let ca = pki::TestCa::new("zode-ca");
+        let mut adapter = KmNoise::new(
+            true,
+            true,
+            None,
+            ZPIPair::new(1, 2),
+            KmCertExchange::new(None, Some(ca.cert.clone())),
+        )
+        .unwrap();
+        let msg0 = adapter.reset().unwrap().unwrap();
+        assert!(!starts_zode_handshake(&msg0));
+        assert!(!starts_zode_handshake(&[]));
     }
 
     /// The responder refuses an initiator that presents no certificate.

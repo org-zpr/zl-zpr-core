@@ -205,9 +205,23 @@ pub enum Command {
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         forwarding: Option<bool>,
 
+        /// A link to start at startup, before any topology arrives, as
+        /// CN@IP:PORT: the peer's certificate CN and substrate address.
+        /// Repeatable. Replaces the config file's `[[node.initial_link]]`
+        /// list.
+        #[arg(long, value_name = "CN@IP:PORT", value_parser = parse_initial_link)]
+        initial_link: Vec<crate::config::InitialLink>,
+
         #[command(flatten)]
         common: CommonArgs,
     },
+}
+
+/// clap value parser for `--initial-link CN@IP:PORT`.
+fn parse_initial_link(
+    s: &str,
+) -> Result<crate::config::InitialLink, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    Ok(crate::config::InitialLink::parse_cli(s)?)
 }
 
 fn parse_socket_addr_or_scoped_ip_addr(

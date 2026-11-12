@@ -38,6 +38,13 @@ pub fn dispatch_mgmt_packet_with_addr(
                 .lookup_peer(&peer_sa, &interface_addr)
                 .unwrap_or_zero();
 
+            // A same-address Zode handshake whose established link has gone
+            // keeps reaching its own link (gate g78 q5).
+            if ingress_link_id == LINK_ID_UNKNOWN {
+                ingress_link_id =
+                    keying_zode_link_at(asm, &peer_sa, &interface_addr, None).unwrap_or_zero();
+            }
+
             if ingress_link_id == LINK_ID_UNKNOWN {
                 // A dialing Zode marks its first handshake message
                 // (zl-zipline#250); anything else docks as an adapter.
@@ -106,20 +113,16 @@ fn zode_handshake_link(asm: &Arc<Assembly>, link_id: LinkId, km_body: &[u8]) -> 
     }) else {
         return link_id;
     };
-    if link_type != LinkType::NodeToNode
-        || !asm.peer_table.is_security_association_established(link_id)
-    {
+    if link_type != LinkType::NodeToNode {
         return link_id;
     }
-    // A new handshake from this address already under way?
-    let keying = asm.peer_table.find(|(id, p)| {
-        id.get() != link_id
-            && p.substrate_addr == sa
-            && p.interface_addr == iface
-            && p.link_state_machine.get_state() == crate::link_state::LinkState::Keying
-    });
-    if let Some((id, _)) = keying {
+    // A new handshake from this address already under way goes to its own
+    // link, whatever has become of `link_id` meanwhile (it may be closing).
+    if let Some(id) = keying_zode_link_at(asm, &sa, &iface, Some(link_id)) {
         return id.get();
+    }
+    if !asm.peer_table.is_security_association_established(link_id) {
+        return link_id;
     }
     if !crate::km_noise::starts_zode_handshake(km_noise_message(km_body)) {
         return link_id;
@@ -131,6 +134,26 @@ fn zode_handshake_link(asm: &Arc<Assembly>, link_id: LinkId, km_body: &[u8]) -> 
             link_id
         }
     }
+}
+
+/// A Zode link still keying at substrate address `sa` on interface `iface`,
+/// other than `except`: a same-address handshake keyed alongside an
+/// established link (gate g78 q5).
+fn keying_zode_link_at(
+    asm: &Assembly,
+    sa: &SubstrateAddr,
+    iface: &net_defs::ScopedIpAddr,
+    except: Option<LinkId>,
+) -> Option<std::num::NonZero<LinkId>> {
+    asm.peer_table
+        .find(|(id, p)| {
+            Some(id.get()) != except
+                && p.substrate_addr == *sa
+                && p.interface_addr == *iface
+                && p.link_state_machine.get_link_type() == LinkType::NodeToNode
+                && p.link_state_machine.get_state() == crate::link_state::LinkState::Keying
+        })
+        .map(|(id, _)| id)
 }
 
 /// Dispatch the given management packet.
@@ -635,6 +658,44 @@ mod test {
                     asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
                     Some(new)
                 );
+            })
+            .await
+    }
+
+    /// Review round 3 (core#105): the established link closing while the
+    /// new handshake from its address is still keying does not lose the
+    /// handshake. While the old link is closing (its SA cleared) and after
+    /// its peer entry is gone, messages from that address reach the keying
+    /// link; no adapter dock is created.
+    #[tokio::test(start_paused = true)]
+    async fn test_same_address_handshake_survives_the_old_link_closing() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                let sa = asm.peer_table.get(old).unwrap().substrate_addr;
+                let iface = asm.peer_table.get(old).unwrap().interface_addr;
+                let (zode_msg0, _) = first_messages();
+                deliver_km_on_link(&asm, old, &zode_msg0);
+                let new = other_links_at_same_address(&asm, old)[0];
+
+                // The old link starts closing: its SA is cleared first.
+                asm.peer_table.clear_security_association(old).unwrap();
+                deliver_km_on_link(&asm, old, &[0u8; 48]);
+                assert_eq!(other_links_at_same_address(&asm, old), vec![new]);
+
+                // Its peer entry goes; the address is unmapped.
+                asm.drop_peer(old);
+                assert!(asm.peer_table.lookup_peer(&sa, &iface).is_none());
+                let mut pkt = km_packet(&[0u8; 48]);
+                dispatch_mgmt_packet_with_addr(&asm, sa, iface, &mut pkt);
+                let mut at_address = Vec::new();
+                asm.peer_table.for_each(|(id, p)| {
+                    if p.substrate_addr == sa && p.interface_addr == iface {
+                        at_address.push(id.get());
+                    }
+                });
+                assert_eq!(at_address, vec![new], "no adapter dock appears");
+                assert_eq!(pkt.metadata().ingress_link_id, new);
             })
             .await
     }

@@ -394,7 +394,7 @@ impl LinkStateWrapper {
             // topology, never from Hello.
             mgmt::requests::send_hello_success_response(asm, self.id, 0, &[], None, false)
                 .enqueue();
-            return self.run_active(asm, locked_fsm);
+            return self.run_active_zode(asm, locked_fsm);
         }
         let is_vs = asm
             .peer_table
@@ -462,7 +462,7 @@ impl LinkStateWrapper {
                 drop(locked_fsm);
                 return self.initiate_close(asm, TerminateReason::Other);
             }
-            return self.run_active(asm, locked_fsm);
+            return self.run_active_zode(asm, locked_fsm);
         }
         if response.aaa_address.is_none() && !response.vs_bootstrap {
             return Err(LinkStateError::InvalidOperation(
@@ -1373,6 +1373,18 @@ impl LinkStateWrapper {
     }
 
     /// Common code to enter the `Active` state and kick off our keepalive mechanism
+    /// Enter Active on a Zode link, then tell its link record the link is
+    /// up (zl-zipline#250, rules 7 and 8) once the FSM lock is released.
+    fn run_active_zode(
+        &self,
+        asm: &Arc<Assembly>,
+        locked_fsm: MutexGuard<'_, LinkStateMachine>,
+    ) -> Result<(), LinkStateError> {
+        self.run_active(asm, locked_fsm)?;
+        crate::zode_links::link_up(asm, self.id);
+        Ok(())
+    }
+
     fn run_active(
         &self,
         asm: &Arc<Assembly>,
@@ -1458,34 +1470,6 @@ impl Display for LinkData {
             self.latency_data.get_min(),
             self.latency_data.get_max(),
         )
-    }
-}
-
-/// Close every keyed Zode link that the acceptance rules would now refuse
-/// (zl-zipline#220, #250). Called after each topology update, so removing a
-/// Zode from the topology ends the links it dialed to this Zode without a
-/// revocation list.
-pub fn close_zode_links_outside_topology(asm: &Arc<Assembly>) {
-    let mut to_close = Vec::new();
-    asm.peer_table.for_each(|(link_id, peer)| {
-        let fsm = &peer.link_state_machine;
-        let keyed = fsm.get_link_type() == LinkType::NodeToNode
-            && matches!(fsm.get_state(), LinkState::Helloing | LinkState::Active);
-        let refused = |end: &ZodeEnd| {
-            crate::zode_links::check_keyed_peer(asm, end, peer.verified_peer_cn().as_deref())
-                .is_err()
-        };
-        if keyed && fsm.zode_end().is_none_or(refused) {
-            to_close.push(link_id.get());
-        }
-    });
-    for link_id in to_close {
-        warn!(target: LINK_STATE, "{} peer left this Zode's topology; closing", asm.formatted_link_id(link_id));
-        if let Err(e) =
-            asm.process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Reset))
-        {
-            warn!(target: LINK_STATE, "{} close after topology update failed: {e}", asm.formatted_link_id(link_id));
-        }
     }
 }
 

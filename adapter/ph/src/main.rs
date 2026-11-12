@@ -532,6 +532,7 @@ fn main() -> ExitCode {
             &node_zpr_addr,
         )),
         topology: Default::default(),
+        zode_links: Default::default(),
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
@@ -708,7 +709,7 @@ fn main() -> ExitCode {
 
             // Dial the configured initial link (zl-zipline#250): the relay
             // this Zode reaches the network through.
-            asm.dial_initial_link();
+            crate::zode_links::start_initial_link(&asm);
         }
     }
 

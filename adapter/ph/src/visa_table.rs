@@ -535,6 +535,10 @@ fn make_tcp_visa(
         dock_pep: Some(dock_pep),
         fwd_pep: None,
         cons: None,
+        // A node's own visas to and from the visa service are installed
+        // locally and never arrive by StreamIdRequest, so they have no
+        // previous hop (zl-zipline#245).
+        prev_hop: None,
     }
 }
 
@@ -600,6 +604,7 @@ pub mod tests {
                 style: vsapi_types::FwdPepStyle::OneWay,
             }),
             cons: None,
+            prev_hop: None,
         }
     }
 

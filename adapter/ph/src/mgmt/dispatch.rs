@@ -77,10 +77,11 @@ fn inbound_link_type(km_msg: &[u8]) -> LinkType {
 }
 
 /// The Noise message carried in `km_body` (a KM header and its payload), or
-/// an empty slice if the header is malformed or not Noise.
+/// an empty slice if the header is malformed. Both the Noise and the null KM
+/// header carry a Noise handshake: `--km-impl null` only changes the label.
 fn km_noise_message(km_body: &[u8]) -> &[u8] {
     match zdp::ZdpKeyManagementHeader::ref_from_prefix(km_body) {
-        Ok((hdr, rest)) if hdr.is_noise() => {
+        Ok((hdr, rest)) if hdr.is_noise() || hdr.is_null() => {
             &rest[..usize::from(hdr.message_length.get()).min(rest.len())]
         }
         _ => &[],
@@ -432,6 +433,21 @@ mod test {
         assert_eq!(inbound_link_type(&zode_msg0), LinkType::NodeToNode);
         assert_eq!(inbound_link_type(&adapter_msg0), LinkType::NodeToAdapter);
         assert_eq!(inbound_link_type(&[]), LinkType::NodeToAdapter);
+    }
+
+    /// Review round 2: with `--km-impl null` the Noise handshake goes out
+    /// under a null KM header; the Zode marker is still recognised.
+    #[test]
+    fn test_zode_marker_is_found_under_a_null_km_header() {
+        let (zode_msg0, _) = first_messages();
+        let mut body = Vec::new();
+        body.extend_from_slice(&KM_ID_NULL.to_be_bytes());
+        body.extend_from_slice(&(zode_msg0.len() as u16).to_be_bytes());
+        body.extend_from_slice(&zode_msg0);
+        assert_eq!(
+            inbound_link_type(km_noise_message(&body)),
+            LinkType::NodeToNode
+        );
     }
 
     /// zl-zipline#250: dispatching a marked first message from an unknown

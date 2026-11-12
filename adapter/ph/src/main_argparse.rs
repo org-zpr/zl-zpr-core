@@ -90,6 +90,8 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             auth_private_key,
             advertised_substrate_addr,
             forwarding,
+            initial_link,
+            relay,
             common,
         } => {
             ph_mode = PhMode::Node;
@@ -119,6 +121,12 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
             // default, false).
             if let Some(forwarding) = forwarding {
                 config.forwarding = forwarding;
+            }
+            if let Some(spec) = initial_link {
+                config.initial_link = Some(crate::config::InitialLink::parse_cli(&spec)?);
+            }
+            if let Some(relay) = relay {
+                config.relay = relay;
             }
         }
     }
@@ -982,6 +990,127 @@ mod test {
         ]))
         .unwrap();
         assert!(!config.forwarding, "--forwarding false overrides the file");
+    }
+
+    /// A minimal node config file whose `[node]` section is `node_section`,
+    /// with the referenced key files kept alive by the returned guards.
+    fn node_config_file(node_section: &str) -> (TempFile, [TempFile; 3]) {
+        let files = [TempFile::touch(), TempFile::touch(), TempFile::touch()];
+        let tomltxt = r#"
+        [global]
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
+        control_path = "/tmp/control.sock"
+        self_addr = "10.0.0.1:12345"
+        zpr_addr = [ "10.0.0.1" ]
+
+        [node]
+        "#
+        .replace("$CAFILE", files[0].get_path().to_str().unwrap())
+        .replace("$CERTFILE", files[1].get_path().to_str().unwrap())
+        .replace("$PKFILE", files[2].get_path().to_str().unwrap());
+        (
+            TempFile::new_toml(&format!("{tomltxt}{node_section}\n")),
+            files,
+        )
+    }
+
+    /// `ph node --initial-link CN@IP:PORT` sets the initial link, IPv6 in
+    /// brackets too, and overrides the config file (zl-zipline#250).
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_node_initial_link_cli() {
+        let (cfg, _keys) = node_config_file("");
+        let path = cfg.get_path().to_str().unwrap();
+        let (_, config) = argparse(Some(vec![
+            "ph",
+            "node",
+            "-c",
+            path,
+            "--initial-link",
+            "relay.zpr@[fd00::9]:5000",
+        ]))
+        .unwrap();
+        let link = config.initial_link.unwrap();
+        assert_eq!(link.cn, "relay.zpr");
+        assert_eq!(link.addr, "[fd00::9]:5000".parse::<SocketAddr>().unwrap());
+
+        let (cfg, _keys) =
+            node_config_file("[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"file.zpr\"");
+        let path = cfg.get_path().to_str().unwrap();
+        let (_, config) = argparse(Some(vec!["ph", "node", "-c", path])).unwrap();
+        assert_eq!(config.initial_link.as_ref().unwrap().cn, "file.zpr");
+        let (_, config) = argparse(Some(vec![
+            "ph",
+            "node",
+            "-c",
+            path,
+            "--initial-link",
+            "cli.zpr@10.0.0.7:6000",
+        ]))
+        .unwrap();
+        let link = config.initial_link.unwrap();
+        assert_eq!(link.cn, "cli.zpr");
+        assert_eq!(link.addr, "10.0.0.7:6000".parse::<SocketAddr>().unwrap());
+    }
+
+    /// A Zode has at most one initial link: `--initial-link` given twice is
+    /// an error, and so is a malformed one.
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_node_initial_link_cli_rejects() {
+        let (cfg, _keys) = node_config_file("");
+        let path = cfg.get_path().to_str().unwrap();
+        let twice = Control::try_parse_from(vec![
+            "ph",
+            "node",
+            "-c",
+            path,
+            "--initial-link",
+            "a.zpr@10.0.0.9:5000",
+            "--initial-link",
+            "b.zpr@10.0.0.8:5000",
+        ]);
+        assert!(twice.is_err(), "a second --initial-link must be refused");
+        for bad in ["@10.0.0.9:5000", "a.zpr@0.0.0.0:5000", "a.zpr@10.0.0.9:0"] {
+            assert!(
+                argparse(Some(vec!["ph", "node", "-c", path, "--initial-link", bad])).is_err(),
+                "accepted --initial-link {bad}"
+            );
+        }
+    }
+
+    /// `ph node --relay` overrides `relay` in the config file, and a relay
+    /// with an initial link is refused (a relay never dials, R4).
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_node_relay_cli() {
+        let (cfg, _keys) = node_config_file("relay = true");
+        let path = cfg.get_path().to_str().unwrap();
+        let (_, config) = argparse(Some(vec!["ph", "node", "-c", path])).unwrap();
+        assert!(config.relay);
+        let (_, config) =
+            argparse(Some(vec!["ph", "node", "-c", path, "--relay", "false"])).unwrap();
+        assert!(!config.relay);
+
+        let (cfg, _keys) = node_config_file("");
+        let path = cfg.get_path().to_str().unwrap();
+        let (_, config) = argparse(Some(vec!["ph", "node", "-c", path])).unwrap();
+        assert!(!config.relay, "relay defaults to false");
+        assert!(
+            argparse(Some(vec![
+                "ph",
+                "node",
+                "-c",
+                path,
+                "--relay",
+                "true",
+                "--initial-link",
+                "a.zpr@10.0.0.9:5000",
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

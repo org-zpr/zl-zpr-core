@@ -346,15 +346,15 @@ fn process_configuration(asm: &Arc<Assembly>, params: Vec<Param>) -> ConfigureRe
     Ok(())
 }
 
-/// Store the topology the visa service pushed and close Zode links to peers
-/// that left it (zl-zipline#220). Starting links from it is zl-zipline#222.
+/// Store the topology the visa service pushed and apply it to the Zode link
+/// records (zl-zipline#250, ZODE_LINKS.md rules 12 and 13).
 fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
     info!(target: VSS_RPC, "received topology update with {} links", links.len());
     for (i, link) in links.iter().enumerate() {
         info!(target: VSS_RPC, "[link {i}]-> peer {:?}, zpr addr {}, peer cn {:?}", link.peer, link.zpr_addr, link.peer_cn);
     }
     *asm.topology.write().unwrap() = links;
-    crate::link_state::close_zode_links_outside_topology(asm);
+    crate::zode_links::apply_topology(asm);
     Ok(())
 }
 

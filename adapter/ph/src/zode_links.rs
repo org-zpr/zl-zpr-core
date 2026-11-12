@@ -15,13 +15,29 @@
 //! and an answerer accepts only a peer in its current topology that owns the
 //! link. A relay's ownership rule makes every topology peer the owner, so the
 //! same check covers it.
+//!
+//! The lifecycle of each link lives in a per-peer record
+//! ([crate::zode_link_record]); this module keeps the records in a
+//! [ZodeLinkTable] and drives them: it feeds them the connection events from
+//! `link_state` and `setTopology`, and performs the dials, closes and timers
+//! they ask for (rules 6-13).
+//!
+//! Contract for #251 and #252: everything tied to one connection (stream
+//! bindings, bootstrap visas) hangs off that connection's peer-table entry,
+//! so dropping the entry on loss clears it (rule 9). Records hold only the
+//! connection's id.
 
 use crate::assembly::Assembly;
 use crate::config::Config;
-use crate::link_state::{LinkType, ZodeEnd};
+use crate::link_state::{LinkEvent, LinkType, ZodeEnd};
 use crate::prelude::*;
+use crate::zdp::TerminateReason;
+use crate::zode_link_record::{Action, Event, Kind, LinkRecord, Timer, system_jitter};
+use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::sync::Mutex;
 use thiserror::Error;
 
 /// The end of a Zode link that owns it: the only end that dials it.
@@ -181,6 +197,281 @@ pub fn replace_established_links(asm: &Arc<Assembly>, link_id: LinkId, peer_cn: 
         }
     }
     asm.peer_table.map_substrate_addr(link_id);
+}
+
+/// This Zode's link records, one per peer certificate CN: its initial link
+/// and every link in its current topology.
+#[derive(Default)]
+pub struct ZodeLinkTable {
+    inner: Mutex<TableInner>,
+}
+
+#[derive(Default)]
+struct TableInner {
+    /// Records by peer CN, each with the serial it was inserted under.
+    records: HashMap<String, (u64, LinkRecord)>,
+    /// The next record serial. A timer carries its record's serial, so a
+    /// timer armed for a record that was since removed and re-added is
+    /// ignored.
+    next_serial: u64,
+}
+
+impl ZodeLinkTable {
+    /// A copy of the record for `peer_cn`, if there is one.
+    pub fn record(&self, peer_cn: &str) -> Option<LinkRecord> {
+        let inner = self.inner.lock().unwrap();
+        inner.records.get(peer_cn).map(|(_, r)| r.clone())
+    }
+
+    /// Insert `record` for `peer_cn`, replacing any older one.
+    fn insert(&self, peer_cn: &str, record: LinkRecord) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.next_serial += 1;
+        let serial = inner.next_serial;
+        inner.records.insert(peer_cn.to_owned(), (serial, record));
+    }
+
+    /// The CN of the record whose current connection is `link_id`.
+    fn peer_cn_of_link(&self, link_id: LinkId) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .records
+            .iter()
+            .find(|(_, (_, r))| r.link_id == Some(link_id))
+            .map(|(cn, _)| cn.clone())
+    }
+
+    /// Feed `event` to the record for `peer_cn`. `serial`, if given, must be
+    /// the record's (a timer's check). Returns the record's actions, its
+    /// serial and its dial address; `None` if there is no such record.
+    fn feed(
+        &self,
+        peer_cn: &str,
+        serial: Option<u64>,
+        event: Event,
+    ) -> Option<(Vec<Action>, u64, SocketAddr)> {
+        let mut inner = self.inner.lock().unwrap();
+        let (record_serial, record) = inner.records.get_mut(peer_cn)?;
+        if serial.is_some_and(|s| s != *record_serial) {
+            return None;
+        }
+        let now = tokio::time::Instant::now().into_std();
+        Some((record.handle(event, now), *record_serial, record.dial_addr))
+    }
+}
+
+/// Feed `event` to the record for `peer_cn` and perform what it asks, until
+/// nothing is left. The table lock is never held while acting, because a
+/// dial or close re-enters this module (a failed start drops a peer).
+fn drive(asm: &Arc<Assembly>, peer_cn: &str, serial: Option<u64>, event: Event) {
+    let mut pending = VecDeque::from([event]);
+    let mut serial = serial;
+    while let Some(event) = pending.pop_front() {
+        let Some((actions, record_serial, dial_addr)) = asm.zode_links.feed(peer_cn, serial, event)
+        else {
+            return;
+        };
+        serial = Some(record_serial);
+        for action in actions {
+            match action {
+                Action::Dial => pending.push_back(match dial(asm, peer_cn, dial_addr) {
+                    Some(link_id) => Event::Dialed(link_id),
+                    None => Event::DialFailed,
+                }),
+                Action::Close(link_id) => close_link(asm, link_id, "the link-up window ended"),
+                Action::Arm {
+                    timer,
+                    after,
+                    clock,
+                } => arm(asm, peer_cn, record_serial, timer, after, clock),
+            }
+        }
+    }
+}
+
+/// Dial the peer `peer_cn` at `dial_addr` as the owner. Returns the new
+/// connection, or `None` (logged) if no attempt could start.
+fn dial(asm: &Arc<Assembly>, peer_cn: &str, dial_addr: SocketAddr) -> Option<LinkId> {
+    let interface_addr =
+        match crate::assembly::dial_interface(asm.config.get().self_addr, dial_addr) {
+            Ok(interface_addr) => interface_addr,
+            Err(e) => {
+                warn!(target: LINK_STATE, "cannot route to Zode {peer_cn:?} at {dial_addr}: {e}");
+                return None;
+            }
+        };
+    // One connection per substrate address: an older connection there (one
+    // still closing) must go first. The record retries.
+    if let Some(other) = asm.peer_table.lookup_peer(&dial_addr, &interface_addr) {
+        warn!(target: LINK_STATE, "not dialing Zode {peer_cn:?} at {dial_addr}: {} still holds the address", asm.formatted_link_id(other.get()));
+        return None;
+    }
+    let end = ZodeEnd::Dialer {
+        peer_cn: peer_cn.to_owned(),
+    };
+    match asm.start_zode_link(&dial_addr, &interface_addr, end) {
+        Ok(link_id) => Some(link_id.get()),
+        Err(e) => {
+            warn!(target: LINK_STATE, "cannot dial Zode {peer_cn:?} at {dial_addr}: {e}");
+            None
+        }
+    }
+}
+
+/// Close the connection `link_id`, logging `why`.
+fn close_link(asm: &Arc<Assembly>, link_id: LinkId, why: &str) {
+    info!(target: LINK_STATE, "closing {}: {why}", asm.formatted_link_id(link_id));
+    if let Err(e) = asm.process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Reset))
+    {
+        debug!(target: LINK_STATE, "close of {} not needed: {e}", asm.formatted_link_id(link_id));
+    }
+}
+
+/// Fire `timer` for the record `peer_cn` (serial `serial`) after `after`.
+fn arm(
+    asm: &Arc<Assembly>,
+    peer_cn: &str,
+    serial: u64,
+    timer: Timer,
+    after: std::time::Duration,
+    clock: u64,
+) {
+    let asm = asm.clone();
+    let peer_cn = peer_cn.to_owned();
+    tokio::task::spawn_local(async move {
+        tokio::time::sleep(after).await;
+        drive(&asm, &peer_cn, Some(serial), Event::Timer { timer, clock });
+    });
+}
+
+/// Start this Zode's initial link, if it has one (rule 11): create its
+/// record and dial. Called once at startup; the record redials from then on.
+pub fn start_initial_link(asm: &Arc<Assembly>) {
+    let Some(link) = asm.config.get().initial_link.clone() else {
+        return;
+    };
+    info!(target: LINK_STATE, "dialing initial link {:?} at {}", link.cn, link.addr);
+    asm.zode_links.insert(
+        &link.cn,
+        LinkRecord::new(Kind::Initial, Owner::ThisZode, link.addr, system_jitter),
+    );
+    drive(asm, &link.cn, None, Event::Start);
+}
+
+/// Apply the topology just stored in `asm.topology` (rules 12 and 13):
+///
+/// - a link that left it is closed and its record forgotten;
+/// - every link in it is started: the owner dials a new, failed or down
+///   link once more (rule 6), an up link is left alone, and the non-owner
+///   waits;
+/// - a link whose owner cannot be decided (equal addresses) is logged and
+///   skipped, and the rest is applied;
+/// - the initial link's record is never touched: when the relay is also in
+///   the topology, the initial-link rule wins.
+///
+/// Connections this Zode answered that the acceptance rules now refuse are
+/// closed too ([close_refused_zode_links]).
+pub fn apply_topology(asm: &Arc<Assembly>) {
+    let config = asm.config.get();
+    let initial_cn = config.initial_link.as_ref().map(|link| link.cn.clone());
+    let mut wanted: HashMap<String, (Owner, SocketAddr)> = HashMap::new();
+    for link in asm.topology.read().unwrap().iter() {
+        if Some(&link.peer_cn) == initial_cn.as_ref() {
+            continue;
+        }
+        match link_owner(&config, &link.peer_cn, link.zpr_addr) {
+            Ok(owner) => {
+                let dial_addr = SocketAddr::new(link.peer.addr, link.peer.port);
+                wanted.insert(link.peer_cn.clone(), (owner, dial_addr));
+            }
+            Err(e) => {
+                warn!(target: LINK_STATE, "skipping topology link {} to {:?}: {e}", link.link_id, link.peer_cn);
+            }
+        }
+    }
+
+    let mut closes = Vec::new();
+    {
+        let mut inner = asm.zode_links.inner.lock().unwrap();
+        // Rule 12: forget topology links that left the topology. A record
+        // whose owner changed is replaced, which is the same thing.
+        inner.records.retain(|cn, (_, record)| {
+            let keep = record.kind == Kind::Initial
+                || wanted
+                    .get(cn)
+                    .is_some_and(|(owner, _)| *owner == record.owner);
+            if !keep {
+                info!(target: LINK_STATE, "Zode link to {cn:?} left the topology; forgetting it");
+                closes.extend(record.link_id);
+            }
+            keep
+        });
+        for (cn, (_, dial_addr)) in &wanted {
+            if let Some((_, record)) = inner.records.get_mut(cn) {
+                record.dial_addr = *dial_addr;
+            }
+        }
+    }
+    for link_id in closes {
+        close_link(asm, link_id, "its peer left the topology");
+    }
+    for (cn, (owner, dial_addr)) in wanted {
+        if asm.zode_links.record(&cn).is_none() {
+            asm.zode_links.insert(
+                &cn,
+                LinkRecord::new(Kind::Topology, owner, dial_addr, system_jitter),
+            );
+        }
+        drive(asm, &cn, None, Event::Start);
+    }
+    close_refused_zode_links(asm);
+}
+
+/// The Zode connection `link_id` went Active with its peer's CN verified
+/// (rules 7 and 8).
+pub fn link_up(asm: &Arc<Assembly>, link_id: LinkId) {
+    let Some(peer_cn) = asm
+        .peer_table
+        .get(link_id)
+        .and_then(|p| p.verified_peer_cn())
+    else {
+        return;
+    };
+    drive(asm, &peer_cn, None, Event::Up(link_id));
+}
+
+/// The Zode connection `link_id` closed and its peer entry was dropped
+/// (rules 9-11). Its record, if it still tracks it, goes down, fails or
+/// redials.
+pub fn link_dropped(asm: &Arc<Assembly>, link_id: LinkId) {
+    if let Some(peer_cn) = asm.zode_links.peer_cn_of_link(link_id) {
+        drive(asm, &peer_cn, None, Event::Closed(link_id));
+    }
+}
+
+/// Close every Zode connection this Zode answered that the acceptance rules
+/// would now refuse (rule 3), for example because its peer left the
+/// topology. Connections this Zode dialed are closed through their records.
+pub fn close_refused_zode_links(asm: &Arc<Assembly>) {
+    let mut to_close = Vec::new();
+    asm.peer_table.for_each(|(link_id, peer)| {
+        let fsm = &peer.link_state_machine;
+        let keyed = fsm.get_link_type() == LinkType::NodeToNode
+            && matches!(
+                fsm.get_state(),
+                crate::link_state::LinkState::Helloing | crate::link_state::LinkState::Active
+            );
+        if keyed
+            && fsm.zode_end() == Some(&ZodeEnd::Answerer)
+            && check_keyed_peer(asm, &ZodeEnd::Answerer, peer.verified_peer_cn().as_deref())
+                .is_err()
+        {
+            to_close.push(link_id.get());
+        }
+    });
+    for link_id in to_close {
+        close_link(asm, link_id, "the acceptance rules now refuse its peer");
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +642,500 @@ mod tests {
             check_keyed_peer(&asm, &dialer, None),
             Err(Refusal::NoVerifiedCn)
         );
+    }
+
+    // ---- the driver: records, connections and setTopology (rules 6-13) ----
+
+    use crate::link_state::LinkState;
+    use crate::zode_link_record::{Outcome, RecordState};
+    use std::time::Duration;
+    use tokio::task::LocalSet;
+
+    /// The substrate egress queue a driver test keeps open.
+    type EgressRx = crate::packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
+
+    /// A Zode named `self_cn` at ZPR address `self_addr`, bound to
+    /// 127.0.0.1, with CA-signed link keys. `initial_link`, if given, is
+    /// its initial link.
+    fn driven_zode(
+        self_addr: &str,
+        self_cn: &str,
+        initial_link: Option<&str>,
+    ) -> (Arc<Assembly>, EgressRx) {
+        let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(256);
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let (keypair, certx) = crate::assembly::test::zode_link_keys(&ca, self_cn);
+        let mut config = zode_config(self_addr);
+        config.self_addr = "127.0.0.1:0".parse().unwrap();
+        config.initial_link = initial_link.map(|spec| InitialLink::parse_cli(spec).unwrap());
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(crate::assembly::PhMode::Node),
+            self_noise_keypair: Some(keypair),
+            certx: Some(certx),
+            config: Some(rcu::RcuBox::new(config)),
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        (asm, egress_rx)
+    }
+
+    /// A topology link to `cn` at ZPR address `addr`, dialed at
+    /// 127.0.0.1:`port`.
+    fn peer(cn: &str, addr: &str, port: u16) -> zpr::vsapi_types::Link {
+        let mut link = topology_link_at(cn, ip(addr));
+        link.peer = zpr::vsapi_types::SockAddr {
+            addr: ip("127.0.0.1"),
+            port,
+        };
+        link
+    }
+
+    /// Store `links` as the topology and apply it, as `setTopology` does.
+    fn set_topology(asm: &Arc<Assembly>, links: Vec<zpr::vsapi_types::Link>) {
+        *asm.topology.write().unwrap() = links;
+        apply_topology(asm);
+    }
+
+    /// The Zode connections in the peer table.
+    fn zode_connections(asm: &Arc<Assembly>) -> Vec<LinkId> {
+        let mut ids = Vec::new();
+        asm.peer_table.for_each(|(id, p)| {
+            if p.link_state_machine.get_link_type() == LinkType::NodeToNode {
+                ids.push(id.get());
+            }
+        });
+        ids
+    }
+
+    /// Bring the Zode connection `link_id` up as if keying verified `cn`
+    /// and Hello completed.
+    fn bring_up(asm: &Arc<Assembly>, link_id: LinkId, cn: &str) {
+        crate::peer_table::test::set_verified_peer_cn(asm, link_id, cn);
+        asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+            .unwrap();
+        let dialer = asm
+            .peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .is_zode_dialer();
+        let hello = if dialer {
+            LinkEvent::ReceivedHelloResponse {
+                status: crate::zdp::ResponseCode::Success,
+                aaa_address: None,
+                oidc_idps: None,
+                vs_bootstrap: false,
+            }
+        } else {
+            LinkEvent::ReceivedHelloRequest
+        };
+        asm.process_link_state_event(link_id, hello).unwrap();
+        assert_eq!(
+            asm.peer_table
+                .get(link_id)
+                .unwrap()
+                .link_state_machine
+                .get_state(),
+            LinkState::Active
+        );
+    }
+
+    /// An inbound connection from `cn`, keyed and up, on a fresh port.
+    fn answered_up(asm: &Arc<Assembly>, cn: &str, port: u16) -> LinkId {
+        let iface = zpr_utils::net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        let id = asm
+            .start_zode_link(
+                &SubstrateAddr::from(([127, 0, 0, 1], port)),
+                &iface,
+                ZodeEnd::Answerer,
+            )
+            .unwrap()
+            .get();
+        bring_up(asm, id, cn);
+        id
+    }
+
+    /// Let spawned work (cleanup, timers due now) run.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// The record for `cn`.
+    fn record_of(asm: &Arc<Assembly>, cn: &str) -> LinkRecord {
+        asm.zode_links.record(cn).expect("a record")
+    }
+
+    /// Rules 1 and 6: a new topology link this Zode owns is dialed once,
+    /// as the dialer for the peer's CN.
+    #[tokio::test(start_paused = true)]
+    async fn test_owner_dials_a_new_topology_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(&asm, vec![peer("b", "fd5a::20", 7101)]);
+                let record = record_of(&asm, "b");
+                assert_eq!(record.owner, Owner::ThisZode);
+                assert!(matches!(record.state, RecordState::Dialing { .. }));
+                let link_id = record.link_id.unwrap();
+                assert_eq!(zode_connections(&asm), vec![link_id]);
+                let peer = asm.peer_table.get(link_id).unwrap();
+                assert_eq!(
+                    peer.substrate_addr,
+                    SubstrateAddr::from(([127, 0, 0, 1], 7101))
+                );
+                assert_eq!(
+                    peer.link_state_machine.zode_end(),
+                    Some(&ZodeEnd::Dialer {
+                        peer_cn: "b".to_owned()
+                    })
+                );
+            })
+            .await
+    }
+
+    /// Rules 2 and 8: the non-owner never dials; it goes up when the
+    /// owner's connection is accepted, and is never failed.
+    #[tokio::test(start_paused = true)]
+    async fn test_non_owner_waits_and_goes_up_on_accept() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(&asm, vec![peer("b", "fd5a::9", 7102)]);
+                assert_eq!(record_of(&asm, "b").state, RecordState::Idle);
+                assert!(zode_connections(&asm).is_empty());
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                assert!(
+                    zode_connections(&asm).is_empty(),
+                    "the non-owner never dials"
+                );
+                assert_eq!(record_of(&asm, "b").outcome, None);
+
+                let link_id = answered_up(&asm, "b", 7202);
+                let record = record_of(&asm, "b");
+                assert_eq!(record.state, RecordState::Up);
+                assert_eq!(record.link_id, Some(link_id));
+            })
+            .await
+    }
+
+    /// Rules 6 and 7: the owner's connection goes Active, so the link is up.
+    #[tokio::test(start_paused = true)]
+    async fn test_owner_link_goes_up() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(&asm, vec![peer("b", "fd5a::20", 7103)]);
+                let link_id = record_of(&asm, "b").link_id.unwrap();
+                bring_up(&asm, link_id, "b");
+                assert_eq!(record_of(&asm, "b").state, RecordState::Up);
+                assert_eq!(record_of(&asm, "b").outcome, Some(Outcome::Up));
+            })
+            .await
+    }
+
+    /// Rule 6: a link that never comes up is redialed about once a second
+    /// inside the window, then reported failed with nothing left behind,
+    /// and nothing dials it again.
+    #[tokio::test(start_paused = true)]
+    async fn test_owner_link_fails_after_the_window() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(&asm, vec![peer("b", "fd5a::20", 7104)]);
+                let first = record_of(&asm, "b").link_id.unwrap();
+                // The first attempt times out keying (2 s) and closes; the
+                // owner redials inside the window.
+                tokio::time::sleep(Duration::from_millis(4200)).await;
+                let redialed = record_of(&asm, "b").link_id;
+                assert!(
+                    redialed.is_some_and(|id| id != first),
+                    "redialed inside the window"
+                );
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                let record = record_of(&asm, "b");
+                assert_eq!(record.state, RecordState::Failed);
+                assert_eq!(record.outcome, Some(Outcome::Failed));
+                assert_eq!(record.link_id, None);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                assert!(
+                    zode_connections(&asm).is_empty(),
+                    "the aborted attempt is gone"
+                );
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                assert!(
+                    zode_connections(&asm).is_empty(),
+                    "nothing redials a failed link"
+                );
+            })
+            .await
+    }
+
+    /// Rules 9 and 10: losing an up topology link takes it down on the
+    /// owner and on the non-owner. Nothing redials, and nothing references
+    /// the lost connection: not the peer table, not key management, not the
+    /// record.
+    #[tokio::test(start_paused = true)]
+    async fn test_lost_topology_link_goes_down_on_both_ends() {
+        LocalSet::new()
+            .run_until(async {
+                let (owner, _e1) = driven_zode("fd5a::10", "a", None);
+                set_topology(&owner, vec![peer("b", "fd5a::20", 7105)]);
+                let dialed = record_of(&owner, "b").link_id.unwrap();
+                bring_up(&owner, dialed, "b");
+
+                let (non_owner, _e2) = driven_zode("fd5a::20", "b", None);
+                set_topology(&non_owner, vec![peer("a", "fd5a::10", 7205)]);
+                let answered = answered_up(&non_owner, "a", 7305);
+
+                let ends = [(&owner, "b", dialed), (&non_owner, "a", answered)];
+                for (asm, _, link_id) in ends {
+                    asm.process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Reset))
+                        .unwrap();
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                for (asm, cn, link_id) in ends {
+                    let record = record_of(asm, cn);
+                    assert_eq!(record.state, RecordState::Down);
+                    assert_eq!(record.outcome, Some(Outcome::Down));
+                    assert_eq!(record.link_id, None);
+                    assert!(asm.peer_table.get(link_id).is_none());
+                    assert!(asm.peer_table.clone_km_manager(link_id).is_none());
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                for (asm, _, _) in ends {
+                    assert!(zode_connections(asm).is_empty(), "nobody redials (rule 10)");
+                }
+            })
+            .await
+    }
+
+    /// Rule 12: a link that leaves the topology is closed and forgotten,
+    /// whatever its state: up, dialing, failed or down.
+    #[tokio::test(start_paused = true)]
+    async fn test_removed_link_is_closed_and_forgotten() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(
+                    &asm,
+                    vec![
+                        peer("up", "fd5a::21", 7106),
+                        peer("dialing", "fd5a::22", 7107),
+                    ],
+                );
+                let up = record_of(&asm, "up").link_id.unwrap();
+                bring_up(&asm, up, "up");
+                let dialing = record_of(&asm, "dialing").link_id.unwrap();
+                set_topology(&asm, vec![]);
+                assert!(asm.zode_links.record("up").is_none());
+                assert!(asm.zode_links.record("dialing").is_none());
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert!(asm.peer_table.get(up).is_none());
+                assert!(asm.peer_table.get(dialing).is_none());
+
+                // Failed and down records are forgotten too.
+                set_topology(&asm, vec![peer("f", "fd5a::23", 7108)]);
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                assert_eq!(record_of(&asm, "f").state, RecordState::Failed);
+                set_topology(&asm, vec![]);
+                assert!(asm.zode_links.record("f").is_none());
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                assert!(zode_connections(&asm).is_empty());
+            })
+            .await
+    }
+
+    /// Rule 13: every setTopology retries the failed and down links it
+    /// still contains, once, and leaves an up link alone; the non-owner
+    /// does nothing.
+    #[tokio::test(start_paused = true)]
+    async fn test_repeat_topology_retries_failed_and_down_once() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let links = vec![
+                    peer("failed", "fd5a::21", 7109),
+                    peer("down", "fd5a::22", 7110),
+                    peer("up", "fd5a::23", 7111),
+                    peer("waits", "fd5a::9", 7112),
+                ];
+                set_topology(&asm, links.clone());
+                let down = record_of(&asm, "down").link_id.unwrap();
+                bring_up(&asm, down, "down");
+                let up = record_of(&asm, "up").link_id.unwrap();
+                bring_up(&asm, up, "up");
+                asm.process_link_state_event(down, LinkEvent::Close(TerminateReason::Reset))
+                    .unwrap();
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                assert_eq!(record_of(&asm, "failed").state, RecordState::Failed);
+                assert_eq!(record_of(&asm, "down").state, RecordState::Down);
+
+                set_topology(&asm, links);
+                for cn in ["failed", "down"] {
+                    let record = record_of(&asm, cn);
+                    assert!(
+                        matches!(record.state, RecordState::Dialing { .. }),
+                        "{cn} retried"
+                    );
+                    assert!(record.link_id.is_some());
+                }
+                assert_eq!(
+                    record_of(&asm, "up").link_id,
+                    Some(up),
+                    "the up link is untouched"
+                );
+                assert_eq!(record_of(&asm, "up").state, RecordState::Up);
+                assert_eq!(record_of(&asm, "waits").state, RecordState::Idle);
+                assert_eq!(
+                    zode_connections(&asm).len(),
+                    3,
+                    "two retries plus the up link"
+                );
+            })
+            .await
+    }
+
+    /// The issue's "topology removal and re-add": a link removed and then
+    /// proposed again is dialed again, and exactly one connection remains.
+    #[tokio::test(start_paused = true)]
+    async fn test_removed_then_readded_link_is_dialed_again() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(&asm, vec![peer("b", "fd5a::20", 7113)]);
+                let first = record_of(&asm, "b").link_id.unwrap();
+                bring_up(&asm, first, "b");
+                set_topology(&asm, vec![]);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                set_topology(&asm, vec![peer("b", "fd5a::20", 7113)]);
+                let second = record_of(&asm, "b").link_id.unwrap();
+                assert_ne!(second, first);
+                bring_up(&asm, second, "b");
+                assert_eq!(zode_connections(&asm), vec![second]);
+            })
+            .await
+    }
+
+    /// One link per pair: when both Zodes receive the topology naming each
+    /// other, only the owner (the lower address) dials.
+    #[tokio::test(start_paused = true)]
+    async fn test_simultaneous_topology_dials_from_the_owner_only() {
+        LocalSet::new()
+            .run_until(async {
+                let (a, _e1) = driven_zode("fd5a::10", "a", None);
+                let (b, _e2) = driven_zode("fd5a::20", "b", None);
+                set_topology(&a, vec![peer("b", "fd5a::20", 7114)]);
+                set_topology(&b, vec![peer("a", "fd5a::10", 7214)]);
+                assert_eq!(zode_connections(&a).len(), 1);
+                assert!(zode_connections(&b).is_empty());
+            })
+            .await
+    }
+
+    /// The walkthrough "the owner restarts": its new connection replaces
+    /// the non-owner's old one (rule 5), the record follows it, and one
+    /// link remains, up.
+    #[tokio::test(start_paused = true)]
+    async fn test_owner_restart_leaves_one_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::20", "b", None);
+                set_topology(&asm, vec![peer("a", "fd5a::10", 7115)]);
+                let old = answered_up(&asm, "a", 7215);
+                let new = answered_up(&asm, "a", 7216);
+                settle().await;
+                assert_eq!(zode_connections(&asm), vec![new]);
+                let record = record_of(&asm, "a");
+                assert_eq!(record.state, RecordState::Up);
+                assert_eq!(record.link_id, Some(new));
+                assert!(asm.peer_table.get(old).is_none());
+            })
+            .await
+    }
+
+    /// A topology entry whose owner cannot be decided (both ends claim the
+    /// same ZPR address) is skipped, and the rest is applied.
+    #[tokio::test(start_paused = true)]
+    async fn test_equal_address_entry_is_skipped() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(
+                    &asm,
+                    vec![peer("twin", "fd5a::10", 7116), peer("b", "fd5a::20", 7117)],
+                );
+                assert!(asm.zode_links.record("twin").is_none());
+                assert!(asm.zode_links.record("b").is_some());
+            })
+            .await
+    }
+
+    /// Rule 11: the initial link is dialed at startup and redialed with
+    /// backoff after each failed attempt; it is never failed.
+    #[tokio::test(start_paused = true)]
+    async fn test_initial_link_redials_until_it_comes_up() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::20", "b", Some("relay@127.0.0.1:7118"));
+                start_initial_link(&asm);
+                let first = record_of(&asm, "relay").link_id.unwrap();
+                // The attempt times out keying, closes, and is redialed.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let record = record_of(&asm, "relay");
+                assert_ne!(record.state, RecordState::Failed);
+                let again = record.link_id.expect("redialed");
+                assert_ne!(again, first);
+                bring_up(&asm, again, "relay");
+                assert_eq!(record_of(&asm, "relay").state, RecordState::Up);
+            })
+            .await
+    }
+
+    /// The issue's "initial-link close": the relay closes the endpoint's
+    /// initial link; the endpoint goes down, redials, and ends with exactly
+    /// one link. A topology without the relay never closes it (rule 12
+    /// does not apply to the initial link).
+    #[tokio::test(start_paused = true)]
+    async fn test_initial_link_close_redials_to_one_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::20", "b", Some("relay@127.0.0.1:7119"));
+                start_initial_link(&asm);
+                let first = record_of(&asm, "relay").link_id.unwrap();
+                bring_up(&asm, first, "relay");
+                set_topology(&asm, vec![]);
+                assert_eq!(record_of(&asm, "relay").state, RecordState::Up);
+
+                asm.process_link_state_event(
+                    first,
+                    LinkEvent::ReceivedTerminateLink(TerminateReason::Reset),
+                )
+                .unwrap();
+                settle().await;
+                assert_eq!(record_of(&asm, "relay").state, RecordState::Down);
+                tokio::time::sleep(crate::zode_link_record::INITIAL_LINK_BACKOFF_MIN).await;
+                let second = record_of(&asm, "relay").link_id.expect("redialed");
+                bring_up(&asm, second, "relay");
+                assert_eq!(zode_connections(&asm), vec![second]);
+            })
+            .await
+    }
+
+    /// The initial-link rule wins when the relay is also in the topology:
+    /// the endpoint keeps its initial record and dials the configured
+    /// address, not the topology's.
+    #[tokio::test(start_paused = true)]
+    async fn test_initial_link_in_topology_keeps_the_initial_rule() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::20", "b", Some("relay@127.0.0.1:7120"));
+                start_initial_link(&asm);
+                set_topology(&asm, vec![peer("relay", "fd5a::1", 7999)]);
+                let record = record_of(&asm, "relay");
+                assert_eq!(record.kind, Kind::Initial);
+                assert_eq!(record.dial_addr, "127.0.0.1:7120".parse().unwrap());
+                assert_eq!(zode_connections(&asm).len(), 1);
+            })
+            .await
     }
 }

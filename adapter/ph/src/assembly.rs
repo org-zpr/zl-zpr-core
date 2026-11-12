@@ -85,6 +85,10 @@ pub struct Assembly {
     /// (zl-zipline#220); NodeToNode link start (#222) reads it too.
     pub topology: std::sync::RwLock<Vec<zpr::vsapi_types::Link>>,
 
+    /// This Zode's link records: its initial link and its topology links
+    /// (zl-zipline#250, [crate::zode_links]).
+    pub zode_links: crate::zode_links::ZodeLinkTable,
+
     // Used to intercept packets that are unencrypted but still have ZDP headers
     pub capture_queue: Capture,
     pub capture_worker: CaptureWorker,
@@ -544,8 +548,16 @@ impl Assembly {
             // dying link's own entries are skipped — that peer is gone.
             self.withdraw_streams(withdrawn, Some(link_id));
         }
+        let zode_link = self
+            .peer_table
+            .get(link_id)
+            .is_some_and(|p| p.link_state_machine.get_link_type() == LinkType::NodeToNode);
         self.peer_table.remove(link_id);
         info!(target: PEER_MGMT, "Removed peer {}", self.formatted_link_id(link_id));
+        if zode_link {
+            // Its link record goes down, fails or redials (rules 9-11).
+            crate::zode_links::link_dropped(self, link_id);
+        }
     }
 
     /// Withdraw the given forwarding entries from the peers still bound to
@@ -715,32 +727,6 @@ impl Assembly {
         Ok(())
     }
 
-    /// Dial this Zode's initial link, if it has one (zl-zipline#250): the
-    /// relay it reaches the network through. Called once at startup.
-    ///
-    /// This is one attempt. Redialing with backoff after a failed attempt or
-    /// a lost link (ZODE_LINKS.md rule 11) is the per-link record's job,
-    /// which the core-lifecycle part of #250 adds on top of this.
-    pub fn dial_initial_link(self: &Arc<Self>) {
-        let config = self.config.get();
-        let Some(link) = config.initial_link.clone() else {
-            return;
-        };
-        let interface_addr = match dial_interface(config.self_addr, link.addr) {
-            Ok(interface_addr) => interface_addr,
-            Err(e) => {
-                error!(target: PEER_MGMT, "cannot route to initial link {} at {}: {e}", link.cn, link.addr);
-                return;
-            }
-        };
-        let end = ZodeEnd::Dialer {
-            peer_cn: link.cn.clone(),
-        };
-        if let Err(e) = self.start_zode_link(&link.addr, &interface_addr, end) {
-            error!(target: PEER_MGMT, "cannot start initial link {} at {}: {e}", link.cn, link.addr);
-        }
-    }
-
     /// Temporary? function to find a link based on the actor address
     pub fn find_egress_link(&self, actor_addr: IpAddress) -> Option<NonZero<LinkId>> {
         // First check the local actor addresses to see if it's a locally-destined packet
@@ -785,7 +771,7 @@ impl Assembly {
 /// A concrete `self_addr` is that address: the substrate sockets are bound to
 /// it. Only a wildcard `self_addr` is resolved, by asking the kernel which
 /// local address routes to `peer`.
-fn dial_interface(
+pub(crate) fn dial_interface(
     self_addr: std::net::SocketAddr,
     peer: std::net::SocketAddr,
 ) -> std::io::Result<ScopedIpAddr> {
@@ -1586,45 +1572,6 @@ pub mod test {
         );
     }
 
-    /// zl-zipline#250: a Zode with an initial link dials it at startup, as
-    /// the dialer expecting the relay's CN.
-    #[cfg(test)]
-    #[tokio::test(start_paused = true)]
-    async fn test_dial_initial_link_starts_a_dialed_zode_link() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let ca = crate::pki::TestCa::new("zode-ca");
-                let (keypair, certx) = zode_link_keys(&ca, "b.zpr");
-                let mut cfg = config::Config::default();
-                cfg.zpr_addr = vec!["fd5a:5052::2".parse().unwrap()];
-                cfg.self_addr = "127.0.0.1:0".parse().unwrap();
-                cfg.initial_link =
-                    Some(config::InitialLink::parse_cli("relay.zpr@127.0.0.1:7010").unwrap());
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-                    ph_mode: Some(PhMode::Node),
-                    self_noise_keypair: Some(keypair),
-                    certx: Some(certx),
-                    config: Some(rcu::RcuBox::new(cfg)),
-                    ..TestAssemblyBuilder::new()
-                }));
-                asm.dial_initial_link();
-                let (_, peer) = asm
-                    .peer_table
-                    .find(|(_, p)| p.substrate_addr == SubstrateAddr::from(([127, 0, 0, 1], 7010)))
-                    .expect("the initial link was dialed");
-                let fsm = &peer.link_state_machine;
-                assert_eq!(fsm.get_link_type(), LinkType::NodeToNode);
-                assert_eq!(fsm.get_state(), crate::link_state::LinkState::Keying);
-                assert_eq!(
-                    fsm.zode_end(),
-                    Some(&crate::link_state::ZodeEnd::Dialer {
-                        peer_cn: "relay.zpr".to_owned()
-                    })
-                );
-            })
-            .await
-    }
-
     #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {
         let ph_mode = builder.ph_mode.unwrap_or(PhMode::Adapter);
@@ -1700,6 +1647,7 @@ pub mod test {
             vsconn,
             visa_table,
             topology: Default::default(),
+            zode_links: Default::default(),
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
             deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),

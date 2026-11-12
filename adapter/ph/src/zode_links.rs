@@ -500,44 +500,65 @@ pub const REPORT_COALESCE: std::time::Duration = std::time::Duration::from_milli
 /// Send this Zode's link-state snapshot whenever one is asked for
 /// ([ZodeLinkTable::request_report]), with `send` (in production,
 /// `VSConnHandle::report_link_states`). Requests within [REPORT_COALESCE] of
-/// each other coalesce into one send. A failed send is logged; the next
-/// change or VS-API reconnect asks again. Runs for the life of the node.
+/// each other coalesce into one snapshot. Runs for the life of the node.
+///
+/// Taking snapshots and sending them are two loops joined by a queue, so a
+/// send that waits on the visa service (up to the RPC timeout) never merges
+/// the snapshots taken meanwhile: each one is sent, in order. That matters
+/// for the visa service's "new failure" rule (ZODE_LINKS.md "Reporting
+/// contract"): failed -> retry (not listed) -> failed must arrive as three
+/// snapshots, not two `failed` ones. A failed send is logged; the next change
+/// or VS-API registration asks for a fresh snapshot.
 pub async fn run_link_state_reporter<F, Fut>(asm: Arc<Assembly>, send: F)
 where
     F: Fn(Vec<zpr::vsapi_types::LinkStateReport>) -> Fut,
     Fut: std::future::Future<Output = Result<(), VSApiError>>,
 {
-    loop {
-        asm.zode_links.report_wakeup.notified().await;
-        tokio::time::sleep(REPORT_COALESCE).await;
-        if !asm
-            .zode_links
-            .report_pending
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            continue;
-        }
-        let snapshot = asm.zode_links.snapshot();
-        let summary: Vec<String> = snapshot
-            .iter()
-            .map(|r| format!("{}={:?}", r.peer_cn, r.state))
-            .collect();
-        match send(snapshot).await {
-            Ok(()) => {
-                info!(target: LINK_STATE, "reported Zode link states to the visa service: [{}]", summary.join(", "))
+    // ponytail: unbounded, but it only grows by one snapshot per coalesced
+    // burst of link changes while a send is in flight.
+    let (queue_tx, mut queue_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let take_snapshots = async {
+        loop {
+            asm.zode_links.report_wakeup.notified().await;
+            tokio::time::sleep(REPORT_COALESCE).await;
+            if asm
+                .zode_links
+                .report_pending
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                // The receiver lives as long as this function, so the send
+                // cannot fail.
+                let _ = queue_tx.send(asm.zode_links.snapshot());
             }
-            // No VS-API session (always the case on a Zode other than the
-            // visa service's own until zl-zipline#252): VSConn refuses the
-            // call locally, so nothing goes on the wire. The session's
-            // (re)connect asks for a fresh report.
-            Err(e @ (VSApiError::ConnClosed | VSApiError::CommandFailed(_))) => {
-                debug!(target: LINK_STATE, "link-state report not sent, no VS-API session: {e}")
-            }
-            // The call reached the visa service and failed: worth a warning.
-            // The next change or reconnect sends a fresh snapshot.
-            Err(e) => warn!(target: LINK_STATE, "link-state report failed: {e}"),
         }
-    }
+    };
+
+    let send_snapshots = async {
+        while let Some(snapshot) = queue_rx.recv().await {
+            let summary: Vec<String> = snapshot
+                .iter()
+                .map(|r| format!("{}={:?}", r.peer_cn, r.state))
+                .collect();
+            match send(snapshot).await {
+                Ok(()) => {
+                    info!(target: LINK_STATE, "reported Zode link states to the visa service: [{}]", summary.join(", "))
+                }
+                // No VS-API session (always the case on a Zode other than the
+                // visa service's own until zl-zipline#252): VSConn refuses the
+                // call locally, so nothing goes on the wire. The session's
+                // (re)connect asks for a fresh report.
+                Err(e @ (VSApiError::ConnClosed | VSApiError::CommandFailed(_))) => {
+                    debug!(target: LINK_STATE, "link-state report not sent, no VS-API session: {e}")
+                }
+                // The call reached the visa service and failed: worth a
+                // warning. The next change or reconnect sends a fresh snapshot.
+                Err(e) => warn!(target: LINK_STATE, "link-state report failed: {e}"),
+            }
+        }
+    };
+
+    tokio::join!(take_snapshots, send_snapshots);
 }
 
 /// The Zode connection `link_id` went Active with its peer's CN verified
@@ -1363,6 +1384,58 @@ mod tests {
                     asm.zode_links.report_pending(),
                     "not listed -> failed is a change"
                 );
+            })
+            .await
+    }
+
+    /// A send that blocks (the RPC waits up to its timeout) must not merge
+    /// the snapshots taken meanwhile: failed -> retry (not listed) -> failed
+    /// while the first send is in flight still reaches the visa service as
+    /// three snapshots, in order, so it sees the second failure as new
+    /// ("Reporting contract"; core#107 review).
+    #[tokio::test(start_paused = true)]
+    async fn test_reporter_keeps_snapshots_taken_during_a_blocked_send() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let sent: std::rc::Rc<std::cell::RefCell<Vec<Vec<LinkStateReport>>>> =
+                    Default::default();
+                let release = std::rc::Rc::new(tokio::sync::Notify::new());
+                let (log, gate) = (sent.clone(), release.clone());
+                tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |reports| {
+                    log.borrow_mut().push(reports);
+                    // Only the first send blocks, until the test releases it.
+                    let wait = (log.borrow().len() == 1).then(|| gate.clone());
+                    async move {
+                        if let Some(gate) = wait {
+                            gate.notified().await;
+                        }
+                        Ok(())
+                    }
+                }));
+
+                let links = vec![peer("b", "fd5a::20", 7142)];
+                set_topology(&asm, links.clone());
+                tokio::time::sleep(
+                    crate::zode_link_record::LINK_UP_WINDOW + Duration::from_secs(1),
+                )
+                .await;
+                // The first send ([b=failed]) is now blocked. Retry and fail
+                // again while it is.
+                set_topology(&asm, links);
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+                tokio::time::sleep(
+                    crate::zode_link_record::LINK_UP_WINDOW + Duration::from_secs(1),
+                )
+                .await;
+                release.notify_one();
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+
+                let failed = vec![LinkStateReport {
+                    peer_cn: "b".to_owned(),
+                    state: Reported::Failed,
+                }];
+                assert_eq!(*sent.borrow(), vec![failed.clone(), Vec::new(), failed]);
             })
             .await
     }

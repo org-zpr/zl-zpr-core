@@ -1458,18 +1458,34 @@ mod tests {
         assert_eq!(decoded, reports);
     }
 
-    /// With no VS-API session, a report fails cleanly instead of hanging.
+    /// A visa service that implements nothing: enough to build a command
+    /// state that has no VS-API session.
+    struct NoSessionVs;
+    impl vsapi2::visa_service::Server for NoSessionVs {}
+
+    /// With no VS-API session (the run loop is up, but `vs_handle` is
+    /// unset), the run loop refuses a report locally with `CommandFailed`
+    /// and sends nothing (zl-zipline#250).
     #[tokio::test]
-    async fn report_link_states_without_session_fails_cleanly() {
-        let conn = VSConn::new_for_test(
+    async fn report_link_states_without_session_is_refused_locally() {
+        let mut conn = VSConn::new_for_test(
             "127.0.0.1:1".parse().unwrap(),
             "node".to_string(),
             test_key(),
             refusing_connect_fn(),
         );
-        let handle = conn.handle();
-        drop(conn);
-        assert!(handle.report_link_states(Vec::new()).await.is_err());
+        let mut cmd_state = VSCommandState::new(capnp_rpc::new_client(NoSessionVs));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        conn.handle_command(
+            &mut cmd_state,
+            VS2Command::ReportLinkStates(Vec::new(), resp_tx),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
     }
 
     /// C3 (zipline#45): the zpr v0.27.0 `ReauthRequest` wrapper round-trips

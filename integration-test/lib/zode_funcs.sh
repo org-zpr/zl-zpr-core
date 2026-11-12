@@ -281,10 +281,15 @@ function check_registered() {
 }
 
 # The number of Active links Zode NAME ($1) has to substrate address $2,
-# from `ph-cli link show`.
+# from `ph-cli link show`. Prints "query-failed" and fails when ph-cli does,
+# so a dead control socket never reads as zero links.
 function active_links_to() {
-  "$PH_DEBUG_BIN" -p "$1.sock" link show 2> /dev/null \
-    | grep -cE "^ *[0-9]+: $(ere_escape "$2"):[0-9]+ \(Active\)" || true
+  local OUT
+  if ! OUT=$("$PH_DEBUG_BIN" -p "$1.sock" link show 2> /dev/null); then
+    echo "query-failed"
+    return 1
+  fi
+  grep -cE "^ *[0-9]+: $(ere_escape "$2"):[0-9]+ \(Active\)" <<< "$OUT" || true
 }
 
 # Succeed when Zode $1 has exactly $3 Active links to substrate address $2.

@@ -161,17 +161,19 @@ pub async fn launch(
 
 /// The VS-API session is gone (the run loop exited): clear
 /// `vs_session_up`, so a joining Zode accepts the bootstrap visas its relay
-/// hands it to reconnect (zl-zipline#222).
-fn vs_session_ended(asm: &Assembly) {
+/// hands it to reconnect, and install a hand-off it refused while the
+/// session still looked up (zl-zipline#222).
+fn vs_session_ended(asm: &Arc<Assembly>) {
     asm.vs_session_up
         .store(false, std::sync::atomic::Ordering::Release);
+    crate::bootstrap_handoff::replay_pending(asm);
 }
 
 /// Wait for the VSConn run loop to start. A run-loop exit seen while
 /// waiting -- after a registration, the worker waits here with its session
 /// up -- ends the session.
 async fn wait_for_runloop_start(
-    asm: &Assembly,
+    asm: &Arc<Assembly>,
     lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>,
 ) {
     loop {
@@ -492,9 +494,12 @@ mod tests {
     /// visas its relay hands it to recover.
     #[tokio::test]
     async fn test_run_loop_exit_while_gated_clears_vs_session_up() {
-        let asm = create_assembly(TestAssemblyBuilder::new());
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
         asm.vs_session_up
             .store(true, std::sync::atomic::Ordering::Release);
+        // A hand-off held for the session's end is replayed (here it names
+        // no link, so it is only dropped).
+        *asm.pending_handoff.lock().unwrap() = Some((99, Vec::new()));
         let (tx, mut rx) = broadcast::channel(4);
         tx.send(VSConnLifecycleEvent::RunLoopExits).unwrap();
         tx.send(VSConnLifecycleEvent::RunLoopStarts).unwrap();
@@ -502,5 +507,6 @@ mod tests {
         wait_for_runloop_start(&asm, &mut rx).await;
 
         assert!(!asm.vs_session_up.load(std::sync::atomic::Ordering::Acquire));
+        assert!(asm.pending_handoff.lock().unwrap().is_none());
     }
 }

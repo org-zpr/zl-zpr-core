@@ -535,6 +535,8 @@ fn main() -> ExitCode {
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         vs_session_up: std::sync::atomic::AtomicBool::new(false),
         dial_retry_pending: std::sync::atomic::AtomicBool::new(false),
+        topology_received: std::sync::atomic::AtomicBool::new(false),
+        pending_handoff: std::sync::Mutex::new(None),
         deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
         capture_queue: cap_inq,

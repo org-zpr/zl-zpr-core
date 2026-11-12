@@ -78,6 +78,14 @@ pub struct Assembly {
     /// A retry of failed Zode dials is scheduled ([Assembly::retry_dials],
     /// zl-zipline#222).
     pub dial_retry_pending: std::sync::atomic::AtomicBool,
+    /// A topology has arrived since startup (zl-zipline#222). From then on
+    /// it is the only source of Zode peer addresses; a bootstrap hand-off
+    /// no longer gives one.
+    pub topology_received: std::sync::atomic::AtomicBool,
+    /// The latest bootstrap hand-off refused only because a VS-API session
+    /// still looked up: its link and visas, replayed when that session ends
+    /// ([crate::bootstrap_handoff::replay_pending], zl-zipline#222).
+    pub pending_handoff: Mutex<Option<(LinkId, Vec<zpr::vsapi_types::Visa>)>>,
     pub deferred_vs_connect: Mutex<Option<(LinkId, IpAddress, ConnectRequest)>>, // present only on nodes, the VS adapter's connect request and self-granted address, held until the node has VSAPI access
     /// Node only (zipline#121): true while an in-place self re-authentication
     /// against the visa service is in flight. A VSS `requestAuthentication`
@@ -828,6 +836,8 @@ impl Assembly {
     /// that left are closed separately, by
     /// [crate::link_state::close_zode_links_outside_topology].
     pub fn start_topology_links(self: &Arc<Self>) {
+        self.topology_received
+            .store(true, std::sync::atomic::Ordering::Release);
         let mut keyed_zode_links = Vec::new();
         self.peer_table.for_each(|(id, peer)| {
             let fsm = &peer.link_state_machine;
@@ -1925,6 +1935,8 @@ pub mod test {
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
             vs_session_up: std::sync::atomic::AtomicBool::new(false),
             dial_retry_pending: std::sync::atomic::AtomicBool::new(false),
+            topology_received: std::sync::atomic::AtomicBool::new(false),
+            pending_handoff: Mutex::new(None),
             deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
             capture_queue,

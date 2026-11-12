@@ -169,6 +169,9 @@ pub fn accept(asm: &Arc<Assembly>, link_id: LinkId, visas: Vec<Visa>) -> Result<
         return Err(HandoffError::NotInitialLink);
     }
     if asm.vs_session_up.load(std::sync::atomic::Ordering::Acquire) {
+        // The session may be stale, its loss not yet noticed: keep the
+        // hand-off to replay when it ends ([replay_pending]).
+        *asm.pending_handoff.lock().unwrap() = Some((link_id, visas));
         return Err(HandoffError::SessionUp);
     }
     if visas.len() > MAX_HANDOFF_VISAS {
@@ -209,8 +212,12 @@ pub fn accept(asm: &Arc<Assembly>, link_id: LinkId, visas: Vec<Visa>) -> Result<
         // only from the forward visa's next hop, which the relay chose. That
         // is safe only while the relay is its sole Zode link -- before any
         // topology, only initial-link CNs may link -- and the first topology
-        // replaces it (Assembly::start_topology_links).
-        if fsm.zode_peer_addr().is_none() {
+        // replaces it (Assembly::start_topology_links). After that, the
+        // topology is the only source of addresses.
+        let topology_received = asm
+            .topology_received
+            .load(std::sync::atomic::Ordering::Acquire);
+        if !topology_received && fsm.zode_peer_addr().is_none() {
             if let Some(fwd) = visas.iter().find_map(|visa| visa.fwd_pep.as_ref()) {
                 fsm.set_zode_peer_addr(Some(IpAddress::new_from_std(&fwd.next_hop)));
             }
@@ -232,6 +239,23 @@ pub fn accept(asm: &Arc<Assembly>, link_id: LinkId, visas: Vec<Visa>) -> Result<
         }
     }
     Ok(())
+}
+
+/// Joiner side: the VS-API session ended, so install the hand-off last
+/// refused only because the session looked up, if any (zl-zipline#222).
+/// It goes through every check of [accept] again.
+pub fn replay_pending(asm: &Arc<Assembly>) {
+    let Some((link_id, visas)) = asm.pending_handoff.lock().unwrap().take() else {
+        return;
+    };
+    match accept(asm, link_id, visas) {
+        Ok(()) => {
+            info!(target: VISA_MGMT, "{} installed a held bootstrap visa hand-off", asm.formatted_link_id(link_id))
+        }
+        Err(e) => {
+            warn!(target: VISA_MGMT, "{} refused a held bootstrap visa hand-off: {e}", asm.formatted_link_id(link_id))
+        }
+    }
 }
 
 /// The bootstrap visas the stored topology holds for the peer whose
@@ -436,6 +460,60 @@ mod tests {
                     Err(HandoffError::SessionUp)
                 );
                 assert!(!installed(&asm, 9001));
+            })
+            .await
+    }
+
+    /// Local Codex review on zl-zpr-core#104: a hand-off refused because a
+    /// stale VS-API session still looked up is kept, and installed once that
+    /// session ends -- the relay sends again only on link activation or a
+    /// topology update, which a joiner without a session never gets.
+    #[tokio::test]
+    async fn test_handoff_refused_for_session_is_replayed_when_session_ends() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link) = joiner("relay.zpr");
+                asm.vs_session_up
+                    .store(true, std::sync::atomic::Ordering::Release);
+                assert_eq!(
+                    accept(&asm, link, vsapi_pair()),
+                    Err(HandoffError::SessionUp)
+                );
+                assert!(!installed(&asm, 9001));
+
+                asm.vs_session_up
+                    .store(false, std::sync::atomic::Ordering::Release);
+                replay_pending(&asm);
+                assert!(installed(&asm, 9001) && installed(&asm, 9002));
+                assert!(asm.pending_handoff.lock().unwrap().is_none());
+            })
+            .await
+    }
+
+    /// Local Codex review on zl-zpr-core#104: once a topology has arrived it
+    /// is the only source of peer addresses. A later hand-off (during a
+    /// VS-API outage) installs its visas but cannot give the relay link an
+    /// address the topology withheld.
+    #[tokio::test]
+    async fn test_handoff_after_topology_sets_no_address() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link) = joiner("relay.zpr");
+                let mut other = topology_link("other.zpr");
+                other.peer.port = 0; // not dialable: keep the test link-free
+                *asm.topology.write().unwrap() = vec![other];
+                asm.start_topology_links();
+
+                accept(&asm, link, vsapi_pair()).unwrap();
+                assert!(installed(&asm, 9001));
+                assert_eq!(
+                    asm.peer_table
+                        .get(link)
+                        .unwrap()
+                        .link_state_machine
+                        .zode_peer_addr(),
+                    None
+                );
             })
             .await
     }

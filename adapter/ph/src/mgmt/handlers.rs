@@ -387,6 +387,20 @@ pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> Handl
     Ok(())
 }
 
+/// Handle a BootstrapVisas message (zl-zipline#222): the relay handing this
+/// joining Zode its own VSAPI bootstrap visas. Refused unless every check in
+/// [crate::bootstrap_handoff::accept] passes.
+pub async fn handle_bootstrap_visas(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
+    let link_id = pkt.metadata().ingress_link_id;
+    let accepted = crate::bootstrap_handoff::decode(pkt.body())
+        .and_then(|visas| crate::bootstrap_handoff::accept(asm, link_id, visas));
+    if let Err(e) = accepted {
+        warn!(target: ZDP, "{}: refused bootstrap visa hand-off: {e}", asm.formatted_link_id(link_id));
+        return Err(HandleMgmtError::MessageNotPermitted);
+    }
+    Ok(())
+}
+
 pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
     let link_id = pkt.metadata().ingress_link_id;
     let event = parse_hello_response(asm, link_id, &mut pkt)?;
@@ -1282,6 +1296,57 @@ mod test {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    /// zl-zipline#222 (gap 6, g60): a bootstrap visa carried inside a
+    /// HelloResponse is never installed, even on a joiner's link to its
+    /// relay; only the BootstrapVisas message after Hello can carry one.
+    #[tokio::test]
+    async fn test_bootstrap_visa_inside_hello_is_not_installed() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let asm = crate::assembly::test::zode_assembly_with_ca("b.zpr");
+                let mut cfg = (*asm.config.get()).clone();
+                cfg.initial_links =
+                    vec![crate::config::InitialLink::new("relay.zpr", "10.9.9.9:5000").unwrap()];
+                asm.config.write(cfg);
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "relay.zpr",
+                    crate::link_state::LinkState::Helloing,
+                );
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .set_zode_dialer(true);
+
+                let visa = zpr::vsapi_types::Visa {
+                    issuer_id: 4242,
+                    config: 0,
+                    expires: std::time::SystemTime::now() + std::time::Duration::from_secs(60),
+                    visa_type: zpr::vsapi_types::VisaType::Full,
+                    dock_pep: None,
+                    fwd_pep: None,
+                    cons: None,
+                };
+                let mut pkt = core::new_heap_packet();
+                zdp::ZdpHelloResponseHeader {
+                    status: zdp::ResponseCode::Success,
+                }
+                .write_to_buf(&mut pkt)
+                .unwrap();
+                tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
+                tlv::TlvEncoding::new_bootstrap_visa(visa).put(&mut pkt);
+                pkt.metadata_mut().ingress_link_id = link_id;
+
+                handle_hello_response(&asm, pkt).await.unwrap();
+                assert!(
+                    !asm.visa_table.read().unwrap().table.contains_key(&4242),
+                    "a visa inside Hello must not be installed"
+                );
+            })
+            .await
     }
 
     /// A ~3 KB blob (JWT plus a self-signed blob in a JSON array) must fit

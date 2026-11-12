@@ -72,6 +72,9 @@ pub struct Assembly {
 
     pub vsconn: Option<libnode::vsconn::VSConnHandle>, // present only on nodes
     pub vs_auth_services: std::sync::RwLock<AuthServicesList>, // present only on nodes, may be empty, managed by visa service
+    /// True while this node has a VS-API session (zl-zipline#222). A
+    /// joining Zode accepts a bootstrap-visa hand-off only while it is false.
+    pub vs_session_up: std::sync::atomic::AtomicBool,
     pub deferred_vs_connect: Mutex<Option<(LinkId, IpAddress, ConnectRequest)>>, // present only on nodes, the VS adapter's connect request and self-granted address, held until the node has VSAPI access
     /// Node only (zipline#121): true while an in-place self re-authentication
     /// against the visa service is in flight. A VSS `requestAuthentication`
@@ -757,14 +760,25 @@ impl Assembly {
     /// that left are closed separately, by
     /// [crate::link_state::close_zode_links_outside_topology].
     pub fn start_topology_links(self: &Arc<Self>) {
-        self.peer_table.for_each(|(_id, peer)| {
+        let mut keyed_zode_links = Vec::new();
+        self.peer_table.for_each(|(id, peer)| {
             let fsm = &peer.link_state_machine;
             if fsm.get_link_type() == LinkType::NodeToNode {
                 if let Some(cn) = peer.verified_peer_cn() {
-                    fsm.set_zode_peer_addr(self.topology_zpr_addr(&cn));
+                    // An initial link's relay may not be in the topology
+                    // yet; keep the address the hand-off gave it until it is.
+                    if let Some(addr) = self.topology_zpr_addr(&cn) {
+                        fsm.set_zode_peer_addr(Some(addr));
+                    }
+                    keyed_zode_links.push(id.get());
                 }
             }
         });
+        // A joiner whose link came up before its topology entry (and its
+        // bootstrap visas) reached us gets them now (zl-zipline#222).
+        for link_id in keyed_zode_links {
+            crate::bootstrap_handoff::send(self, link_id);
+        }
 
         let links = self.topology.read().unwrap().clone();
         for link in links {
@@ -1676,6 +1690,7 @@ pub mod test {
             visa_table,
             topology: Default::default(),
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
+            vs_session_up: std::sync::atomic::AtomicBool::new(false),
             deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
             capture_queue,

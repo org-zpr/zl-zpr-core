@@ -61,6 +61,8 @@ pub async fn launch(
                 evt = lifecycle_rx.recv() => {
                     match evt {
                         Ok(VSConnLifecycleEvent::RunLoopExits) => {
+                            asm.vs_session_up
+                                .store(false, std::sync::atomic::Ordering::Release);
                             info!(target: STARTUP, "VSConn runloop exited; aborting connect attempts and re-gating");
                             break; // break inner connect loop, go re-gate on RunLoopStarts
                         }
@@ -87,6 +89,8 @@ pub async fn launch(
             };
 
             if connected {
+                asm.vs_session_up
+                    .store(true, std::sync::atomic::Ordering::Release);
                 // VSS registration snapshots both actors' A2A keys into its callback
                 // visa. Register the bootstrapped VS adapter before minting that visa.
                 let deferred = asm.deferred_vs_connect.lock().unwrap().take();

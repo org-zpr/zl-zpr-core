@@ -45,6 +45,9 @@ pub enum ZdpPacketType {
     // upstream #1410 claimed those for StartAuthentication/Abandon.
     RenewAuthenticationRequest = 144, // TODO: add to RFC 6 (zipline#66)
     RenewAuthenticationResponse = 145, // TODO: add to RFC 6 (zipline#66)
+    /// Relay to joining Zode: the joiner's own bootstrap visas, after Hello
+    /// (zl-zipline#222, operator g60). Zipline-local assignment.
+    BootstrapVisas = 146,
 
     Canceled = 252, // TODO: add to RFC 17
     Cancel = 253,   // TODO: add to RFC 17

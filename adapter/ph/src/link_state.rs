@@ -379,7 +379,11 @@ impl LinkStateWrapper {
             // comes from the topology, never from Hello.
             mgmt::requests::send_hello_success_response(asm, self.id, 0, &[], None, false)
                 .enqueue();
-            return self.run_active(asm, locked_fsm);
+            self.run_active(asm, locked_fsm)?;
+            // After Hello, never inside it: hand a joining peer its
+            // bootstrap visas if the topology holds any for it (g60).
+            crate::bootstrap_handoff::send(asm, self.id);
+            return Ok(());
         }
         let is_vs = asm
             .peer_table
@@ -439,7 +443,9 @@ impl LinkStateWrapper {
                 warn!(target: LINK_STATE, "{}: ignoring AAA address / bootstrap flag in a Zode HelloResponse",
                     asm.formatted_link_id(self.id));
             }
-            return self.run_active(asm, locked_fsm);
+            self.run_active(asm, locked_fsm)?;
+            crate::bootstrap_handoff::send(asm, self.id);
+            return Ok(());
         }
         if response.aaa_address.is_none() && !response.vs_bootstrap {
             return Err(LinkStateError::InvalidOperation(

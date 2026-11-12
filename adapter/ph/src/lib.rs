@@ -18,6 +18,7 @@ pub mod address_pool;
 pub mod admin_worker;
 pub mod auth;
 pub mod auth_agent;
+pub mod bootstrap_handoff;
 pub mod capture_worker;
 pub mod classifier;
 pub mod compress;

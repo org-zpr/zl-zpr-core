@@ -517,11 +517,17 @@ where
             continue;
         }
         let snapshot = asm.zode_links.snapshot();
-        debug!(target: LINK_STATE, "reporting {} Zode link states", snapshot.len());
-        if let Err(e) = send(snapshot).await {
+        let summary: Vec<String> = snapshot
+            .iter()
+            .map(|r| format!("{}={:?}", r.peer_cn, r.state))
+            .collect();
+        match send(snapshot).await {
+            Ok(()) => {
+                info!(target: LINK_STATE, "reported Zode link states to the visa service: [{}]", summary.join(", "))
+            }
             // Without a VS-API session the send fails locally; the session's
             // (re)connect asks for a report again.
-            warn!(target: LINK_STATE, "link-state report not sent: {e}");
+            Err(e) => warn!(target: LINK_STATE, "link-state report not sent: {e}"),
         }
     }
 }

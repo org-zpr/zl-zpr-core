@@ -324,25 +324,6 @@ impl LinkStateWrapper {
         matches!(self.zode_end(), Some(ZodeEnd::Dialer { .. }))
     }
 
-    /// Check a keyed Zode link's peer, whose verified certificate CN is
-    /// `peer_cn` (`None` if keying verified none). The dialer accepts only
-    /// the CN it dialed for; the answerer accepts only a CN in its topology.
-    /// Returns the reason for refusing the peer.
-    fn check_keyed_zode_peer(&self, asm: &Assembly, peer_cn: Option<&str>) -> Result<(), String> {
-        let Some(peer_cn) = peer_cn else {
-            return Err("no verified certificate CN".into());
-        };
-        match self.zode_end() {
-            Some(ZodeEnd::Dialer { peer_cn: dialed }) if dialed == peer_cn => Ok(()),
-            Some(ZodeEnd::Dialer { peer_cn: dialed }) => Err(format!(
-                "dialed for CN {dialed:?}, but the peer is {peer_cn:?}"
-            )),
-            Some(ZodeEnd::Answerer) if asm.peer_cn_allowed(peer_cn) => Ok(()),
-            Some(ZodeEnd::Answerer) => Err("unknown CN".into()),
-            None => Err("Zode end not set".into()),
-        }
-    }
-
     /// Read the assigned AAA without taking the link-data mutex.
     pub fn aaa_address(&self) -> Option<IpAddress> {
         *self.aaa_address.get()
@@ -713,14 +694,28 @@ impl LinkStateWrapper {
         // is known, and refused with a logged reason. This runs before the
         // certificate block below so a refused peer never claims a
         // special-peer name.
+        //
+        // An inbound Zode link that passes replaces any established link to
+        // the same peer (ZODE_LINKS.md rule 5), once the guards below are
+        // released.
+        let mut replaces_links_to: Option<String> = None;
         if self.link_type == LinkType::NodeToNode {
             let peer_cn = peer_state.verified_peer_cn();
-            if let Err(reason) = self.check_keyed_zode_peer(asm, peer_cn.as_deref()) {
+            let verdict = match self.zode_end() {
+                Some(end) => crate::zode_links::check_keyed_peer(asm, end, peer_cn.as_deref())
+                    .map_err(|refusal| refusal.to_string()),
+                None => Err("Zode end not set".to_string()),
+            };
+            if let Err(reason) = verdict {
                 warn!(target: LINK_STATE, "{} refusing Zode link with peer CN {peer_cn:?}: {reason}; closing", asm.formatted_link_id(link_id));
                 drop(sa);
                 drop(peer_state);
                 drop(locked_fsm);
                 return self.initiate_close(asm, TerminateReason::Reset);
+            }
+            info!(target: LINK_STATE, "{} accepted Zode link with peer CN {peer_cn:?}", asm.formatted_link_id(link_id));
+            if self.zode_end() == Some(&ZodeEnd::Answerer) {
+                replaces_links_to = peer_cn;
             }
         }
 
@@ -769,6 +764,9 @@ impl LinkStateWrapper {
             }
         }
 
+        drop(sa);
+        drop(peer_state);
+
         debug!(target: LINK_STATE, "{} finished keying.  Starting hello", asm.formatted_link_id(link_id));
 
         locked_fsm.set_state(LinkState::Helloing);
@@ -788,6 +786,10 @@ impl LinkStateWrapper {
             // bounds the wait so a peer that keys and goes quiet cannot hold
             // the link open (zl-zipline#250).
             self.set_timeout(asm, &mut locked_fsm, config::ZODE_HELLO_TIMEOUT);
+        }
+        drop(locked_fsm);
+        if let Some(peer_cn) = replaces_links_to {
+            crate::zode_links::replace_established_links(asm, link_id, &peer_cn);
         }
         // Otherwise we are a node so wait for an adapter to reach out
         Ok(())
@@ -1250,6 +1252,19 @@ impl LinkStateWrapper {
     /// Instead of transitioning, the state machine will be destroyed
     /// Sends a Terminate Indication
     pub async fn reset(&self, asm: &Arc<Assembly>) {
+        let _ = self.begin_reset(asm).join_all().await;
+    }
+
+    /// Drop this Zode link because a newly accepted link to the same peer
+    /// replaces it (ZODE_LINKS.md rule 5). Its state is cleared now; its
+    /// key manager and peer entry go when the returned cleanup completes.
+    pub fn drop_replaced(&self, asm: &Arc<Assembly>) {
+        self.begin_reset(asm).detach_all();
+    }
+
+    /// Start a reset: tell the peer, enter Resetting and clear the link's
+    /// state. Returns the cleanup tasks, which end with the peer dropped.
+    fn begin_reset(&self, asm: &Arc<Assembly>) -> tokio::task::JoinSet<()> {
         let link_id = self.id;
         info!(target: LINK_STATE,
             "Resetting {} from state {:?}",
@@ -1266,7 +1281,7 @@ impl LinkStateWrapper {
             TerminateReason::Reset,
         )
         .enqueue();
-        let _ = self.clean_up_link_state(asm).join_all().await;
+        self.clean_up_link_state(asm)
     }
 
     /// Handle a terminate link acknowledgement.
@@ -1440,19 +1455,21 @@ impl Display for LinkData {
     }
 }
 
-/// Close every keyed Zode link whose verified peer CN this Zode no longer
-/// expects (zl-zipline#220). Called after each topology update, so removing
-/// a Zode from the topology ends its links without a revocation list.
+/// Close every keyed Zode link that the acceptance rules would now refuse
+/// (zl-zipline#220, #250). Called after each topology update, so removing a
+/// Zode from the topology ends the links it dialed to this Zode without a
+/// revocation list.
 pub fn close_zode_links_outside_topology(asm: &Arc<Assembly>) {
     let mut to_close = Vec::new();
     asm.peer_table.for_each(|(link_id, peer)| {
         let fsm = &peer.link_state_machine;
-        if fsm.get_link_type() == LinkType::NodeToNode
-            && matches!(fsm.get_state(), LinkState::Helloing | LinkState::Active)
-            && !peer
-                .verified_peer_cn()
-                .is_some_and(|cn| asm.peer_cn_allowed(&cn))
-        {
+        let keyed = fsm.get_link_type() == LinkType::NodeToNode
+            && matches!(fsm.get_state(), LinkState::Helloing | LinkState::Active);
+        let refused = |end: &ZodeEnd| {
+            crate::zode_links::check_keyed_peer(asm, end, peer.verified_peer_cn().as_deref())
+                .is_err()
+        };
+        if keyed && fsm.zode_end().is_none_or(refused) {
             to_close.push(link_id.get());
         }
     });
@@ -1730,10 +1747,14 @@ mod tests {
         }))
     }
 
-    /// A keyable assembly whose stored topology names `peer_cns` (zl-zipline#220).
+    /// A keyable assembly whose stored topology names `peer_cns`
+    /// (zl-zipline#220), each of which owns its link to this Zode.
     fn zode_assembly(peer_cns: &[&str]) -> Arc<Assembly> {
         use crate::peer_table::test::topology_link;
         let asm = keyable_assembly(true);
+        let mut cfg = (*asm.config.get()).clone();
+        cfg.zpr_addr = vec!["fd5a:5052::10".parse().unwrap()];
+        asm.config.write(cfg);
         *asm.topology.write().unwrap() = peer_cns.iter().map(|cn| topology_link(cn)).collect();
         asm
     }
@@ -1789,29 +1810,20 @@ mod tests {
             .await
     }
 
-    /// zl-zipline#220: an empty `peer_cn` (a sender that predates peerCn)
-    /// never authorises a peer, and neither does an empty certificate CN.
-    #[tokio::test]
-    async fn test_empty_peer_cn_never_matches() {
-        let asm = zode_assembly(&[""]);
-        assert!(!asm.peer_cn_allowed(""));
-        let asm = zode_assembly(&["relay.zpr"]);
-        assert!(asm.peer_cn_allowed("relay.zpr"));
-        assert!(!asm.peer_cn_allowed(""));
-    }
-
     /// The substrate egress queue a Zode test assembly sends through.
     type EgressRx = crate::packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>;
 
-    /// A Zode test assembly in node mode with ZPR address `fd5a:5052::1`,
-    /// link keys for `self_cn` signed by a fresh test CA, and an egress
-    /// queue the test can read (zl-zipline#250).
+    /// A Zode test assembly in node mode with ZPR address `fd5a:5052::10`,
+    /// above the `fd5a:5052::9` of [crate::peer_table::test::topology_link],
+    /// so a topology peer owns its link to it; link keys for `self_cn` signed
+    /// by a fresh test CA; and an egress queue the test can read
+    /// (zl-zipline#250).
     fn zode_keys_assembly(self_cn: &str) -> (Arc<Assembly>, EgressRx) {
         let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(64);
         let ca = crate::pki::TestCa::new("zode-ca");
         let (keypair, certx) = crate::assembly::test::zode_link_keys(&ca, self_cn);
         let mut cfg = <config::Config as std::default::Default>::default();
-        cfg.zpr_addr = vec!["fd5a:5052::1".parse().unwrap()];
+        cfg.zpr_addr = vec!["fd5a:5052::10".parse().unwrap()];
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
             ph_mode: Some(crate::assembly::PhMode::Node),
             self_noise_keypair: Some(keypair),
@@ -2133,6 +2145,113 @@ mod tests {
                 }
                 tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN * 2).await;
                 assert!(asm.peer_table.get(dialed).is_none());
+            })
+            .await
+    }
+
+    /// The NodeToNode links whose verified peer CN is `cn`.
+    fn zode_links_to(asm: &Arc<Assembly>, cn: &str) -> Vec<LinkId> {
+        let mut links = Vec::new();
+        asm.peer_table.for_each(|(id, peer)| {
+            if peer.link_state_machine.get_link_type() == LinkType::NodeToNode
+                && peer.verified_peer_cn().as_deref() == Some(cn)
+            {
+                links.push(id.get());
+            }
+        });
+        links
+    }
+
+    /// Let spawned link cleanup (key manager shutdown, CloseDone) run.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Rule 5: an accepted inbound link from a peer that already has an
+    /// established link replaces it. The old link's id is dropped from the
+    /// peer table and its key-management state, and exactly one link
+    /// remains.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_inbound_link_replaces_established_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                *asm.topology.write().unwrap() =
+                    vec![crate::peer_table::test::topology_link("b.zpr")];
+                let old = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+                asm.peer_table
+                    .get(old)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_active();
+                let new = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+
+                asm.process_link_state_event(new, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, new), LinkState::Helloing);
+                settle().await;
+                assert!(asm.peer_table.get(old).is_none(), "the old link is gone");
+                assert!(asm.peer_table.clone_km_manager(old).is_none());
+                assert_eq!(zode_links_to(&asm, "b.zpr"), vec![new]);
+            })
+            .await
+    }
+
+    /// Rule 5 does not apply to a refused link: an inbound link that fails
+    /// rule 3 leaves the established link alone.
+    #[tokio::test(start_paused = true)]
+    async fn test_refused_zode_link_does_not_replace_established_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let old = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+                asm.peer_table
+                    .get(old)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_active();
+                // b.zpr has left the topology: a new link from it is refused.
+                let new = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+                asm.process_link_state_event(new, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, new), LinkState::Closing);
+                settle().await;
+                assert_eq!(link_state_of(&asm, old), LinkState::Active);
+            })
+            .await
+    }
+
+    /// The walkthrough "the higher-address Zode dials anyway": the
+    /// lower-address Zode owns the link, so it refuses the dial after
+    /// keying, and no second link can form.
+    #[tokio::test(start_paused = true)]
+    async fn test_higher_address_zode_dialing_anyway_is_refused() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                // This Zode is fd5a:5052::10; the peer is higher.
+                *asm.topology.write().unwrap() = vec![crate::peer_table::test::topology_link_at(
+                    "b.zpr",
+                    "fd5a:5052::20".parse().unwrap(),
+                )];
+                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, "b.zpr");
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+            })
+            .await
+    }
+
+    /// A dialer refuses a peer whose verified CN is not the one it dialed.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_dialer_refuses_a_different_cn() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let link_id = zode_link_keyed(&asm, dialer("relay.zpr"), "impostor.zpr");
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
             })
             .await
     }

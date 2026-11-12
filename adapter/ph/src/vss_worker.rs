@@ -406,17 +406,29 @@ mod tests {
     /// A node-mode assembly whose own (configured) ZPR address is `own`:
     /// a node's local addresses are its configured `zpr_addr`.
     /// zl-zipline#220: a topology update that drops a peer's CN closes its
-    /// live Zode link; links to peers still in the topology stay up.
+    /// live Zode link; links to peers still in the topology stay up. Both
+    /// peers dialed this Zode, which sits above them (fd5a:5052::10).
     #[tokio::test]
     async fn test_topology_update_closes_zode_link_whose_cn_left() {
+        use crate::link_state::ZodeEnd;
         use crate::peer_table::test::{insert_zode_peer_with_verified_cn, topology_link};
         LocalSet::new()
             .run_until(async {
-                let asm = Arc::new(create_assembly(node_builder("10.1.1.1".parse().unwrap())));
+                let asm = Arc::new(create_assembly(node_builder(
+                    "fd5a:5052::10".parse().unwrap(),
+                )));
                 process_topology(&asm, vec![topology_link("a.zpr"), topology_link("b.zpr")])
                     .unwrap();
-                let a = insert_zode_peer_with_verified_cn(&asm, "a.zpr", LinkState::Active);
-                let b = insert_zode_peer_with_verified_cn(&asm, "b.zpr", LinkState::Active);
+                let answered = |cn| {
+                    let id = insert_zode_peer_with_verified_cn(&asm, cn, LinkState::Active);
+                    let peer = asm.peer_table.get(id).unwrap();
+                    peer.link_state_machine
+                        .set_zode_end(ZodeEnd::Answerer)
+                        .unwrap();
+                    id
+                };
+                let a = answered("a.zpr");
+                let b = answered("b.zpr");
 
                 process_topology(&asm, vec![topology_link("a.zpr")]).unwrap();
 

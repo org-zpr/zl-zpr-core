@@ -315,8 +315,12 @@ impl PeerTable {
         let Some(peer_state) = peer_slab.get((link_id as usize).wrapping_sub(1)) else {
             return;
         };
-        self.sa_to_link
-            .remove(&(peer_state.substrate_addr, peer_state.interface_addr));
+        // Only unmap the address if it still leads to this link: a Zode link
+        // that replaced this one at the same address now owns it (rule 5).
+        self.sa_to_link.remove_if(
+            &(peer_state.substrate_addr, peer_state.interface_addr),
+            |_, mapped| mapped.get() == link_id,
+        );
 
         self.special_peers
             .update(|sp_ref| {
@@ -363,6 +367,19 @@ impl PeerTable {
         atomic::fence(Ordering::Acquire);
 
         id
+    }
+
+    /// Point `link_id`'s substrate address at `link_id`, taking it over from
+    /// any other link. Used when a Zode link keyed from the same address as
+    /// an established link replaces it (ZODE_LINKS.md rule 5, zl-zipline#250);
+    /// see [VacantPeerTableEntry::insert_unmapped].
+    pub fn map_substrate_addr(&self, link_id: LinkId) {
+        let Some(key) = self.inspect(link_id, |p| (p.substrate_addr, p.interface_addr)) else {
+            return;
+        };
+        if let Some(id) = NonZero::new(link_id) {
+            self.sa_to_link.insert(key, id);
+        }
     }
 
     pub fn lookup_special_peer(&self, name: SpecialPeerName) -> Option<NonZero<LinkId>> {
@@ -538,7 +555,23 @@ impl VacantPeerTableEntry<'_> {
         NonZero::new((self.peer_slab_guard.vacant_key().unwrap() + 1) as LinkId).unwrap()
     }
 
-    pub fn insert(mut self, peer_state: PeerState) -> NonZero<LinkId> {
+    pub fn insert(self, peer_state: PeerState) -> NonZero<LinkId> {
+        self.insert_and_map(peer_state, true)
+    }
+
+    /// Insert a peer without mapping its substrate address, which already
+    /// leads to an established link. Only a second handshake from a Zode at
+    /// the same address does this (ZODE_LINKS.md rule 5, gate g78 q5): the
+    /// established link keeps the address until the new link's peer CN is
+    /// verified, so an unauthenticated packet cannot end a link. Inbound
+    /// packets reach the new link only by link id until
+    /// [PeerTable::map_substrate_addr].
+    pub fn insert_unmapped(self, peer_state: PeerState) -> NonZero<LinkId> {
+        self.insert_and_map(peer_state, false)
+    }
+
+    /// Insert `peer_state`, mapping its substrate address to it if `map`.
+    fn insert_and_map(mut self, peer_state: PeerState, map: bool) -> NonZero<LinkId> {
         let id = self.peer_slab_guard.insert(peer_state).unwrap();
         let peer_state_ref = self.peer_slab_guard.get(id).unwrap();
 
@@ -549,7 +582,7 @@ impl VacantPeerTableEntry<'_> {
         // the "reverse" table with Acquire ordering
         atomic::fence(Ordering::Release);
 
-        if !peer_state_ref.substrate_addr.ip().is_unspecified() {
+        if map && !peer_state_ref.substrate_addr.ip().is_unspecified() {
             if let Some(other) = self.sa_to_link_ref.insert(
                 (peer_state_ref.substrate_addr, peer_state_ref.interface_addr),
                 link_id,
@@ -615,7 +648,6 @@ pub mod test {
         cn: &str,
         state: crate::link_state::LinkState,
     ) -> LinkId {
-        use crate::km::{PeerCertificate, ZPIPair};
         let entry = asm.peer_table.vacant_entry().unwrap();
         let link_id = entry.key();
         let peer = create_dummy_peer_state(
@@ -625,13 +657,7 @@ pub mod test {
             ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
         );
         let link_id = entry.insert(peer).get();
-        let keypair = crate::km_noise::NoiseKeypair::generate();
-        let cert = crate::pki::generate_self_signed_noise_cert(cn, &keypair).unwrap();
-        let mut sa = KmTransportSA::new_with_zpis(ZPIPair::new(1, 2), ZPIPair::new(3, 4));
-        sa.peer_cert = Some(PeerCertificate::Verified(cert));
-        asm.peer_table
-            .set_security_association(link_id, sa)
-            .unwrap();
+        set_verified_peer_cn(asm, link_id, cn);
         asm.peer_table
             .get(link_id)
             .unwrap()
@@ -640,9 +666,31 @@ pub mod test {
         link_id
     }
 
-    /// A topology link to a peer Zode whose certificate must carry `peer_cn`.
+    /// Give `link_id` an established SA whose peer certificate is verified
+    /// and carries CN `cn`, as keying does.
+    pub fn set_verified_peer_cn(asm: &crate::assembly::Assembly, link_id: LinkId, cn: &str) {
+        use crate::km::{PeerCertificate, ZPIPair};
+        let keypair = crate::km_noise::NoiseKeypair::generate();
+        let cert = crate::pki::generate_self_signed_noise_cert(cn, &keypair).unwrap();
+        let mut sa = KmTransportSA::new_with_zpis(ZPIPair::new(1, 2), ZPIPair::new(3, 4));
+        sa.peer_cert = Some(PeerCertificate::Verified(cert));
+        asm.peer_table
+            .set_security_association(link_id, sa)
+            .unwrap();
+    }
+
+    /// A topology link to a peer Zode whose certificate must carry `peer_cn`,
+    /// at ZPR address `fd5a:5052::9`.
     #[allow(dead_code)]
     pub fn topology_link(peer_cn: &str) -> zpr::vsapi_types::Link {
+        topology_link_at(
+            peer_cn,
+            std::net::IpAddr::from([0xfd5a, 0x5052, 0, 0, 0, 0, 0, 9]),
+        )
+    }
+
+    /// A topology link to the peer Zode `peer_cn` at ZPR address `zpr_addr`.
+    pub fn topology_link_at(peer_cn: &str, zpr_addr: std::net::IpAddr) -> zpr::vsapi_types::Link {
         zpr::vsapi_types::Link {
             link_id: format!("link-{peer_cn}"),
             peer: zpr::vsapi_types::SockAddr {
@@ -651,7 +699,7 @@ pub mod test {
             },
             role: zpr::vsapi_types::LinkRole::Active,
             visas: Vec::new(),
-            zpr_addr: std::net::IpAddr::from([0xfd5a, 0x5052, 0, 0, 0, 0, 0, 9]),
+            zpr_addr,
             peer_cn: peer_cn.to_owned(),
         }
     }

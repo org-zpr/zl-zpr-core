@@ -170,20 +170,6 @@ pub enum SelfAddressError {
 }
 
 impl Assembly {
-    /// Is `cn` the certificate CN of a peer this Zode was told to link with
-    /// (zl-zipline#220)? True only for a non-empty CN that equals some
-    /// `peer_cn` in the stored topology; an empty `peer_cn` (a sender that
-    /// predates peerCn) matches nothing. #222 adds configured initial links.
-    pub fn peer_cn_allowed(&self, cn: &str) -> bool {
-        !cn.is_empty()
-            && self
-                .topology
-                .read()
-                .unwrap()
-                .iter()
-                .any(|link| link.peer_cn == cn)
-    }
-
     pub fn get_uptime(&self) -> std::time::Duration {
         std::time::Instant::now().duration_since(self.system_start_time)
     }
@@ -495,6 +481,18 @@ impl Assembly {
         peer_addr: &SubstrateAddr,
         interface_addr: &ScopedIpAddr,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
+        self.add_peer_mapped(link_type, peer_addr, interface_addr, true)
+    }
+
+    /// [Assembly::add_peer], mapping the peer's substrate address to the new
+    /// link only if `map` (see [peer_table::VacantPeerTableEntry::insert_unmapped]).
+    fn add_peer_mapped(
+        self: &Arc<Self>,
+        link_type: LinkType,
+        peer_addr: &SubstrateAddr,
+        interface_addr: &ScopedIpAddr,
+        map: bool,
+    ) -> Result<NonZero<LinkId>, PeerInsertError> {
         let entry = self.peer_table.vacant_entry()?;
 
         let worker_config = mgmt_processor_worker::Config {
@@ -506,7 +504,11 @@ impl Assembly {
                 mgmt_processor_worker::launch(worker_config, self.clone(), q)
             });
 
-        let link_id = entry.insert(peer_state);
+        let link_id = if map {
+            entry.insert(peer_state)
+        } else {
+            entry.insert_unmapped(peer_state)
+        };
 
         tokio::task::spawn_local(zdpr_worker::launch(self.clone(), link_id.get()));
 
@@ -665,6 +667,29 @@ impl Assembly {
         let peer_id = self.add_peer(LinkType::NodeToNode, peer, interface_addr)?;
         self.start_added_zode_link(peer_id, end)?;
         info!(target: PEER_MGMT, "Started Zode link with {peer}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
+        Ok(peer_id)
+    }
+
+    /// Answer a new Zode handshake from the substrate address of the
+    /// established Zode link `established` (ZODE_LINKS.md rule 5, gate g78
+    /// q5): typically the owner restarted on its fixed port and dialed
+    /// again. The new link keys alongside the established one, which keeps
+    /// the address until the new peer's CN is verified at `KeyingDone`.
+    pub fn answer_zode_redial(
+        self: &Arc<Self>,
+        established: LinkId,
+    ) -> Result<NonZero<LinkId>, PeerInsertError> {
+        let Some((peer, interface_addr)) = self
+            .peer_table
+            .inspect(established, |p| (p.substrate_addr, p.interface_addr))
+        else {
+            return Err(PeerInsertError::FailedToStart(
+                "established link is gone".into(),
+            ));
+        };
+        info!(target: PEER_MGMT, "New Zode handshake from {peer}, the address of {}; keying it alongside", self.formatted_link_id(established));
+        let peer_id = self.add_peer_mapped(LinkType::NodeToNode, &peer, &interface_addr, false)?;
+        self.start_added_zode_link(peer_id, ZodeEnd::Answerer)?;
         Ok(peer_id)
     }
 

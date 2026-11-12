@@ -588,6 +588,41 @@ mod test {
             .await
     }
 
+    /// Review round 1: a same-address handshake accepted for a different
+    /// peer (also an owner in the topology) displaces the established link
+    /// from the address, so that link is dropped rather than left Active
+    /// with its packets going to the new link.
+    #[tokio::test(start_paused = true)]
+    async fn test_same_address_handshake_for_another_peer_drops_the_displaced_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                asm.topology
+                    .write()
+                    .unwrap()
+                    .push(crate::peer_table::test::topology_link("c.zpr"));
+                let sa = asm.peer_table.get(old).unwrap().substrate_addr;
+                let iface = asm.peer_table.get(old).unwrap().interface_addr;
+                let (zode_msg0, _) = first_messages();
+                deliver_km_on_link(&asm, old, &zode_msg0);
+                let new = other_links_at_same_address(&asm, old)[0];
+
+                crate::peer_table::test::set_verified_peer_cn(&asm, new, "c.zpr");
+                asm.process_link_state_event(new, crate::link_state::LinkEvent::KeyingDone)
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(
+                    asm.peer_table.get(old).is_none(),
+                    "the displaced link is dropped"
+                );
+                assert_eq!(
+                    asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
+                    Some(new)
+                );
+            })
+            .await
+    }
+
     /// Gate g78 q5: a same-address handshake whose CN fails the acceptance
     /// check is closed, and the established link keeps the address.
     #[tokio::test(start_paused = true)]

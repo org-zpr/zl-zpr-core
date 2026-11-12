@@ -742,7 +742,13 @@ impl LinkStateWrapper {
                 }
             };
 
-            if !is_verified {
+            if self.link_type == LinkType::NodeToNode {
+                // Special peers are adapters (the visa service's); a Zode
+                // link never claims a special-peer name (zl-zipline#250).
+                for name in special_peers::special_peer_names_from_subject_der(&subject_der) {
+                    warn!(target: LINK_STATE, "{} is a Zode link whose certificate claims special peer name {name:?}; ignoring", asm.formatted_link_id(link_id));
+                }
+            } else if !is_verified {
                 for name in special_peers::special_peer_names_from_subject_der(&subject_der) {
                     warn!(
                         target: LINK_STATE,
@@ -2165,6 +2171,30 @@ mod tests {
     /// Let spawned link cleanup (key manager shutdown, CloseDone) run.
     async fn settle() {
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Review round 1: a Zode link never claims a special-peer name, even
+    /// when it is accepted and its certificate carries the visa service's
+    /// DN; special peers are adapters.
+    #[tokio::test(start_paused = true)]
+    async fn test_accepted_zode_link_claims_no_special_name() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                *asm.topology.write().unwrap() = vec![crate::peer_table::test::topology_link(
+                    zpr::dn::VISA_SERVICE_CN,
+                )];
+                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, zpr::dn::VISA_SERVICE_CN);
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+                assert_eq!(
+                    asm.peer_table
+                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
+                    None
+                );
+            })
+            .await
     }
 
     /// Rule 5: an accepted inbound link from a peer that already has an

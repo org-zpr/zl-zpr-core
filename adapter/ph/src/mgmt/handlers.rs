@@ -397,7 +397,8 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
 /// Parse a HelloResponse body into the [LinkEvent::ReceivedHelloResponse] to
 /// raise: status code, optional AAA address, and any advertised OIDC identity
 /// providers (OIDC_IDP TLVs, JSON [auth::OidcIdpInfo] each; a TLV with bad
-/// JSON is warned about and skipped).
+/// JSON is warned about and skipped). On a Zode link, a response carrying
+/// any of those TLVs yields a [LinkEvent::Close] instead.
 fn parse_hello_response(
     asm: &Arc<Assembly>,
     link_id: LinkId,
@@ -423,6 +424,27 @@ fn parse_hello_response(
     if !has_actor_auth_protocol(&tlv_data) {
         warn!(target: ZDP, "{}: incompatible actor authorization protocol", asm.formatted_link_id(link_id));
         return Err(HandleMgmtError::MessageNotPermitted);
+    }
+    // zl-zipline#250 (gaps 5 and 6): a Zode answers Hello with none of the
+    // TLVs an adapter dock gets. Refuse their mere presence on a Zode link,
+    // before the tolerant decoding below can skip an undecodable one: the
+    // event becomes a close.
+    let zode_link = asm
+        .peer_table
+        .inspect(link_id, |p| {
+            p.link_state_machine.get_link_type() == LinkType::NodeToNode
+        })
+        .unwrap_or(false);
+    let adapter_tlvs = [
+        tlv::DataType::AAA,
+        tlv::DataType::OIDC_IDP,
+        tlv::DataType::VS_BOOTSTRAP_LINK,
+    ]
+    .iter()
+    .any(|t| tlv_data.contains_key(t));
+    if zode_link && adapter_tlvs {
+        warn!(target: ZDP, "{}: refusing a Zode HelloResponse that carries AAA, OIDC_IDP or VS_BOOTSTRAP_LINK; closing", asm.formatted_link_id(link_id));
+        return Ok(LinkEvent::Close(zdp::TerminateReason::Other));
     }
     let vs_bootstrap = match tlv_data.get(&tlv::DataType::VS_BOOTSTRAP_LINK) {
         None => false,
@@ -1282,6 +1304,58 @@ mod test {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    /// zl-zipline#250 review round 1: a Zode link refuses a HelloResponse
+    /// that carries adapter TLVs even when they do not decode, such as an
+    /// OIDC_IDP advertisement with invalid JSON; the link closes.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_hello_response_with_undecodable_idp_closes_the_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(64);
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+                    mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+                    ..TestAssemblyBuilder::new()
+                }));
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "b.zpr",
+                    crate::link_state::LinkState::Helloing,
+                );
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .set_zode_end(crate::link_state::ZodeEnd::Dialer {
+                        peer_cn: "b.zpr".to_owned(),
+                    })
+                    .unwrap();
+
+                let mut pkt = core::new_heap_packet();
+                zdp::ZdpHelloResponseHeader {
+                    status: zdp::ResponseCode::Success,
+                }
+                .write_to_buf(&mut pkt)
+                .unwrap();
+                tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
+                // An OIDC_IDP TLV (type, length, value) whose JSON is invalid.
+                let bad_json = b"{not json";
+                pkt.put_slice(&[tlv::DataType::OIDC_IDP, bad_json.len() as u8]);
+                pkt.put_slice(bad_json);
+                pkt.metadata_mut().ingress_link_id = link_id;
+
+                let _ = handle_hello_response(&asm, pkt).await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    crate::link_state::LinkState::Closing
+                );
+            })
+            .await
     }
 
     /// A ~3 KB blob (JWT plus a self-signed blob in a JSON array) must fit

@@ -992,9 +992,39 @@ mod test {
         assert!(!config.forwarding, "--forwarding false overrides the file");
     }
 
+    /// The node-only settings in an adapter config file are refused, not
+    /// silently ignored: a `[node]` section, and `relay` or `initial_link`
+    /// in `[adapter]` (zl-zipline#250).
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_adapter_config_refuses_node_settings() {
+        for extra in [
+            "[adapter]\nnode_addr = \"10.0.0.9:5000\"\nrelay = false\n",
+            "[adapter]\nnode_addr = \"10.0.0.9:5000\"\n[adapter.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"r\"\n",
+            "[adapter]\nnode_addr = \"10.0.0.9:5000\"\n[node]\nrelay = true\n",
+        ] {
+            let tomltxt = format!(
+                "[global]\ncontrol_path = \"/tmp/control.sock\"\nname = \"adapter\"\n{extra}"
+            );
+            let tmpfile = TempFile::new_toml(&tomltxt);
+            let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
+            match argparse(Some(args)) {
+                Err(ArgsError::ParseError(msg)) => {
+                    assert!(msg.contains("node"), "unexpected error: {msg}")
+                }
+                other => panic!("accepted node settings in an adapter config: {other:?}"),
+            }
+        }
+    }
+
     /// A minimal node config file whose `[node]` section is `node_section`,
     /// with the referenced key files kept alive by the returned guards.
     fn node_config_file(node_section: &str) -> (TempFile, [TempFile; 3]) {
+        node_config_file_at("10.0.0.1:12345", node_section)
+    }
+
+    /// [node_config_file] with substrate address `self_addr`.
+    fn node_config_file_at(self_addr: &str, node_section: &str) -> (TempFile, [TempFile; 3]) {
         let files = [TempFile::touch(), TempFile::touch(), TempFile::touch()];
         let tomltxt = r#"
         [global]
@@ -1002,11 +1032,12 @@ mod test {
         certificate_file = '$CERTFILE'
         private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
-        self_addr = "10.0.0.1:12345"
+        self_addr = "$SELFADDR"
         zpr_addr = [ "10.0.0.1" ]
 
         [node]
         "#
+        .replace("$SELFADDR", self_addr)
         .replace("$CAFILE", files[0].get_path().to_str().unwrap())
         .replace("$CERTFILE", files[1].get_path().to_str().unwrap())
         .replace("$PKFILE", files[2].get_path().to_str().unwrap());
@@ -1021,7 +1052,7 @@ mod test {
     #[test]
     #[parallel(env)]
     fn test_main_args_argparse_node_initial_link_cli() {
-        let (cfg, _keys) = node_config_file("");
+        let (cfg, _keys) = node_config_file_at("[::1]:12345", "");
         let path = cfg.get_path().to_str().unwrap();
         let (_, config) = argparse(Some(vec![
             "ph",

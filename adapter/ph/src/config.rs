@@ -333,6 +333,7 @@ impl Config {
         if let Some(config_file) = config_file {
             let base_dir = config_file.config_path.parent().unwrap();
             config.set_from_globals(&config_file.global, base_dir)?;
+            config_file.refuse_node_settings()?;
             config.set_from_adapter(&config_file.adapter, base_dir)?;
             config.set_from_authentication(&config_file.authentication, base_dir)?;
         }
@@ -494,6 +495,18 @@ impl Config {
                         "a relay has no initial link: set relay or initial_link, not both"
                             .to_string(),
                     ));
+                }
+                // The initial link is dialed from the substrate sockets,
+                // which are bound to self_addr: an address of the other
+                // family could never be dialed.
+                if let Some(link) = &self.initial_link {
+                    if link.addr.is_ipv4() != self.self_addr.is_ipv4() {
+                        return Err(ArgsError::ParseError(format!(
+                            "initial_link addr {} and self_addr {} are of different address \
+                             families; set self_addr to an address of the relay's family",
+                            link.addr, self.self_addr
+                        )));
+                    }
                 }
                 if self.zpr_addr.is_empty() {
                     return Err("zpr_addr".arg_missing());
@@ -801,6 +814,29 @@ pub struct AdapterConfig {
     pub global: GlobalConfigSection,
     pub adapter: AdapterConfigSection,
     pub authentication: Option<AuthenticationConfigSection>,
+
+    /// Present only to be refused: an adapter has no `[node]` section
+    /// (zl-zipline#250). See [AdapterConfig::refuse_node_settings].
+    node: Option<toml::Value>,
+}
+
+impl AdapterConfig {
+    /// Refuse the node-only settings in an adapter config file, rather than
+    /// ignoring them: a `[node]` section, and `relay` or `initial_link` in
+    /// `[adapter]` (zl-zipline#250).
+    fn refuse_node_settings(&self) -> Result<(), ArgsError> {
+        if self.node.is_some()
+            || self.adapter.relay.is_some()
+            || self.adapter.initial_link.is_some()
+        {
+            return Err(ArgsError::ParseError(
+                "an adapter config has no [node] section, relay or initial_link: \
+                 those are Zode (node) settings"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // This describes the node configuration file TOML format.
@@ -911,6 +947,10 @@ pub struct AdapterConfigSection {
     pub node_addr: Option<SocketAddr>,
     pub bootstrap_key: Option<PathBuf>,
     pub auto_connect: Option<bool>,
+    /// Present only to be refused (see [AdapterConfig::refuse_node_settings]).
+    relay: Option<toml::Value>,
+    /// Present only to be refused (see [AdapterConfig::refuse_node_settings]).
+    initial_link: Option<toml::Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1316,6 +1356,28 @@ mod test {
         ] {
             assert!(InitialLink::parse_cli(bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    /// An initial link must use the address family of the substrate
+    /// address it is dialed from; anything else could never be dialed.
+    #[test]
+    fn test_check_valid_initial_link_family() {
+        let node = |self_addr: &str, link: &str| Config {
+            zpr_addr: vec!["fd5a:5052::1".parse().unwrap()],
+            certificate_file: Some(std::env::temp_dir()),
+            private_key_data: Some("key".to_owned()),
+            control_path: std::env::temp_dir().join("ctl.sock"),
+            self_addr: self_addr.parse().unwrap(),
+            initial_link: Some(InitialLink::parse_cli(link).unwrap()),
+            ..Config::default()
+        };
+        let ok = |s, l| node(s, l).check_valid(PhMode::Node).is_ok();
+        assert!(ok("0.0.0.0:0", "r@10.0.0.9:5000"));
+        assert!(ok("10.0.0.1:5000", "r@10.0.0.9:5000"));
+        assert!(ok("[::]:5000", "r@[fd00::9]:5000"));
+        assert!(!ok("0.0.0.0:0", "r@[fd00::9]:5000"));
+        assert!(!ok("[::]:5000", "r@10.0.0.9:5000"));
+        assert!(!ok("[fd00::1]:5000", "r@10.0.0.9:5000"));
     }
 
     /// The initial link and relay knobs are node-only, and a relay never

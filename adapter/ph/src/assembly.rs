@@ -726,15 +726,8 @@ impl Assembly {
         let Some(link) = config.initial_link.clone() else {
             return;
         };
-        // The local address the kernel uses to reach the relay is the
-        // interface address its packets will arrive on. Probe from our IP
-        // with an ephemeral port: the substrate sockets hold our port. Keep
-        // the rest of the address, including an IPv6 scope.
-        let mut probe_from = config.self_addr;
-        probe_from.set_port(0);
-        let interface_addr = match crate::sys::substrate::resolve_local_addr(probe_from, link.addr)
-        {
-            Ok(local) => local.scoped_ip(),
+        let interface_addr = match dial_interface(config.self_addr, link.addr) {
+            Ok(interface_addr) => interface_addr,
             Err(e) => {
                 error!(target: PEER_MGMT, "cannot route to initial link {} at {}: {e}", link.cn, link.addr);
                 return;
@@ -783,6 +776,29 @@ impl Assembly {
     pub fn formatted_link_id(&self, link_id: LinkId) -> impl std::fmt::Display {
         std::fmt::from_fn(move |f| self.format_link_id(link_id, f))
     }
+}
+
+/// The local interface address a Zode link dialed from substrate address
+/// `self_addr` to `peer` uses: the address the peer's packets arrive on, which
+/// keys the link in the peer table.
+///
+/// A concrete `self_addr` is that address: the substrate sockets are bound to
+/// it. Only a wildcard `self_addr` is resolved, by asking the kernel which
+/// local address routes to `peer`.
+fn dial_interface(
+    self_addr: std::net::SocketAddr,
+    peer: std::net::SocketAddr,
+) -> std::io::Result<ScopedIpAddr> {
+    if !self_addr.ip().is_unspecified() {
+        return Ok(self_addr.scoped_ip());
+    }
+    // ponytail: the probe uses an ephemeral port, since the substrate sockets
+    // hold ours. Under source-port policy routing that could pick another
+    // local address than the sockets would; configure a concrete self_addr
+    // on such hosts.
+    let mut probe_from = self_addr;
+    probe_from.set_port(0);
+    crate::sys::substrate::resolve_local_addr(probe_from, peer).map(|local| local.scoped_ip())
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
@@ -1548,6 +1564,26 @@ pub mod test {
             Some(ca.cert.clone()),
         );
         (keypair, certx)
+    }
+
+    /// zl-zipline#250: a concrete substrate address is the interface a
+    /// dialed Zode link uses, with no route probe (a probe could pick a
+    /// different interface than the bound sockets); only a wildcard address
+    /// is resolved by probing.
+    #[test]
+    fn test_dial_interface_uses_a_concrete_self_addr() {
+        // Not a local address: a probe bound to it would fail.
+        let concrete: std::net::SocketAddr = "192.0.2.77:5000".parse().unwrap();
+        let peer: std::net::SocketAddr = "127.0.0.1:7011".parse().unwrap();
+        assert_eq!(
+            dial_interface(concrete, peer).unwrap(),
+            ScopedIpAddr::V4("192.0.2.77".parse().unwrap())
+        );
+        let wildcard: std::net::SocketAddr = "0.0.0.0:5000".parse().unwrap();
+        assert_eq!(
+            dial_interface(wildcard, peer).unwrap(),
+            ScopedIpAddr::V4("127.0.0.1".parse().unwrap())
+        );
     }
 
     /// zl-zipline#250: a Zode with an initial link dials it at startup, as

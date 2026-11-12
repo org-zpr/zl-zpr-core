@@ -163,6 +163,16 @@ pub fn replace_established_links(asm: &Arc<Assembly>, link_id: LinkId, peer_cn: 
             replaced.push(id.get());
         }
     });
+    // A same-address handshake accepted for another peer displaces the link
+    // that held the address: it goes too, rather than staying Active while
+    // its packets reach this link.
+    let displaced = asm
+        .peer_table
+        .inspect(link_id, |p| (p.substrate_addr, p.interface_addr))
+        .and_then(|(sa, iface)| asm.peer_table.lookup_peer(&sa, &iface))
+        .map(|id| id.get())
+        .filter(|id| *id != link_id && !replaced.contains(id));
+    replaced.extend(displaced);
     for old in replaced {
         info!(target: LINK_STATE, "{} replaces {} to peer CN {peer_cn:?}; dropping the old link",
             asm.formatted_link_id(link_id), asm.formatted_link_id(old));

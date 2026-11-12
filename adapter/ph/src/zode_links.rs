@@ -33,6 +33,7 @@ use crate::link_state::{LinkEvent, LinkType, ZodeEnd};
 use crate::prelude::*;
 use crate::zdp::TerminateReason;
 use crate::zode_link_record::{Action, Event, Kind, LinkRecord, Timer, system_jitter};
+use libnode::error::VSApiError;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::net::IpAddr;
@@ -204,6 +205,11 @@ pub fn replace_established_links(asm: &Arc<Assembly>, link_id: LinkId, peer_cn: 
 #[derive(Default)]
 pub struct ZodeLinkTable {
     inner: Mutex<TableInner>,
+    /// Set when the link-state report must be sent again; see
+    /// [run_link_state_reporter].
+    report_pending: std::sync::atomic::AtomicBool,
+    /// Wakes the reporter after [ZodeLinkTable::request_report].
+    report_wakeup: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -221,6 +227,51 @@ impl ZodeLinkTable {
     pub fn record(&self, peer_cn: &str) -> Option<LinkRecord> {
         let inner = self.inner.lock().unwrap();
         inner.records.get(peer_cn).map(|(_, r)| r.clone())
+    }
+
+    /// Ask for a fresh link-state report: a reported state changed, or the
+    /// VS-API session (re)connected. Bursts of requests coalesce into one
+    /// send.
+    pub fn request_report(&self) {
+        self.report_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.report_wakeup.notify_one();
+    }
+
+    /// Whether a report has been asked for and not yet sent.
+    #[cfg(test)]
+    pub fn report_pending(&self) -> bool {
+        self.report_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// This Zode's link-state snapshot for `reportLinkStates`, by peer CN:
+    /// every link that has an outcome ("Reporting summary"). A link still
+    /// in its first window, a non-owner's link that was never up, and an
+    /// initial link that was never up have none and are not listed; a link
+    /// removed from the topology has no record. `failed` is listed only
+    /// while the owner's record is Failed ("Reporting contract").
+    pub fn snapshot(&self) -> Vec<zpr::vsapi_types::LinkStateReport> {
+        use crate::zode_link_record::Outcome;
+        use zpr::vsapi_types::{LinkState, LinkStateReport};
+        let inner = self.inner.lock().unwrap();
+        let mut reports: Vec<LinkStateReport> = inner
+            .records
+            .iter()
+            .filter_map(|(cn, (_, record))| {
+                let state = match record.outcome? {
+                    Outcome::Up => LinkState::Up,
+                    Outcome::Down => LinkState::Down,
+                    Outcome::Failed => LinkState::Failed,
+                };
+                Some(LinkStateReport {
+                    peer_cn: cn.clone(),
+                    state,
+                })
+            })
+            .collect();
+        reports.sort_by(|a, b| a.peer_cn.cmp(&b.peer_cn));
+        reports
     }
 
     /// Insert `record` for `peer_cn`, replacing any older one.
@@ -256,7 +307,15 @@ impl ZodeLinkTable {
             return None;
         }
         let now = tokio::time::Instant::now().into_std();
-        Some((record.handle(event, now), *record_serial, record.dial_addr))
+        let before = record.outcome;
+        let actions = record.handle(event, now);
+        let (serial, dial_addr, changed) =
+            (*record_serial, record.dial_addr, record.outcome != before);
+        drop(inner);
+        if changed {
+            self.request_report();
+        }
+        Some((actions, serial, dial_addr))
     }
 }
 
@@ -391,6 +450,9 @@ pub fn apply_topology(asm: &Arc<Assembly>) {
     }
 
     let mut closes = Vec::new();
+    // Whether a forgotten record was listed in the report: if so, the next
+    // snapshot leaves it out (rule 12) and must be sent.
+    let mut unlisted = false;
     {
         let mut inner = asm.zode_links.inner.lock().unwrap();
         // Rule 12: forget topology links that left the topology. A record
@@ -403,6 +465,7 @@ pub fn apply_topology(asm: &Arc<Assembly>) {
             if !keep {
                 info!(target: LINK_STATE, "Zode link to {cn:?} left the topology; forgetting it");
                 closes.extend(record.link_id);
+                unlisted |= record.outcome.is_some();
             }
             keep
         });
@@ -411,6 +474,9 @@ pub fn apply_topology(asm: &Arc<Assembly>) {
                 record.dial_addr = *dial_addr;
             }
         }
+    }
+    if unlisted {
+        asm.zode_links.request_report();
     }
     for link_id in closes {
         close_link(asm, link_id, "its peer left the topology");
@@ -425,6 +491,97 @@ pub fn apply_topology(asm: &Arc<Assembly>) {
         drive(asm, &cn, None, Event::Start);
     }
     close_refused_zode_links(asm);
+}
+
+/// How long the reporter waits after the first report request before it
+/// sends, so a burst of link changes goes out as one snapshot.
+pub const REPORT_COALESCE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The most snapshots the reporter queues behind a send that is still in
+/// flight. Past it, the newest snapshot replaces the last queued one.
+pub const REPORT_QUEUE_MAX: usize = 32;
+
+/// Send this Zode's link-state snapshot whenever one is asked for
+/// ([ZodeLinkTable::request_report]), with `send` (in production,
+/// `VSConnHandle::report_link_states`). Requests within [REPORT_COALESCE] of
+/// each other coalesce into one snapshot. Runs for the life of the node.
+///
+/// Taking snapshots and sending them are two loops joined by a queue, so a
+/// send that waits on the visa service (up to the RPC timeout) never merges
+/// the snapshots taken meanwhile: each one is sent, in order. That matters
+/// for the visa service's "new failure" rule (ZODE_LINKS.md "Reporting
+/// contract"): failed -> retry (not listed) -> failed must arrive as three
+/// snapshots, not two `failed` ones. A failed send is logged; the next change
+/// or VS-API registration asks for a fresh snapshot.
+pub async fn run_link_state_reporter<F, Fut>(asm: Arc<Assembly>, send: F)
+where
+    F: Fn(Vec<zpr::vsapi_types::LinkStateReport>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), VSApiError>>,
+{
+    // Both loops run on this one task (`join!` below), so a RefCell is
+    // enough. `queued` wakes the sender; a wake-up sent while it is busy is
+    // kept as a permit, so none is lost.
+    let queue = std::cell::RefCell::new(VecDeque::new());
+    let queued = tokio::sync::Notify::new();
+
+    let take_snapshots = async {
+        loop {
+            asm.zode_links.report_wakeup.notified().await;
+            tokio::time::sleep(REPORT_COALESCE).await;
+            if asm
+                .zode_links
+                .report_pending
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                let snapshot = asm.zode_links.snapshot();
+                let mut queue = queue.borrow_mut();
+                // ponytail: a stall longer than REPORT_QUEUE_MAX snapshots
+                // merges the newest changes into the last queued snapshot,
+                // so transitions inside that tail can be lost. Bounded
+                // memory wins over that corner; each send is bounded by the
+                // RPC timeout, so only a long run of stalls gets there.
+                if queue.len() >= REPORT_QUEUE_MAX {
+                    queue.pop_back();
+                }
+                queue.push_back(snapshot);
+                drop(queue);
+                queued.notify_one();
+            }
+        }
+    };
+
+    let send_snapshots = async {
+        loop {
+            // Take the next snapshot without holding the borrow across the
+            // await below.
+            let next = queue.borrow_mut().pop_front();
+            let Some(snapshot) = next else {
+                queued.notified().await;
+                continue;
+            };
+            let summary: Vec<String> = snapshot
+                .iter()
+                .map(|r| format!("{}={:?}", r.peer_cn, r.state))
+                .collect();
+            match send(snapshot).await {
+                Ok(()) => {
+                    info!(target: LINK_STATE, "reported Zode link states to the visa service: [{}]", summary.join(", "))
+                }
+                // No VS-API session (always the case on a Zode other than the
+                // visa service's own until zl-zipline#252): VSConn refuses the
+                // call locally, so nothing goes on the wire. The session's
+                // (re)connect asks for a fresh report.
+                Err(e @ (VSApiError::ConnClosed | VSApiError::CommandFailed(_))) => {
+                    debug!(target: LINK_STATE, "link-state report not sent, no VS-API session: {e}")
+                }
+                // The call reached the visa service and failed: worth a
+                // warning. The next change or reconnect sends a fresh snapshot.
+                Err(e) => warn!(target: LINK_STATE, "link-state report failed: {e}"),
+            }
+        }
+    };
+
+    tokio::join!(take_snapshots, send_snapshots);
 }
 
 /// The Zode connection `link_id` went Active with its peer's CN verified
@@ -1135,6 +1292,247 @@ mod tests {
                 assert_eq!(record.kind, Kind::Initial);
                 assert_eq!(record.dial_addr, "127.0.0.1:7120".parse().unwrap());
                 assert_eq!(zode_connections(&asm).len(), 1);
+            })
+            .await
+    }
+
+    // ---- link-state reporting ("Reporting summary", "Reporting contract") ----
+
+    use zpr::vsapi_types::{LinkState as Reported, LinkStateReport};
+
+    /// The snapshot as (CN, state) pairs.
+    fn listed(asm: &Arc<Assembly>) -> Vec<(String, Reported)> {
+        asm.zode_links
+            .snapshot()
+            .into_iter()
+            .map(|r| (r.peer_cn, r.state))
+            .collect()
+    }
+
+    /// One case per row of the design's reporting summary: owner up,
+    /// failed, down and first window; non-owner never up, up, down; the
+    /// initial link never up, up, down; a removed link.
+    #[tokio::test(start_paused = true)]
+    async fn test_snapshot_follows_the_reporting_summary() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", Some("relay@127.0.0.1:7130"));
+                start_initial_link(&asm);
+                set_topology(
+                    &asm,
+                    vec![
+                        peer("o-up", "fd5a::21", 7131),
+                        peer("o-failed", "fd5a::22", 7132),
+                        peer("o-down", "fd5a::23", 7133),
+                        peer("n-never", "fd5a::1", 7134),
+                        peer("n-up", "fd5a::2", 7135),
+                        peer("n-down", "fd5a::3", 7136),
+                        peer("removed", "fd5a::24", 7137),
+                    ],
+                );
+                assert!(
+                    listed(&asm).is_empty(),
+                    "nothing is listed in the first window"
+                );
+                assert!(
+                    listed(&asm).iter().all(|(cn, _)| cn != "relay"),
+                    "an initial link never up is not listed"
+                );
+                let relay = record_of(&asm, "relay").link_id.expect("dialing the relay");
+                bring_up(&asm, relay, "relay");
+
+                for cn in ["o-up", "o-down", "removed"] {
+                    let id = record_of(&asm, cn).link_id.unwrap();
+                    bring_up(&asm, id, cn);
+                }
+                answered_up(&asm, "n-up", 7235);
+                let n_down = answered_up(&asm, "n-down", 7236);
+
+                // "removed" leaves the topology; the others are already up or
+                // dialing, so the repeat leaves them as they are.
+                let mut topology = asm.topology.read().unwrap().clone();
+                topology.retain(|l| l.peer_cn != "removed");
+                set_topology(&asm, topology);
+
+                for id in [record_of(&asm, "o-down").link_id.unwrap(), n_down] {
+                    asm.process_link_state_event(id, LinkEvent::Close(TerminateReason::Reset))
+                        .unwrap();
+                }
+                tokio::time::sleep(Duration::from_secs(6)).await;
+
+                assert_eq!(
+                    listed(&asm),
+                    vec![
+                        ("n-down".to_owned(), Reported::Down),
+                        ("n-up".to_owned(), Reported::Up),
+                        ("o-down".to_owned(), Reported::Down),
+                        ("o-failed".to_owned(), Reported::Failed),
+                        ("o-up".to_owned(), Reported::Up),
+                        ("relay".to_owned(), Reported::Up),
+                    ]
+                );
+            })
+            .await
+    }
+
+    /// Reporting contract: a failed link that a new setTopology retries is
+    /// not listed while it retries, and is listed failed again when the
+    /// retry fails; each change asks for a report.
+    #[tokio::test(start_paused = true)]
+    async fn test_snapshot_failed_retry_unlisted_then_failed() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let links = vec![peer("b", "fd5a::20", 7138)];
+                set_topology(&asm, links.clone());
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                assert_eq!(listed(&asm), vec![("b".to_owned(), Reported::Failed)]);
+                asm.zode_links
+                    .report_pending
+                    .store(false, std::sync::atomic::Ordering::Release);
+
+                set_topology(&asm, links);
+                assert!(listed(&asm).is_empty(), "a retrying link is not listed");
+                assert!(
+                    asm.zode_links.report_pending(),
+                    "failed -> not listed is a change"
+                );
+                asm.zode_links
+                    .report_pending
+                    .store(false, std::sync::atomic::Ordering::Release);
+
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                assert_eq!(listed(&asm), vec![("b".to_owned(), Reported::Failed)]);
+                assert!(
+                    asm.zode_links.report_pending(),
+                    "not listed -> failed is a change"
+                );
+            })
+            .await
+    }
+
+    /// A send that blocks (the RPC waits up to its timeout) must not merge
+    /// the snapshots taken meanwhile: failed -> retry (not listed) -> failed
+    /// while the first send is in flight still reaches the visa service as
+    /// three snapshots, in order, so it sees the second failure as new
+    /// ("Reporting contract"; core#107 review).
+    #[tokio::test(start_paused = true)]
+    async fn test_reporter_keeps_snapshots_taken_during_a_blocked_send() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let sent: std::rc::Rc<std::cell::RefCell<Vec<Vec<LinkStateReport>>>> =
+                    Default::default();
+                let release = std::rc::Rc::new(tokio::sync::Notify::new());
+                let (log, gate) = (sent.clone(), release.clone());
+                tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |reports| {
+                    log.borrow_mut().push(reports);
+                    // Only the first send blocks, until the test releases it.
+                    let wait = (log.borrow().len() == 1).then(|| gate.clone());
+                    async move {
+                        if let Some(gate) = wait {
+                            gate.notified().await;
+                        }
+                        Ok(())
+                    }
+                }));
+
+                let links = vec![peer("b", "fd5a::20", 7142)];
+                set_topology(&asm, links.clone());
+                tokio::time::sleep(
+                    crate::zode_link_record::LINK_UP_WINDOW + Duration::from_secs(1),
+                )
+                .await;
+                // The first send ([b=failed]) is now blocked. Retry and fail
+                // again while it is.
+                set_topology(&asm, links);
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+                tokio::time::sleep(
+                    crate::zode_link_record::LINK_UP_WINDOW + Duration::from_secs(1),
+                )
+                .await;
+                release.notify_one();
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+
+                let failed = vec![LinkStateReport {
+                    peer_cn: "b".to_owned(),
+                    state: Reported::Failed,
+                }];
+                assert_eq!(*sent.borrow(), vec![failed.clone(), Vec::new(), failed]);
+            })
+            .await
+    }
+
+    /// While a send is stalled, the queue of snapshots taken meanwhile is
+    /// bounded: past [REPORT_QUEUE_MAX] the newest snapshot replaces the
+    /// last queued one, so a long stall cannot grow memory without limit
+    /// (core#107 review).
+    #[tokio::test(start_paused = true)]
+    async fn test_reporter_queue_is_bounded_while_a_send_stalls() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let sent = std::rc::Rc::new(std::cell::Cell::new(0usize));
+                let release = std::rc::Rc::new(tokio::sync::Notify::new());
+                let (count, gate) = (sent.clone(), release.clone());
+                tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |_| {
+                    count.set(count.get() + 1);
+                    let wait = (count.get() == 1).then(|| gate.clone());
+                    async move {
+                        if let Some(gate) = wait {
+                            gate.notified().await;
+                        }
+                        Ok(())
+                    }
+                }));
+
+                for _ in 0..(REPORT_QUEUE_MAX * 3) {
+                    asm.zode_links.request_report();
+                    tokio::time::sleep(REPORT_COALESCE * 2).await;
+                }
+                release.notify_one();
+                tokio::time::sleep(REPORT_COALESCE * 2).await;
+                assert_eq!(sent.get(), 1 + REPORT_QUEUE_MAX);
+            })
+            .await
+    }
+
+    /// The reporter sends one snapshot per burst of changes, and sends again
+    /// on the next request (a VS-API reconnect asks for one). A failed send
+    /// is only logged.
+    #[tokio::test(start_paused = true)]
+    async fn test_reporter_coalesces_and_resends() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let sent: std::rc::Rc<std::cell::RefCell<Vec<Vec<LinkStateReport>>>> =
+                    Default::default();
+                let log = sent.clone();
+                tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |reports| {
+                    log.borrow_mut().push(reports);
+                    async { Err(VSApiError::ConnClosed) }
+                }));
+
+                set_topology(&asm, vec![peer("b", "fd5a::9", 7139)]);
+                // Three answered links from b in a row (each replaces the
+                // last, rule 5): one burst of changes.
+                for port in [7239, 7240, 7241] {
+                    answered_up(&asm, "b", port);
+                }
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+                assert_eq!(sent.borrow().len(), 1, "one burst, one send");
+                assert_eq!(
+                    sent.borrow()[0],
+                    vec![LinkStateReport {
+                        peer_cn: "b".to_owned(),
+                        state: Reported::Up
+                    }]
+                );
+
+                asm.zode_links.request_report();
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+                assert_eq!(sent.borrow().len(), 2, "a reconnect sends again");
+                assert!(!asm.zode_links.report_pending());
             })
             .await
     }

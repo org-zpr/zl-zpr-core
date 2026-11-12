@@ -21,8 +21,8 @@ use crate::error::VSApiError;
 use crate::logging::targets::VS_RPC;
 
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, DisconnectNotice, Param, ReauthRequest,
-    VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse, pname,
+    ConnectRequest, ConnectType, Connection, DisconnectNotice, LinkStateReport, Param,
+    ReauthRequest, VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse, pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -55,6 +55,7 @@ type VSNotifyDisconnectResponse = Result<(), VSApiError>;
 type VSPingResponse = Result<(), VSApiError>;
 type VSVisaIdsResponse = Result<Vec<u64>, VSApiError>;
 type VSVisaByIdResponse = Result<Vec<Visa>, VSApiError>;
+type VSReportLinkStatesResponse = Result<(), VSApiError>;
 
 #[derive(Debug)]
 pub struct NodeConnect {
@@ -135,6 +136,13 @@ enum VS2Command {
     VisaIdsRequest(oneshot::Sender<VSVisaIdsResponse>),
 
     VisaByIdsRequest(Vec<u64>, oneshot::Sender<VSVisaByIdResponse>),
+
+    /// Send this node's link-state snapshot, `VSHandle.reportLinkStates`
+    /// (zl-zipline#250, ZODE_LINKS.md "Reporting summary").
+    ReportLinkStates(
+        Vec<LinkStateReport>,
+        oneshot::Sender<VSReportLinkStatesResponse>,
+    ),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -718,6 +726,22 @@ impl VSConn {
                 }
                 Ok(())
             }
+
+            VS2Command::ReportLinkStates(reports, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: report_link_states ({} links)", reports.len());
+                let resp = if !cmd_state.is_connected() {
+                    Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    ))
+                } else {
+                    self.do_report_link_states(cmd_state.vs_handle.as_ref().unwrap(), reports)
+                        .await
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send report_link_states response: {:?}", e);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -942,6 +966,31 @@ impl VSConn {
                 Ok(connection)
             }
             vsapi2::result::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
+        }
+    }
+
+    /// Send `reports`, this node's whole link-state snapshot, with
+    /// `VSHandle.reportLinkStates` (zl-zipline#250).
+    async fn do_report_link_states(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+        reports: Vec<LinkStateReport>,
+    ) -> Result<(), VSApiError> {
+        let mut request = vs_h.report_link_states_request();
+        write_link_state_reports(&reports, request.get())?;
+        debug!(target: VS_RPC, "VS-API -> report_link_states");
+        let response = rpc_with_timeout(
+            "report_link_states",
+            DEFAULT_RPC_TIMEOUT,
+            request.send().promise,
+        )
+        .await?;
+        match response.get()?.get_res()?.which()? {
+            vsapi2::ok_or_error::Which::Ok(_) => Ok(()),
+            vsapi2::ok_or_error::Which::Error(err_obj) => {
                 let err_obj = err_obj?;
                 Err(ApiResponseError::try_from(err_obj)?.into())
             }
@@ -1208,6 +1257,35 @@ impl VSConnHandle {
         self.send_command(cmd).await?;
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
+
+    /// Report this node's link states to the visa service (zl-zipline#250).
+    /// `reports` is the whole snapshot: a link it leaves out is one the node
+    /// has nothing to say about.
+    pub async fn report_link_states(
+        &self,
+        reports: Vec<LinkStateReport>,
+    ) -> Result<(), VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::ReportLinkStates(reports, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+}
+
+/// Write `reports` into a `reportLinkStates` request's parameters.
+fn write_link_state_reports(
+    reports: &[LinkStateReport],
+    params: vsapi2::v_s_handle::report_link_states_params::Builder<'_>,
+) -> Result<(), VSApiError> {
+    let len = u32::try_from(reports.len())
+        .map_err(|_| VSApiError::CommandFailed("too many link-state reports".to_string()))?;
+    let mut list = params.init_links(len);
+    for (i, report) in reports.iter().enumerate() {
+        let mut entry = list.reborrow().get(i as u32);
+        entry.set_peer_cn(report.peer_cn.as_str());
+        entry.set_state(report.state.into());
+    }
+    Ok(())
 }
 
 /// Get a unix timestamp in seconds.
@@ -1343,6 +1421,71 @@ mod tests {
                 substrate_addr: "127.0.0.1:5000".parse().unwrap(),
             }
         }
+    }
+
+    /// zl-zipline#250: a link-state snapshot round-trips through the
+    /// `reportLinkStates` parameters exactly as `do_report_link_states`
+    /// writes them.
+    #[test]
+    fn report_link_states_capnp_builder_round_trip() {
+        use zpr::vsapi_types::LinkState;
+        let reports = vec![
+            LinkStateReport {
+                peer_cn: "a.zpr".to_string(),
+                state: LinkState::Up,
+            },
+            LinkStateReport {
+                peer_cn: "b.zpr".to_string(),
+                state: LinkState::Failed,
+            },
+            LinkStateReport {
+                peer_cn: "c.zpr".to_string(),
+                state: LinkState::Down,
+            },
+        ];
+        let mut msg = capnp::message::Builder::new_default();
+        let params = msg.init_root::<vsapi2::v_s_handle::report_link_states_params::Builder>();
+        write_link_state_reports(&reports, params).unwrap();
+        let reader = msg
+            .get_root_as_reader::<vsapi2::v_s_handle::report_link_states_params::Reader>()
+            .unwrap();
+        let decoded: Vec<LinkStateReport> = reader
+            .get_links()
+            .unwrap()
+            .iter()
+            .map(|r| LinkStateReport::try_from(r).unwrap())
+            .collect();
+        assert_eq!(decoded, reports);
+    }
+
+    /// A visa service that implements nothing: enough to build a command
+    /// state that has no VS-API session.
+    struct NoSessionVs;
+    impl vsapi2::visa_service::Server for NoSessionVs {}
+
+    /// With no VS-API session (the run loop is up, but `vs_handle` is
+    /// unset), the run loop refuses a report locally with `CommandFailed`
+    /// and sends nothing (zl-zipline#250).
+    #[tokio::test]
+    async fn report_link_states_without_session_is_refused_locally() {
+        let mut conn = VSConn::new_for_test(
+            "127.0.0.1:1".parse().unwrap(),
+            "node".to_string(),
+            test_key(),
+            refusing_connect_fn(),
+        );
+        let mut cmd_state = VSCommandState::new(capnp_rpc::new_client(NoSessionVs));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        conn.handle_command(
+            &mut cmd_state,
+            VS2Command::ReportLinkStates(Vec::new(), resp_tx),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
     }
 
     /// C3 (zipline#45): the zpr v0.27.0 `ReauthRequest` wrapper round-trips

@@ -1,0 +1,56 @@
+# -*- mode: toml -*-
+#
+# zodes.zplc without the relay-zb link (zl-zipline#250): installing it
+# removes the link from the relay's topology (ZODE_LINKS.md rule 12), and
+# zode-link-test.sh checks that the relay then closes the link and refuses
+# zb's redials. Otherwise identical to zodes.zplc.
+#
+# All Zodes share one substrate segment (a bridge in the relay's
+# namespace); the addresses below match lib/zode_funcs.sh.
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[nodes.zb.substrate_addrs]
+i0 = "10.2.0.2:5000"
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[visa_service]
+dock_node = "relay"
+
+[bootstrap]
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableRelay]
+protocol = "ping"
+
+[services.PingableZb]
+protocol = "ping"

@@ -675,10 +675,14 @@ impl Assembly {
         interface_addr: &ScopedIpAddr,
         end: ZodeEnd,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
+        let role = match &end {
+            ZodeEnd::Dialer { .. } => "dialer",
+            ZodeEnd::Answerer => "answerer",
+        };
         debug!(target: PEER_MGMT, "Starting Zode link with {peer} on {interface_addr} as {end:?}");
         let peer_id = self.add_peer(LinkType::NodeToNode, peer, interface_addr)?;
         self.start_added_zode_link(peer_id, end)?;
-        info!(target: PEER_MGMT, "Started Zode link with {peer}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
+        info!(target: PEER_MGMT, "Started Zode link with {peer} as the {role}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
         Ok(peer_id)
     }
 

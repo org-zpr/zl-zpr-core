@@ -1182,6 +1182,16 @@ impl LinkStateWrapper {
                 asm.dial_initial_links();
                 return;
             }
+            // zl-zipline#222: a Zode link this Zode dialed is redialed only
+            // while its address still belongs to a topology entry or an
+            // initial link. Once a topology update removes its peer, redialing
+            // would only key, fail the CN check and close again, forever.
+            (LinkState::Closing, LinkType::NodeToNode) if !self.zode_dial_still_wanted(asm) => {
+                info!(target: LINK_STATE, "{} left the topology; not redialing", asm.formatted_link_id(link_id));
+                drop(locked_fsm);
+                asm.drop_peer(link_id);
+                return;
+            }
             (LinkState::Closing, _) => {
                 locked_fsm.silent = false;
                 locked_fsm.set_state(LinkState::Inactive);
@@ -1219,6 +1229,14 @@ impl LinkStateWrapper {
                 );
             }
         }
+    }
+
+    /// Does this Zode still have a reason to dial this link's address: a
+    /// configured initial link or a topology entry naming it?
+    fn zode_dial_still_wanted(&self, asm: &Assembly) -> bool {
+        asm.peer_table
+            .get(self.id)
+            .is_some_and(|peer| asm.expected_zode_cn(&peer.substrate_addr).is_some())
     }
 
     /// Set a timer to attempt a link restart after a holddown period
@@ -1939,8 +1957,27 @@ mod tests {
             .await
     }
 
+    /// Add a NodeToNode link this Zode dialed, and put its substrate address
+    /// in the stored topology if `in_topology`.
+    fn add_dialed_zode_link(asm: &Arc<Assembly>, in_topology: bool) -> LinkId {
+        use crate::peer_table::test::topology_link;
+        let dialed = add_peer(asm, LinkType::NodeToNode, 9900);
+        let peer = asm.peer_table.get(dialed).unwrap();
+        peer.link_state_machine.set_zode_dialer(true);
+        if in_topology {
+            let mut link = topology_link("peer.zpr");
+            link.peer = zpr::vsapi_types::SockAddr {
+                addr: peer.substrate_addr.ip(),
+                port: peer.substrate_addr.port(),
+            };
+            *asm.topology.write().unwrap() = vec![link];
+        }
+        dialed
+    }
+
     /// zl-zipline#222: a Zode link this Zode answered is dropped when it
-    /// closes (the dialer reconnects); one it dialed waits and redials.
+    /// closes (the dialer reconnects); one it dialed to a peer still in the
+    /// topology waits and redials.
     #[tokio::test(start_paused = true)]
     async fn test_zode_link_close_drops_answerer_and_redials_dialer() {
         LocalSet::new()
@@ -1950,14 +1987,25 @@ mod tests {
                 complete_close_of(&asm, answered);
                 assert!(asm.peer_table.get(answered).is_none());
 
-                let dialed = add_peer(&asm, LinkType::NodeToNode, 9900);
-                asm.peer_table
-                    .get(dialed)
-                    .unwrap()
-                    .link_state_machine
-                    .set_zode_dialer(true);
+                let dialed = add_dialed_zode_link(&asm, true);
                 complete_close_of(&asm, dialed);
                 assert_eq!(link_state_of(&asm, dialed), LinkState::Inactive);
+            })
+            .await
+    }
+
+    /// zl-zipline#222 (Codex review on zl-zpr-core#104): a dialed Zode link
+    /// whose address is in neither the topology nor the initial links -- a
+    /// topology update removed its peer -- is dropped when it closes, not
+    /// redialed forever.
+    #[tokio::test(start_paused = true)]
+    async fn test_dialed_zode_link_outside_topology_is_dropped_on_close() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = keyable_assembly(true);
+                let dialed = add_dialed_zode_link(&asm, false);
+                complete_close_of(&asm, dialed);
+                assert!(asm.peer_table.get(dialed).is_none());
             })
             .await
     }

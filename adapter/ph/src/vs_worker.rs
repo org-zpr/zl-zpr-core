@@ -24,7 +24,7 @@ pub async fn launch(
 
     loop {
         // This acts as a gate -- waiting for runloop to start.
-        wait_for_runloop_start(&mut lifecycle_rx).await;
+        wait_for_runloop_start(&asm, &mut lifecycle_rx).await;
 
         loop {
             // Kick off a connect request to the VS, if it succeeds, notify the VS about our VSS endpoint.
@@ -61,8 +61,7 @@ pub async fn launch(
                 evt = lifecycle_rx.recv() => {
                     match evt {
                         Ok(VSConnLifecycleEvent::RunLoopExits) => {
-                            asm.vs_session_up
-                                .store(false, std::sync::atomic::Ordering::Release);
+                            vs_session_ended(&asm);
                             info!(target: STARTUP, "VSConn runloop exited; aborting connect attempts and re-gating");
                             break; // break inner connect loop, go re-gate on RunLoopStarts
                         }
@@ -160,10 +159,25 @@ pub async fn launch(
     }
 }
 
-async fn wait_for_runloop_start(lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>) {
+/// The VS-API session is gone (the run loop exited): clear
+/// `vs_session_up`, so a joining Zode accepts the bootstrap visas its relay
+/// hands it to reconnect (zl-zipline#222).
+fn vs_session_ended(asm: &Assembly) {
+    asm.vs_session_up
+        .store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Wait for the VSConn run loop to start. A run-loop exit seen while
+/// waiting -- after a registration, the worker waits here with its session
+/// up -- ends the session.
+async fn wait_for_runloop_start(
+    asm: &Assembly,
+    lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>,
+) {
     loop {
         match lifecycle_rx.recv().await {
             Ok(VSConnLifecycleEvent::RunLoopStarts) => return,
+            Ok(VSConnLifecycleEvent::RunLoopExits) => vs_session_ended(asm),
             Ok(_) => {
                 // ignored
             }
@@ -469,5 +483,24 @@ mod tests {
                 assert!(state.borrow().register_calls >= 2);
             })
             .await;
+    }
+
+    /// zl-zipline#222 (Codex review on zl-zpr-core#104): after a
+    /// registration the worker waits for the next run loop outside the
+    /// connect loop. A run-loop exit seen there ends the VS-API session, so
+    /// `vs_session_up` must drop -- or a joiner refuses the fresh bootstrap
+    /// visas its relay hands it to recover.
+    #[tokio::test]
+    async fn test_run_loop_exit_while_gated_clears_vs_session_up() {
+        let asm = create_assembly(TestAssemblyBuilder::new());
+        asm.vs_session_up
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (tx, mut rx) = broadcast::channel(4);
+        tx.send(VSConnLifecycleEvent::RunLoopExits).unwrap();
+        tx.send(VSConnLifecycleEvent::RunLoopStarts).unwrap();
+
+        wait_for_runloop_start(&asm, &mut rx).await;
+
+        assert!(!asm.vs_session_up.load(std::sync::atomic::Ordering::Acquire));
     }
 }

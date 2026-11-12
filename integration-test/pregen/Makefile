@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2 zodes.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -80,6 +80,14 @@ policy-reauth-no-node.bin2: policy-reauth-no-node.zplc policy-reauth.zpl oidc-te
 # `service` warning as oidc-test; expected.
 attr-query.bin2: attr-query.zpl attr-query.zplc oidc-test-seed-jwks.json
 	$(ZPLC) -c attr-query.zplc -k $(KEY) -f v2 -o $@ attr-query.zpl
+
+# Zode netns fixture (zl-zipline#222): a relay docking the visa service and
+# two joining Zodes, used by the zode-*-test.sh scripts. `transit` needs
+# zplc >= the zl-zipline#226 compiler (feature/zodes); an older zplc
+# rejects or ignores it. The zb/zc RSA authentication keys are checked in
+# (test-only); the relay reuses node-rsa-key.pem.
+zodes.bin2: zodes.zplc zodes.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.pem
+	$(ZPLC) -c zodes.zplc -k $(KEY) -f v2 -o $@ zodes.zpl
 
 # Fake-IdP signing keys (checked in; test-only, no secrecy requirement) and
 # the seed JWKS derived from key 1 only via --print-jwks, which reuses the

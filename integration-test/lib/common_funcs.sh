@@ -404,7 +404,8 @@ function emitlog() {
 }
 
 
-function cleanup() {
+# Kill every process the test started and wait for them.
+function stop_test_processes() {
   # Kill the known test processes (ph/vs/valkey and the netns holders) first:
   # `jobs -p` only yields each pipeline's leader, and killing that leaves the
   # actual daemons running with the `tee`s still holding their pipes, which
@@ -419,6 +420,10 @@ function cleanup() {
   done
 
   wait -f
+}
+
+function cleanup() {
+  stop_test_processes
 
   destroy_network || true
 
@@ -426,15 +431,17 @@ function cleanup() {
 
   if [ "$SHOW_LOGS" != "no" ]
      then
-         emitlog "valkey.log"
-         emitlog "node.log"
-         emitlog "vs.log"
          # The VS's own adapter has to dock before the node can reach the visa
-         # service at all, so its log is emitted with the rest of them.
-         emitlog "adapter-vs.log"
-         emitlog "adapter1.log"
-         emitlog "adapter2.log"
-         emitlog "adapter3.log"
+         # service at all, so its log is emitted with the rest of them. A test
+         # with other logs names them in the ZPR_TEST_LOGS array.
+         local LOGS=(valkey.log node.log vs.log adapter-vs.log adapter1.log adapter2.log adapter3.log)
+         if [ -n "${ZPR_TEST_LOGS+set}" ]
+         then LOGS=("${ZPR_TEST_LOGS[@]}")
+         fi
+         local LOG
+         for LOG in "${LOGS[@]}"
+         do emitlog "$LOG"
+         done
   fi
 
   popd > /dev/null

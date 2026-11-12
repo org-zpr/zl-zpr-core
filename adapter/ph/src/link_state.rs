@@ -1175,9 +1175,11 @@ impl LinkStateWrapper {
             // zl-zipline#222: a Zode link this Zode answered is the
             // dialer's to restore; drop it like an adapter dock.
             (LinkState::Closing, LinkType::NodeToNode) if !self.is_zode_dialer() => {
-                // Clear whole peer out
+                // Clear whole peer out; if it was on an initial link's
+                // address, dial that again (zl-zipline#222).
                 drop(locked_fsm);
                 asm.drop_peer(link_id);
+                asm.dial_initial_links();
                 return;
             }
             (LinkState::Closing, _) => {
@@ -1956,6 +1958,37 @@ mod tests {
                     .set_zode_dialer(true);
                 complete_close_of(&asm, dialed);
                 assert_eq!(link_state_of(&asm, dialed), LinkState::Inactive);
+            })
+            .await
+    }
+
+    /// zl-zipline#222: a Zode that answered on its initial link's address --
+    /// it lost a crossed dial to the relay -- dials the relay again when
+    /// that link closes, instead of waiting for the relay to come back.
+    #[tokio::test(start_paused = true)]
+    async fn test_answered_initial_link_redials_on_close() {
+        LocalSet::new()
+            .run_until(async {
+                use crate::peer_table::test::topology_link;
+                let relay_sa = std::net::SocketAddr::from(topology_link("relay").peer);
+                let mut cfg = <config::Config as std::default::Default>::default();
+                cfg.initial_links =
+                    vec![config::InitialLink::new("relay", &relay_sa.to_string()).unwrap()];
+                let asm = crate::assembly::test::zode_assembly_with_config("zb", cfg);
+                let iface = zpr_utils::net_defs::ScopedIpAddr::V4(
+                    std::net::Ipv4Addr::new(127, 0, 0, 1).into(),
+                );
+                let answered = asm.start_zode_link(&relay_sa, &iface, false).unwrap().get();
+
+                complete_close_of(&asm, answered);
+
+                let mut links = Vec::new();
+                asm.peer_table.for_each(|(_id, peer)| {
+                    if peer.substrate_addr == relay_sa {
+                        links.push(peer.link_state_machine.is_zode_dialer());
+                    }
+                });
+                assert_eq!(links, vec![true], "one link to the relay, dialed by us");
             })
             .await
     }

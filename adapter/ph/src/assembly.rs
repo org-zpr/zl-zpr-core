@@ -705,14 +705,46 @@ impl Assembly {
             .map_err(|e| format!("cannot start a link to {addr}: {e}"))
     }
 
-    /// Dial every configured initial link (zl-zipline#222). Called once at
-    /// startup; a dialed link redials on its own after a close.
+    /// Dial every configured initial link this Zode has no link to yet
+    /// (zl-zipline#222). Called at startup, and when a link this Zode
+    /// answered closes: a Zode that lost a crossed dial to its relay answers
+    /// on the initial link's address, and must dial again when that link
+    /// ends. A dialed link redials on its own after a close.
     pub fn dial_initial_links(self: &Arc<Self>) {
         for link in self.config.get().initial_links.clone() {
+            let linked = self
+                .peer_table
+                .find(|(_id, peer)| peer.substrate_addr == link.addr)
+                .is_some();
+            if linked {
+                continue;
+            }
             if let Err(e) = self.dial_zode(link.addr) {
                 error!(target: PEER_MGMT, "initial link {}: {e}", link.cn);
             }
         }
+    }
+
+    /// The certificate CN this Zode expects of the Zode at substrate address
+    /// `addr`: from a configured initial link, else from the stored topology
+    /// (zl-zipline#222). Used to settle crossed dials before keying; the
+    /// peer's actual CN is checked after keying.
+    pub fn expected_zode_cn(&self, addr: &SocketAddr) -> Option<String> {
+        if let Some(link) = self
+            .config
+            .get()
+            .initial_links
+            .iter()
+            .find(|l| l.addr == *addr)
+        {
+            return Some(link.cn.clone());
+        }
+        self.topology
+            .read()
+            .unwrap()
+            .iter()
+            .find(|link| SocketAddr::from(link.peer.clone()) == *addr && !link.peer_cn.is_empty())
+            .map(|link| link.peer_cn.clone())
     }
 
     /// The CN of this Zode's own link certificate, if it has one.
@@ -1598,6 +1630,12 @@ pub mod test {
     /// it also trusts. Its topology starts empty.
     #[cfg(test)]
     pub fn zode_assembly_with_ca(own_cn: &str) -> Arc<Assembly> {
+        zode_assembly_with_config(own_cn, config::Config::default())
+    }
+
+    /// [zode_assembly_with_ca] with the node configuration `cfg`.
+    #[cfg(test)]
+    pub fn zode_assembly_with_config(own_cn: &str, cfg: config::Config) -> Arc<Assembly> {
         let ca = crate::pki::TestCa::new("zode-ca");
         let keypair = km_noise::NoiseKeypair::generate();
         let window =
@@ -1610,6 +1648,7 @@ pub mod test {
             ph_mode: Some(PhMode::Node),
             self_noise_keypair: Some(keypair),
             certx: Some(certx),
+            config: Some(rcu::RcuBox::new(cfg)),
             ..TestAssemblyBuilder::new()
         }))
     }

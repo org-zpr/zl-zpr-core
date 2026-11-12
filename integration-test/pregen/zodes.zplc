@@ -1,0 +1,76 @@
+# -*- mode: toml -*-
+#
+# Zodes netns fixture (zl-zipline#222): a relay Zode docking the visa
+# service, and two Zodes, zb and zc, each joined to the relay. There is no
+# direct zb-zc link, so zb-zc traffic crosses the relay on a forward-only
+# visa. Used by zode-join-test.sh, zode-line-test.sh and
+# zode-wrong-ca-test.sh through lib/zode_funcs.sh.
+#
+# All Zodes share one substrate segment (a bridge in the relay's
+# namespace); the addresses below match lib/zode_funcs.sh.
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+"zc.zpr" = "fd5a:5052::4"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+# The relay carries zb-zc traffic.
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[nodes.zb.substrate_addrs]
+i0 = "10.2.0.2:5000"
+
+[nodes.zc]
+provider = [ [ "device.zpr.adapter.cn", "zc" ] ]
+zpr_address = "zc.zpr"
+
+[nodes.zc.substrate_addrs]
+i0 = "10.2.0.3:5000"
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
+
+[links.relay-zc]
+peers = [ { node = "relay" }, { node = "zc" } ]
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[visa_service]
+dock_node = "relay"
+
+[bootstrap]
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
+"zc" = "zc-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableRelay]
+protocol = "ping"
+
+[services.PingableZb]
+protocol = "ping"
+
+[services.PingableZc]
+protocol = "ping"

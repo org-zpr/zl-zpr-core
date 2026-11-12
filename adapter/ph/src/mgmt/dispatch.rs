@@ -3,7 +3,7 @@
 use super::core;
 use crate::counters::{ManagementCounterType, ManagementCounters};
 use crate::km_multiplexor;
-use crate::link_state::LinkType;
+use crate::link_state::{LinkState, LinkType};
 use crate::prelude::*;
 use crate::queues;
 use crate::zdp;
@@ -85,11 +85,97 @@ fn km_noise_message(km_body: &[u8]) -> &[u8] {
     }
 }
 
+/// What a Zode does with another Zode's first handshake message when it
+/// arrives on a link this Zode is itself dialing (zl-zipline#222).
+///
+/// One substrate address pair carries one link, so when two Zodes dial each
+/// other at once -- a joiner dialing its initial link while the relay dials
+/// it from topology, say -- each sees the other's first message on its own
+/// dialing link, and neither handshake can finish. Both ends must pick the
+/// same survivor without having keyed yet.
+#[derive(Debug, PartialEq, Eq)]
+enum CrossedDial {
+    /// Not a crossed dial: handle the message on the link as usual.
+    NotCrossed,
+    /// Keep our dial and drop the peer's message: the peer answers ours.
+    KeepDialing,
+    /// Give up our dial and answer the peer's.
+    Answer,
+}
+
+/// Decide a crossed dial on a dialing Zode link in `state`. `own_cn` is our
+/// certificate CN; `expected_peer_cn` the CN we dialed (from the initial
+/// link or topology entry for that address), which the peer, dialing us,
+/// knows as well. The dial of the Zode whose CN sorts lower survives, the
+/// rule pd gate g56 q2 chose for crossed dials. A dial that is idle,
+/// waiting to redial, always answers. The CN is still verified after
+/// keying, so a peer that is not who we dialed is closed then.
+fn crossed_dial(state: LinkState, own_cn: &str, expected_peer_cn: Option<&str>) -> CrossedDial {
+    match state {
+        LinkState::Inactive => CrossedDial::Answer,
+        LinkState::Keying => match expected_peer_cn {
+            Some(peer_cn) if own_cn < peer_cn => CrossedDial::KeepDialing,
+            _ => CrossedDial::Answer,
+        },
+        _ => CrossedDial::NotCrossed,
+    }
+}
+
+/// Apply [crossed_dial] to the key-management packet `pkt` (its ZDP base
+/// header already consumed). Returns false when the packet is to be
+/// dropped; when we answer, the dialing link is replaced by an answering
+/// one and `pkt` is redirected to it.
+fn resolve_crossed_zode_dial(asm: &Arc<Assembly>, pkt: &mut Packet) -> bool {
+    if !crate::km_noise::starts_zode_handshake(km_noise_message(pkt.body())) {
+        return true;
+    }
+    let link_id = pkt.metadata().ingress_link_id;
+    let Some(peer) = asm.peer_table.get(link_id) else {
+        return true;
+    };
+    if !peer.link_state_machine.is_zode_dialer() {
+        return true;
+    }
+    let state = peer.link_state_machine.get_state();
+    let (peer_sa, interface_addr) = (peer.substrate_addr, peer.interface_addr);
+    drop(peer);
+
+    let expected_cn = asm.expected_zode_cn(&std::net::SocketAddr::from(peer_sa));
+    let own_cn = asm.own_cn().unwrap_or_default();
+    match crossed_dial(state, &own_cn, expected_cn.as_deref()) {
+        CrossedDial::NotCrossed => true,
+        CrossedDial::KeepDialing => {
+            info!(target: PEER_MGMT, "{} crossed dial with {peer_sa}: keeping ours", asm.formatted_link_id(link_id));
+            false
+        }
+        CrossedDial::Answer => {
+            info!(target: PEER_MGMT, "{} crossed dial with {peer_sa}: answering the peer's", asm.formatted_link_id(link_id));
+            // Stop the dial's key manager, then drop the link; the
+            // answering link takes the address pair.
+            let _ = asm.peer_table.clear_security_association(link_id);
+            if let Some(km) = asm.peer_table.remove_km_state(link_id) {
+                km.ctok.cancel();
+            }
+            asm.drop_peer(link_id);
+            match asm.start_zode_link(&peer_sa, &interface_addr, false) {
+                Ok(answer) => {
+                    pkt.metadata_mut().ingress_link_id = answer.get();
+                    true
+                }
+                Err(e) => {
+                    warn!(target: PEER_MGMT, "cannot answer a crossed dial from {peer_sa}: {e}");
+                    false
+                }
+            }
+        }
+    }
+}
+
 /// Dispatch the given management packet.
 ///
 /// This function does not block, and does not perform significant processing.
 /// It merely dispatches the management packet to the correct queue.
-pub fn dispatch_mgmt_packet_with_link(asm: &Assembly, pkt: &mut Packet) {
+pub fn dispatch_mgmt_packet_with_link(asm: &Arc<Assembly>, pkt: &mut Packet) {
     let Ok((base_hdr, rest)) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()) else {
         core::count_event(asm, ManagementCounterType::BadStructure);
         return;
@@ -98,6 +184,9 @@ pub fn dispatch_mgmt_packet_with_link(asm: &Assembly, pkt: &mut Packet) {
     match base_hdr.packet_type {
         zdp::ZdpPacketType::KeyManagement => {
             pkt.advance(std::mem::size_of::<zdp::ZdpBaseHeader>());
+            if !resolve_crossed_zode_dial(asm, pkt) {
+                return;
+            }
             return handle_key_management(asm, pkt);
         }
 
@@ -376,6 +465,107 @@ mod test {
         assert_eq!(inbound_link_type(&[]), LinkType::NodeToAdapter);
     }
 
+    /// zl-zipline#222: who survives when two Zodes dial each other at once.
+    /// One substrate address pair carries one link, so each Zode sees the
+    /// other's first handshake message on its own dialing link. The dial of
+    /// the Zode whose CN sorts lower survives (g56 q2); a Zode whose dial
+    /// is idle, waiting to redial, always answers.
+    #[test]
+    fn test_crossed_dial_decision() {
+        use crate::link_state::LinkState;
+        assert_eq!(
+            crossed_dial(LinkState::Keying, "relay", Some("zb")),
+            CrossedDial::KeepDialing
+        );
+        assert_eq!(
+            crossed_dial(LinkState::Keying, "zb", Some("relay")),
+            CrossedDial::Answer
+        );
+        assert_eq!(
+            crossed_dial(LinkState::Inactive, "relay", Some("zb")),
+            CrossedDial::Answer
+        );
+        // Who we dialed is unknown: answer; the CN is still checked after keying.
+        assert_eq!(
+            crossed_dial(LinkState::Keying, "relay", None),
+            CrossedDial::Answer
+        );
+        // A keyed link is not a crossed dial.
+        for state in [LinkState::Helloing, LinkState::Active] {
+            assert_eq!(
+                crossed_dial(state, "zb", Some("relay")),
+                CrossedDial::NotCrossed
+            );
+        }
+    }
+
+    /// A Zode's first handshake message, wrapped as the ZDP key-management
+    /// packet a peer would send on link `link_id`.
+    fn zode_msg0_packet(link_id: LinkId) -> Packet {
+        use crate::km::KeyManagerStateMachine;
+        let ca = crate::pki::TestCa::new("other-ca");
+        let kp = NoiseKeypair::generate();
+        let window =
+            x509_cert::time::Validity::from_now(std::time::Duration::from_secs(3600)).unwrap();
+        let certx = KmCertExchange::new(Some(ca.issue("peer", &kp, window)), Some(ca.cert.clone()));
+        let mut noise =
+            crate::km_noise::KmNoise::new_zode(true, kp, crate::km::ZPIPair::new(1, 2), certx)
+                .unwrap();
+        let msg0 = noise.reset().unwrap().unwrap();
+
+        let mut pkt = core::new_heap_packet();
+        let km_hdr = pkt.alloc_zeroed_header::<zdp::ZdpKeyManagementHeader>();
+        km_hdr.message_type = KM_ID_NOISE.into();
+        km_hdr.message_length = (msg0.len() as u16).into();
+        pkt.put(&msg0[..]);
+        let hdr = pkt.alloc_zeroed_header::<zdp::ZdpBaseHeader>();
+        hdr.packet_type = zdp::ZdpPacketType::KeyManagement;
+        pkt.metadata_mut().ingress_link_id = link_id;
+        pkt
+    }
+
+    /// Dial the topology peer "relay" from a Zode with CN `own_cn`, then
+    /// deliver the relay's own first handshake message on that link.
+    /// Returns the Zode's links to the relay's address afterwards, as
+    /// (link id, is dialer).
+    fn crossed_dial_links(own_cn: &str) -> (LinkId, Vec<(LinkId, bool)>) {
+        use crate::peer_table::test::topology_link;
+        let asm = crate::assembly::test::zode_assembly_with_ca(own_cn);
+        let relay = topology_link("relay");
+        let relay_sa = std::net::SocketAddr::from(relay.peer.clone());
+        *asm.topology.write().unwrap() = vec![relay];
+        let iface = net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 1).into());
+        let dialed = asm.start_zode_link(&relay_sa, &iface, true).unwrap().get();
+
+        let mut pkt = zode_msg0_packet(dialed);
+        dispatch_mgmt_packet_with_link(&asm, &mut pkt);
+
+        let mut links = Vec::new();
+        asm.peer_table.for_each(|(id, peer)| {
+            if peer.substrate_addr == relay_sa {
+                links.push((id.get(), peer.link_state_machine.is_zode_dialer()));
+            }
+        });
+        (dialed, links)
+    }
+
+    /// zl-zipline#222: a crossed dial leaves one link per address pair, and
+    /// both Zodes agree which: the lower CN keeps dialing and ignores the
+    /// peer's first message; the higher CN replaces its dial with a link
+    /// answering the peer's. Found by zode-join-test.sh, where a relay and
+    /// a joiner dialed each other and neither link ever keyed.
+    #[tokio::test(flavor = "local")]
+    async fn test_crossed_dial_leaves_one_link() {
+        // "a" < "relay": keep our dial.
+        let (dialed, links) = crossed_dial_links("a");
+        assert_eq!(links, vec![(dialed, true)]);
+
+        // "zb" > "relay": answer the relay's dial instead.
+        let (_dialed, links) = crossed_dial_links("zb");
+        assert_eq!(links.len(), 1, "one link to the relay: {links:?}");
+        assert!(!links[0].1, "the remaining link answers the relay's dial");
+    }
+
     // Ensure that this old issue is fixed:
     // https://github.com/org-zpr/zpr-core/issues/929
     #[tokio::test(flavor = "local")]
@@ -415,7 +605,7 @@ mod test {
         let mut tab = TestAssemblyBuilder::new();
         let (egress_send, mut egress_recv) = crate::packet_queue::packet_queue(1);
         tab.mgmt_substrate_egress = Some(crate::queues::MgmtSubstrateEgress::new(egress_send));
-        let asm = create_assembly(tab);
+        let asm = Arc::new(create_assembly(tab));
 
         let peer_sa = SubstrateAddr::from(([127, 0, 0, 1], 1234));
         let intf_addr = net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 1).into());

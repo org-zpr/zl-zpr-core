@@ -53,6 +53,12 @@ pub fn dispatch_mgmt_packet_with_addr(
             }
 
             pkt.metadata_mut().ingress_link_id = ingress_link_id;
+            // The link found may be our own dial, made after fastpath queued
+            // this packet: settle a crossed dial exactly as the
+            // link-dispatched path does (zl-zipline#222).
+            if !resolve_crossed_zode_dial(asm, pkt) {
+                return;
+            }
             handle_key_management(asm, pkt);
         }
 
@@ -529,6 +535,13 @@ mod test {
     /// Returns the Zode's links to the relay's address afterwards, as
     /// (link id, is dialer).
     fn crossed_dial_links(own_cn: &str) -> (LinkId, Vec<(LinkId, bool)>) {
+        crossed_dial_links_via(own_cn, false)
+    }
+
+    /// [crossed_dial_links], delivering the relay's message by link ID or,
+    /// with `by_addr`, by substrate address (the path fastpath takes for a
+    /// packet it queued before our dial existed).
+    fn crossed_dial_links_via(own_cn: &str, by_addr: bool) -> (LinkId, Vec<(LinkId, bool)>) {
         use crate::peer_table::test::topology_link;
         let asm = crate::assembly::test::zode_assembly_with_ca(own_cn);
         let relay = topology_link("relay");
@@ -538,7 +551,11 @@ mod test {
         let dialed = asm.start_zode_link(&relay_sa, &iface, true).unwrap().get();
 
         let mut pkt = zode_msg0_packet(dialed);
-        dispatch_mgmt_packet_with_link(&asm, &mut pkt);
+        if by_addr {
+            dispatch_mgmt_packet_with_addr(&asm, relay_sa, iface, &mut pkt);
+        } else {
+            dispatch_mgmt_packet_with_link(&asm, &mut pkt);
+        }
 
         let mut links = Vec::new();
         asm.peer_table.for_each(|(id, peer)| {
@@ -562,6 +579,19 @@ mod test {
 
         // "zb" > "relay": answer the relay's dial instead.
         let (_dialed, links) = crossed_dial_links("zb");
+        assert_eq!(links.len(), 1, "one link to the relay: {links:?}");
+        assert!(!links[0].1, "the remaining link answers the relay's dial");
+    }
+
+    /// Local Codex review on zl-zpr-core#104: a handshake fastpath queued by
+    /// address before our dial existed reaches the address-dispatched path,
+    /// which must settle the crossed dial the same way.
+    #[tokio::test(flavor = "local")]
+    async fn test_crossed_dial_leaves_one_link_via_address_path() {
+        let (dialed, links) = crossed_dial_links_via("a", true);
+        assert_eq!(links, vec![(dialed, true)]);
+
+        let (_dialed, links) = crossed_dial_links_via("zb", true);
         assert_eq!(links.len(), 1, "one link to the relay: {links:?}");
         assert!(!links[0].1, "the remaining link answers the relay's dial");
     }

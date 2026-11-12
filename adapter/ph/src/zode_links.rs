@@ -238,6 +238,7 @@ impl ZodeLinkTable {
     }
 
     /// Whether a report has been asked for and not yet sent.
+    #[cfg(test)]
     pub fn report_pending(&self) -> bool {
         self.report_pending
             .load(std::sync::atomic::Ordering::Acquire)

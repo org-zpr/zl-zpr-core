@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2 zodes.bin2 zodes-unlinked.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -104,3 +104,12 @@ oidc-test-seed-jwks.json: fake-idp-rsa.key
 .PHONY: all clean rebuild fake-idp-keys
 
 .DEFAULT_GOAL: info
+
+# Zode links fixture (zl-zipline#250): the relay linked to zb, and the same
+# without the link. Needs a zplc that knows node links and peer CNs
+# (feature/zodes). zb's RSA authentication key is checked in.
+zodes.bin2: zodes.zplc zodes.zpl zb-rsa-pubkey.pem
+	$(ZPLC) -c zodes.zplc -k $(KEY) -f v2 -o $@ zodes.zpl
+
+zodes-unlinked.bin2: zodes-unlinked.zplc zodes.zpl zb-rsa-pubkey.pem
+	$(ZPLC) -c zodes-unlinked.zplc -k $(KEY) -f v2 -o $@ zodes.zpl

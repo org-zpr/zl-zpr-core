@@ -36,7 +36,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  VISA_SERVICE_RELEASE: v0.21.2
+  # Zodes pre-release per BUILD.md rule 6, built from zl-zpr-visaservice
+  # feature/zodes: bump it when the visa service changes on feature/zodes.
+  VISA_SERVICE_RELEASE: v0.22.0-zodes.1
 
 jobs:
   # Build and upload ph

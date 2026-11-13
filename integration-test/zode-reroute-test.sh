@@ -86,14 +86,21 @@ if [[ "$PASS" == 0 ]]; then
   assert_no_refusals relay zb zc || PASS=1
 
   echo "== 3. the substrate between zb and zc is blocked"
+  # Counted just before the block, so only what the block causes matches
+  # below, not an earlier loss of the link (a flap while it came up).
+  ZB_LOST=$(log_count zb.log "$KEEPALIVE_LOST")
+  ZC_LOST=$(log_count zc.log "$KEEPALIVE_LOST")
+  ZB_DOWN=$(log_count zb.log "$REPORT_ZC_DOWN")
+  ZC_DOWN=$(log_count zc.log "$REPORT_ZB_DOWN")
+  VS_DOWN=$(log_count vs.log "$VS_LINK_DOWN")
   block_pair zb zc
-  wait_log_after 30 zb.log "$KEEPALIVE_LOST" 0 "zb gives up on the silent link" || PASS=1
-  wait_log_after 30 zc.log "$KEEPALIVE_LOST" 0 "zc gives up on the silent link" || PASS=1
+  wait_log_after 30 zb.log "$KEEPALIVE_LOST" "$ZB_LOST" "zb gives up on the silent link" || PASS=1
+  wait_log_after 30 zc.log "$KEEPALIVE_LOST" "$ZC_LOST" "zc gives up on the silent link" || PASS=1
   assert_active_links 10 zb "$ZC_SUBSTRATE_ADDR" 0 "zb cleared its link to zc (rule 9)" || PASS=1
   assert_active_links 10 zc "$ZB_SUBSTRATE_ADDR" 0 "zc cleared its link to zb (rule 9)" || PASS=1
-  wait_log_after 10 zb.log "$REPORT_ZC_DOWN" 0 "zb reports the zb-zc link down (rule 10)" || PASS=1
-  wait_log_after 10 zc.log "$REPORT_ZB_DOWN" 0 "zc reports the zb-zc link down (rule 10)" || PASS=1
-  wait_log_after 10 vs.log "$VS_LINK_DOWN" 0 "the visa service stops routing over the zb-zc link" || PASS=1
+  wait_log_after 10 zb.log "$REPORT_ZC_DOWN" "$ZB_DOWN" "zb reports the zb-zc link down (rule 10)" || PASS=1
+  wait_log_after 10 zc.log "$REPORT_ZB_DOWN" "$ZC_DOWN" "zc reports the zb-zc link down (rule 10)" || PASS=1
+  wait_log_after 10 vs.log "$VS_LINK_DOWN" "$VS_DOWN" "the visa service stops routing over the zb-zc link" || PASS=1
   assert_active_links 0 zb "$RELAY_SUBSTRATE_ADDR" 1 "zb still has its link to the relay" || PASS=1
   assert_active_links 0 zc "$RELAY_SUBSTRATE_ADDR" 1 "zc still has its link to the relay" || PASS=1
   # The link is already down here, so the bound is the revoke and zb's

@@ -367,6 +367,11 @@ fn session_lost(asm: &Assembly, node_zpr_addr: IpAddr, joiner: bool) {
 /// initial link's record redials with backoff (R11), and the relay hands
 /// off fresh bootstrap visas (J1-J6). The current hand-off is marked seen:
 /// the caller then waits for one installed after this ([wait_for_handoff]).
+///
+/// The hand-off is read and its link closed before the session is ended:
+/// `restart` may wait on VSConn's command queue, and a replacement link
+/// with a new hand-off arriving meanwhile must not be taken for the old one
+/// and closed (hosted review).
 async fn rejoin(
     asm: &Arc<Assembly>,
     vs_handle: &VSConnHandle,
@@ -377,14 +382,14 @@ async fn rejoin(
     warn!(target: STARTUP, "VS-API session over the initial link broke ({why}); rejoining (J10)");
     asm.vs_session_up
         .store(false, std::sync::atomic::Ordering::Release);
+    let handoff_link = *handoff_rx.borrow_and_update();
+    if let Some(link_id) = handoff_link {
+        crate::zode_links::close_link(asm, link_id, "the VS-API session over it broke (J10)");
+    }
     if end_session && let Err(e) = vs_handle.restart().await {
         // Discarded mid-dial or during a reconnect delay: a fresh dial is
         // already coming, which is the point.
         info!(target: STARTUP, "VSConn restart request not delivered (restart already in progress?): {e:?}");
-    }
-    let handoff_link = *handoff_rx.borrow_and_update();
-    if let Some(link_id) = handoff_link {
-        crate::zode_links::close_link(asm, link_id, "the VS-API session over it broke (J10)");
     }
 }
 
@@ -1126,6 +1131,53 @@ mod tests {
                     .await,
                     "the session ends before the registration retries run out"
                 );
+            })
+            .await;
+    }
+
+    /// Hosted review (Copilot): J10 closes the initial link that carries
+    /// the current hand-off before it ends the session. Ending it can wait
+    /// on VSConn's command queue (here full, with no run loop draining it),
+    /// and the old link must already be closed by then, so a hand-off that
+    /// arrives on a replacement link during the wait is never mistaken for
+    /// the old one.
+    #[tokio::test]
+    async fn test_rejoin_closes_the_handoff_link_before_ending_the_session() {
+        LocalSet::new()
+            .run_until(async {
+                use crate::zode_links::tests::{bring_up, driven_zode, record_of};
+                let (asm, _egress) = driven_zode(NODE_ADDR, "b", Some("relay@127.0.0.1:7502"));
+                crate::zode_links::start_initial_link(&asm);
+                let link = record_of(&asm, "relay").link_id.unwrap();
+                bring_up(&asm, link, "relay");
+                asm.bootstrap_handoff.send_replace(Some(link));
+                let mut handoff_rx = asm.bootstrap_handoff.subscribe();
+
+                // A VSConn with no run loop and a one-slot queue, already full.
+                let vsconn = VSConn::new(
+                    1,
+                    "127.0.0.1:1".parse().unwrap(),
+                    "test-node".to_string(),
+                    aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+                        .expect("test RSA key"),
+                    "127.0.0.1:5000".parse().unwrap(),
+                );
+                let vs_handle = vsconn.handle();
+                vs_handle.restart().await.unwrap();
+
+                let rejoiner = asm.clone();
+                let _rejoin = tokio::task::spawn_local(async move {
+                    rejoin(&rejoiner, &vs_handle, &mut handoff_rx, "test", true).await;
+                });
+                assert!(
+                    eventually(Duration::from_secs(5), || asm
+                        .peer_table
+                        .get(link)
+                        .is_none())
+                    .await,
+                    "the hand-off link is closed while ending the session waits"
+                );
+                drop(vsconn);
             })
             .await;
     }

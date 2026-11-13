@@ -282,6 +282,22 @@ impl ZodeLinkTable {
         inner.records.insert(peer_cn.to_owned(), (serial, record));
     }
 
+    /// Test-only: put a topology record for `peer_cn` in `state`, served by
+    /// connection `link_id`, without walking the lifecycle.
+    #[cfg(test)]
+    pub fn test_put(
+        &self,
+        peer_cn: &str,
+        state: crate::zode_link_record::RecordState,
+        link_id: Option<LinkId>,
+    ) {
+        let dial_addr = SocketAddr::from(([127, 0, 0, 9], 5000));
+        let mut record = LinkRecord::new(Kind::Topology, Owner::Peer, dial_addr, system_jitter);
+        record.state = state;
+        record.link_id = link_id;
+        self.insert(peer_cn, record);
+    }
+
     /// The CN of the record whose current connection is `link_id`.
     fn peer_cn_of_link(&self, link_id: LinkId) -> Option<String> {
         let inner = self.inner.lock().unwrap();
@@ -491,6 +507,24 @@ pub fn apply_topology(asm: &Arc<Assembly>) {
         drive(asm, &cn, None, Event::Start);
     }
     close_refused_zode_links(asm);
+
+    if let Some(cn) = initial_link_missing_from_topology(&config, &asm.topology.read().unwrap()) {
+        warn!(target: LINK_STATE,
+            "the topology has no entry for the initial link's CN {cn:?}: F1 cannot reach the relay through it; the policy must peer this Zode with its relay");
+    }
+}
+
+/// The CN of this Zode's initial link if `topology` has no entry for it,
+/// else `None` (also when there is no initial link). F1 (zl-zipline#251)
+/// finds the relay as an egress only through its topology entry, so a
+/// missing one means nothing can be forwarded to the relay. That is a
+/// policy error, which `apply_topology` only logs: there is no fallback.
+fn initial_link_missing_from_topology<'c>(
+    config: &'c Config,
+    topology: &[zpr::vsapi_types::Link],
+) -> Option<&'c str> {
+    let cn = config.initial_link.as_ref()?.cn.as_str();
+    (!topology.iter().any(|link| link.peer_cn == cn)).then_some(cn)
 }
 
 /// How long the reporter waits after the first report request before it
@@ -673,6 +707,35 @@ mod tests {
             zpr_addr: vec![ip(self_addr)],
             ..Config::default()
         }
+    }
+
+    /// F1 (zl-zipline#251): an endpoint whose topology lacks its initial
+    /// link's CN cannot reach its relay, so `apply_topology` warns. The check
+    /// names the missing CN; with the CN present, or with no initial link,
+    /// there is nothing to warn about.
+    #[test]
+    fn test_initial_link_missing_from_topology() {
+        let mut config = zode_config("fd5a::5");
+        let relay_entry = [topology_link_at("relay", ip("fd5a::1"))];
+        let other_entry = [topology_link_at("b", ip("fd5a::9"))];
+        assert_eq!(
+            initial_link_missing_from_topology(&config, &other_entry),
+            None
+        );
+
+        config.initial_link = Some(InitialLink::parse_cli("relay@10.0.0.9:5000").unwrap());
+        assert_eq!(
+            initial_link_missing_from_topology(&config, &other_entry),
+            Some("relay")
+        );
+        assert_eq!(
+            initial_link_missing_from_topology(&config, &[]),
+            Some("relay")
+        );
+        assert_eq!(
+            initial_link_missing_from_topology(&config, &relay_entry),
+            None
+        );
     }
 
     /// The ownership matrix: the initial link wins over address order, a

@@ -307,9 +307,11 @@ pub fn request_stream(
         return;
     };
 
-    // Check if we already have the indicated visa.
-    let visa_table = asm.visa_table.read().unwrap();
-    if visa_table.table.get(&visa_id).is_some() {
+    // Check if we already have the indicated visa. The visa-table lock is
+    // released before the bind goes on: `requested_visa_granted` looks up
+    // the egress link and sends, neither of which may run under it.
+    let have_visa = asm.visa_table.read().unwrap().table.contains_key(&visa_id);
+    if have_visa {
         // Visa found.
         return requested_visa_granted(asm, ingress_link_id, txn_id, visa_id);
     }
@@ -937,7 +939,7 @@ mod tests {
     use crate::link_state::LinkType;
     use crate::packet::Packet;
     use crate::packet_queue;
-    use crate::peer_table::test::create_dummy_peer_state;
+    use crate::peer_table::test::{create_dummy_peer_state, insert_up_zode_link};
     use crate::queues::MgmtSubstrateEgress;
     use crate::visa_table::VisaTable;
     use crate::visa_table::tests::{never_expires, new_vsapi_visa_forward_only};
@@ -955,42 +957,58 @@ mod tests {
 
     type EgressRx = packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>;
 
-    /// Build a middle node: a Node-mode assembly whose management egress we
-    /// can read back, an upstream peer of type `upstream` on link A, and a
-    /// downstream peer of type `downstream` on link B that owns [NEXT_HOP]
-    /// (so `find_egress_link` resolves the visa's next hop to link B). The
-    /// forward-only visa [VISA_ID] is already in the visa table.
-    ///
-    /// Returns (asm, egress queue receiver, link A, link B).
-    fn middle_node(
-        upstream: LinkType,
-        downstream: LinkType,
-    ) -> (Arc<Assembly>, EgressRx, LinkId, LinkId) {
+    /// A Node-mode assembly whose management egress we can read back, with
+    /// the forward-only visa [VISA_ID] (next hop [NEXT_HOP]) in its visa
+    /// table and no links yet.
+    fn node_with_visa() -> (Arc<Assembly>, EgressRx) {
         let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
         let mut builder = TestAssemblyBuilder::new();
         builder.ph_mode = Some(PhMode::Node);
         builder.visa_table = Some(VisaTable::new());
         builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
         let asm = Arc::new(create_assembly(builder));
-
-        let link_a = add_peer(&asm, upstream, 1);
-        let link_b = add_peer(&asm, downstream, 2);
-        let next_hop: IpAddr = NEXT_HOP.parse().unwrap();
-        asm.peer_table
-            .get(link_b)
-            .unwrap()
-            .actor_auth
-            .test_set_addresses(vec![IpAddress::new_from_std(&next_hop)]);
-
         asm.visa_table
             .write()
             .unwrap()
             .insert_visa(new_vsapi_visa_forward_only(
                 VISA_ID,
                 never_expires(),
-                next_hop,
+                next_hop(),
             ))
             .unwrap();
+        (asm, egress_rx)
+    }
+
+    /// [NEXT_HOP] as an address.
+    fn next_hop() -> IpAddr {
+        NEXT_HOP.parse().unwrap()
+    }
+
+    /// Build a middle node ([node_with_visa]) with an upstream peer of type
+    /// `upstream` on link A and a downstream peer of type `downstream` on
+    /// link B that `find_egress_link` resolves [NEXT_HOP] to. A downstream
+    /// Zode is reached the way F1 says (zl-zipline#251): an up Zode link
+    /// whose CN has [NEXT_HOP] in the topology. A downstream adapter owns
+    /// [NEXT_HOP] as an actor address.
+    ///
+    /// Returns (asm, egress queue receiver, link A, link B).
+    fn middle_node(
+        upstream: LinkType,
+        downstream: LinkType,
+    ) -> (Arc<Assembly>, EgressRx, LinkId, LinkId) {
+        let (asm, egress_rx) = node_with_visa();
+        let link_a = add_peer(&asm, upstream, 1);
+        let link_b = if downstream == LinkType::NodeToNode {
+            insert_up_zode_link(&asm, "next-hop.zpr", next_hop())
+        } else {
+            let link_b = add_peer(&asm, downstream, 2);
+            asm.peer_table
+                .get(link_b)
+                .unwrap()
+                .actor_auth
+                .test_set_addresses(vec![IpAddress::new_from_std(&next_hop())]);
+            link_b
+        };
         (asm, egress_rx, link_a, link_b)
     }
 

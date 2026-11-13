@@ -676,6 +676,28 @@ pub mod test {
         link_id
     }
 
+    /// A Zode link that is up to the Zode `cn` at topology ZPR address
+    /// `zpr_addr`, as F1 finds it (zl-zipline#251): an Active NodeToNode
+    /// peer whose verified CN is `cn`, a topology entry for `cn` at
+    /// `zpr_addr`, and an up link record for `cn` served by that peer.
+    /// Returns the peer's link ID.
+    #[allow(dead_code)]
+    pub fn insert_up_zode_link(
+        asm: &crate::assembly::Assembly,
+        cn: &str,
+        zpr_addr: std::net::IpAddr,
+    ) -> LinkId {
+        let link_id =
+            insert_zode_peer_with_verified_cn(asm, cn, crate::link_state::LinkState::Active);
+        asm.topology
+            .write()
+            .unwrap()
+            .push(topology_link_at(cn, zpr_addr));
+        asm.zode_links
+            .test_put(cn, crate::zode_link_record::RecordState::Up, Some(link_id));
+        link_id
+    }
+
     /// Give `link_id` an established SA whose peer certificate is verified
     /// and carries CN `cn`, as keying does.
     pub fn set_verified_peer_cn(asm: &crate::assembly::Assembly, link_id: LinkId, cn: &str) {

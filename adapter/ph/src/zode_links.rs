@@ -460,7 +460,7 @@ fn dial(asm: &Arc<Assembly>, peer_cn: &str, dial_addr: SocketAddr) -> Option<Lin
 }
 
 /// Close the connection `link_id`, logging `why`.
-fn close_link(asm: &Arc<Assembly>, link_id: LinkId, why: &str) {
+pub(crate) fn close_link(asm: &Arc<Assembly>, link_id: LinkId, why: &str) {
     info!(target: LINK_STATE, "closing {}: {why}", asm.formatted_link_id(link_id));
     if let Err(e) = asm.process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Reset))
     {
@@ -736,6 +736,8 @@ pub fn link_up(asm: &Arc<Assembly>, link_id: LinkId) {
         return;
     };
     drive(asm, &peer_cn, None, Event::Up(link_id));
+    // J2: a relay asks for the joiner's bootstrap visas, after Hello.
+    crate::bootstrap_handoff::start_relay_hand_off(asm, link_id, &peer_cn);
 }
 
 /// The Zode connection `link_id` closed and its peer entry was dropped
@@ -1068,7 +1070,7 @@ pub(crate) mod tests {
     }
 
     /// An inbound connection from `cn`, keyed and up, on a fresh port.
-    fn answered_up(asm: &Arc<Assembly>, cn: &str, port: u16) -> LinkId {
+    pub(crate) fn answered_up(asm: &Arc<Assembly>, cn: &str, port: u16) -> LinkId {
         let iface = zpr_utils::net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
         let id = asm
             .start_zode_link(

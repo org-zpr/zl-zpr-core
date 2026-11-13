@@ -14,6 +14,13 @@
 //! - **reverse**: `vs.zpr:VSAPI -> joiner:0`, TCP, a full visa. The joiner
 //!   is its egress, so its copy has no forwarding PEP.
 //!
+//! **The relay's half** ([start_relay_hand_off], [relay_hand_off]): when a
+//! Zode link comes up on a relay, it asks over its own VS-API session,
+//! naming the peer by its link-verified CN (J2), installs its own copies
+//! bound to the link, then sends the joiner's pair. If it cannot (no
+//! session, a refusal, no answer within [BOOTSTRAP_REQUEST_TIMEOUT]), it
+//! closes the link and hands nothing off (J7); the joiner redials.
+//!
 //! The joiner trusts a hand-off only as far as it must ([check_handoff]).
 //! It accepts one only on its initial link, after Hello, with no VS-API
 //! session yet, and only exactly its own two VS-API visas, unexpired. A
@@ -45,15 +52,25 @@ use crate::link_state::{LinkState, LinkType};
 use crate::peer_table::PeerTable;
 use crate::prelude::*;
 use crate::visa_table::VisaTable;
+use libnode::error::VSApiError;
 use std::net::IpAddr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use zpr::addrs::{VISA_SERVICE_ADDR, VISA_SERVICE_PORT};
-use zpr::vsapi_types::{DockPepType, Visa, VisaType};
+use zpr::vsapi_types::{BootstrapVisas, DockPepType, Visa, VisaType};
 use zpr_utils::net_defs::IpAddress;
 
 /// How many visas a hand-off carries: the joiner's VS-API flow in each
 /// direction.
 pub const HANDOFF_VISA_COUNT: usize = 2;
+
+/// How long a relay waits for the visa service to answer a bootstrap-visa
+/// request before it closes the joiner's link (J7). The visa service docks
+/// on the relay, so the answer is one local round trip and a policy lookup;
+/// five seconds is far beyond that, yet short enough that a joiner whose
+/// relay cannot reach its visa service redials (R11) instead of sitting on
+/// a link that will never carry its VS-API session. Shorter than the VS-API
+/// call's own timeout, so this is the bound that applies.
+pub const BOOTSTRAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why a hand-off was refused.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -105,9 +122,6 @@ pub enum HandoffError {
 ///
 /// Fails with [HandoffError::Malformed] only if a packed visa does not fit
 /// the u16 length.
-// Used by the relay's hand-off, which comes with zl-zipline#252's relay
-// half (t206); until then only the tests encode.
-#[allow(dead_code)]
 pub fn encode(visas: &[Visa; HANDOFF_VISA_COUNT]) -> Result<Vec<u8>, HandoffError> {
     let mut body = vec![HANDOFF_VISA_COUNT as u8];
     for visa in visas {
@@ -326,6 +340,142 @@ pub fn install_bound_to_link(
         relay_addr,
     });
     Ok(())
+}
+
+/// Relay side (J2): on a Zode configured as a relay, start the bootstrap
+/// hand-off for the Zode link `link_id`, which just came up with its peer's
+/// CN `peer_cn` verified (rule 4). A no-op on any other Zode. Called by
+/// `zode_links::link_up` after Hello, so 146 always follows it; spawns the
+/// request on the node's LocalSet and returns at once.
+///
+/// In v1 every Zode link on a relay is a joiner's initial link (a relay
+/// never dials, rule 4). Only the node the visa service docks on may ask
+/// (J3); the visa service enforces that, and refuses any other relay with
+/// `invalidOperation`, which closes the link like any refusal (J7).
+pub fn start_relay_hand_off(asm: &Arc<Assembly>, link_id: LinkId, peer_cn: &str) {
+    if !asm.config.get().relay {
+        return;
+    }
+    let asm = asm.clone();
+    let peer_cn = peer_cn.to_owned();
+    tokio::task::spawn_local(async move {
+        let vsconn = asm.vsconn.clone();
+        relay_hand_off(&asm, link_id, peer_cn, |cn| async move {
+            match vsconn {
+                Some(handle) => handle.request_bootstrap_visas(cn).await,
+                None => Err(VSApiError::CommandFailed("no VS-API connection".to_owned())),
+            }
+        })
+        .await;
+    });
+}
+
+/// Relay side (J2, J7): ask the visa service, through `request`, for the
+/// bootstrap visas of the joiner `peer_cn` on Zode link `link_id`, then:
+///
+/// 1. install this relay's copies (`relay`) bound to the link (rule 9),
+///    so the joiner's first SYN already matches here, and
+/// 2. send the joiner's copies (`peer`) on the link in message 146.
+///
+/// J7: if `request` fails or takes longer than
+/// [BOOTSTRAP_REQUEST_TIMEOUT], or the relay's copies cannot be installed,
+/// the link is closed and nothing is handed off. There is no retry: the
+/// joiner's initial-link backoff (R11) brings a new link and a new request.
+///
+/// If the link dropped while the request was in flight (or its slot now
+/// holds another connection), the answer is dropped: nothing is installed
+/// for a dead link. Installing and sending do not await, so the link cannot
+/// drop between them.
+pub async fn relay_hand_off<F, Fut>(
+    asm: &Arc<Assembly>,
+    link_id: LinkId,
+    peer_cn: String,
+    request: F,
+) where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<BootstrapVisas, VSApiError>>,
+{
+    let Some(connection) = asm.peer_table.get(link_id).map(|peer| peer.txn_mgr.clone()) else {
+        return;
+    };
+    info!(target: VISA_MGMT, "{}: requesting bootstrap visas for {peer_cn:?}", asm.formatted_link_id(link_id));
+    let answer = tokio::time::timeout(BOOTSTRAP_REQUEST_TIMEOUT, request(peer_cn.clone())).await;
+
+    // The peer entry's transaction manager is created with the connection,
+    // so the same `Arc` means the same connection, not a later one that
+    // reuses the slot.
+    let still_up = asm.peer_table.get(link_id).is_some_and(|peer| {
+        Arc::ptr_eq(&peer.txn_mgr, &connection)
+            && peer.link_state_machine.get_state() == LinkState::Active
+            && peer.verified_peer_cn().as_deref() == Some(peer_cn.as_str())
+    });
+    if !still_up {
+        info!(target: VISA_MGMT, "{}: link to {peer_cn:?} went away during the bootstrap-visa request; dropping the answer", asm.formatted_link_id(link_id));
+        return;
+    }
+
+    let visas = match answer {
+        Ok(Ok(visas)) => visas,
+        Ok(Err(e)) => {
+            return refuse_join(asm, link_id, &peer_cn, &format!("the request failed: {e}"));
+        }
+        Err(_) => {
+            return refuse_join(
+                asm,
+                link_id,
+                &peer_cn,
+                "the visa service did not answer in time",
+            );
+        }
+    };
+    // The decoder guarantees two of each; this keeps the shape in the type.
+    let Ok(peer_pair) = <[Visa; HANDOFF_VISA_COUNT]>::try_from(visas.peer) else {
+        return refuse_join(
+            asm,
+            link_id,
+            &peer_cn,
+            "the answer does not hold two joiner visas",
+        );
+    };
+    let body = match encode(&peer_pair) {
+        Ok(body) => body,
+        Err(e) => {
+            return refuse_join(
+                asm,
+                link_id,
+                &peer_cn,
+                &format!("cannot encode the hand-off: {e}"),
+            );
+        }
+    };
+    if let Err(e) = install_bound_to_link(asm, link_id, &visas.relay, None) {
+        return refuse_join(
+            asm,
+            link_id,
+            &peer_cn,
+            &format!("cannot install the relay's copies: {e}"),
+        );
+    }
+    // install_bound_to_link has released the visa-table lock: never send
+    // under it (zipline#9).
+    let mut pkt = crate::mgmt::core::new_heap_packet();
+    bytes::BufMut::put_slice(&mut pkt, &body);
+    crate::mgmt::core::send_non_flow_mgmt(
+        asm,
+        link_id,
+        crate::zdp::ZdpPacketType::BootstrapVisas,
+        pkt,
+    )
+    .enqueue();
+    info!(target: VISA_MGMT, "{}: handed bootstrap visas {:?} to {peer_cn:?}", asm.formatted_link_id(link_id),
+        peer_pair.iter().map(|visa| visa.issuer_id).collect::<Vec<_>>());
+}
+
+/// J7: the relay cannot hand `peer_cn` its bootstrap visas (`why`), so it
+/// closes the link. The joiner's backoff redials (R11).
+fn refuse_join(asm: &Arc<Assembly>, link_id: LinkId, peer_cn: &str, why: &str) {
+    warn!(target: VISA_MGMT, "{}: no bootstrap visas for {peer_cn:?}: {why}; closing the link (J7)", asm.formatted_link_id(link_id));
+    crate::zode_links::close_link(asm, link_id, "no bootstrap visas for the joiner (J7)");
 }
 
 /// Joiner side: accept the `Bootstrap Visas` message `body` that arrived on
@@ -1119,6 +1269,217 @@ mod tests {
                     asm.find_egress_link(IpAddress::new_from_std(&ip(RELAY))),
                     None
                 );
+            })
+            .await
+    }
+
+    // ---- relay side: request and hand off (t206, J2 and J7) ----
+
+    use libnode::error::VSApiError;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use zpr::vsapi_types::{ApiResponseError, BootstrapVisas, ErrorCode};
+
+    /// The joiner's CN, as the relay's topology and the joiner's
+    /// certificate name it.
+    const JOINER_CN: &str = "b";
+
+    /// The visa service's answer for [JOINER_CN]: the joiner's pair, and the
+    /// relay's copies of the same two flows.
+    fn answer() -> BootstrapVisas {
+        BootstrapVisas {
+            peer: vec![forward(), reverse()],
+            relay: vec![forward(), reverse()],
+        }
+    }
+
+    /// A Zode at [RELAY] configured as a relay.
+    fn relay_zode() -> (Arc<Assembly>, crate::zode_links::tests::EgressRx) {
+        let (asm, egress) = driven_zode(RELAY, "relay", None);
+        let mut config = asm.config.get().clone();
+        config.relay = true;
+        asm.config.write(config);
+        (asm, egress)
+    }
+
+    /// [relay_zode] with the joiner's link up, inserted directly so that
+    /// `zode_links::link_up` starts no hand-off of its own.
+    fn relay_with_joiner() -> (Arc<Assembly>, LinkId, crate::zode_links::tests::EgressRx) {
+        let (asm, egress) = relay_zode();
+        let link = crate::peer_table::test::insert_up_zode_link(&asm, JOINER_CN, ip(OWN));
+        (asm, link, egress)
+    }
+
+    /// The Bootstrap Visas messages waiting in `egress`, whole: the body
+    /// is at the end, after the ZDP headers.
+    async fn sent_handoffs(egress: &mut crate::zode_links::tests::EgressRx) -> Vec<Vec<u8>> {
+        use zerocopy::FromBytes;
+        tokio::task::yield_now().await;
+        let mut bodies = Vec::new();
+        loop {
+            let buf = vec![0u8; config::PACKET_BUFFER_SIZE].into_boxed_slice();
+            let Ok(pkt) = egress.try_recv(buf) else {
+                return bodies;
+            };
+            let (hdr, _) = crate::zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+            if hdr.packet_type == crate::zdp::ZdpPacketType::BootstrapVisas {
+                bodies.push(pkt.body().to_vec());
+            }
+        }
+    }
+
+    /// Is `link_id` closing or gone?
+    fn closed(asm: &Assembly, link_id: LinkId) -> bool {
+        asm.peer_table
+            .get(link_id)
+            .is_none_or(|peer| peer.link_state_machine.get_state() != LinkState::Active)
+    }
+
+    /// J2: the relay asks with the joiner's link-verified CN, installs its
+    /// own copies bound to the link, then hands the joiner's pair over in
+    /// message 146.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_requests_installs_then_hands_off() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, mut egress) = relay_with_joiner();
+                let asked = Rc::new(RefCell::new(Vec::new()));
+                let asked_by = asked.clone();
+                relay_hand_off(&asm, link, JOINER_CN.to_owned(), |cn| async move {
+                    asked_by.borrow_mut().push(cn);
+                    Ok(answer())
+                })
+                .await;
+
+                assert_eq!(*asked.borrow(), vec![JOINER_CN.to_owned()]);
+                assert!(holds(&asm, FWD_ID) && holds(&asm, REV_ID));
+                // Bound to the link: losing it revokes them (rule 9).
+                let sent = sent_handoffs(&mut egress).await;
+                assert_eq!(sent.len(), 1);
+                assert!(sent[0].ends_with(&good_body()), "the joiner's pair");
+                assert!(!closed(&asm, link));
+                asm.drop_peer(link);
+                assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
+            })
+            .await
+    }
+
+    /// J7: an error answer, no VS-API session, or no answer in time closes
+    /// the link, and nothing is installed or handed off.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_closes_the_link_when_the_request_fails() {
+        LocalSet::new()
+            .run_until(async {
+                let internal = || {
+                    VSApiError::CodedError(ApiResponseError::new_code_msg(
+                        ErrorCode::Internal,
+                        "mint failed",
+                    ))
+                };
+                let no_session = || VSApiError::CommandFailed("not connected to VS-API".into());
+                for error in [internal(), no_session()] {
+                    let (asm, link, mut egress) = relay_with_joiner();
+                    relay_hand_off(
+                        &asm,
+                        link,
+                        JOINER_CN.to_owned(),
+                        |_| async move { Err(error) },
+                    )
+                    .await;
+                    assert!(closed(&asm, link));
+                    assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
+                    assert!(sent_handoffs(&mut egress).await.is_empty());
+                }
+
+                let (asm, link, mut egress) = relay_with_joiner();
+                relay_hand_off(&asm, link, JOINER_CN.to_owned(), |_| {
+                    std::future::pending::<Result<BootstrapVisas, VSApiError>>()
+                })
+                .await;
+                assert!(closed(&asm, link), "a timeout closes the link");
+                assert!(!holds(&asm, FWD_ID));
+                assert!(sent_handoffs(&mut egress).await.is_empty());
+            })
+            .await
+    }
+
+    /// J7: if the relay's copies cannot be installed, the joiner's are not
+    /// handed off either, and the link closes.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_hands_nothing_off_if_its_install_fails() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, mut egress) = relay_with_joiner();
+                let mut bad = answer();
+                bad.relay[1].dock_pep = None; // a full visa the table refuses
+                relay_hand_off(&asm, link, JOINER_CN.to_owned(), |_| async move { Ok(bad) }).await;
+                assert!(closed(&asm, link));
+                assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
+                assert!(sent_handoffs(&mut egress).await.is_empty());
+            })
+            .await
+    }
+
+    /// A link that drops while the request is in flight gets nothing: the
+    /// answer is dropped, nothing is installed and nothing is sent.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_drops_the_answer_for_a_link_lost_mid_request() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, mut egress) = relay_with_joiner();
+                let dropper = asm.clone();
+                relay_hand_off(&asm, link, JOINER_CN.to_owned(), |_| async move {
+                    dropper.drop_peer(link);
+                    Ok(answer())
+                })
+                .await;
+                assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
+                assert!(sent_handoffs(&mut egress).await.is_empty());
+            })
+            .await
+    }
+
+    /// J2 wiring: on a relay, every Zode link that comes up starts a
+    /// request. With no VS-API connection it fails at once, so the link
+    /// closes (J7).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_link_up_on_a_relay_starts_a_hand_off() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = relay_zode();
+                set_topology(
+                    &asm,
+                    vec![crate::peer_table::test::topology_link_at(
+                        JOINER_CN,
+                        ip(OWN),
+                    )],
+                );
+                let link = crate::zode_links::tests::answered_up(&asm, JOINER_CN, 7401);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert!(closed(&asm, link));
+            })
+            .await
+    }
+
+    /// A Zode that is not a relay never asks for bootstrap visas: its link
+    /// stays up even with no VS-API connection.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_non_relay_never_requests() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode(RELAY, "relay", None);
+                // Below this Zode's address, so the peer owns the link and
+                // this Zode answers it (rule 3).
+                let peer_addr = ip("fd5a:5052::1");
+                set_topology(
+                    &asm,
+                    vec![crate::peer_table::test::topology_link_at(
+                        JOINER_CN, peer_addr,
+                    )],
+                );
+                let link = crate::zode_links::tests::answered_up(&asm, JOINER_CN, 7402);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert!(!closed(&asm, link));
             })
             .await
     }

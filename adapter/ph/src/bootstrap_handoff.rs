@@ -943,6 +943,48 @@ mod tests {
             .await
     }
 
+    /// J11 meets J4 (core#112 after core#111): the visa service's J5a visa
+    /// for the joiner's VS-API flow, with the forward bootstrap visa's
+    /// five-tuple, supersedes that bootstrap visa and takes the lookup.
+    /// Losing the initial link then revokes the superseded bootstrap visas
+    /// (rule 9) and leaves their successor, not learned over the link, in
+    /// place.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_bootstrap_visa_superseded_by_j5a_leaves_it_on_link_loss() {
+        const J5A_ID: VisaId = 9101;
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, _egress) = joiner(7305);
+                accept(&asm, link, &good_body()).unwrap();
+                let mut j5a = forward();
+                j5a.issuer_id = J5A_ID;
+                crate::visa_mgmt::insert_visa(&asm, j5a).unwrap();
+
+                let vs_api_packet = crate::defs::FiveTuple {
+                    src_address: IpAddress::new_from_std(&ip(OWN)),
+                    dst_address: IpAddress::new_from_std(&VISA_SERVICE_ADDR),
+                    l3_type: zpr::packet_info::L3Type::Ipv6,
+                    l4_protocol: zpr_utils::net_defs::ip_number::TCP,
+                    src_port: 40000,
+                    dst_port: VISA_SERVICE_PORT,
+                };
+                {
+                    let visa_table = asm.visa_table.read().unwrap();
+                    assert_eq!(visa_table.successor_of(FWD_ID), Some(J5A_ID));
+                    assert_eq!(visa_table.match_traffic(&vs_api_packet), Some(J5A_ID));
+                }
+
+                asm.drop_peer(link);
+                assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
+                assert!(holds(&asm, J5A_ID), "the successor survives the link");
+                assert_eq!(
+                    asm.visa_table.read().unwrap().match_traffic(&vs_api_packet),
+                    Some(J5A_ID)
+                );
+            })
+            .await
+    }
+
     /// Before topology, F1 finds the relay by the forward visa's next hop,
     /// over the initial link only; another address finds nothing.
     #[tokio::test(start_paused = true)]

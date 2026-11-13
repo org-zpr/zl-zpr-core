@@ -6,8 +6,9 @@
 
 use cslab::{RcuCslab, RcuCslabReader};
 use rcu::{RcuBox, RcuCslabEntryGuard};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, MutexGuard};
-use zpr::packet_info::{ForwardingEntry, StreamId, VisaId};
+use zpr::packet_info::{ForwardingEntry, LinkId, StreamId, VisaId};
 
 const PEER_FORWARDING_TABLE_SIZE: usize = 1 << 20; // 1 million
 
@@ -16,10 +17,61 @@ const PEER_FORWARDING_TABLE_SIZE: usize = 1 << 20; // 1 million
 // and recompress
 // (necessary since (a) adapter can choose compression level, and (b)
 // visas may be more narrowly scoped than what can be compressed out)
-#[derive(Clone)]
+/// One PFT entry: where a stream arriving on this link goes, and under
+/// which visa.
+///
+/// The fields are atomics so that a J11 rebind (zl-zipline#252) can move
+/// the stream onto a superseding visa's next-hop stream **in place**,
+/// keeping the stream ID the requestor already sends with. The slab gives
+/// readers shared references only, so an entry cannot be replaced by a new
+/// one under the same key. `next_hop` packs the link and stream IDs into
+/// one word, so a reader never sees half of an old target and half of a
+/// new one.
 pub struct PftPep {
-    pub next_hop: ForwardingEntry,
-    pub visa_id: VisaId,
+    /// The next hop's `ForwardingEntry`, packed by [pack_forwarding_entry].
+    next_hop: AtomicU64,
+    visa_id: AtomicU64,
+}
+
+/// Pack a `ForwardingEntry` (two 32-bit IDs) into one 64-bit word: the
+/// link ID in the high half, the stream ID in the low half.
+fn pack_forwarding_entry(entry: ForwardingEntry) -> u64 {
+    (u64::from(entry.0) << 32) | u64::from(entry.1)
+}
+
+/// The inverse of [pack_forwarding_entry].
+fn unpack_forwarding_entry(packed: u64) -> ForwardingEntry {
+    ForwardingEntry((packed >> 32) as LinkId, packed as u32 as StreamId)
+}
+
+impl PftPep {
+    /// An entry forwarding to `next_hop` under the visa `visa_id`.
+    pub fn new(next_hop: ForwardingEntry, visa_id: VisaId) -> Self {
+        Self {
+            next_hop: AtomicU64::new(pack_forwarding_entry(next_hop)),
+            visa_id: AtomicU64::new(visa_id),
+        }
+    }
+
+    /// Where a stream arriving on this entry is forwarded to.
+    pub fn next_hop(&self) -> ForwardingEntry {
+        unpack_forwarding_entry(self.next_hop.load(AtomicOrdering::Acquire))
+    }
+
+    /// The visa the stream is bound under.
+    pub fn visa_id(&self) -> VisaId {
+        self.visa_id.load(AtomicOrdering::Acquire)
+    }
+
+    /// Move this entry onto `visa_id`, forwarding to `next_hop` (J11
+    /// commit). The only writer after [PftPep::new]; the visa table calls it
+    /// under its write lock. The visa ID is stored first, so a reader that
+    /// sees the new next hop also sees the new visa ID.
+    pub fn rebind(&self, next_hop: ForwardingEntry, visa_id: VisaId) {
+        self.visa_id.store(visa_id, AtomicOrdering::Release);
+        self.next_hop
+            .store(pack_forwarding_entry(next_hop), AtomicOrdering::Release);
+    }
 }
 
 pub struct PeerForwardingTable {

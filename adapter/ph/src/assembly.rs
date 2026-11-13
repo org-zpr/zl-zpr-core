@@ -1862,10 +1862,7 @@ pub mod test {
                     .get(link)
                     .unwrap()
                     .pft
-                    .insert(PftPep {
-                        next_hop: ForwardingEntry(link, 1),
-                        visa_id,
-                    })
+                    .insert(PftPep::new(ForwardingEntry(link, 1), visa_id))
                     .unwrap();
                 visa_table.bind(visa_id, binding_on(link, tether)).unwrap();
                 bound.push((link, tether));
@@ -2053,10 +2050,7 @@ pub mod test {
             let peer = asm.peer_table.get(link_id).unwrap();
             let tether_id = peer
                 .pft
-                .insert(PftPep {
-                    next_hop: ForwardingEntry(link_id, 1),
-                    visa_id,
-                })
+                .insert(PftPep::new(ForwardingEntry(link_id, 1), visa_id))
                 .unwrap();
             visa_table
                 .bind(visa_id, binding_on(link_id, tether_id))

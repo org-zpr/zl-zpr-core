@@ -439,6 +439,11 @@ pub async fn relay_hand_off<F, Fut>(
             "the answer does not hold two joiner visas",
         );
     };
+    // Bootstrap visas carry no constraints, and constraints cannot be
+    // packed yet (the common writer panics on them): refuse instead.
+    if peer_pair.iter().any(|visa| visa.cons.is_some()) {
+        return refuse_join(asm, link_id, &peer_cn, "a joiner visa carries constraints");
+    }
     let body = match encode(&peer_pair) {
         Ok(body) => body,
         Err(e) => {
@@ -450,6 +455,14 @@ pub async fn relay_hand_off<F, Fut>(
             );
         }
     };
+    let Some(pkt) = handoff_message(&body) else {
+        return refuse_join(
+            asm,
+            link_id,
+            &peer_cn,
+            "the hand-off does not fit in one message",
+        );
+    };
     if let Err(e) = install_bound_to_link(asm, link_id, &visas.relay, None) {
         return refuse_join(
             asm,
@@ -460,8 +473,6 @@ pub async fn relay_hand_off<F, Fut>(
     }
     // install_bound_to_link has released the visa-table lock: never send
     // under it (zipline#9).
-    let mut pkt = crate::mgmt::core::new_heap_packet();
-    bytes::BufMut::put_slice(&mut pkt, &body);
     crate::mgmt::core::send_non_flow_mgmt(
         asm,
         link_id,
@@ -471,6 +482,17 @@ pub async fn relay_hand_off<F, Fut>(
     .enqueue();
     info!(target: VISA_MGMT, "{}: handed bootstrap visas {:?} to {peer_cn:?}", asm.formatted_link_id(link_id),
         peer_pair.iter().map(|visa| visa.issuer_id).collect::<Vec<_>>());
+}
+
+/// The ZDP message carrying the hand-off `body`, or `None` if the body does
+/// not fit in one message (writing past the packet's tailroom would panic).
+fn handoff_message(body: &[u8]) -> Option<Packet> {
+    let mut pkt = crate::mgmt::core::new_heap_packet();
+    if body.len() > pkt.tailroom_available() {
+        return None;
+    }
+    bytes::BufMut::put_slice(&mut pkt, body);
+    Some(pkt)
 }
 
 /// J7: the relay cannot hand `peer_cn` its bootstrap visas (`why`), so it
@@ -1415,6 +1437,40 @@ mod tests {
                 let mut bad = answer();
                 bad.relay[1].dock_pep = None; // a full visa the table refuses
                 relay_hand_off(&asm, link, JOINER_CN.to_owned(), |_| async move { Ok(bad) }).await;
+                assert!(closed(&asm, link));
+                assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
+                assert!(sent_handoffs(&mut egress).await.is_empty());
+            })
+            .await
+    }
+
+    /// Hosted review (Codex): a hand-off body larger than one message is
+    /// refused, not written past the packet's tailroom (a panic).
+    #[test]
+    fn test_a_hand_off_must_fit_in_one_message() {
+        assert!(handoff_message(&vec![0; 8000]).is_none());
+        let pkt = handoff_message(&[1, 2, 3]).expect("a small body fits");
+        assert_eq!(pkt.body(), &[1, 2, 3]);
+    }
+
+    /// Hosted review (Codex): a joiner visa with constraints (which cannot
+    /// be packed, and could make the hand-off too large) is refused like
+    /// any bad answer (J7), not a panic: nothing installed, nothing sent,
+    /// link closed.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_refuses_a_joiner_visa_with_constraints() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, mut egress) = relay_with_joiner();
+                let mut big = answer();
+                big.peer[0].cons = Some(zpr::vsapi_types::Constraints {
+                    bw: false,
+                    bw_limit_bps: 0,
+                    data_cap_id: "x".repeat(8000),
+                    data_cap_bytes: 0,
+                    data_cap_affinity_addr: Vec::new(),
+                });
+                relay_hand_off(&asm, link, JOINER_CN.to_owned(), |_| async move { Ok(big) }).await;
                 assert!(closed(&asm, link));
                 assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
                 assert!(sent_handoffs(&mut egress).await.is_empty());

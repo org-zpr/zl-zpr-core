@@ -701,8 +701,9 @@ mod io_uring {
                 // approach suffered from a kernel bug where AsyncCancel can
                 // spuriously fail to cancel an operation which is, in fact,
                 // still genuinely pending, causing submit_and_wait() to block
-                // indefinitely (see the (removed) `test_recv_stress_no_stall`
-                // test's history for more detail).
+                // indefinitely, until unrelated traffic arrived (zipline#117).
+                // `tests::test_recv_stress_no_stall` guards against that
+                // regression; see its comments for more detail.
 
                 // SAFETY: the buf ptrs are valid for our entire body, and we
                 // are waiting on completion before we exit.
@@ -2408,9 +2409,21 @@ mod tests {
     #[cfg(unix)]
     #[derive(Debug)]
     struct RecvStressStats {
-        /// The longest single batch receive call of the run.
+        /// The longest single batch receive call of the run.  Informational
+        /// only: a slow call is not a failure (zl-zipline#261).
         max_call: Duration,
     }
+
+    /// Value of `run_recv_stress`'s shared timed-out sequence number while
+    /// no ack has timed out.
+    #[cfg(unix)]
+    const RECV_STRESS_NO_TIMEOUT: u64 = u64::MAX;
+
+    /// Payload of the one datagram `run_recv_stress`'s sender sends after an
+    /// ack timed out, so that a blocked batch call can return.  It is never a
+    /// valid sequence number.
+    #[cfg(unix)]
+    const RECV_STRESS_WAKE: u64 = u64::MAX;
 
     /// Drive `bio` through the receive stress run of zipline#117 and report
     /// the first failure as `Err`, naming the engine.
@@ -2419,20 +2432,29 @@ mod tests {
     /// sub-millisecond offsets while the receiver busy-loops
     /// `RECV_STRESS_BATCH`-op batch receives on the otherwise empty socket,
     /// so datagrams keep arriving inside a batch call.  The receiver acks
-    /// each newly-seen datagram; the sender sends the next only on an ack,
-    /// or after GAP if the ack never comes (i.e. the receiver is blocked
-    /// inside a batch call).  Any batch call taking STALL or longer fails
-    /// the run, as does any datagram that is never returned.
+    /// each newly-seen datagram, and the sender sends the next one only
+    /// after that ack.
     ///
-    /// `_liveness` is not used yet: the STALL timer still decides.
+    /// The failure signal is liveness, not latency.  While the sender waits
+    /// for the ack of datagram k it sends nothing, so a batch call that is
+    /// not stalled returns k with no new traffic, however slow the call is.
+    /// A stalled call (an op left in flight) returns only when another
+    /// datagram arrives, which never happens during the wait.  So if no ack
+    /// comes within `liveness`, the sender records k, sends one `WAKE`
+    /// datagram so that a blocked call can return, and stops.  The receiver
+    /// then reports a stall if k arrived after the wake, or a lost datagram
+    /// if it never arrived.  A false failure needs the receiver thread to
+    /// make no progress at all for the whole `liveness` bound.
+    ///
+    /// The receiver also keeps an overall deadline, as a backstop for a lost
+    /// datagram that no wake reveals.
     #[cfg(unix)]
     fn run_recv_stress(
         bio: &mut BatchIo,
-        _liveness: Duration,
+        liveness: Duration,
     ) -> std::result::Result<RecvStressStats, String> {
-        const STALL: Duration = Duration::from_millis(50);
-        const GAP: Duration = Duration::from_millis(100);
-        const HEARTBEAT: u64 = u64::MAX;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc::RecvTimeoutError;
 
         let engine_name = bio.engine_name();
 
@@ -2442,10 +2464,13 @@ mod tests {
         outq.set_nonblocking(true).unwrap();
         inq.connect(outq.local_addr().unwrap()).unwrap();
 
-        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<u64>();
+        // The sequence number whose ack timed out, or RECV_STRESS_NO_TIMEOUT.
+        // The sender stores it before it sends the wake datagram, so the
+        // receiver always sees it once it has received the wake.
+        let timed_out = std::sync::Arc::new(AtomicU64::new(RECV_STRESS_NO_TIMEOUT));
 
-        let sender_stop = stop.clone();
+        let sender_timed_out = timed_out.clone();
         let sender = std::thread::spawn(move || {
             let mut rng = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2453,32 +2478,30 @@ mod tests {
                 .subsec_nanos() as u64
                 | 1;
 
-            let mut seq = 0u64;
-            while seq < RECV_STRESS_DATAGRAMS
-                && !sender_stop.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            for seq in 0..RECV_STRESS_DATAGRAMS {
                 // One datagram at a randomized sub-millisecond offset, to
                 // land it at an arbitrary point of the receiver's batch
-                // calls; then wait for its ack before the next, so that a
-                // stall shows up as a >= GAP batch call instead of being
-                // cut short by the following datagram.
+                // calls; then stay silent until its ack.
                 std::thread::sleep(Duration::from_micros(xorshift(&mut rng) % 700));
                 inq.send(&seq.to_le_bytes()).unwrap();
-                seq += 1;
-                let _ = ack_rx.recv_timeout(GAP);
-            }
-
-            // Keep the receiver unblockable while it drains the last
-            // bursts: a stalled batch call only returns when the next
-            // datagram arrives.
-            while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                inq.send(&HEARTBEAT.to_le_bytes()).unwrap();
-                std::thread::sleep(GAP);
+                match ack_rx.recv_timeout(liveness) {
+                    Ok(acked) => assert_eq!(acked, seq, "acks arrive in send order"),
+                    Err(RecvTimeoutError::Timeout) => {
+                        // No progress without new traffic: record k, then
+                        // wake a possibly blocked call, and stop.
+                        sender_timed_out.store(seq, Ordering::SeqCst);
+                        inq.send(&RECV_STRESS_WAKE.to_le_bytes()).unwrap();
+                        return;
+                    }
+                    // The receiver gave up (it reported a failure).
+                    Err(RecvTimeoutError::Disconnected) => return,
+                }
             }
         });
 
         let mut seen = vec![false; RECV_STRESS_DATAGRAMS as usize];
         let mut nseen = 0usize;
+        let mut wake_seen = false;
         let mut max_elapsed = Duration::ZERO;
         let mut bufs = vec![Vec::with_capacity(64); RECV_STRESS_BATCH];
         let mut results = Vec::new();
@@ -2490,6 +2513,32 @@ mod tests {
                     max_call: max_elapsed,
                 });
             }
+
+            // Once the wake datagram is in, every datagram the sender sent
+            // has had its chance to arrive: classify the timeout.
+            if wake_seen {
+                let k = timed_out.load(Ordering::SeqCst);
+                if k == RECV_STRESS_NO_TIMEOUT {
+                    break Err(format!(
+                        "[{engine_name}] received a wake datagram, but no ack timed out"
+                    ));
+                }
+                break Err(if seen[k as usize] {
+                    format!(
+                        "[{engine_name}] stall: datagram {k} of {RECV_STRESS_DATAGRAMS} \
+                         was not received within {liveness:?} while the sender was \
+                         silent, and arrived only after a wake datagram: a batch call \
+                         returned only when new traffic arrived (an operation was left \
+                         in flight, zipline#117)"
+                    )
+                } else {
+                    format!(
+                        "[{engine_name}] lost datagram {k} of {RECV_STRESS_DATAGRAMS}: \
+                         not received within {liveness:?}, nor after a wake datagram"
+                    )
+                });
+            }
+
             if std::time::Instant::now() >= deadline {
                 break Err(format!(
                     "[{engine_name}] lost datagram(s): only {nseen} of \
@@ -2506,34 +2555,29 @@ mod tests {
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
                 Err(err) => break Err(format!("[{engine_name}] batch receive failed: {err}")),
             }
-            let elapsed = start.elapsed();
-            max_elapsed = max_elapsed.max(elapsed);
-
-            if elapsed >= STALL {
-                break Err(format!(
-                    "[{engine_name}] stall: batch receive blocked for {elapsed:?} \
-                     (>= {STALL:?}) after {nseen} of {RECV_STRESS_DATAGRAMS} datagrams: \
-                     an operation was left in flight and the engine waited for traffic \
-                     that had not arrived"
-                ));
-            }
+            max_elapsed = max_elapsed.max(start.elapsed());
 
             for (buf, result) in bufs.iter().zip(results.drain(..)) {
                 let Ok(packet) = result else { continue };
                 assert_eq!(packet.size, 8, "[{engine_name}] short datagram");
                 let seq = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                if seq == HEARTBEAT || seq as usize >= seen.len() {
+                if seq == RECV_STRESS_WAKE {
+                    wake_seen = true;
+                    continue;
+                }
+                if seq as usize >= seen.len() {
                     continue;
                 }
                 if !seen[seq as usize] {
                     seen[seq as usize] = true;
                     nseen += 1;
-                    let _ = ack_tx.send(());
+                    let _ = ack_tx.send(seq);
                 }
             }
         };
 
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Dropping the ack channel stops a sender still waiting for an ack.
+        drop(ack_tx);
         sender.join().unwrap();
 
         if let Ok(stats) = &outcome {
@@ -2547,21 +2591,22 @@ mod tests {
     }
 
     /// The liveness bound of `test_recv_stress_no_stall` and
-    /// `test_recv_stress_tolerates_slow_call` (gate g107, q2).
+    /// `test_recv_stress_tolerates_slow_call` (gate g107, q2).  It is not a
+    /// latency bound: a stalled call never returns without traffic, so any
+    /// value detects a stall; the bound only sets how long the receiver
+    /// thread must make no progress before the run fails.
     #[cfg(unix)]
     const RECV_STRESS_LIVENESS: Duration = Duration::from_secs(10);
 
-    /// Unix only: the stall this guards against is an op left in flight by
-    /// a batching engine.  `windows_unbatched` is a loop of non-blocking
-    /// `recv_from` calls with nothing in flight, so on Windows the test only
-    /// measures scheduler preemption, which on a loaded VM exceeds STALL.
+    /// zipline#117: a batch receive must never leave an operation in flight
+    /// that makes the call wait for traffic that has not arrived.  Unix only:
+    /// `windows_unbatched` is a loop of non-blocking `recv_from` calls with
+    /// nothing in flight, so it cannot stall this way.  The test checks
+    /// liveness, not latency: a slow call on a loaded runner passes (see
+    /// `test_recv_stress_tolerates_slow_call`, zl-zipline#261).
     #[cfg(unix)]
     #[test]
     fn test_recv_stress_no_stall() {
-        // zipline#117: a batch receive on an empty or partly-filled socket
-        // must never block the calling thread waiting for traffic that has
-        // not arrived.
-        //
         // On the io_uring engine, each batch op was paired with an
         // AsyncCancel and the engine waited for every completion, relying on
         // each cancel finding its op.  A cancel can return -ENOENT while its
@@ -2569,7 +2614,8 @@ mod tests {
         // sibling op then consumed, and re-armed its poll), leaving
         // submit_and_wait() blocked until the next unrelated datagram
         // completes the op -- observed as ~600 ms fastpath stalls in the
-        // netns integration tier.  `run_recv_stress` reproduces that load.
+        // netns integration tier.  `run_recv_stress` reproduces that load
+        // and fails if a call returns only when new traffic arrives.
 
         // Iterate posix_unbatched (the control engine) first, so an io_uring
         // failure does not mask its result.
@@ -2609,7 +2655,7 @@ mod tests {
         match run_recv_stress(&mut bio, Duration::from_millis(500)) {
             Ok(stats) => panic!("an injected stall went undetected: {stats:?}"),
             Err(err) => assert!(
-                err.contains("stall"),
+                err.contains("] stall: datagram"),
                 "the run must fail with a stall, not: {err}"
             ),
         }

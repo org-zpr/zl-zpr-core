@@ -87,10 +87,7 @@ REPORT_RELAY_UP='reported Zode link states to the visa service: \[.*relay=Up'
 REJOIN='rejoining \(J10\)'
 # J11: a failed rebind (mgmt/node.rs rebind_failed).
 REBIND_FAILED='its rebind onto visa [0-9]+ failed'
-# Gap 7: a Stream ID Request refused as not from the visa's previous hop
-# (mgmt/node.rs prepare_next_hop_bind), and the counter of every refusal.
-PREV_HOP_REFUSED="refusing Stream ID Request from .*: not the visa's previous hop"
-REJECTED='Stream ID Request Rejected'
+# Gap 7's refusal, PREV_HOP_REFUSED, is in lib/zode_funcs.sh.
 
 if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
@@ -115,8 +112,7 @@ if [[ "$PASS" == 0 ]]; then
   assert_no_log zb.log "$REJOIN" "zb has not rejoined" || PASS=1
   # Gap 7: the join, both directions and J11 ran under the previous-hop
   # check, and no Stream ID Request was refused on either Zode.
-  assert_counter_zero relay "$REJECTED" || PASS=1
-  assert_counter_zero zb "$REJECTED" || PASS=1
+  assert_no_refusals relay zb || PASS=1
 
   echo "== 2. zb restarts on the same address"
   UP_REPORTS=$(log_count relay.log "$REPORT_ZB_UP")

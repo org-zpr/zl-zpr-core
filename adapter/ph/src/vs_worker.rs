@@ -504,14 +504,11 @@ async fn wait_for_runloop_start(
 mod tests {
     use super::*;
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
-    use libnode::vsconn::VSConn;
+    use crate::fake_vs::{FakeVsState, eventually, start_vsconn};
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::time::Duration;
     use tokio::task::LocalSet;
-    use zpr::vsapi::v1 as vsapi2;
-    use zpr::vsapi_types::ApiResponseError;
-    use zpr::write_to::WriteTo;
 
     // ------------------------------------------------------------------
     // zipline#167 defect 2: after a failed VSS registration the node must
@@ -521,203 +518,12 @@ mod tests {
     // CommandFailed("connect called but already connected to VS-API") and
     // the node never re-registers — the wedge from the issue log.
     //
-    // The fake VS below implements just enough of the VS-API — connect →
-    // challenge → authenticate, register_vss, notify_disconnect, ping — to
-    // fail registration a configurable number of times and observe whether
-    // the node's retry ever reaches registration again.
+    // The fake VS ([crate::fake_vs]) implements just enough of the VS-API
+    // — connect → challenge → authenticate, register_vss,
+    // notify_disconnect, ping — to fail registration a configurable number
+    // of times and observe whether the node's retry ever reaches
+    // registration again.
     // ------------------------------------------------------------------
-
-    /// Shared observable state of the fake visa service.
-    #[derive(Default)]
-    struct FakeVsState {
-        /// How many `register_vss` calls arrived.
-        register_calls: u32,
-        /// Fail this many leading `register_vss` calls with Internal —
-        /// the error the real VS returns when the VS→VSS visa mint denies.
-        fail_registers: u32,
-        /// When set, `notify_disconnect` fails with AuthRequired, like the
-        /// real VS once it has already dropped the node (issue log).
-        fail_notify_disconnect: bool,
-        /// Set when a `register_vss` call succeeds.
-        register_succeeded: bool,
-        /// How many VS-API connections (TCP) the fake accepted.
-        connections: u32,
-        /// Every `connect`, in order: true for `reconnect`, false for
-        /// `reset` (zl-zipline#252, R16).
-        connects: Vec<bool>,
-        /// When set, a `reconnect` is refused with this code (R16).
-        refuse_reconnect: Option<zpr::vsapi_types::ErrorCode>,
-        /// When set, every `authenticate` fails with AuthError.
-        fail_auth: bool,
-    }
-
-    struct FakeVs {
-        state: Rc<RefCell<FakeVsState>>,
-    }
-    struct FakeVsGate {
-        state: Rc<RefCell<FakeVsState>>,
-    }
-    struct FakeVsHandle {
-        state: Rc<RefCell<FakeVsState>>,
-    }
-
-    impl vsapi2::visa_service::Server for FakeVs {
-        async fn connect(
-            self: Rc<Self>,
-            params: vsapi2::visa_service::ConnectParams,
-            mut results: vsapi2::visa_service::ConnectResults,
-        ) -> Result<(), capnp::Error> {
-            let req = zpr::vsapi_types::VSConnectRequest::try_from(params.get()?.get_req()?)
-                .map_err(|e| capnp::Error::failed(format!("{e:?}")))?;
-            let reconnect = matches!(req.ctype, zpr::vsapi_types::ConnectType::Reconnect);
-            let refusal = {
-                let mut st = self.state.borrow_mut();
-                st.connects.push(reconnect);
-                st.refuse_reconnect.clone().filter(|_| reconnect)
-            };
-            if let Some(code) = refusal {
-                let mut err = results.get().init_resp().init_error();
-                ApiResponseError::new_code_msg(code, "refusing reconnect").write_to(&mut err);
-                return Ok(());
-            }
-            let gate: vsapi2::v_s_gate::Client = capnp_rpc::new_client(FakeVsGate {
-                state: self.state.clone(),
-            });
-            results.get().init_resp().set_ok(gate)?;
-            Ok(())
-        }
-    }
-
-    impl vsapi2::v_s_gate::Server for FakeVsGate {
-        async fn challenge(
-            self: Rc<Self>,
-            _params: vsapi2::v_s_gate::ChallengeParams,
-            mut results: vsapi2::v_s_gate::ChallengeResults,
-        ) -> Result<(), capnp::Error> {
-            let mut chal = results.get().init_challenge();
-            chal.set_alg(vsapi2::ChallengeAlg::RsaSha256Pkcs1v15);
-            chal.set_bytes(b"fake-challenge");
-            Ok(())
-        }
-
-        async fn authenticate(
-            self: Rc<Self>,
-            _params: vsapi2::v_s_gate::AuthenticateParams,
-            mut results: vsapi2::v_s_gate::AuthenticateResults,
-        ) -> Result<(), capnp::Error> {
-            if self.state.borrow().fail_auth {
-                let mut err = results.get().init_res().init_error();
-                ApiResponseError::new_code_msg(
-                    zpr::vsapi_types::ErrorCode::AuthError,
-                    "fake auth failure",
-                )
-                .write_to(&mut err);
-                return Ok(());
-            }
-            let handle: vsapi2::v_s_handle::Client = capnp_rpc::new_client(FakeVsHandle {
-                state: self.state.clone(),
-            });
-            results.get().init_res().set_ok(handle)?;
-            Ok(())
-        }
-    }
-
-    impl vsapi2::v_s_handle::Server for FakeVsHandle {
-        async fn register_vss(
-            self: Rc<Self>,
-            _params: vsapi2::v_s_handle::RegisterVssParams,
-            mut results: vsapi2::v_s_handle::RegisterVssResults,
-        ) -> Result<(), capnp::Error> {
-            let mut st = self.state.borrow_mut();
-            st.register_calls += 1;
-            if st.register_calls <= st.fail_registers {
-                let mut err = results.get().init_res().init_error();
-                ApiResponseError::new_code_msg(
-                    zpr::vsapi_types::ErrorCode::Internal,
-                    "failed to initialize node VSS",
-                )
-                .write_to(&mut err);
-            } else {
-                st.register_succeeded = true;
-                results.get().init_res().initn_ok(0);
-            }
-            Ok(())
-        }
-
-        async fn notify_disconnect(
-            self: Rc<Self>,
-            _params: vsapi2::v_s_handle::NotifyDisconnectParams,
-            mut results: vsapi2::v_s_handle::NotifyDisconnectResults,
-        ) -> Result<(), capnp::Error> {
-            let fail = self.state.borrow().fail_notify_disconnect;
-            if fail {
-                let mut err = results.get().init_res().init_error();
-                ApiResponseError::new_code_msg(
-                    zpr::vsapi_types::ErrorCode::AuthRequired,
-                    "node is no longer connected; re-authenticate",
-                )
-                .write_to(&mut err);
-            } else {
-                results.get().init_res().set_ok(());
-            }
-            Ok(())
-        }
-
-        async fn ping(
-            self: Rc<Self>,
-            _params: vsapi2::v_s_handle::PingParams,
-            mut results: vsapi2::v_s_handle::PingResults,
-        ) -> Result<(), capnp::Error> {
-            results.get().init_res().set_ok(());
-            Ok(())
-        }
-    }
-
-    /// Spawn the fake VS: TLS + capnp RPC, bootstrap capability is a
-    /// [FakeVs]. Returns the bound address and the shared state. Mirrors
-    /// the libnode2 test helper (vsconn.rs).
-    async fn spawn_fake_vs(state: FakeVsState) -> (std::net::SocketAddr, Rc<RefCell<FakeVsState>>) {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-        use tokio_util::compat::*;
-
-        let state = Rc::new(RefCell::new(state));
-
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let chain = vec![CertificateDer::from(cert.cert.der().clone())];
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(chain, key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server_state = state.clone();
-        tokio::task::spawn_local(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                server_state.borrow_mut().connections += 1;
-                let acceptor = acceptor.clone();
-                let state = server_state.clone();
-                tokio::task::spawn_local(async move {
-                    let Ok(tls) = acceptor.accept(sock).await else {
-                        return;
-                    };
-                    let (reader, writer) = tokio::io::split(tls);
-                    let network = capnp_rpc::twoparty::VatNetwork::new(
-                        tokio::io::BufReader::new(reader).compat(),
-                        tokio::io::BufWriter::new(writer).compat_write(),
-                        capnp_rpc::rpc_twoparty_capnp::Side::Server,
-                        capnp::message::ReaderOptions::new(),
-                    );
-                    let vs: vsapi2::visa_service::Client = capnp_rpc::new_client(FakeVs { state });
-                    let rpc = capnp_rpc::RpcSystem::new(Box::new(network), Some(vs.client));
-                    let _ = rpc.await;
-                });
-            }
-        });
-        (addr, state)
-    }
 
     /// Stand up the whole pair — real VSConn against the fake VS, the real
     /// `vs_worker::launch` driving it — and wait for `register_vss` to
@@ -737,21 +543,7 @@ mod tests {
         VSConnHandle,
         tokio::task::JoinHandle<()>,
     ) {
-        let (vs_addr, state) = spawn_fake_vs(state).await;
-
-        let mut vsconn = VSConn::new(
-            16,
-            vs_addr,
-            "test-node".to_string(),
-            aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
-                .expect("test RSA key"),
-            "127.0.0.1:5000".parse().unwrap(),
-        );
-        let lifecycle_rx = vsconn.subscribe_lifecycle_events();
-        let vs_handle = vsconn.handle();
-        let _vsconn_task = tokio::task::spawn_local(async move {
-            vsconn.run_with_reconnect(Duration::from_millis(50)).await
-        });
+        let (state, vs_handle, lifecycle_rx) = start_vsconn(state).await;
 
         let node_zpr_addr: IpAddr = NODE_ADDR.parse().unwrap();
         let vss_addr: SocketAddr = SocketAddr::new(node_zpr_addr, 8183);
@@ -763,17 +555,6 @@ mod tests {
             lifecycle_rx,
         ));
         (state, vs_handle, worker)
-    }
-
-    /// Wait up to `window` for `done` to hold; true if it did.
-    async fn eventually(window: Duration, mut done: impl FnMut() -> bool) -> bool {
-        tokio::time::timeout(window, async {
-            while !done() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .is_ok()
     }
 
     async fn run_worker_until_registered(
@@ -1154,7 +935,7 @@ mod tests {
                 let mut handoff_rx = asm.bootstrap_handoff.subscribe();
 
                 // A VSConn with no run loop and a one-slot queue, already full.
-                let vsconn = VSConn::new(
+                let vsconn = libnode::vsconn::VSConn::new(
                     1,
                     "127.0.0.1:1".parse().unwrap(),
                     "test-node".to_string(),

@@ -68,6 +68,9 @@ pub mod zprtun;
 #[cfg(test)]
 mod km_testdata;
 
+#[cfg(test)]
+mod fake_vs;
+
 /// Re-export test modules for fuzzing when feature is enabled
 #[cfg(feature = "fuzzing")]
 pub use assembly::test;

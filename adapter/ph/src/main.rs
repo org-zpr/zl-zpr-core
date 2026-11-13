@@ -78,6 +78,9 @@ mod zprtun;
 #[cfg(test)]
 mod km_testdata;
 
+#[cfg(test)]
+mod fake_vs;
+
 use assembly::{Assembly, PhMode, SelfAddressError};
 use capture_worker::CaptureWorker;
 use fastpath::FastpathWorkerConfig;

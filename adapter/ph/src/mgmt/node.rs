@@ -873,6 +873,12 @@ fn abandon_next_hop_bind(
 ///
 /// - A bind on another link waiting on `lost` as its next hop is refused:
 ///   its requestor gets an error at once, instead of never hearing back.
+///   Its visa is revoked locally as well (F3: losing either side revokes),
+///   exactly as a finished binding over `lost` is by `revoke_for_link`.
+///   The visa has no binding yet, so `revoke_for_link` did not see it; left
+///   cached, it would match the requestor's next bind, which would then be
+///   refused for want of an egress link instead of asking for a new visa
+///   (F6). The visa itself is never edited, only removed.
 /// - A next-hop bind on another link issued for a bind from `lost` is
 ///   marked abandoned, so its answer cannot reach whatever peer takes the
 ///   link ID next.
@@ -880,15 +886,21 @@ fn abandon_next_hop_bind(
 /// Sends, so never call it under the visa-table lock (zipline#9).
 pub fn clear_pending_binds_for_lost_link(asm: &Arc<Assembly>, lost: LinkId) {
     let mut refuse = Vec::new();
+    let mut revoke = Vec::new();
     asm.peer_table.for_each(|(link_id, peer)| {
         if link_id.get() == lost {
             return;
         }
         for st in peer.node_state.bind_request_state.iter() {
-            if let BindRequestState::AwaitingNextHopBind { egress_link_id, .. } = st.value()
+            if let BindRequestState::AwaitingNextHopBind {
+                visa_id,
+                egress_link_id,
+                ..
+            } = st.value()
                 && egress_link_id.get() == lost
             {
                 refuse.push((link_id, *st.key()));
+                revoke.push(*visa_id);
             }
         }
         for mut originator in peer.node_state.awaiting_next_hop_bind_table.iter_mut() {
@@ -897,6 +909,29 @@ pub fn clear_pending_binds_for_lost_link(asm: &Arc<Assembly>, lost: LinkId) {
             }
         }
     });
+    // Revoke before refusing, so a requestor that retries at once already
+    // misses. This node's own visas (below MIN_VISA_ID) are spared, as in
+    // `revoke_for_link`. Revoke under the visa-table write lock, but
+    // withdraw only after it is released: the send path takes the peer's
+    // `zdpr_send` mutex, which must never nest under it (zipline#9). A
+    // pending bind has no binding of its own, so anything withdrawn here
+    // belongs to another binding of the same visa.
+    revoke.retain(|visa_id| *visa_id >= config::MIN_VISA_ID);
+    if !revoke.is_empty() {
+        let mut withdrawn = Vec::new();
+        {
+            let mut visa_table = asm.visa_table.write().unwrap();
+            for visa_id in revoke {
+                info!(target: FLOW_MGMT, "revoking visa {visa_id}: its pending bind lost next hop {}",
+                    asm.formatted_link_id(lost));
+                // `revoke` treats a visa that is already gone as revoked.
+                if let Ok(entries) = visa_table.revoke(&asm.peer_table, visa_id) {
+                    withdrawn.extend(entries);
+                }
+            }
+        }
+        asm.withdraw_streams(withdrawn, Some(lost));
+    }
     // Refuse outside the peer-table walk: bind_reject looks peers up and
     // sends.
     for (link_id, txn_id) in refuse {
@@ -1648,6 +1683,42 @@ mod tests {
 
         assert_only_stream_id_error_response(&mut egress_rx, link_a);
         assert!(no_bind_state(&asm, link_a));
+    }
+
+    /// F3 for a bind that has not finished (core#110 review, g93): when a
+    /// pending bind is refused because its next hop B was lost, its visa is
+    /// revoked locally too, as a finished binding's would be. The visa had
+    /// no binding yet, so `revoke_for_link` alone left it cached, and every
+    /// later bind matched it and was refused for want of an egress link.
+    /// Now the next bind misses and asks the visa service for a visa (F6).
+    #[tokio::test]
+    async fn test_losing_the_next_hop_link_revokes_the_pending_binds_visa() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
+                let link_a = NonZero::new(add_peer(&asm, LinkType::NodeToNode, 1)).unwrap();
+                let link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
+                request_stream(&asm, link_a, 7, VISA_ID);
+                assert!(
+                    try_recv_packet(&mut egress_rx).is_some(),
+                    "a StreamIdRequest to B"
+                );
+
+                asm.drop_peer(link_b);
+
+                assert_only_stream_id_error_response(&mut egress_rx, link_a.get());
+                assert!(!asm.visa_table.read().unwrap().contains(VISA_ID));
+
+                let asked = &asm.counters.management[ManagementCounterType::VisaByIdRequested];
+                let before = asked.get_count();
+                request_stream(&asm, link_a, 8, VISA_ID);
+                assert_eq!(
+                    asked.get_count(),
+                    before + 1,
+                    "the next bind asks the visa service"
+                );
+            })
+            .await
     }
 
     /// R9, pending binds from a lost link (zl-zipline#251): A's bind is

@@ -1719,7 +1719,7 @@ pub mod tests {
         };
         assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7101));
         assert!(visa_table.bindings(7100).is_empty());
-        assert_eq!(visa_table.bindings(7101), &[moved.clone()]);
+        assert_eq!(visa_table.bindings(7101), std::slice::from_ref(&moved));
         assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 43), 7101)));
         assert_eq!(asm.peer_table.get(link_a).unwrap().pft.len(), 1);
         assert!(

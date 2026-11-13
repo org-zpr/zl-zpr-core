@@ -147,6 +147,10 @@ pub enum ManagementCounterType {
     VisaRequestSuccess,
     VisaRequestDenied,
     VisaRequestError,
+
+    /// J11 (zl-zipline#252): a live stream could not be moved onto the
+    /// visa that supersedes its own, and stays on the old visa.
+    RebindFailed,
 }
 
 impl FastpathCounterType {
@@ -239,6 +243,7 @@ impl ManagementCounterType {
             Self::VisaRequestSuccess => "Visa Request Success",
             Self::VisaRequestDenied => "Visa Request Denied",
             Self::VisaRequestError => "Visa Request Error",
+            Self::RebindFailed => "Rebind Failed",
         }
     }
 }

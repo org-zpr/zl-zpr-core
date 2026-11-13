@@ -243,7 +243,8 @@ pub async fn actor_disconnect(asm: Arc<Assembly>, addr: IpAddress) {
 /// defence in depth, and it catches a misconfigured relay early.
 ///
 /// This is the single entry point for visas from the visa service, pushed or
-/// pulled. A visa whose shape does not match its type is refused with
+/// pulled, so it is also where a newer visa for a live flow's five-tuple
+/// starts the J11 supersede and rebind (zl-zipline#252). A visa whose shape does not match its type is refused with
 /// [VisaTableError::ParseError].
 ///
 /// [VisaTableError::ForwardingDisabled]: visa_table::VisaTableError::ForwardingDisabled
@@ -270,13 +271,33 @@ pub fn insert_visa(
         ));
     }
 
-    let visa_id = asm.visa_table.write().unwrap().insert_visa(visa)?;
+    // J11 (zl-zipline#252): a new visa with the same five-tuple as one
+    // held may supersede it. Only a fresh insert can: installing an ID
+    // already held is a no-op, and must not start a second rebind.
+    let (visa_id, superseded) = {
+        let mut visa_table = asm.visa_table.write().unwrap();
+        let fresh = !visa_table.contains(visa.issuer_id);
+        let visa_id = visa_table.insert_visa(visa)?;
+        let superseded = if fresh {
+            visa_table.supersedes(visa_id)
+        } else {
+            None
+        };
+        (visa_id, superseded)
+    };
 
     if let Some(next_hop) = next_hop
         && asm.find_egress_link(next_hop.into()).is_none()
     {
         warn!(target: VISA_MGMT,
             "visa {visa_id}: no egress link to next hop {next_hop} yet; storing it anyway");
+    }
+
+    // The superseded visa still has live streams: move the ones this Zode
+    // is the ingress of. That sends, so only now that the lock is released
+    // (zipline#9).
+    if let Some(old) = superseded {
+        crate::mgmt::node::rebind_ingress_streams(asm, old, visa_id);
     }
     Ok(visa_id)
 }

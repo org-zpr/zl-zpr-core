@@ -2244,6 +2244,313 @@ mod tests {
         }
     }
 
+    /// Batch size of every `run_recv_stress` receive call.
+    #[cfg(unix)]
+    const RECV_STRESS_BATCH: usize = 64;
+
+    /// Number of sequenced datagrams one `run_recv_stress` run sends.
+    #[cfg(unix)]
+    const RECV_STRESS_DATAGRAMS: u64 = 1000;
+
+    /// The datagram count after which a `FaultyEngine` fires its one fault:
+    /// midway through a `run_recv_stress` run.
+    #[cfg(unix)]
+    const RECV_STRESS_FAULT_AFTER: usize = RECV_STRESS_DATAGRAMS as usize / 2;
+
+    /// What a `FaultyEngine` does in its one faulty batch receive call.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        /// Receive the batch, sleep for the given time, then return it
+        /// normally.  This simulates scheduler preemption of the calling
+        /// thread on a loaded runner: slow, but not stalled.
+        SlowOnce(Duration),
+        /// Receive the batch, then block in `poll(2)` until another datagram
+        /// arrives on the socket, then return the batch.  This simulates the
+        /// zipline#117 stall: an op left in flight makes the call return
+        /// only when unrelated traffic arrives.
+        StallOnce,
+    }
+
+    /// Test-only batch I/O engine: `posix_unbatched` with one injected fault.
+    ///
+    /// Every operation delegates to `posix_unbatched`.  The first
+    /// `try_recv_buf_from_batch` call that brings the number of received
+    /// datagrams to `fault_after` or more applies `fault` (see `Fault`) to
+    /// that call; every other call is unchanged.  It lets the stress test
+    /// prove both that a slow call is tolerated and that a real stall is
+    /// detected, without timing-dependent behaviour of a real engine.
+    #[cfg(unix)]
+    struct FaultyEngine {
+        inner: posix_unbatched::BatchIo,
+        fault: Fault,
+        fault_after: usize,
+        received: usize,
+        fired: bool,
+    }
+
+    #[cfg(unix)]
+    impl FaultyEngine {
+        /// Wrap a new `posix_unbatched` engine of `entries` entries that
+        /// applies `fault` once, after `fault_after` received datagrams.
+        fn new(entries: usize, fault: Fault, fault_after: usize) -> Self {
+            Self {
+                inner: posix_unbatched::BatchIo::new(entries).unwrap(),
+                fault,
+                fault_after,
+                received: 0,
+                fired: false,
+            }
+        }
+
+        /// Wrap a new faulty engine as a `BatchIo`, the type the stress test
+        /// drives.
+        fn instantiate(entries: usize, fault: Fault, fault_after: usize) -> BatchIo {
+            BatchIo(Box::new(Self::new(entries, fault, fault_after)))
+        }
+
+        /// Apply the fault to the current call if it is due: called after
+        /// the inner receive returned `new` datagrams on `handle`.
+        fn maybe_fire(&mut self, handle: WaitHandle<'_>, new: usize) {
+            self.received += new;
+            if self.fired || new == 0 || self.received < self.fault_after {
+                return;
+            }
+            self.fired = true;
+            match self.fault {
+                Fault::SlowOnce(delay) => std::thread::sleep(delay),
+                Fault::StallOnce => {
+                    // Hold the received batch until the next datagram is
+                    // readable.  The datagram stays queued for the next call.
+                    let mut fds = [nix::poll::PollFd::new(
+                        handle.as_fd(),
+                        nix::poll::PollFlags::POLLIN,
+                    )];
+                    nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE).unwrap();
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl BatchIoImpl for FaultyEngine {
+        fn engine_name(&self) -> &'static str {
+            match self.fault {
+                Fault::SlowOnce(_) => "posix_unbatched+slow_once",
+                Fault::StallOnce => "posix_unbatched+stall_once",
+            }
+        }
+
+        fn try_write_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = &'a [u8]>,
+            results: &mut Vec<Result<usize>>,
+        ) -> Result<usize> {
+            self.inner.try_write_batch(handle, bufs, results)
+        }
+
+        fn try_read_buf_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+            results: &mut Vec<Result<usize>>,
+        ) -> Result<usize> {
+            self.inner.try_read_buf_batch(handle, bufs, results)
+        }
+
+        fn try_send_to_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, SendFlags)>,
+            results: &mut Vec<Result<usize>>,
+        ) -> Result<usize> {
+            self.inner.try_send_to_batch(handle, bufs, results)
+        }
+
+        fn try_send_to_from_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
+            results: &mut Vec<Result<usize>>,
+        ) -> Result<usize> {
+            self.inner.try_send_to_from_batch(handle, bufs, results)
+        }
+
+        /// Delegate, then apply the fault if this call is the faulty one.
+        fn try_recv_buf_from_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+            results: &mut Vec<Result<ReceivedPacket>>,
+        ) -> Result<usize> {
+            let n = self.inner.try_recv_buf_from_batch(handle, bufs, results)?;
+            self.maybe_fire(handle, n);
+            Ok(n)
+        }
+
+        /// Delegate, then apply the fault if this call is the faulty one.
+        fn try_recv_buf_from_to_batch<'a>(
+            &mut self,
+            handle: WaitHandle<'_>,
+            bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+            results: &mut Vec<Result<ReceivedPacket>>,
+        ) -> Result<usize> {
+            let n = self
+                .inner
+                .try_recv_buf_from_to_batch(handle, bufs, results)?;
+            self.maybe_fire(handle, n);
+            Ok(n)
+        }
+    }
+
+    /// What one successful `run_recv_stress` run measured.
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct RecvStressStats {
+        /// The longest single batch receive call of the run.
+        max_call: Duration,
+    }
+
+    /// Drive `bio` through the receive stress run of zipline#117 and report
+    /// the first failure as `Err`, naming the engine.
+    ///
+    /// The sender sends sequenced datagrams one at a time at randomized
+    /// sub-millisecond offsets while the receiver busy-loops
+    /// `RECV_STRESS_BATCH`-op batch receives on the otherwise empty socket,
+    /// so datagrams keep arriving inside a batch call.  The receiver acks
+    /// each newly-seen datagram; the sender sends the next only on an ack,
+    /// or after GAP if the ack never comes (i.e. the receiver is blocked
+    /// inside a batch call).  Any batch call taking STALL or longer fails
+    /// the run, as does any datagram that is never returned.
+    ///
+    /// `_liveness` is not used yet: the STALL timer still decides.
+    #[cfg(unix)]
+    fn run_recv_stress(
+        bio: &mut BatchIo,
+        _liveness: Duration,
+    ) -> std::result::Result<RecvStressStats, String> {
+        const STALL: Duration = Duration::from_millis(50);
+        const GAP: Duration = Duration::from_millis(100);
+        const HEARTBEAT: u64 = u64::MAX;
+
+        let engine_name = bio.engine_name();
+
+        let inq = udp_socket().unwrap();
+        let outq = udp_socket().unwrap();
+        inq.set_nonblocking(true).unwrap();
+        outq.set_nonblocking(true).unwrap();
+        inq.connect(outq.local_addr().unwrap()).unwrap();
+
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let sender_stop = stop.clone();
+        let sender = std::thread::spawn(move || {
+            let mut rng = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos() as u64
+                | 1;
+
+            let mut seq = 0u64;
+            while seq < RECV_STRESS_DATAGRAMS
+                && !sender_stop.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // One datagram at a randomized sub-millisecond offset, to
+                // land it at an arbitrary point of the receiver's batch
+                // calls; then wait for its ack before the next, so that a
+                // stall shows up as a >= GAP batch call instead of being
+                // cut short by the following datagram.
+                std::thread::sleep(Duration::from_micros(xorshift(&mut rng) % 700));
+                inq.send(&seq.to_le_bytes()).unwrap();
+                seq += 1;
+                let _ = ack_rx.recv_timeout(GAP);
+            }
+
+            // Keep the receiver unblockable while it drains the last
+            // bursts: a stalled batch call only returns when the next
+            // datagram arrives.
+            while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                inq.send(&HEARTBEAT.to_le_bytes()).unwrap();
+                std::thread::sleep(GAP);
+            }
+        });
+
+        let mut seen = vec![false; RECV_STRESS_DATAGRAMS as usize];
+        let mut nseen = 0usize;
+        let mut max_elapsed = Duration::ZERO;
+        let mut bufs = vec![Vec::with_capacity(64); RECV_STRESS_BATCH];
+        let mut results = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+
+        let outcome = loop {
+            if nseen == RECV_STRESS_DATAGRAMS as usize {
+                break Ok(RecvStressStats {
+                    max_call: max_elapsed,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                break Err(format!(
+                    "[{engine_name}] lost datagram(s): only {nseen} of \
+                     {RECV_STRESS_DATAGRAMS} received"
+                ));
+            }
+
+            bufs.iter_mut().for_each(|b| b.clear());
+            results.clear();
+
+            let start = std::time::Instant::now();
+            match bio.try_recv_buf_from_batch(&outq, bufs.iter_mut(), &mut results) {
+                Ok(_) => (),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(err) => break Err(format!("[{engine_name}] batch receive failed: {err}")),
+            }
+            let elapsed = start.elapsed();
+            max_elapsed = max_elapsed.max(elapsed);
+
+            if elapsed >= STALL {
+                break Err(format!(
+                    "[{engine_name}] stall: batch receive blocked for {elapsed:?} \
+                     (>= {STALL:?}) after {nseen} of {RECV_STRESS_DATAGRAMS} datagrams: \
+                     an operation was left in flight and the engine waited for traffic \
+                     that had not arrived"
+                ));
+            }
+
+            for (buf, result) in bufs.iter().zip(results.drain(..)) {
+                let Ok(packet) = result else { continue };
+                assert_eq!(packet.size, 8, "[{engine_name}] short datagram");
+                let seq = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                if seq == HEARTBEAT || seq as usize >= seen.len() {
+                    continue;
+                }
+                if !seen[seq as usize] {
+                    seen[seq as usize] = true;
+                    nseen += 1;
+                    let _ = ack_tx.send(());
+                }
+            }
+        };
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        sender.join().unwrap();
+
+        if let Ok(stats) = &outcome {
+            println!(
+                "engine {engine_name}: received all {RECV_STRESS_DATAGRAMS} datagrams, \
+                 max batch call {:?}",
+                stats.max_call
+            );
+        }
+        outcome
+    }
+
+    /// The liveness bound of `test_recv_stress_no_stall` and
+    /// `test_recv_stress_tolerates_slow_call` (gate g107, q2).
+    #[cfg(unix)]
+    const RECV_STRESS_LIVENESS: Duration = Duration::from_secs(10);
+
     /// Unix only: the stall this guards against is an op left in flight by
     /// a batching engine.  `windows_unbatched` is a loop of non-blocking
     /// `recv_from` calls with nothing in flight, so on Windows the test only
@@ -2262,130 +2569,53 @@ mod tests {
         // sibling op then consumed, and re-armed its poll), leaving
         // submit_and_wait() blocked until the next unrelated datagram
         // completes the op -- observed as ~600 ms fastpath stalls in the
-        // netns integration tier.
-        //
-        // Reproduce: the sender sends sequenced datagrams one at a time at
-        // randomized sub-millisecond offsets while the receiver busy-loops
-        // 64-op batch receives on the otherwise empty socket, so datagrams
-        // keep arriving inside the submit/cancel window.  The receiver acks
-        // each newly-seen datagram; the sender sends the next only on an
-        // ack, or after GAP if the ack never comes (i.e. the receiver is
-        // blocked inside a batch call).  A stalled call is thus always
-        // unblocked by a later datagram, its duration is measured, and no
-        // datagram can paper over a preceding one's stall.  Any batch call
-        // taking STALL or longer fails the test, as does any datagram that
-        // is never returned.
-
-        const BATCH: usize = 64;
-        const NDATAGRAMS: u64 = 1000;
-        const STALL: Duration = Duration::from_millis(50);
-        const GAP: Duration = Duration::from_millis(100);
-        const HEARTBEAT: u64 = u64::MAX;
+        // netns integration tier.  `run_recv_stress` reproduces that load.
 
         // Iterate posix_unbatched (the control engine) first, so an io_uring
         // failure does not mask its result.
         for engine in ENGINES.iter().rev() {
-            let engine_name = engine.engine_name();
-
-            let inq = udp_socket().unwrap();
-            let outq = udp_socket().unwrap();
-            inq.set_nonblocking(true).unwrap();
-            outq.set_nonblocking(true).unwrap();
-            inq.connect(outq.local_addr().unwrap()).unwrap();
-
-            let mut bio = engine.instantiate(BATCH).unwrap();
-
-            let (ack_tx, ack_rx) = std::sync::mpsc::channel::<()>();
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-            let sender_stop = stop.clone();
-            let sender = std::thread::spawn(move || {
-                let mut rng = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .subsec_nanos() as u64
-                    | 1;
-
-                let mut seq = 0u64;
-                while seq < NDATAGRAMS {
-                    // One datagram at a randomized sub-millisecond offset, to
-                    // land it at an arbitrary point of the receiver's batch
-                    // calls; then wait for its ack before the next, so that a
-                    // stall shows up as a >= GAP batch call instead of being
-                    // cut short by the following datagram.
-                    std::thread::sleep(Duration::from_micros(xorshift(&mut rng) % 700));
-                    inq.send(&seq.to_le_bytes()).unwrap();
-                    seq += 1;
-                    let _ = ack_rx.recv_timeout(GAP);
-                }
-
-                // Keep the receiver unblockable while it drains the last
-                // bursts: a stalled batch call only returns when the next
-                // datagram arrives.
-                while !sender_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    inq.send(&HEARTBEAT.to_le_bytes()).unwrap();
-                    std::thread::sleep(GAP);
-                }
-            });
-
-            let mut seen = vec![false; NDATAGRAMS as usize];
-            let mut nseen = 0usize;
-            let mut max_elapsed = Duration::ZERO;
-            let mut bufs = vec![Vec::with_capacity(64); BATCH];
-            let mut results = Vec::new();
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
-
-            while nseen < NDATAGRAMS as usize {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "[{engine_name}] lost datagram(s): only {nseen} of {NDATAGRAMS} received"
-                );
-
-                bufs.iter_mut().for_each(|b| b.clear());
-                results.clear();
-
-                let start = std::time::Instant::now();
-                match bio.try_recv_buf_from_batch(&outq, bufs.iter_mut(), &mut results) {
-                    Ok(_) => (),
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
-                    Err(err) => panic!("[{engine_name}] batch receive failed: {err}"),
-                }
-                let elapsed = start.elapsed();
-                max_elapsed = max_elapsed.max(elapsed);
-
-                assert!(
-                    elapsed < STALL,
-                    "[{engine_name}] batch receive blocked for {elapsed:?} (>= {STALL:?}) \
-                     after {nseen} of {NDATAGRAMS} datagrams: an operation was left in \
-                     flight and the engine waited for traffic that had not arrived"
-                );
-
-                for (buf, result) in bufs.iter().zip(results.drain(..)) {
-                    let Ok(packet) = result else { continue };
-                    assert_eq!(packet.size, 8, "[{engine_name}] short datagram");
-                    let seq = u64::from_le_bytes(buf[..8].try_into().unwrap());
-                    if seq == HEARTBEAT || seq as usize >= seen.len() {
-                        continue;
-                    }
-                    if !seen[seq as usize] {
-                        seen[seq as usize] = true;
-                        nseen += 1;
-                        let _ = ack_tx.send(());
-                    }
-                }
+            let mut bio = engine.instantiate(RECV_STRESS_BATCH).unwrap();
+            if let Err(err) = run_recv_stress(&mut bio, RECV_STRESS_LIVENESS) {
+                panic!("{err}");
             }
-
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            sender.join().unwrap();
-
-            println!(
-                "engine {engine_name}: received all {NDATAGRAMS} datagrams, \
-                 max batch call {max_elapsed:?}"
-            );
         }
     }
 
-    /// Minimal PRNG for `test_recv_stress_no_stall`'s send jitter.
+    /// A slow batch call is not a stall: a call that takes 150 ms (simulated
+    /// preemption on a loaded runner, as macOS CI saw) but then returns
+    /// without new traffic must pass the stress run (zl-zipline#261).
+    #[cfg(unix)]
+    #[test]
+    fn test_recv_stress_tolerates_slow_call() {
+        let mut bio = FaultyEngine::instantiate(
+            RECV_STRESS_BATCH,
+            Fault::SlowOnce(Duration::from_millis(150)),
+            RECV_STRESS_FAULT_AFTER,
+        );
+        if let Err(err) = run_recv_stress(&mut bio, RECV_STRESS_LIVENESS) {
+            panic!("a slow but live batch call must not fail the run: {err}");
+        }
+    }
+
+    /// A real stall must still fail: a call that returns its batch only when
+    /// the next datagram arrives (the zipline#117 signature) must make the
+    /// stress run report a stall.  A stalled call never returns without
+    /// traffic, so a short liveness bound detects it as surely as a long one.
+    #[cfg(unix)]
+    #[test]
+    fn test_recv_stress_detects_stall() {
+        let mut bio =
+            FaultyEngine::instantiate(RECV_STRESS_BATCH, Fault::StallOnce, RECV_STRESS_FAULT_AFTER);
+        match run_recv_stress(&mut bio, Duration::from_millis(500)) {
+            Ok(stats) => panic!("an injected stall went undetected: {stats:?}"),
+            Err(err) => assert!(
+                err.contains("stall"),
+                "the run must fail with a stall, not: {err}"
+            ),
+        }
+    }
+
+    /// Minimal PRNG for `run_recv_stress`'s send jitter.
     #[cfg(unix)]
     fn xorshift(state: &mut u64) -> u64 {
         *state ^= *state << 13;

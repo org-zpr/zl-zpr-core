@@ -246,9 +246,18 @@ pub struct VisaTable {
     /// again. When the newest visa goes, the five-tuple has none until the
     /// next one arrives; an older visa never becomes the newest again.
     newest: HashMap<FlowKey, VisaId>,
+    /// J11 (g98): for each dock-PEP five-tuple, how many held visas have
+    /// it. A new visa can supersede a live stream only if another visa
+    /// with its five-tuple is held, so an insert that finds no count here
+    /// skips the scan of the bindings in O(1).
+    held_per_flow: HashMap<FlowKey, usize>,
     pub timeout_queue: BinaryHeap<VisaTimeout>,
     /// The five-tuple lookup, built only from the visas in `current`.
     lookup_table: FiveTupleLookupTable,
+    /// Tests only: how many times [VisaTable::superseded_bindings] scanned
+    /// the bindings, so a test can tell an insert that skipped the scan.
+    #[cfg(test)]
+    binding_scans: std::sync::atomic::AtomicUsize,
 }
 
 /// A dock-PEP five-tuple as a map key (J11): two visas supersede one
@@ -286,8 +295,11 @@ impl VisaTable {
             bindings: HashMap::new(),
             current: HashMap::new(),
             newest: HashMap::new(),
+            held_per_flow: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
             lookup_table: FiveTupleLookupTable::new(),
+            #[cfg(test)]
+            binding_scans: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -359,10 +371,41 @@ impl VisaTable {
     /// effects: no parse, no lookup-table rewrite, no second timeout entry,
     /// and the held visa keeps its bindings (the tenet: visas are immutable).
     pub fn insert_visa(&mut self, visa: vsapi_types::Visa) -> Result<VisaId, VisaTableError> {
+        self.insert(visa).map(|(visa_id, _)| visa_id)
+    }
+
+    /// Insert a visa from the visa service, as [VisaTable::insert_visa],
+    /// and return with its ID the live streams of the visas it supersedes
+    /// (J11, zl-zipline#252), as `(old visa, ingress entry)`: the streams
+    /// to rebind onto it. A visa ID already held supersedes nothing:
+    /// installing it again is a no-op, and must not start a second rebind.
+    pub fn insert_superseding(
+        &mut self,
+        visa: vsapi_types::Visa,
+    ) -> Result<(VisaId, Vec<(VisaId, ForwardingEntry)>), VisaTableError> {
+        let (visa_id, may_supersede) = self.insert(visa)?;
+        // Most inserts are for a five-tuple this Zode holds no other visa
+        // for, and skip the scan of the bindings in O(1) (g98).
+        // ponytail: the remaining scan is linear in the bound visas when a
+        // supersede is possible; zl-zipline#258 indexes the bindings by
+        // five-tuple.
+        let superseded = if may_supersede {
+            self.superseded_bindings(visa_id)
+        } else {
+            Vec::new()
+        };
+        Ok((visa_id, superseded))
+    }
+
+    /// The insert behind [VisaTable::insert_visa]. Returns the visa's ID,
+    /// and whether it may supersede a live stream: true only for a fresh
+    /// visa whose five-tuple another held visa has (see
+    /// [VisaTable::supersede_on_insert]).
+    fn insert(&mut self, visa: vsapi_types::Visa) -> Result<(VisaId, bool), VisaTableError> {
         let visa_id = visa.issuer_id;
         if self.table.contains_key(&visa_id) {
             debug!(target: VISA_MGMT, "visa {visa_id} is already held; dropping the duplicate");
-            return Ok(visa_id);
+            return Ok((visa_id, false));
         }
 
         let expiration = DateTime::from(visa.expires);
@@ -382,11 +425,12 @@ impl VisaTable {
         let ftuple = visa.ftuple;
         self.table.insert(visa_id, visa);
         self.timeout_queue.push(timeout);
-        if let Some(ftuple) = ftuple {
-            self.supersede_on_insert(visa_id, ftuple);
-        }
+        let may_supersede = match ftuple {
+            Some(ftuple) => self.supersede_on_insert(visa_id, ftuple),
+            None => false,
+        };
 
-        Ok(visa_id)
+        Ok((visa_id, may_supersede))
     }
 
     /// J11 (zl-zipline#252): the newly inserted visa `new`, whose dock-PEP
@@ -402,8 +446,15 @@ impl VisaTable {
     ///   caller now rebinds the superseded visas' streams onto `new`
     ///   ([VisaTable::superseded_bindings]). Elsewhere the old binding stays
     ///   until its visa goes.
-    fn supersede_on_insert(&mut self, new: VisaId, ftuple: VsapiFiveTuple) {
+    ///
+    /// Returns whether `new` may supersede a live stream: whether another
+    /// visa with its five-tuple is held. If none is, no scan of the
+    /// bindings is needed.
+    fn supersede_on_insert(&mut self, new: VisaId, ftuple: VsapiFiveTuple) -> bool {
         let key = FlowKey::from(&ftuple);
+        let held = self.held_per_flow.entry(key).or_insert(0);
+        let others_held = *held > 0;
+        *held += 1;
         if let Some(earlier) = self.newest.insert(key, new) {
             info!(target: VISA_MGMT, "visa {new} supersedes visa {earlier}");
         }
@@ -420,6 +471,7 @@ impl VisaTable {
                 info!(target: VISA_MGMT, "the lookup keeps visa {current} until its live streams move onto visa {new}");
             }
         }
+        others_held
     }
 
     /// The dock-PEP five-tuple of the visa `visa_id`, as a key, if it is
@@ -437,11 +489,9 @@ impl VisaTable {
 
     /// J11: if `new` is the newest visa for its five-tuple, every live
     /// stream of the visas it supersedes, as `(old visa, ingress entry)`:
-    /// the streams to rebind onto `new`.
-    ///
-    /// ponytail: a scan of every bound visa; a by-five-tuple index if
-    /// installing visas on a Zode with very many bindings shows up in
-    /// profiles.
+    /// the streams to rebind onto `new`. A scan of every bound visa:
+    /// [VisaTable::insert_superseding] calls it only when a supersede is
+    /// possible.
     pub fn superseded_bindings(&self, new: VisaId) -> Vec<(VisaId, ForwardingEntry)> {
         let Some(key) = self.flow_key(new) else {
             return Vec::new();
@@ -449,6 +499,9 @@ impl VisaTable {
         if self.newest.get(&key) != Some(&new) {
             return Vec::new();
         }
+        #[cfg(test)]
+        self.binding_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bindings
             .iter()
             .filter(|(old, _)| **old != new && self.flow_key(**old) == Some(key))
@@ -778,8 +831,8 @@ impl VisaTable {
     /// cannot commit. If it answered the lookup, the five-tuple has no visa
     /// there: nothing is promoted, because the other visas' routes may be
     /// dead too, and a stale visa would refuse the next bind instead of
-    /// letting it ask for a new visa (F6). The caller rebuilds the lookup
-    /// table.
+    /// letting it ask for a new visa (F6). It no longer counts as held for
+    /// its five-tuple. The caller rebuilds the lookup table.
     fn forget_supersede_state(&mut self, visa_id: VisaId, visa: &Visa) {
         let Some(key) = visa.ftuple.as_ref().map(FlowKey::from) else {
             return;
@@ -789,6 +842,12 @@ impl VisaTable {
         }
         if self.current.get(&key) == Some(&visa_id) {
             self.current.remove(&key);
+        }
+        if let Some(held) = self.held_per_flow.get_mut(&key) {
+            *held -= 1;
+            if *held == 0 {
+                self.held_per_flow.remove(&key);
+            }
         }
     }
 
@@ -1745,6 +1804,82 @@ pub mod tests {
             .unwrap();
         assert!(visa_table.superseded_bindings(7005) == vec![(7000, ForwardingEntry(1, 10))]);
         assert_eq!(visa_table.successor_of(7000), Some(7005));
+    }
+
+    /// g98 (core#112 review): an insert for a five-tuple this Zode holds no
+    /// other visa for cannot supersede anything, so it never scans the
+    /// bindings, however many there are. A visa that can supersede still
+    /// scans, and finds the stream to rebind.
+    #[test]
+    fn test_an_unrelated_insert_skips_the_binding_scan() {
+        let scans = |visa_table: &VisaTable| {
+            visa_table
+                .binding_scans
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let mut visa_table = VisaTable::new();
+        visa_table
+            .insert_visa(tcp_visa(7400, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        visa_table.bind(7400, binding_on(1, 10)).unwrap();
+
+        // Bound visas for other five-tuples (other ports), each a fresh
+        // five-tuple when it arrives.
+        for (visa_id, port) in (7401..7411).zip(81..) {
+            let (_, superseded) = visa_table
+                .insert_superseding(tcp_visa(visa_id, CLIENT, 0, SERVICE, port))
+                .unwrap();
+            assert!(superseded.is_empty(), "visa {visa_id}");
+            visa_table
+                .bind(visa_id, binding_on(1, port.into()))
+                .unwrap();
+        }
+        assert_eq!(scans(&visa_table), 0, "no unrelated insert scans");
+
+        // The same five-tuple as visa 7400: one scan, which finds its stream.
+        let (_, superseded) = visa_table
+            .insert_superseding(tcp_visa(7411, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        assert!(superseded == vec![(7400, ForwardingEntry(1, 10))]);
+        assert_eq!(scans(&visa_table), 1);
+
+        // A visa ID already held is a no-op, and scans nothing.
+        let (_, superseded) = visa_table
+            .insert_superseding(tcp_visa(7411, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        assert!(superseded.is_empty());
+        assert_eq!(scans(&visa_table), 1);
+    }
+
+    /// g98 (local review): the scan is skipped only when no other visa
+    /// with the five-tuple is held, not merely when the five-tuple has no
+    /// newest visa and no visa in the lookup. Here visa 7421 keeps a
+    /// stream (a late bind whose rebind onto 7422 did not happen) after
+    /// both maps lost their entries: 7420 and then 7422 were revoked. The
+    /// next visa for the five-tuple, 7423, still supersedes 7421.
+    #[test]
+    fn test_a_new_visa_supersedes_a_bound_visa_no_map_names() {
+        let peer_table = asm_less_peer_table();
+        let mut visa_table = VisaTable::new();
+        for visa_id in [7420, 7421] {
+            visa_table
+                .insert_visa(tcp_visa(visa_id, CLIENT, 0, SERVICE, 80))
+                .unwrap();
+        }
+        visa_table.revoke(&peer_table, 7420).unwrap();
+        visa_table
+            .insert_visa(tcp_visa(7422, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        assert_eq!(
+            visa_table.bind(7421, binding_on(1, 10)).unwrap(),
+            Some(7422)
+        );
+        visa_table.revoke(&peer_table, 7422).unwrap();
+
+        let (_, superseded) = visa_table
+            .insert_superseding(tcp_visa(7423, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        assert!(superseded == vec![(7421, ForwardingEntry(1, 10))]);
     }
 
     /// J11: while the old visa has a live binding, the lookup keeps

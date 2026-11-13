@@ -272,19 +272,8 @@ pub fn insert_visa(
     }
 
     // J11 (zl-zipline#252): a new visa with the same five-tuple as visas
-    // held supersedes them. Only a fresh insert can: installing an ID
-    // already held is a no-op, and must not start a second rebind.
-    let (visa_id, superseded) = {
-        let mut visa_table = asm.visa_table.write().unwrap();
-        let fresh = !visa_table.contains(visa.issuer_id);
-        let visa_id = visa_table.insert_visa(visa)?;
-        let superseded = if fresh {
-            visa_table.superseded_bindings(visa_id)
-        } else {
-            Vec::new()
-        };
-        (visa_id, superseded)
-    };
+    // held supersedes them, and their live streams move onto it.
+    let (visa_id, superseded) = asm.visa_table.write().unwrap().insert_superseding(visa)?;
 
     if let Some(next_hop) = next_hop
         && asm.find_egress_link(next_hop.into()).is_none()

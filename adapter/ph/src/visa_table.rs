@@ -717,7 +717,17 @@ impl VisaTable {
             .map_or(false, |entry| entry.expiration < current_time)
         {
             let timeout_entry = self.timeout_queue.pop().unwrap();
-            // Ignore if the visa was not found, since it might have been previously revoked
+            // An entry is stale if its visa was revoked, or revoked and an
+            // ID of this node's own range granted again with a new lifetime
+            // ([VisaTable::regrant_vs_visas]): only the held visa's own
+            // expiry removes it.
+            let held_expiry = self
+                .table
+                .get(&timeout_entry.id)
+                .and_then(|visa| expiry_as_utc(visa.visa().expires));
+            if held_expiry != Some(timeout_entry.expiration) {
+                continue;
+            }
             if let Ok(entries) = self.revoke_no_rebuild(peer_table, timeout_entry.id) {
                 withdrawn.extend(entries);
             }
@@ -1691,6 +1701,23 @@ pub mod tests {
         visa_table.regrant_vs_visas(&peer_table, &addr);
         assert_eq!(visa_table.match_traffic(&packet), Some(1));
         assert!(visa_table.contains(2));
+    }
+
+    /// Local Codex review: a regranted ID keeps its new lifetime. The
+    /// expiry entry of the copy it replaced is stale, and handling it must
+    /// not revoke the new grant.
+    #[test]
+    fn test_a_regranted_vs_visa_outlives_its_predecessors_expiry() {
+        let addr: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let peer_table = crate::peer_table::PeerTable::new();
+        let mut visa_table = VisaTable::new();
+        for mut visa in self_granted_vs_visas(&addr) {
+            visa.expires = ALREADY_EXPIRED + Duration::from_secs(1);
+            visa_table.insert_visa(visa).unwrap();
+        }
+        visa_table.regrant_vs_visas(&peer_table, &addr);
+        visa_table.handle_expirations(&peer_table);
+        assert!(visa_table.contains(1) && visa_table.contains(2));
     }
 
     /// A visa whose expiry chrono cannot represent (a visa service bug, or

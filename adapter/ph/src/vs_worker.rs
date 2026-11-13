@@ -114,6 +114,13 @@ pub async fn launch(
                     }
                 }
 
+                () = initial_link_lost(joiner, &mut handoff_rx) => {
+                    session_lost(&asm, node_zpr_addr, joiner);
+                    rejoin(&asm, &vs_handle, &mut handoff_rx, "the initial link was lost", true).await;
+                    after_rejoin = true;
+                    break; // re-gate on RunLoopStarts
+                }
+
                 evt = lifecycle_rx.recv() => {
                     match evt {
                         Ok(VSConnLifecycleEvent::RunLoopExits) => {
@@ -174,7 +181,26 @@ pub async fn launch(
                         );
                     }
                 }
-                match register_vss(&vs_handle, vss_addr, joiner).await {
+                // J10: a joiner whose initial link is lost meanwhile stops
+                // registering and rejoins at once.
+                let registered = tokio::select! {
+                    res = register_vss(&vs_handle, vss_addr, joiner) => Some(res),
+                    () = initial_link_lost(joiner, &mut handoff_rx) => None,
+                };
+                let Some(registered) = registered else {
+                    session_lost(&asm, node_zpr_addr, joiner);
+                    rejoin(
+                        &asm,
+                        &vs_handle,
+                        &mut handoff_rx,
+                        "the initial link was lost",
+                        true,
+                    )
+                    .await;
+                    after_rejoin = true;
+                    break; // re-gate on RunLoopStarts
+                };
+                match registered {
                     Ok(ops) => {
                         info!(target: STARTUP, "registered VSS, received {} pending visa ops", ops.len());
                         for op in ops {
@@ -392,13 +418,24 @@ async fn watch_session(
     lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>,
 ) -> Wait {
     let wait = tokio::select! {
-        _ = handoff_rx.wait_for(Option::is_none) => Wait::Done,
+        () = initial_link_lost(true, handoff_rx) => Wait::Done,
         wait = wait_for_run_loop_exit(lifecycle_rx) => wait,
     };
     if !matches!(wait, Wait::Abort) {
         session_lost(asm, node_zpr_addr, true);
     }
     wait
+}
+
+/// J10: resolves when a joiner's initial link, the one carrying its
+/// hand-off, is lost (its hand-off is cleared). Never resolves on a node
+/// without an initial link.
+async fn initial_link_lost(joiner: bool, handoff_rx: &mut watch::Receiver<Option<LinkId>>) {
+    if !joiner {
+        return std::future::pending().await;
+    }
+    // The sender lives in the Assembly, so this never fails.
+    let _ = handoff_rx.wait_for(Option::is_none).await;
 }
 
 /// Wait for the VSConn run loop to exit ([Wait::RunLoopExited]), or for
@@ -1034,6 +1071,38 @@ mod tests {
                     })
                     .await,
                     "the session ends and the run loop dials afresh"
+                );
+            })
+            .await;
+    }
+
+    /// Local Codex review: losing the initial link while `registerVss` is
+    /// still being retried ends the session at once, not after the last
+    /// retry, so the redialed link's hand-off is not refused as
+    /// `SessionUp`.
+    #[tokio::test]
+    async fn test_losing_the_initial_link_during_registration_ends_the_session() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, state, _vs, _egress) = start_joiner(FakeVsState {
+                    fail_registers: u32::MAX,
+                    ..Default::default()
+                })
+                .await;
+                asm.bootstrap_handoff.send_replace(Some(link));
+                assert!(
+                    eventually(Duration::from_secs(10), || state.borrow().register_calls
+                        == 1)
+                    .await
+                );
+
+                asm.drop_peer(link);
+                assert!(
+                    eventually(Duration::from_millis(500), || {
+                        !asm.vs_session_up.load(std::sync::atomic::Ordering::Acquire)
+                    })
+                    .await,
+                    "the session ends before the registration retries run out"
                 );
             })
             .await;

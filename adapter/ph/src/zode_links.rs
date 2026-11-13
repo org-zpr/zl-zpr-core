@@ -40,6 +40,7 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use thiserror::Error;
+use zpr_utils::net_defs::SocketAddrExt as _;
 
 /// The end of a Zode link that owns it: the only end that dials it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -497,6 +498,42 @@ pub fn start_initial_link(asm: &Arc<Assembly>) {
         LinkRecord::new(Kind::Initial, Owner::ThisZode, link.addr, system_jitter),
     );
     drive(asm, &link.cn, None, Event::Start);
+}
+
+/// The local address of this Zode's initial link as it is now, with `port`:
+/// the interface address its current connection was dialed from (the
+/// [crate::assembly::dial_interface] result its peer-table entry carries).
+/// This is the substrate address a Zode with a wildcard `self_addr` reports
+/// (zl-zipline#230, [crate::config::ReportedSubstrateAddr::InitialLink]).
+///
+/// Fails with `NotConnected` when there is no initial link or it has no
+/// connection.
+pub fn initial_link_local_addr(asm: &Assembly, port: u16) -> std::io::Result<SocketAddr> {
+    let not_connected = || {
+        std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "the initial link has no connection",
+        )
+    };
+    let cn = asm
+        .config
+        .get()
+        .initial_link
+        .as_ref()
+        .map(|link| link.cn.clone())
+        .ok_or_else(not_connected)?;
+    let link_id = asm
+        .zode_links
+        .record(&cn)
+        .and_then(|record| record.link_id)
+        .ok_or_else(not_connected)?;
+    let interface = asm
+        .peer_table
+        .inspect(link_id, |peer| peer.interface_addr)
+        .ok_or_else(not_connected)?;
+    let mut addr = SocketAddr::new(interface.ip(), port);
+    addr.set_scoped_ip(interface);
+    Ok(addr)
 }
 
 /// Apply the topology just stored in `asm.topology` (rules 12 and 13):
@@ -991,11 +1028,21 @@ pub(crate) mod tests {
         self_cn: &str,
         initial_link: Option<&str>,
     ) -> (Arc<Assembly>, EgressRx) {
+        driven_zode_bound(self_addr, self_cn, initial_link, "127.0.0.1:0")
+    }
+
+    /// [driven_zode] with substrate address `bind` as its `self_addr`.
+    fn driven_zode_bound(
+        self_addr: &str,
+        self_cn: &str,
+        initial_link: Option<&str>,
+        bind: &str,
+    ) -> (Arc<Assembly>, EgressRx) {
         let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(256);
         let ca = crate::pki::TestCa::new("zode-ca");
         let (keypair, certx) = crate::assembly::test::zode_link_keys(&ca, self_cn);
         let mut config = zode_config(self_addr);
-        config.self_addr = "127.0.0.1:0".parse().unwrap();
+        config.self_addr = bind.parse().unwrap();
         config.initial_link = initial_link.map(|spec| InitialLink::parse_cli(spec).unwrap());
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
             ph_mode: Some(crate::assembly::PhMode::Node),
@@ -1092,6 +1139,60 @@ pub(crate) mod tests {
     /// The record for `cn`.
     pub(crate) fn record_of(asm: &Arc<Assembly>, cn: &str) -> LinkRecord {
         asm.zode_links.record(cn).expect("a record")
+    }
+
+    /// zl-zipline#230 gap 2: a Zode with a wildcard `self_addr` reports its
+    /// initial link's local address with `self_addr`'s port, read each time:
+    /// once the link's connection is from another local address (the redial
+    /// after a network change), that is what it reports. With no connection
+    /// there is nothing to report.
+    #[tokio::test(start_paused = true)]
+    async fn test_reported_substrate_addr_follows_the_initial_link() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode_bound(
+                    "fd5a::10",
+                    "b",
+                    Some("relay@127.0.0.1:7502"),
+                    "0.0.0.0:5000",
+                );
+                let rule =
+                    crate::config::ReportedSubstrateAddr::for_config(&asm.config.get()).unwrap();
+                assert_eq!(
+                    rule,
+                    crate::config::ReportedSubstrateAddr::InitialLink { port: 5000 }
+                );
+                assert_eq!(
+                    rule.resolve(&asm).unwrap_err().kind(),
+                    std::io::ErrorKind::NotConnected,
+                    "no initial link connection yet"
+                );
+
+                start_initial_link(&asm);
+                assert_eq!(
+                    rule.resolve(&asm).unwrap(),
+                    SocketAddr::from(([127, 0, 0, 1], 5000)),
+                    "the kernel's choice of local address for the relay"
+                );
+
+                // The network changed: the initial link's connection now
+                // goes out from another local address.
+                let relay = SocketAddr::from(([127, 0, 0, 1], 7502));
+                let moved =
+                    zpr_utils::net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
+                let end = ZodeEnd::Dialer {
+                    peer_cn: "relay".to_owned(),
+                };
+                let link = asm.start_zode_link(&relay, &moved, end).unwrap().get();
+                asm.zode_links
+                    .test_put("relay", RecordState::Up, Some(link));
+                assert_eq!(
+                    rule.resolve(&asm).unwrap(),
+                    SocketAddr::from(([127, 0, 0, 2], 5000)),
+                    "the report follows the initial link's connection"
+                );
+            })
+            .await;
     }
 
     /// Rules 1 and 6: a new topology link this Zode owns is dialed once,

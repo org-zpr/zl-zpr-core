@@ -33,6 +33,18 @@ type ConnectFn = Box<
     dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = std::io::Result<tokio::net::TcpStream>>>>,
 >;
 
+/// Where a [VSConn] gets the substrate address it reports on each `connect`
+/// and `open`: called once per call, so the report follows the node's
+/// address as it is now (zl-zipline#230). An error fails that `connect` or
+/// `open`.
+pub type SubstrateAddrSource = Box<dyn Fn() -> std::io::Result<SocketAddr> + Send>;
+
+/// A [SubstrateAddrSource] that always reports `addr`: a configured
+/// advertised address, or a concrete bind address.
+pub fn fixed_substrate_addr(addr: SocketAddr) -> SubstrateAddrSource {
+    Box::new(move || Ok(addr))
+}
+
 const LIFECYCLE_EVENT_BUFFER_SIZE: usize = 64;
 
 const VSAPI_PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -178,15 +190,16 @@ pub struct VSConn {
     node_private_key: RsaKeyPair,
     life_tx: broadcast::Sender<VSConnLifecycleEvent>,
     connect_fn: ConnectFn,
-    /// The substrate address this node advertises to the VS (operator config;
-    /// the address peers dial, which may differ from the bind address behind
-    /// NAT). Sent as the `substrate_addr` param on both `connect` and `open`
-    /// (the VS requires it on both). Callers must resolve a concrete,
-    /// reachable address before constructing a [VSConn]: the node may have
-    /// several local IPs (a wildcard bind covers all of them, present and
-    /// future) but only one can be advertised, so the choice belongs to the
-    /// operator, not to a socket-derived guess.
-    substrate_addr: SocketAddr,
+    /// The substrate address this node reports to the VS: the address peers
+    /// dial. Sent as the `substrate_addr` param on both `connect` and `open`
+    /// (the VS requires it on both), read from the source at each call so a
+    /// rejoin after a network change reports the new address (zl-zipline#230,
+    /// ZODE_LINKS.md rule 13a: the address changes only by rejoin). The
+    /// caller picks the rule: a configured advertised address, a concrete
+    /// bind address, or, for a Zode with a wildcard bind, its initial link's
+    /// local address now. That last one is sound because the join that
+    /// precedes every `connect` and `open` runs over the initial link.
+    substrate_addr: SubstrateAddrSource,
 }
 
 /// Handle for sending commands to a running [VSConn].
@@ -250,15 +263,14 @@ impl VSConn {
     /// `buffer_size` determines how many commands can be buffered to send to the run loop before
     /// [VSConnHandle] starts blocking.
     ///
-    /// `substrate_addr` is the substrate address this node advertises to the VS — the
-    /// address peers dial (see the field docs). It must be concrete and reachable;
-    /// there is deliberately no auto-derivation fallback.
+    /// `substrate_addr` gives the substrate address this node reports to the VS on
+    /// each `connect` and `open`: the address peers dial (see the field docs).
     pub fn new(
         buffer_size: usize,
         vs_addr: SocketAddr,
         node_cn: String,
         node_private_key: RsaKeyPair,
-        substrate_addr: SocketAddr,
+        substrate_addr: SubstrateAddrSource,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(buffer_size);
         let (life_tx, _) = broadcast::channel(LIFECYCLE_EVENT_BUFFER_SIZE);
@@ -358,11 +370,6 @@ impl VSConn {
             }
         };
         sock.set_nodelay(true)?;
-
-        debug!(
-            target: VS_RPC,
-            "advertising substrate address {} to the VS", self.substrate_addr
-        );
 
         let connector = tls_connect();
         let tls = connector.connect(self.vs_addr.ip().into(), sock).await?;
@@ -780,12 +787,16 @@ impl VSConn {
         }
     }
 
-    /// The `substrate_addr` param the VS requires on both `connect` and `open`.
-    fn substrate_addr_param(&self) -> Param {
-        Param::new_str(
+    /// The `substrate_addr` param the VS requires on both `connect` and `open`,
+    /// from the substrate address source as it is now. A source error fails
+    /// the call (for a joiner, J10 then rejoins).
+    fn substrate_addr_param(&self) -> Result<Param, VSApiError> {
+        let addr = (self.substrate_addr)()?;
+        debug!(target: VS_RPC, "reporting substrate address {addr} to the VS");
+        Ok(Param::new_str(
             pname::SUBSTRATE_ADDR.into(),
-            self.substrate_addr.to_string(),
-        )
+            addr.to_string(),
+        ))
     }
 
     async fn do_connect(
@@ -798,7 +809,7 @@ impl VSConn {
             ctype: req.connect_type(),
             params: Some(vec![
                 Param::new_ip(pname::ZPR_ADDR.into(), req.zpr_addr),
-                self.substrate_addr_param(),
+                self.substrate_addr_param()?,
                 // adding node's own public key as param
                 Param::new_x25519_pubkey(pname::A2A_DH_PUBKEY.into(), req.a2a_dh_pubkey),
             ]),
@@ -893,7 +904,7 @@ impl VSConn {
         let req = VSConnectRequest {
             cn: self.node_cn.clone(),
             ctype: oreq.connect_type(),
-            params: Some(vec![self.substrate_addr_param()]),
+            params: Some(vec![self.substrate_addr_param()?]),
         };
 
         let mut vs_request = vs_service.open_request();
@@ -1494,7 +1505,7 @@ mod tests {
                 node_private_key,
                 life_tx,
                 connect_fn,
-                substrate_addr: "127.0.0.1:5000".parse().unwrap(),
+                substrate_addr: fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()),
             }
         }
     }
@@ -1753,6 +1764,9 @@ mod tests {
         /// The `peerCn` of every `requestBootstrapVisas` the fake served, in
         /// order (zl-zipline#252).
         bootstrap_requests: Vec<String>,
+        /// The `substrate_addr` param of every `connect` the fake served, in
+        /// order (zl-zipline#230).
+        connect_substrate_addrs: Vec<String>,
     }
 
     struct FakeVs {
@@ -1774,9 +1788,21 @@ mod tests {
     impl vsapi2::visa_service::Server for FakeVs {
         async fn connect(
             self: Rc<Self>,
-            _params: vsapi2::visa_service::ConnectParams,
+            params: vsapi2::visa_service::ConnectParams,
             mut results: vsapi2::visa_service::ConnectResults,
         ) -> Result<(), capnp::Error> {
+            let req = VSConnectRequest::try_from(params.get()?.get_req()?)
+                .map_err(|e| capnp::Error::failed(format!("bad connect request: {e:?}")))?;
+            let substrate = req.params.unwrap_or_default().into_iter().find_map(|p| {
+                match (p.name.as_str(), p.value) {
+                    (pname::SUBSTRATE_ADDR, zpr::vsapi_types::ParamValue::StrParam(s)) => Some(s),
+                    _ => None,
+                }
+            });
+            self.state
+                .borrow_mut()
+                .connect_substrate_addrs
+                .push(substrate.unwrap_or_default());
             let gate: vsapi2::v_s_gate::Client = capnp_rpc::new_client(FakeVsGate {
                 state: self.state.clone(),
             });
@@ -1910,6 +1936,7 @@ mod tests {
             fail_next_auth: false,
             last_ping_handle: None,
             bootstrap_requests: Vec::new(),
+            connect_substrate_addrs: Vec::new(),
         }));
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -1955,21 +1982,47 @@ mod tests {
         Rc<RefCell<FakeVsState>>,
         tokio::task::JoinHandle<Result<(), VSApiError>>,
     ) {
+        let (handle, mut lifecycle_rx, state, task) =
+            running_vsconn_against_fake_vs(fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()))
+                .await;
+        wait_for_run_loop(&mut lifecycle_rx).await;
+        handle
+            .connect(test_node_connect())
+            .await
+            .expect("initial connect against the fake VS failed");
+
+        (handle, state, task)
+    }
+
+    /// Start a real VSConn reporting from `substrate_addr`, against the fake
+    /// VS, without connecting: (handle, lifecycle events, state, run-loop
+    /// task).
+    async fn running_vsconn_against_fake_vs(
+        substrate_addr: SubstrateAddrSource,
+    ) -> (
+        VSConnHandle,
+        broadcast::Receiver<VSConnLifecycleEvent>,
+        Rc<RefCell<FakeVsState>>,
+        tokio::task::JoinHandle<Result<(), VSApiError>>,
+    ) {
         let (vs_addr, state) = spawn_fake_vs().await;
         let mut vsconn = VSConn::new(
             16,
             vs_addr,
             "test-node".to_string(),
             test_key(),
-            "127.0.0.1:5000".parse().unwrap(),
+            substrate_addr,
         );
-        let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
+        let lifecycle_rx = vsconn.subscribe_lifecycle_events();
         let handle = vsconn.handle();
         let task = tokio::task::spawn_local(async move {
             vsconn.run_with_reconnect(Duration::from_millis(100)).await
         });
+        (handle, lifecycle_rx, state, task)
+    }
 
-        // Wait for the run loop, then bootstrap-connect.
+    /// Wait (at most 5 s) for the VSConn's next `RunLoopStarts`.
+    async fn wait_for_run_loop(lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match lifecycle_rx.recv().await {
@@ -1981,17 +2034,89 @@ mod tests {
         })
         .await
         .expect("run loop never started against the fake VS");
+    }
 
-        handle
-            .connect(NodeConnect {
-                zpr_addr: "10.1.1.1".parse().unwrap(),
-                state: StateFlag::NoState,
-                a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+    /// The `connect` request the tests send: a fresh node.
+    fn test_node_connect() -> NodeConnect {
+        NodeConnect {
+            zpr_addr: "10.1.1.1".parse().unwrap(),
+            state: StateFlag::NoState,
+            a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+        }
+    }
+
+    /// zl-zipline#230 gap 2: each `connect` reports the substrate address
+    /// its source gives at that moment, so a rejoin after a network change
+    /// reports the new address, not the one from startup.
+    #[tokio::test]
+    async fn each_connect_reports_the_current_substrate_addr() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let calls_in_source = calls.clone();
+                let source: SubstrateAddrSource = Box::new(move || {
+                    let n = calls_in_source.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(SocketAddr::from(([10, 0, 0, 1 + n as u8], 5000)))
+                });
+                let (handle, mut lifecycle_rx, state, task) =
+                    running_vsconn_against_fake_vs(source).await;
+
+                wait_for_run_loop(&mut lifecycle_rx).await;
+                handle
+                    .connect(test_node_connect())
+                    .await
+                    .expect("first connect");
+                // A rejoin: the session is recycled, then connects again.
+                handle.restart().await.unwrap();
+                wait_for_run_loop(&mut lifecycle_rx).await;
+                handle
+                    .connect(test_node_connect())
+                    .await
+                    .expect("second connect");
+
+                assert_eq!(
+                    state.borrow().connect_substrate_addrs,
+                    vec!["10.0.0.1:5000".to_string(), "10.0.0.2:5000".to_string()],
+                    "each connect reports the address its source gives then"
+                );
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
-            .await
-            .expect("initial connect against the fake VS failed");
+            .await;
+    }
 
-        (handle, state, task)
+    /// zl-zipline#230 gap 2: when the source has no address (a joiner whose
+    /// initial link has no connection), the `connect` fails before reaching
+    /// the visa service.
+    #[tokio::test]
+    async fn connect_fails_when_the_substrate_addr_source_fails() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let source: SubstrateAddrSource = Box::new(|| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "the initial link has no connection (test stub)",
+                    ))
+                });
+                let (handle, mut lifecycle_rx, state, task) =
+                    running_vsconn_against_fake_vs(source).await;
+
+                wait_for_run_loop(&mut lifecycle_rx).await;
+                let res = handle.connect(test_node_connect()).await;
+                assert!(
+                    matches!(&res, Err(VSApiError::IoError(e)) if e.kind() == std::io::ErrorKind::NotConnected),
+                    "the source error fails the connect, got {res:?}"
+                );
+                assert!(
+                    state.borrow().connect_substrate_addrs.is_empty(),
+                    "nothing reached the visa service"
+                );
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
     }
 
     /// zipline#121 K2: a successful `Reauthenticate` re-runs the

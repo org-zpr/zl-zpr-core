@@ -2763,7 +2763,7 @@ mod tests {
             vs_addr,
             "test-node".to_string(),
             key,
-            "127.0.0.1:5000".parse().unwrap(),
+            libnode::vsconn::fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()),
         );
         // Observable egress: the close path puts a Terminate on the mgmt
         // substrate queue, which must have a live receiver.

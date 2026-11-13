@@ -147,6 +147,9 @@ pub enum ManagementCounterType {
     VisaRequestSuccess,
     VisaRequestDenied,
     VisaRequestError,
+
+    /// A bootstrap-visa hand-off (ZDP 146) refused (zl-zipline#252, J4).
+    BootstrapHandoffRefused,
 }
 
 impl FastpathCounterType {
@@ -239,6 +242,7 @@ impl ManagementCounterType {
             Self::VisaRequestSuccess => "Visa Request Success",
             Self::VisaRequestDenied => "Visa Request Denied",
             Self::VisaRequestError => "Visa Request Error",
+            Self::BootstrapHandoffRefused => "Bootstrap Hand-offs Refused",
         }
     }
 }

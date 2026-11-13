@@ -21,9 +21,9 @@ use crate::error::VSApiError;
 use crate::logging::targets::VS_RPC;
 
 use zpr::vsapi_types::{
-    BootstrapVisas, ConnectRequest, ConnectType, Connection, DisconnectNotice, LinkStateReport,
-    Param, ReauthRequest, VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse,
-    pname,
+    AuthBlob, BootstrapVisas, ChallengeAlg, ConnectRequest, ConnectType, Connection,
+    DisconnectNotice, LinkStateReport, LoginNonce, OidcBlob, Param, ReauthRequest, SelfSignedBlob,
+    VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse, pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -64,6 +64,11 @@ type VSVisaIdsResponse = Result<Vec<u64>, VSApiError>;
 type VSVisaByIdResponse = Result<Vec<Visa>, VSApiError>;
 type VSReportLinkStatesResponse = Result<(), VSApiError>;
 type VSBootstrapVisasResponse = Result<BootstrapVisas, VSApiError>;
+type VSLoginNonceResponse = Result<LoginNonce, VSApiError>;
+
+/// Length of the random challenge the node signs into the device leg of a
+/// `reauthorize` of its own actor (zl-zipline#233).
+const DEVICE_LEG_CHALLENGE_LEN: usize = 32;
 
 #[derive(Debug)]
 pub struct NodeConnect {
@@ -156,6 +161,20 @@ enum VS2Command {
     /// `VSHandle.requestBootstrapVisas` (zl-zipline#252, ZODE_LINKS.md J2).
     /// The `String` is the joiner's link-verified certificate CN.
     RequestBootstrapVisas(String, oneshot::Sender<VSBootstrapVisasResponse>),
+
+    /// Ask for a login nonce for this node's own OIDC login,
+    /// `VSHandle.getLoginNonce` (zl-zipline#233, OIDC.md "A Zode's own login").
+    GetLoginNonce(oneshot::Sender<VSLoginNonceResponse>),
+
+    /// `reauthorize` this node's OWN actor at the given address
+    /// (zl-zipline#233): the run loop signs the mandatory device leg with the
+    /// node key, so the key never leaves [VSConn]. With an OIDC blob this is a
+    /// login or a renewal; without one it is a logout.
+    ReauthorizeOwnActor(
+        IpAddr,
+        Option<OidcBlob>,
+        oneshot::Sender<VSAuthorizeConnectResponse>,
+    ),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -777,6 +796,59 @@ impl VSConn {
                 }
                 Ok(())
             }
+
+            VS2Command::GetLoginNonce(resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: get_login_nonce");
+                let resp = match cmd_state.vs_handle.as_ref() {
+                    None => Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    )),
+                    Some(vs_h) => self.do_get_login_nonce(vs_h).await,
+                };
+                if resp_tx.send(resp).is_err() {
+                    error!(target: VS_RPC, "failed to send get_login_nonce response");
+                }
+                Ok(())
+            }
+
+            VS2Command::ReauthorizeOwnActor(zpr_addr, oidc, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: reauthorize own actor (with OIDC: {})", oidc.is_some());
+                let resp = match cmd_state.vs_handle.as_ref() {
+                    None => Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    )),
+                    Some(vs_h) => {
+                        let mut blobs = vec![AuthBlob::SS(self.device_leg())];
+                        blobs.extend(oidc.map(AuthBlob::Oidc));
+                        self.do_reauthorize(vs_h, ReauthRequest { zpr_addr, blobs })
+                            .await
+                    }
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send reauthorize (own actor) response: {:?}", e);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The device leg of a `reauthorize` of this node's own actor
+    /// (zl-zipline#233): a self-signed blob over a fresh random challenge,
+    /// signed with the node key exactly as the `authenticate` answer is
+    /// (`ts || cn || challenge`, [sign_payload]). The visa service checks it
+    /// against the policy's bootstrap key for this CN, and checks the
+    /// timestamp's skew; the challenge only makes each signature unique.
+    fn device_leg(&self) -> SelfSignedBlob {
+        let mut challenge = vec![0u8; DEVICE_LEG_CHALLENGE_LEN];
+        aws_lc_rs::rand::fill(&mut challenge).expect("the system RNG failed");
+        let timestamp = unix_ts();
+        let signature = sign_payload(timestamp, &self.node_cn, &challenge, &self.node_private_key);
+        SelfSignedBlob {
+            alg: ChallengeAlg::RsaSha256Pkcs1v15,
+            challenge,
+            cn: self.node_cn.clone(),
+            timestamp,
+            signature,
         }
     }
 
@@ -1000,6 +1072,28 @@ impl VSConn {
                 let connection = Connection::try_from(conn)?;
                 Ok(connection)
             }
+            vsapi2::result::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
+        }
+    }
+
+    /// Ask for a login nonce with `VSHandle.getLoginNonce` (zl-zipline#233).
+    async fn do_get_login_nonce(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+    ) -> Result<LoginNonce, VSApiError> {
+        let request = vs_h.get_login_nonce_request();
+        debug!(target: VS_RPC, "VS-API -> get_login_nonce");
+        let response = rpc_with_timeout(
+            "get_login_nonce",
+            DEFAULT_RPC_TIMEOUT,
+            request.send().promise,
+        )
+        .await?;
+        match response.get()?.get_res()?.which()? {
+            vsapi2::result::Which::Ok(nonce) => Ok(LoginNonce::try_from(nonce?)?),
             vsapi2::result::Which::Error(err_obj) => {
                 let err_obj = err_obj?;
                 Err(ApiResponseError::try_from(err_obj)?.into())
@@ -1330,6 +1424,34 @@ impl VSConnHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VS2Command::ReportLinkStates(reports, resp_tx);
         self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
+    /// Ask the visa service for a nonce for this node's own OIDC login
+    /// (zl-zipline#233). The visa service binds it to this node's actor and
+    /// VS-API session; it is single-use and expires at
+    /// [LoginNonce::expires_at]. Its refusals (`authRequired`,
+    /// `quotaExceeded`) come back as [VSApiError::CodedError].
+    pub async fn get_login_nonce(&self) -> Result<LoginNonce, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.send_command(VS2Command::GetLoginNonce(resp_tx))
+            .await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
+    /// `reauthorize` this node's own actor at `zpr_addr` (zl-zipline#233).
+    /// The run loop adds the device leg, signed with the node key. With
+    /// `oidc` the request is `[device, OIDC]`: a login (its nonce from
+    /// [Self::get_login_nonce]) or a renewal of one. Without it the request
+    /// is `[device]` alone, which drops any user login (a logout).
+    pub async fn reauthorize_own_actor(
+        &self,
+        zpr_addr: IpAddr,
+        oidc: Option<OidcBlob>,
+    ) -> Result<Connection, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.send_command(VS2Command::ReauthorizeOwnActor(zpr_addr, oidc, resp_tx))
+            .await?;
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
 
@@ -1753,6 +1875,13 @@ mod tests {
         /// The `peerCn` of every `requestBootstrapVisas` the fake served, in
         /// order (zl-zipline#252).
         bootstrap_requests: Vec<String>,
+        /// The DER public key of the node key the VSConn under test signs
+        /// with, so a test can verify the device leg (zl-zipline#233).
+        node_public_key: Vec<u8>,
+        /// When set, `getLoginNonce` fails with this code.
+        login_nonce_error: Option<zpr::vsapi_types::ErrorCode>,
+        /// Every `reauthorize` request the fake served, in order.
+        reauth_requests: Vec<ReauthRequest>,
     }
 
     struct FakeVs {
@@ -1837,6 +1966,45 @@ mod tests {
             Ok(())
         }
 
+        /// Mint [FAKE_LOGIN_NONCE], or fail with the configured code
+        /// (zl-zipline#233).
+        async fn get_login_nonce(
+            self: Rc<Self>,
+            _params: vsapi2::v_s_handle::GetLoginNonceParams,
+            mut results: vsapi2::v_s_handle::GetLoginNonceResults,
+        ) -> Result<(), capnp::Error> {
+            if let Some(code) = self.state.borrow().login_nonce_error.clone() {
+                let mut err = results.get().init_res().init_error();
+                ApiResponseError::new_code_msg(code, "no nonce for you").write_to(&mut err);
+                return Ok(());
+            }
+            zpr::vsapi_types::LoginNonce {
+                nonce: FAKE_LOGIN_NONCE.to_string(),
+                expires_at: UNIX_EPOCH + Duration::from_secs(FAKE_NONCE_EXPIRES),
+            }
+            .write_to(&mut results.get().init_res().init_ok());
+            Ok(())
+        }
+
+        /// Record the request and answer with [FAKE_AUTH_EXPIRES]
+        /// (zl-zipline#233).
+        async fn reauthorize(
+            self: Rc<Self>,
+            params: vsapi2::v_s_handle::ReauthorizeParams,
+            mut results: vsapi2::v_s_handle::ReauthorizeResults,
+        ) -> Result<(), capnp::Error> {
+            let req = ReauthRequest::try_from(params.get()?.get_req()?)
+                .map_err(|e| capnp::Error::failed(format!("{e:?}")))?;
+            let zpr_addr = req.zpr_addr;
+            self.state.borrow_mut().reauth_requests.push(req);
+            Connection {
+                zpr_addr,
+                auth_expires: FAKE_AUTH_EXPIRES,
+            }
+            .write_to(&mut results.get().init_resp().init_ok());
+            Ok(())
+        }
+
         /// Answer for [FAKE_JOINER_CN] with [fake_bootstrap_visas]; refuse any
         /// other CN with `notFound`, as the real visa service does for a CN
         /// that is not a peer in the caller's topology (zl-zipline#252 J3).
@@ -1874,6 +2042,15 @@ mod tests {
     /// A CN the fake visa service takes a minute to answer for.
     const SLOW_JOINER_CN: &str = "slow.zpr";
 
+    /// The login nonce the fake visa service mints (zl-zipline#233).
+    const FAKE_LOGIN_NONCE: &str = "vs-minted-nonce";
+
+    /// When [FAKE_LOGIN_NONCE] expires, in unix seconds.
+    const FAKE_NONCE_EXPIRES: u64 = 1_800_000_000;
+
+    /// The `authExpires` the fake visa service answers `reauthorize` with.
+    const FAKE_AUTH_EXPIRES: u64 = 1_800_000_600;
+
     /// The answer the fake visa service gives for [FAKE_JOINER_CN]: two
     /// distinct visas in each list, so a test can check the order survives.
     fn fake_bootstrap_visas() -> BootstrapVisas {
@@ -1910,6 +2087,9 @@ mod tests {
             fail_next_auth: false,
             last_ping_handle: None,
             bootstrap_requests: Vec::new(),
+            node_public_key: Vec::new(),
+            login_nonce_error: None,
+            reauth_requests: Vec::new(),
         }));
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -1956,11 +2136,16 @@ mod tests {
         tokio::task::JoinHandle<Result<(), VSApiError>>,
     ) {
         let (vs_addr, state) = spawn_fake_vs().await;
+        let key = test_key();
+        {
+            use aws_lc_rs::signature::KeyPair;
+            state.borrow_mut().node_public_key = key.public_key().as_ref().to_vec();
+        }
         let mut vsconn = VSConn::new(
             16,
             vs_addr,
             "test-node".to_string(),
-            test_key(),
+            key,
             "127.0.0.1:5000".parse().unwrap(),
         );
         let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
@@ -2207,6 +2392,180 @@ mod tests {
     /// Before fix: run_with_reconnect blocks in tokio::time::sleep(reconnect_after) even when a
     /// Stop command is already in the channel, causing a full 30-second delay.
     /// After fix: the select! between the sleep and cmd_rx delivers Stop immediately.
+    /// zl-zipline#233: `get_login_nonce` returns the nonce and expiry the
+    /// visa service minted.
+    #[tokio::test]
+    async fn get_login_nonce_returns_the_minted_nonce() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, _state, task) = connected_vsconn_against_fake_vs().await;
+
+                let nonce = handle.get_login_nonce().await.expect("the fake VS mints");
+                assert_eq!(nonce.nonce, FAKE_LOGIN_NONCE);
+                assert_eq!(nonce.expires_at_secs(), FAKE_NONCE_EXPIRES);
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#233: a `quotaExceeded` refusal comes back as that coded
+    /// error.
+    #[tokio::test]
+    async fn get_login_nonce_maps_quota_exceeded_to_its_code() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                state.borrow_mut().login_nonce_error =
+                    Some(zpr::vsapi_types::ErrorCode::QuotaExceeded);
+
+                match handle.get_login_nonce().await {
+                    Err(VSApiError::CodedError(err)) => {
+                        assert_eq!(err.code, zpr::vsapi_types::ErrorCode::QuotaExceeded)
+                    }
+                    other => panic!("expected a quotaExceeded CodedError, got {other:?}"),
+                }
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// Check that `ss` is a device leg the visa service accepts for
+    /// `test-node`: its CN, a fresh timestamp, a 32-byte challenge, and an
+    /// RSA-SHA256 signature over `ts || cn || challenge` (the layout of the
+    /// visa service's `verify_ss_blob_signature`) by `public_key`.
+    fn assert_valid_device_leg(ss: &zpr::vsapi_types::SelfSignedBlob, public_key: &[u8]) {
+        use aws_lc_rs::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+        assert_eq!(ss.cn, "test-node");
+        assert_eq!(ss.challenge.len(), 32);
+        assert!(
+            unix_ts().abs_diff(ss.timestamp) <= 5,
+            "the timestamp must be now, got {}",
+            ss.timestamp
+        );
+        let mut signed = ss.timestamp.to_be_bytes().to_vec();
+        signed.extend_from_slice(ss.cn.as_bytes());
+        signed.extend_from_slice(&ss.challenge);
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key)
+            .verify(&signed, &ss.signature)
+            .expect("the device leg must verify with the node's public key");
+    }
+
+    /// zl-zipline#233: a logout (`None`) sends exactly one blob, a device
+    /// leg signed with the node's key, for the given address, and returns
+    /// the visa service's `Connection`.
+    #[tokio::test]
+    async fn reauthorize_own_actor_without_oidc_sends_only_the_device_leg() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                let addr: IpAddr = "10.1.1.1".parse().unwrap();
+
+                let conn = handle
+                    .reauthorize_own_actor(addr, None)
+                    .await
+                    .expect("the fake VS accepts");
+                assert_eq!(conn.auth_expires, FAKE_AUTH_EXPIRES);
+
+                let st = state.borrow();
+                let [req] = &st.reauth_requests[..] else {
+                    panic!("expected one reauthorize, got {:?}", st.reauth_requests);
+                };
+                assert_eq!(req.zpr_addr, addr);
+                let [zpr::vsapi_types::AuthBlob::SS(ss)] = &req.blobs[..] else {
+                    panic!("expected exactly one SS blob, got {:?}", req.blobs);
+                };
+                assert_valid_device_leg(ss, &st.node_public_key);
+                drop(st);
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#233: a login or renewal (`Some(oidc)`) sends the device
+    /// leg first and the OIDC blob second, unchanged. Each call signs a
+    /// fresh challenge.
+    #[tokio::test]
+    async fn reauthorize_own_actor_with_oidc_sends_device_then_oidc() {
+        use zpr::vsapi_types::{AuthBlob, OidcBlob};
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                let addr: IpAddr = "10.1.1.1".parse().unwrap();
+                let oidc = OidcBlob {
+                    issuer: "https://idp.test".to_string(),
+                    id_token: "FAKE.JWT.TOKEN".to_string(),
+                    nonce: FAKE_LOGIN_NONCE.to_string(),
+                };
+
+                for _ in 0..2 {
+                    handle
+                        .reauthorize_own_actor(addr, Some(oidc.clone()))
+                        .await
+                        .expect("the fake VS accepts");
+                }
+
+                let st = state.borrow();
+                assert_eq!(st.reauth_requests.len(), 2);
+                let mut challenges = Vec::new();
+                for req in &st.reauth_requests {
+                    let [AuthBlob::SS(ss), AuthBlob::Oidc(sent)] = &req.blobs[..] else {
+                        panic!("expected [SS, OIDC], got {:?}", req.blobs);
+                    };
+                    assert_valid_device_leg(ss, &st.node_public_key);
+                    assert_eq!(sent.issuer, oidc.issuer);
+                    assert_eq!(sent.id_token, oidc.id_token);
+                    assert_eq!(sent.nonce, oidc.nonce);
+                    challenges.push(ss.challenge.clone());
+                }
+                assert_ne!(
+                    challenges[0], challenges[1],
+                    "each device leg needs a fresh challenge"
+                );
+                drop(st);
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#233: without a VS-API session both calls are refused
+    /// locally, without reaching the visa service.
+    #[tokio::test]
+    async fn login_calls_without_session_are_refused_locally() {
+        let mut vsconn = test_vsconn(refusing_connect_fn());
+        let mut cmd_state = VSCommandState::new(capnp_rpc::new_client(NoSessionVs));
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        vsconn
+            .handle_command(&mut cmd_state, VS2Command::GetLoginNonce(resp_tx))
+            .await
+            .expect("a refused command must not stop the run loop");
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        vsconn
+            .handle_command(
+                &mut cmd_state,
+                VS2Command::ReauthorizeOwnActor("10.1.1.1".parse().unwrap(), None, resp_tx),
+            )
+            .await
+            .expect("a refused command must not stop the run loop");
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
+    }
+
     #[tokio::test]
     async fn stop_during_reconnect_delay_exits_promptly() {
         tokio::task::LocalSet::new()

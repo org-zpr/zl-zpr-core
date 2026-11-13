@@ -578,7 +578,27 @@ impl VisaTable {
         self.bindings.entry(visa_id).or_default().push(binding);
         // Its bind may have been on its way when a newer visa arrived, so
         // the rebinds started then did not include it.
-        Ok(self.successor_of(visa_id))
+        let successor = self.successor_of(visa_id);
+        if successor.is_none() {
+            self.fill_empty_lookup_place(visa_id);
+        }
+        Ok(successor)
+    }
+
+    /// J11 (core#112 review): `visa_id`, the newest visa for its
+    /// five-tuple, just had a stream bound, which proves its route. If the
+    /// lookup has no visa for that five-tuple (its last one was removed,
+    /// and removal never promotes), `visa_id` takes the place, so new flows
+    /// stop asking the visa service for a visa this Zode already uses.
+    fn fill_empty_lookup_place(&mut self, visa_id: VisaId) {
+        let Some(key) = self.flow_key(visa_id) else {
+            return;
+        };
+        if self.current.contains_key(&key) {
+            return;
+        }
+        self.current.insert(key, visa_id);
+        self.rebuild_lookup_table();
     }
 
     /// The streams bound under the visa `visa_id`, if any.
@@ -1894,6 +1914,11 @@ pub mod tests {
         assert_eq!(visa_table.match_traffic(&client_to_service()), None);
         assert!(visa_table.contains(7401));
         assert_eq!(asm.peer_table.get(link_a).unwrap().pft.len(), 0);
+
+        // A bind of the newest visa then proves its route (core#112
+        // review), so it takes the empty place in the lookup.
+        assert_eq!(visa_table.bind(7401, binding_on(link_a, 9)).unwrap(), None);
+        assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7401));
     }
 
     /// J11 with overlapping successors (local Codex review): a late commit

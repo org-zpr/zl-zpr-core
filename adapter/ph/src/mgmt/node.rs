@@ -667,8 +667,8 @@ fn prepare_next_hop_bind(
 /// It did only if the visa has a `prev_hop` and F1's egress lookup for that
 /// address gives exactly `ingress_link_id`
 /// ([Assembly::find_zode_egress_link]): the topology `zprAddr` keyed by the
-/// link's verified CN, or, on a joiner before its first `setTopology`, the
-/// relay address its hand-off recorded. The record must be up and point at
+/// link's verified CN, or, on a joiner until a `setTopology` names its
+/// relay, the relay address its hand-off recorded. The record must be up and point at
 /// this connection, so the old connection of a CN that has been replaced
 /// (rule 5) fails. The address never comes from anything the peer claims.
 ///

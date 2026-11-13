@@ -299,8 +299,9 @@ pub fn pack_visa(visa: &zpr::vsapi_types::Visa) -> Vec<u8> {
 }
 
 /// Decode a visa written by [pack_visa]. `None` if `bytes` is not exactly
-/// one well-formed packed `Visa` message. The bytes come from a peer, so
-/// nothing here panics.
+/// one well-formed packed `Visa` message, or if its expiry is out of the
+/// range this node can hold ([expiry_millis_in_range]). The bytes come from
+/// a peer, so nothing here panics.
 pub fn unpack_visa(bytes: &[u8]) -> Option<zpr::vsapi_types::Visa> {
     let mut rest = bytes;
     let reader =
@@ -311,7 +312,27 @@ pub fn unpack_visa(bytes: &[u8]) -> Option<zpr::vsapi_types::Visa> {
         return None;
     }
     let typed_reader = capnp::message::TypedReader::<_, zpr::vsapi::v1::visa::Owned>::new(reader);
-    typed_reader.get().ok()?.try_into().ok()
+    let root = typed_reader.get().ok()?;
+    // Check the raw expiry before the conversion below, which does not.
+    if !expiry_millis_in_range(root.get_expiration()) {
+        return None;
+    }
+    root.try_into().ok()
+}
+
+/// Can this node hold a visa expiring `millis` ms after the Unix epoch?
+/// The `Visa` conversion adds it to the epoch unchecked, which panics past
+/// `SystemTime`'s range (much narrower on Windows), and the visa table
+/// keeps expiries as chrono timestamps, whose conversion panics past
+/// chrono's range. Both are checked here, before either conversion.
+fn expiry_millis_in_range(millis: u64) -> bool {
+    let Ok(signed) = i64::try_from(millis) else {
+        return false;
+    };
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(signed).is_some()
+        && std::time::SystemTime::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(millis))
+            .is_some()
 }
 
 fn put_visa(buf: &mut dyn bytes::BufMut, tlv_type: TlvType, visa: &zpr::vsapi_types::Visa) {

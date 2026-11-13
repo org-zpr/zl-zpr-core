@@ -92,9 +92,6 @@ pub enum HandoffError {
     /// The visa has expired.
     #[error("visa {0} has expired")]
     Expired(VisaId),
-    /// The visa's expiry is out of the range the visa table can hold.
-    #[error("visa {0} has an expiry out of range")]
-    BadExpiry(VisaId),
     /// This link already has its hand-off: there is one per link.
     #[error("this link already has a hand-off")]
     AlreadyHandedOff,
@@ -124,7 +121,8 @@ pub fn encode(visas: &[Visa; HANDOFF_VISA_COUNT]) -> Result<Vec<u8>, HandoffErro
 
 /// Decode a hand-off body written by [encode]. Refuses a count other than
 /// [HANDOFF_VISA_COUNT], a length running past the end, a malformed visa
-/// and trailing bytes. The bytes come from the peer: nothing here panics.
+/// (including an expiry this node cannot hold) and trailing bytes. The
+/// bytes come from the peer: nothing here panics.
 pub fn decode(body: &[u8]) -> Result<Vec<Visa>, HandoffError> {
     let (&count, mut rest) = body.split_first().ok_or(HandoffError::Malformed)?;
     if count as usize != HANDOFF_VISA_COUNT {
@@ -181,8 +179,10 @@ pub struct HandoffContext<'a> {
 /// 6. neither with a reserved ID ([HandoffError::ReservedId]),
 /// 7. which are exactly one forward and one reverse VS-API visa for this
 ///    Zode, with distinct IDs ([HandoffError::WrongShape]),
-/// 8. and neither has expired ([HandoffError::Expired]) or expires out of
-///    the range the visa table can hold ([HandoffError::BadExpiry]).
+/// 8. and neither has expired ([HandoffError::Expired]).
+///
+/// An expiry out of the range this node can hold never gets here: [decode]
+/// refuses it ([crate::tlv::unpack_visa]).
 ///
 /// Returns the visas as `[forward, reverse]`, whatever order they came in.
 pub fn check_handoff(
@@ -224,22 +224,7 @@ pub fn check_handoff(
     if let Some(stale) = pair.iter().find(|visa| visa.expires <= ctx.now) {
         return Err(HandoffError::Expired(stale.issuer_id));
     }
-    if let Some(far) = pair.iter().find(|visa| !expiry_in_range(visa.expires)) {
-        return Err(HandoffError::BadExpiry(far.issuer_id));
-    }
     Ok(pair)
-}
-
-/// Can the visa table hold `expires`? It keeps expiries as chrono
-/// timestamps, and converting one out of chrono's range panics, so the
-/// peer's value is checked here, at the trust boundary.
-fn expiry_in_range(expires: SystemTime) -> bool {
-    expires
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|since_epoch| i64::try_from(since_epoch.as_millis()).ok())
-        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-        .is_some()
 }
 
 /// The flow a full TCP visa admits, from its dock PEP, as `(source,
@@ -826,16 +811,28 @@ mod tests {
         );
     }
 
-    /// Local Codex review: an expiry the visa table cannot represent is
-    /// refused here; installing it would panic.
+    /// Review round 1 (Copilot): a wire expiry this node cannot hold
+    /// (`u64::MAX` ms: past Windows' `SystemTime` and chrono's range) is
+    /// refused while decoding, before anything converts it. Built from the
+    /// Cap'n Proto message directly, since no `SystemTime` can carry it.
     #[test]
-    fn test_check_refuses_an_unrepresentable_expiry() {
-        let mut far = reverse();
-        far.expires = SystemTime::UNIX_EPOCH + Duration::from_millis(u64::MAX);
-        assert_eq!(
-            check_pair(forward(), far),
-            Err(HandoffError::BadExpiry(REV_ID))
-        );
+    fn test_decode_refuses_an_out_of_range_expiry() {
+        use zpr::write_to::WriteTo;
+        let mut builder =
+            capnp::message::TypedBuilder::<zpr::vsapi::v1::visa::Owned>::new_default();
+        let mut root = builder.init_root();
+        forward().write_to(&mut root);
+        root.set_expiration(u64::MAX);
+        let mut far = Vec::new();
+        capnp::serialize_packed::write_message(&mut far, builder.borrow_inner()).unwrap();
+        let rev = crate::tlv::pack_visa(&reverse());
+
+        let mut body = vec![2];
+        for packed in [&far, &rev] {
+            body.extend_from_slice(&(packed.len() as u16).to_be_bytes());
+            body.extend_from_slice(packed);
+        }
+        assert_eq!(decode(&body), Err(HandoffError::Malformed));
     }
 
     // ---- install, rule 9 and egress (t202) ----

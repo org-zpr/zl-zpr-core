@@ -703,10 +703,10 @@ where
                 Ok(()) => {
                     info!(target: LINK_STATE, "reported Zode link states to the visa service: [{}]", summary.join(", "))
                 }
-                // No VS-API session (always the case on a Zode other than the
-                // visa service's own until zl-zipline#252): VSConn refuses the
-                // call locally, so nothing goes on the wire. The session's
-                // (re)connect asks for a fresh report.
+                // No VS-API session (a joiner before its hand-off, or any
+                // Zode between sessions): VSConn refuses the call locally, so
+                // nothing goes on the wire. The session's (re)connect asks
+                // for a fresh report.
                 Err(e @ (VSApiError::ConnClosed | VSApiError::CommandFailed(_))) => {
                     debug!(target: LINK_STATE, "link-state report not sent, no VS-API session: {e}")
                 }

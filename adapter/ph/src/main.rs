@@ -529,8 +529,10 @@ fn main() -> ExitCode {
         mgmt_substrate_egress: MgmtSubstrateEgress::new(mgmt_substrate_inq),
         actor_output_requeue: ActorOutputRequeue::new(actor_requeue_inqs),
         vsconn: vsconn.as_ref().map(|c| c.handle()),
-        visa_table: std::sync::RwLock::new(visa_table::VisaTable::new_with_vs_visas(
+        // J1 (zl-zipline#252): a joiner starts with no visas at all.
+        visa_table: std::sync::RwLock::new(visa_table::VisaTable::initial_for_node(
             &node_zpr_addr,
+            config.initial_link.is_some(),
         )),
         topology: Default::default(),
         zode_links: Default::default(),

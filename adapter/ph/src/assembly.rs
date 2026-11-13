@@ -271,6 +271,10 @@ impl Assembly {
     /// Disconnect all non-internal, non-vs adapters.
     /// Used in a node context when (for example) we loose all state with the visa service.
     ///
+    /// Zode links are not adapters and are left up: their state is tied to
+    /// the link, not to the VS-API session, and a joiner's initial link
+    /// carries the very session being reset (zl-zipline#252, R16).
+    ///
     /// Does not remove visas related to the adapter/peer.
     pub async fn disconnect_adapters(self: &Arc<Self>) {
         if matches!(self.ph_mode, PhMode::Node) {
@@ -279,7 +283,8 @@ impl Assembly {
                 .peer_table
                 .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
             self.peer_table.for_each(|(peer_id, peer)| {
-                if Some(peer_id) != vs_peer && !peer.is_internal() {
+                let zode_link = peer.link_state_machine.get_link_type() == LinkType::NodeToNode;
+                if Some(peer_id) != vs_peer && !peer.is_internal() && !zode_link {
                     // This should be a short block and must be blocked on,
                     // otherwise the messages won't get sent
                     let spawn_self = self.clone();
@@ -2093,6 +2098,23 @@ pub mod test {
                 ph_mode: Some(PhMode::Node),
                 ..TestAssemblyBuilder::new()
             })
+        }
+
+        /// R16 (zl-zipline#252): clearing state after a refused reconnect
+        /// resets adapters only. A Zode link, above all a joiner's initial
+        /// link, which carries the VS-API session being reconnected, is
+        /// left alone.
+        #[tokio::test(flavor = "local")]
+        async fn test_disconnect_adapters_leaves_zode_links_up() {
+            let asm = Arc::new(node());
+            let link = insert_up_zode_link(&asm, "b.zpr", ZODE_ADDR.parse().unwrap());
+            asm.disconnect_adapters().await;
+            assert_eq!(
+                asm.peer_table
+                    .get(link)
+                    .map(|peer| peer.link_state_machine.get_state()),
+                Some(LinkState::Active)
+            );
         }
 
         /// A next hop equal to the topology `zprAddr` of an up Zode link

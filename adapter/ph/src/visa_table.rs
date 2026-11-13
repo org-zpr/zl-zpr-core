@@ -303,63 +303,53 @@ impl VisaTable {
         }
     }
 
-    /// Create table and populate with two visas to allow for 2-way comms with the
-    /// VS-API.
-    ///
-    /// TODO: Note that the first thing the visa service does after connecting is
-    /// hand over visas just like this.  So we should have logic somewhere to get
-    /// rid of these.  Maybe?  We might need them again if for example we loose
-    /// contact with visa service and the visas it gives us expire.
+    /// The visa table a node starts with (ZODE_LINKS.md J1, zl-zipline#252).
+    /// A Zode with an initial link starts empty: its VS-API visas come from
+    /// its relay's hand-off ([crate::bootstrap_handoff]). A Zode without
+    /// one (the relay, which hosts the visa service) grants itself the
+    /// VS-API pair ([VisaTable::new_with_vs_visas]): its first
+    /// authentication runs over it.
+    pub fn initial_for_node(node_addr: &IpAddr, has_initial_link: bool) -> Self {
+        if has_initial_link {
+            Self::new()
+        } else {
+            Self::new_with_vs_visas(node_addr)
+        }
+    }
+
+    /// Create a table holding this node's self-granted VS-API pair
+    /// ([self_granted_vs_visas]).
     pub fn new_with_vs_visas(node_addr: &IpAddr) -> Self {
-        // Right away the node wants to reach out to the visa service. So we need visas to match:
-        //  1) NODEADDR/any-port -> VISA_SERVICE/VS_PORT
-        //  2) VISA_SERVICE/VS_PORT -> NODEADDR/any-port (TODO: not great, really needs to check this is non-syn)
-
-        // Node ZPR address must be IPv6, right?
-        let node_zpr_addr = match node_addr {
-            IpAddr::V4(addr) => addr.to_ipv6_mapped(),
-            IpAddr::V6(addr) => addr.clone(),
-        };
-
-        // TODO: This is crazy since VS is always IPv6
-        let vs_zpr_addr = match VISA_SERVICE_ADDR {
-            IpAddr::V4(addr) => addr.to_ipv6_mapped(),
-            IpAddr::V6(addr) => addr,
-        };
-
-        let expires_ms = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + VS_VISAS_DURATION)
-            .as_millis() as i64;
-
-        let node2vs = make_tcp_visa(
-            1,
-            &node_zpr_addr,
-            0,
-            &vs_zpr_addr,
-            VISA_SERVICE_PORT,
-            VS_VISAS_CONFIG_ID,
-            expires_ms,
-        );
-        let vs2node = make_tcp_visa(
-            2,
-            &vs_zpr_addr,
-            VISA_SERVICE_PORT,
-            &node_zpr_addr,
-            0,
-            VS_VISAS_CONFIG_ID,
-            expires_ms,
-        );
-
         let mut visa_table = Self::new();
+        for visa in self_granted_vs_visas(node_addr) {
+            visa_table
+                .insert_visa(visa)
+                .expect("a self-granted VS-API visa is well formed");
+        }
         visa_table
-            .insert_visa(node2vs)
-            .expect("Failed to insert node->vs visa into table");
-        visa_table
-            .insert_visa(vs2node)
-            .expect("Failed to insert visa->node visa into table");
+    }
 
-        visa_table.rebuild_lookup_table();
-
-        visa_table
+    /// Grant this node its VS-API pair ([self_granted_vs_visas]) afresh:
+    /// any held copies are revoked first and new ones inserted, so the pair
+    /// is current for its five-tuples even after the visas that superseded
+    /// it (J5a) were revoked: removal never promotes an older visa. The
+    /// relay calls this when its VS-API session is lost, its equivalent of
+    /// J10 (zl-zipline#252, gate question 7). Returns the forwarding entries
+    /// the revocation withdrew; the caller handles them after it releases
+    /// the visa-table lock (zipline#9).
+    pub fn regrant_vs_visas(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        node_addr: &IpAddr,
+    ) -> Vec<ForwardingEntry> {
+        let mut withdrawn = Vec::new();
+        for visa in self_granted_vs_visas(node_addr) {
+            // `revoke` succeeds whether or not the ID is held.
+            withdrawn.extend(self.revoke(peer_table, visa.issuer_id).unwrap_or_default());
+            self.insert_visa(visa)
+                .expect("a self-granted VS-API visa is well formed");
+        }
+        withdrawn
     }
 
     /// Insert a visa from the visa service into the table.
@@ -872,6 +862,49 @@ impl VisaTable {
             .map(|ftuple| IpAddress::from(ftuple.dest_addr))
             .ok_or(VisaTableError::ParseError("fwd_pep"))
     }
+}
+
+/// The two visas that let a node reach a visa service docked on itself,
+/// IDs 1 and 2 (below `MIN_VISA_ID`, which the visa service never issues),
+/// valid for `VS_VISAS_DURATION`:
+///  1) NODEADDR/any-port -> VISA_SERVICE/VS_PORT
+///  2) VISA_SERVICE/VS_PORT -> NODEADDR/any-port (TODO: not great, really needs to check this is non-syn)
+fn self_granted_vs_visas(node_addr: &IpAddr) -> [vsapi_types::Visa; 2] {
+    // Node ZPR address must be IPv6, right?
+    let node_zpr_addr = match node_addr {
+        IpAddr::V4(addr) => addr.to_ipv6_mapped(),
+        IpAddr::V6(addr) => *addr,
+    };
+
+    // TODO: This is crazy since VS is always IPv6
+    let vs_zpr_addr = match VISA_SERVICE_ADDR {
+        IpAddr::V4(addr) => addr.to_ipv6_mapped(),
+        IpAddr::V6(addr) => addr,
+    };
+
+    let expires_ms = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + VS_VISAS_DURATION)
+        .as_millis() as i64;
+
+    let node2vs = make_tcp_visa(
+        1,
+        &node_zpr_addr,
+        0,
+        &vs_zpr_addr,
+        VISA_SERVICE_PORT,
+        VS_VISAS_CONFIG_ID,
+        expires_ms,
+    );
+    let vs2node = make_tcp_visa(
+        2,
+        &vs_zpr_addr,
+        VISA_SERVICE_PORT,
+        &node_zpr_addr,
+        0,
+        VS_VISAS_CONFIG_ID,
+        expires_ms,
+    );
+
+    [node2vs, vs2node]
 }
 
 fn make_tcp_visa(
@@ -1615,6 +1648,49 @@ pub mod tests {
         assert_eq!(visa_table.bindings(5200), &[binding]);
         assert_eq!(visa_table.timeout_queue.len(), 1);
         assert_eq!(visa_table.match_traffic(&full_tuple), Some(5200));
+    }
+
+    /// J1 (zl-zipline#252): a Zode with an initial link starts with an
+    /// empty visa table; its VS-API visas come from its relay's hand-off.
+    /// A Zode without one (the relay, which hosts the visa service) grants
+    /// itself the VS-API pair, which its first authentication runs over.
+    #[test]
+    fn test_initial_visa_table_is_empty_only_for_a_joiner() {
+        let addr: IpAddr = "fd5a:5052::b".parse().unwrap();
+        assert!(VisaTable::initial_for_node(&addr, true).table.is_empty());
+        let relay = VisaTable::initial_for_node(&addr, false);
+        assert!(relay.contains(1) && relay.contains(2));
+        assert_eq!(relay.table.len(), 2);
+    }
+
+    /// The relay's equivalent of J10 (zl-zipline#252, gate question 7):
+    /// when its VS-API session is lost, it grants itself the VS-API pair
+    /// again, so it can reach its visa service even after the visas that
+    /// superseded the pair (J5a) were revoked: removal never promotes an
+    /// older visa, so without this nothing would match the flow.
+    #[test]
+    fn test_regranting_the_vs_visas_restores_the_vs_api_flow() {
+        let addr: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let peer_table = crate::peer_table::PeerTable::new();
+        let mut visa_table = VisaTable::new_with_vs_visas(&addr);
+        let mut j5a = visa_table.get(1).unwrap().visa().clone();
+        j5a.issuer_id = 5000;
+        visa_table.insert_visa(j5a).unwrap();
+        visa_table.revoke(&peer_table, 5000).unwrap();
+        // A VS-API packet from the relay, from some client port.
+        let packet = crate::defs::FiveTuple {
+            src_address: IpAddress::new_from_std(&addr),
+            dst_address: IpAddress::new_from_std(&VISA_SERVICE_ADDR),
+            l3_type: zpr::packet_info::L3Type::Ipv6,
+            l4_protocol: net_defs::ip_number::TCP,
+            src_port: 40000,
+            dst_port: VISA_SERVICE_PORT,
+        };
+        assert_eq!(visa_table.match_traffic(&packet), None);
+
+        visa_table.regrant_vs_visas(&peer_table, &addr);
+        assert_eq!(visa_table.match_traffic(&packet), Some(1));
+        assert!(visa_table.contains(2));
     }
 
     /// A visa whose expiry chrono cannot represent (a visa service bug, or

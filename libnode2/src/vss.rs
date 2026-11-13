@@ -638,7 +638,6 @@ mod tests {
             ip.write_to(&mut peer.init_addr());
         }
         b.set_role(v1::LinkRole::Active);
-        b.reborrow().init_visas(0);
         if let Some(addr) = zpr_addr {
             addr.write_to(&mut b.reborrow().init_zpr_addr());
         }

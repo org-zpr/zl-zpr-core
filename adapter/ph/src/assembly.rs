@@ -271,6 +271,11 @@ impl Assembly {
     /// Disconnect all non-internal, non-vs adapters.
     /// Used in a node context when (for example) we loose all state with the visa service.
     ///
+    /// Zode links are reset too, except the one carrying the VS-API session
+    /// being reset: a joiner's initial link, the link its bootstrap visas
+    /// were handed off on (zl-zipline#252, R16). On a relay this ends every
+    /// join riding on it, so each joiner redials and gets a fresh hand-off.
+    ///
     /// Does not remove visas related to the adapter/peer.
     pub async fn disconnect_adapters(self: &Arc<Self>) {
         if matches!(self.ph_mode, PhMode::Node) {
@@ -278,8 +283,10 @@ impl Assembly {
             let vs_peer = self
                 .peer_table
                 .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
+            let session_link = *self.bootstrap_handoff.borrow();
             self.peer_table.for_each(|(peer_id, peer)| {
-                if Some(peer_id) != vs_peer && !peer.is_internal() {
+                let carries_session = session_link == Some(peer_id.get());
+                if Some(peer_id) != vs_peer && !peer.is_internal() && !carries_session {
                     // This should be a short block and must be blocked on,
                     // otherwise the messages won't get sent
                     let spawn_self = self.clone();
@@ -2093,6 +2100,34 @@ pub mod test {
                 ph_mode: Some(PhMode::Node),
                 ..TestAssemblyBuilder::new()
             })
+        }
+
+        /// R16 (zl-zipline#252): clearing state after a refused reconnect
+        /// resets every link but the one carrying the VS-API session being
+        /// reset: a joiner's initial link (its hand-off link) stays up, and
+        /// any other Zode link is reset like an adapter. On a relay that
+        /// ends each join riding on it, so a joiner whose relay copies the
+        /// reset purges redials and gets a fresh hand-off (hosted review).
+        #[tokio::test(flavor = "local")]
+        async fn test_disconnect_adapters_keeps_only_the_session_link() {
+            // A node whose egress queue is drained, so a reset can send.
+            let (asm, _egress) =
+                crate::zode_links::tests::driven_zode("fd5a:5052:8::1", "b.zpr", None);
+            let session = insert_up_zode_link(&asm, "relay.zpr", ZODE_ADDR.parse().unwrap());
+            let other = insert_up_zode_link(&asm, "c.zpr", "fd5a:5052:8::98".parse().unwrap());
+            asm.bootstrap_handoff.send_replace(Some(session));
+            asm.disconnect_adapters().await;
+            let state = |link| {
+                asm.peer_table
+                    .get(link)
+                    .map(|peer| peer.link_state_machine.get_state())
+            };
+            assert_eq!(state(session), Some(LinkState::Active));
+            assert_ne!(
+                state(other),
+                Some(LinkState::Active),
+                "the other Zode link is reset"
+            );
         }
 
         /// A next hop equal to the topology `zprAddr` of an up Zode link

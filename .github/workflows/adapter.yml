@@ -41,8 +41,10 @@ env:
   # (v0.21.2 sends no Link.peerCn, so it cannot drive Zode links). Re-cut
   # rule (docs/BUILD.md, zl-zipline#254): when the visa service changes in a
   # way core CI needs, cut the next v0.22.0-zodes.N pre-release from its
-  # feature/zodes and move this pin to it.
-  VISA_SERVICE_RELEASE: v0.22.0-zodes.2
+  # feature/zodes and move this pin to it. v0.22.0-zodes.5 is the exception:
+  # it is cut from visaservice#67's head (requestBootstrapVisas plus the g100 and g101 fixes, zl-zipline#252)
+  # before that PR merges, and is re-cut from the merged commit afterwards.
+  VISA_SERVICE_RELEASE: v0.22.0-zodes.5
 
 jobs:
   # Build and upload ph

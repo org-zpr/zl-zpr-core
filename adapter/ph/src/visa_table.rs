@@ -303,63 +303,106 @@ impl VisaTable {
         }
     }
 
-    /// Create table and populate with two visas to allow for 2-way comms with the
-    /// VS-API.
-    ///
-    /// TODO: Note that the first thing the visa service does after connecting is
-    /// hand over visas just like this.  So we should have logic somewhere to get
-    /// rid of these.  Maybe?  We might need them again if for example we loose
-    /// contact with visa service and the visas it gives us expire.
+    /// The visa table a node starts with (ZODE_LINKS.md J1, zl-zipline#252).
+    /// A Zode with an initial link starts empty: its VS-API visas come from
+    /// its relay's hand-off ([crate::bootstrap_handoff]). A Zode without
+    /// one (the relay, which hosts the visa service) grants itself the
+    /// VS-API pair ([VisaTable::new_with_vs_visas]): its first
+    /// authentication runs over it.
+    pub fn initial_for_node(node_addr: &IpAddr, has_initial_link: bool) -> Self {
+        if has_initial_link {
+            Self::new()
+        } else {
+            Self::new_with_vs_visas(node_addr)
+        }
+    }
+
+    /// Create a table holding this node's self-granted VS-API pair
+    /// ([self_granted_vs_visas]).
     pub fn new_with_vs_visas(node_addr: &IpAddr) -> Self {
-        // Right away the node wants to reach out to the visa service. So we need visas to match:
-        //  1) NODEADDR/any-port -> VISA_SERVICE/VS_PORT
-        //  2) VISA_SERVICE/VS_PORT -> NODEADDR/any-port (TODO: not great, really needs to check this is non-syn)
-
-        // Node ZPR address must be IPv6, right?
-        let node_zpr_addr = match node_addr {
-            IpAddr::V4(addr) => addr.to_ipv6_mapped(),
-            IpAddr::V6(addr) => addr.clone(),
-        };
-
-        // TODO: This is crazy since VS is always IPv6
-        let vs_zpr_addr = match VISA_SERVICE_ADDR {
-            IpAddr::V4(addr) => addr.to_ipv6_mapped(),
-            IpAddr::V6(addr) => addr,
-        };
-
-        let expires_ms = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + VS_VISAS_DURATION)
-            .as_millis() as i64;
-
-        let node2vs = make_tcp_visa(
-            1,
-            &node_zpr_addr,
-            0,
-            &vs_zpr_addr,
-            VISA_SERVICE_PORT,
-            VS_VISAS_CONFIG_ID,
-            expires_ms,
-        );
-        let vs2node = make_tcp_visa(
-            2,
-            &vs_zpr_addr,
-            VISA_SERVICE_PORT,
-            &node_zpr_addr,
-            0,
-            VS_VISAS_CONFIG_ID,
-            expires_ms,
-        );
-
         let mut visa_table = Self::new();
+        for visa in self_granted_vs_visas(node_addr) {
+            visa_table
+                .insert_visa(visa)
+                .expect("a self-granted VS-API visa is well formed");
+        }
         visa_table
-            .insert_visa(node2vs)
-            .expect("Failed to insert node->vs visa into table");
-        visa_table
-            .insert_visa(vs2node)
-            .expect("Failed to insert visa->node visa into table");
+    }
 
-        visa_table.rebuild_lookup_table();
+    /// Grant this node its VS-API pair ([self_granted_vs_visas]) afresh.
+    /// The relay calls this when its VS-API session is lost, its equivalent
+    /// of J10 (zl-zipline#252, gate question 7). Every visa held for its
+    /// VS-API flows (the pair itself, and the J5a visas that superseded it)
+    /// belonged to the lost session and is revoked first, even one with a
+    /// live binding: the dock link to the visa service stays up, so that
+    /// binding would otherwise keep a dead session's visa current, and its
+    /// expiry would leave the flow with no visa (removal never promotes an
+    /// older visa). The fresh pair is then the only visa for those flows.
+    /// Returns the forwarding entries the revocation withdrew; the caller
+    /// handles them after it releases the visa-table lock (zipline#9).
+    pub fn regrant_vs_visas(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        node_addr: &IpAddr,
+    ) -> Vec<ForwardingEntry> {
+        let withdrawn = self.revoke_by_vs_api_flow(peer_table, node_addr, true);
+        for visa in self_granted_vs_visas(node_addr) {
+            self.insert_visa(visa)
+                .expect("a self-granted VS-API visa is well formed");
+        }
+        withdrawn
+    }
 
-        visa_table
+    /// R16 (zl-zipline#252): this node is about to connect to the visa
+    /// service as `reset`, declaring that it holds no state. Revoke every
+    /// visa except those for its own VS-API flows, which carry the reset
+    /// itself: nothing the visa service granted it earlier may stay usable
+    /// here once the service no longer counts it as installed. Returns the
+    /// withdrawn forwarding entries; the caller handles them after it
+    /// releases the visa-table lock (zipline#9).
+    pub fn retain_vs_api_visas(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        node_addr: &IpAddr,
+    ) -> Vec<ForwardingEntry> {
+        self.revoke_by_vs_api_flow(peer_table, node_addr, false)
+    }
+
+    /// Revoke every held visa whose dock-PEP five-tuple is one of the VS-API
+    /// flows of the node at `node_addr` (`vs_api` true), or every visa whose
+    /// five-tuple is not (`vs_api` false). The VS-API flows are those of
+    /// [self_granted_vs_visas]; the bootstrap and J5a visas share them.
+    /// Returns the withdrawn forwarding entries.
+    fn revoke_by_vs_api_flow(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        node_addr: &IpAddr,
+        vs_api: bool,
+    ) -> Vec<ForwardingEntry> {
+        let vs_api_flows: Vec<FlowKey> = self_granted_vs_visas(node_addr)
+            .into_iter()
+            .filter_map(|visa| Visa::new(visa).ok()?.ftuple.as_ref().map(FlowKey::from))
+            .collect();
+        let doomed: Vec<VisaId> = self
+            .table
+            .keys()
+            .copied()
+            .filter(|id| {
+                let is_vs_api = self
+                    .flow_key(*id)
+                    .is_some_and(|key| vs_api_flows.contains(&key));
+                is_vs_api == vs_api
+            })
+            .collect();
+        let mut withdrawn = Vec::new();
+        for visa_id in doomed {
+            withdrawn.extend(
+                self.revoke_no_rebuild(peer_table, visa_id)
+                    .unwrap_or_default(),
+            );
+        }
+        self.rebuild_lookup_table();
+        withdrawn
     }
 
     /// Insert a visa from the visa service into the table.
@@ -408,7 +451,10 @@ impl VisaTable {
             return Ok((visa_id, false));
         }
 
-        let expiration = DateTime::from(visa.expires);
+        // `DateTime::from` panics past chrono's range, so convert checked.
+        // Refusing here covers every insert path at once.
+        let expiration =
+            expiry_as_utc(visa.expires).ok_or(VisaTableError::ParseError("expiration"))?;
 
         info!(target: VISA_MGMT,
             "Visa inserted into VisaTable ID: {visa_id}, Type: {:?}, Expiration: {}",
@@ -724,7 +770,17 @@ impl VisaTable {
             .map_or(false, |entry| entry.expiration < current_time)
         {
             let timeout_entry = self.timeout_queue.pop().unwrap();
-            // Ignore if the visa was not found, since it might have been previously revoked
+            // An entry is stale if its visa was revoked, or revoked and an
+            // ID of this node's own range granted again with a new lifetime
+            // ([VisaTable::regrant_vs_visas]): only the held visa's own
+            // expiry removes it.
+            let held_expiry = self
+                .table
+                .get(&timeout_entry.id)
+                .and_then(|visa| expiry_as_utc(visa.visa().expires));
+            if held_expiry != Some(timeout_entry.expiration) {
+                continue;
+            }
             if let Ok(entries) = self.revoke_no_rebuild(peer_table, timeout_entry.id) {
                 withdrawn.extend(entries);
             }
@@ -871,6 +927,49 @@ impl VisaTable {
     }
 }
 
+/// The two visas that let a node reach a visa service docked on itself,
+/// IDs 1 and 2 (below `MIN_VISA_ID`, which the visa service never issues),
+/// valid for `VS_VISAS_DURATION`:
+///  1) NODEADDR/any-port -> VISA_SERVICE/VS_PORT
+///  2) VISA_SERVICE/VS_PORT -> NODEADDR/any-port (TODO: not great, really needs to check this is non-syn)
+fn self_granted_vs_visas(node_addr: &IpAddr) -> [vsapi_types::Visa; 2] {
+    // Node ZPR address must be IPv6, right?
+    let node_zpr_addr = match node_addr {
+        IpAddr::V4(addr) => addr.to_ipv6_mapped(),
+        IpAddr::V6(addr) => *addr,
+    };
+
+    // TODO: This is crazy since VS is always IPv6
+    let vs_zpr_addr = match VISA_SERVICE_ADDR {
+        IpAddr::V4(addr) => addr.to_ipv6_mapped(),
+        IpAddr::V6(addr) => addr,
+    };
+
+    let expires_ms = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + VS_VISAS_DURATION)
+        .as_millis() as i64;
+
+    let node2vs = make_tcp_visa(
+        1,
+        &node_zpr_addr,
+        0,
+        &vs_zpr_addr,
+        VISA_SERVICE_PORT,
+        VS_VISAS_CONFIG_ID,
+        expires_ms,
+    );
+    let vs2node = make_tcp_visa(
+        2,
+        &vs_zpr_addr,
+        VISA_SERVICE_PORT,
+        &node_zpr_addr,
+        0,
+        VS_VISAS_CONFIG_ID,
+        expires_ms,
+    );
+
+    [node2vs, vs2node]
+}
+
 fn make_tcp_visa(
     visa_id: u64,
     source: &Ipv6Addr,
@@ -907,6 +1006,14 @@ fn make_tcp_visa(
         // previous hop (zl-zipline#245).
         prev_hop: None,
     }
+}
+
+/// `expires` as a chrono timestamp, or `None` if chrono cannot represent it
+/// or it lies before the Unix epoch (no visa service issues either).
+fn expiry_as_utc(expires: SystemTime) -> Option<DateTime<Utc>> {
+    let since_epoch = expires.duration_since(UNIX_EPOCH).ok()?;
+    let secs = i64::try_from(since_epoch.as_secs()).ok()?;
+    DateTime::from_timestamp(secs, since_epoch.subsec_nanos())
 }
 
 #[cfg(test)]
@@ -1604,6 +1711,158 @@ pub mod tests {
         assert_eq!(visa_table.bindings(5200), &[binding]);
         assert_eq!(visa_table.timeout_queue.len(), 1);
         assert_eq!(visa_table.match_traffic(&full_tuple), Some(5200));
+    }
+
+    /// J1 (zl-zipline#252): a Zode with an initial link starts with an
+    /// empty visa table; its VS-API visas come from its relay's hand-off.
+    /// A Zode without one (the relay, which hosts the visa service) grants
+    /// itself the VS-API pair, which its first authentication runs over.
+    #[test]
+    fn test_initial_visa_table_is_empty_only_for_a_joiner() {
+        let addr: IpAddr = "fd5a:5052::b".parse().unwrap();
+        assert!(VisaTable::initial_for_node(&addr, true).table.is_empty());
+        let relay = VisaTable::initial_for_node(&addr, false);
+        assert!(relay.contains(1) && relay.contains(2));
+        assert_eq!(relay.table.len(), 2);
+    }
+
+    /// The relay's equivalent of J10 (zl-zipline#252, gate question 7):
+    /// when its VS-API session is lost, it grants itself the VS-API pair
+    /// again, so it can reach its visa service even after the visas that
+    /// superseded the pair (J5a) were revoked: removal never promotes an
+    /// older visa, so without this nothing would match the flow.
+    #[test]
+    fn test_regranting_the_vs_visas_restores_the_vs_api_flow() {
+        let addr: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let peer_table = crate::peer_table::PeerTable::new();
+        let mut visa_table = VisaTable::new_with_vs_visas(&addr);
+        let mut j5a = visa_table.get(1).unwrap().visa().clone();
+        j5a.issuer_id = 5000;
+        visa_table.insert_visa(j5a).unwrap();
+        visa_table.revoke(&peer_table, 5000).unwrap();
+        // A VS-API packet from the relay, from some client port.
+        let packet = crate::defs::FiveTuple {
+            src_address: IpAddress::new_from_std(&addr),
+            dst_address: IpAddress::new_from_std(&VISA_SERVICE_ADDR),
+            l3_type: zpr::packet_info::L3Type::Ipv6,
+            l4_protocol: net_defs::ip_number::TCP,
+            src_port: 40000,
+            dst_port: VISA_SERVICE_PORT,
+        };
+        assert_eq!(visa_table.match_traffic(&packet), None);
+
+        visa_table.regrant_vs_visas(&peer_table, &addr);
+        assert_eq!(visa_table.match_traffic(&packet), Some(1));
+        assert!(visa_table.contains(2));
+    }
+
+    /// A VS-API packet from the node at `addr` to the visa service.
+    fn vs_api_packet(addr: &IpAddr) -> crate::defs::FiveTuple {
+        crate::defs::FiveTuple {
+            src_address: IpAddress::new_from_std(addr),
+            dst_address: IpAddress::new_from_std(&VISA_SERVICE_ADDR),
+            l3_type: zpr::packet_info::L3Type::Ipv6,
+            l4_protocol: net_defs::ip_number::TCP,
+            src_port: 40000,
+            dst_port: VISA_SERVICE_PORT,
+        }
+    }
+
+    /// Hosted review (Copilot): the session is lost while the J5a visa
+    /// that superseded the pair still has a live binding (the dock link to
+    /// the visa service stays up). The regrant must still make the pair
+    /// current: the dead session's J5a visas are revoked, so their expiry
+    /// cannot leave the flow with no visa at all.
+    #[test]
+    fn test_regranting_drops_a_bound_j5a_visa() {
+        let addr: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let peer_table = crate::peer_table::PeerTable::new();
+        let mut visa_table = VisaTable::new_with_vs_visas(&addr);
+        visa_table.bind(1, binding_on(4, 7)).unwrap();
+        let mut j5a = visa_table.get(1).unwrap().visa().clone();
+        j5a.issuer_id = 5000;
+        visa_table.insert_visa(j5a).unwrap();
+        visa_table.bind(5000, binding_on(4, 8)).unwrap();
+
+        visa_table.regrant_vs_visas(&peer_table, &addr);
+        assert!(
+            !visa_table.contains(5000),
+            "the old session's J5a visa is gone"
+        );
+        assert_eq!(visa_table.match_traffic(&vs_api_packet(&addr)), Some(1));
+    }
+
+    /// Hosted review (Codex): before connecting as `reset` (R16), a node
+    /// keeps only the visas for its own VS-API flows, which carry the
+    /// reset; every other visa the visa service granted before is revoked.
+    #[test]
+    fn test_a_reset_keeps_only_the_vs_api_visas() {
+        let addr: IpAddr = "fd5a:5052::3".parse().unwrap();
+        let peer_table = crate::peer_table::PeerTable::new();
+        let mut visa_table = VisaTable::new();
+        let [forward, reverse] = self_granted_vs_visas(&addr);
+        for (mut visa, id) in [(forward, 1500), (reverse, 1501)] {
+            visa.issuer_id = id;
+            visa_table.insert_visa(visa).unwrap();
+        }
+        insert_full_visa(&mut visa_table, 5200);
+        visa_table.bind(5200, binding_on(4, 9)).unwrap();
+        visa_table
+            .insert_visa(new_vsapi_visa_forward_only(
+                5201,
+                never_expires(),
+                next_hop_addr(),
+            ))
+            .unwrap();
+
+        let withdrawn = visa_table.retain_vs_api_visas(&peer_table, &addr);
+        assert!(
+            withdrawn == vec![ForwardingEntry(4, 9)],
+            "the bound visa's stream is withdrawn"
+        );
+        assert!(!visa_table.contains(5200) && !visa_table.contains(5201));
+        assert!(visa_table.contains(1500) && visa_table.contains(1501));
+        assert_eq!(visa_table.match_traffic(&vs_api_packet(&addr)), Some(1500));
+    }
+
+    /// Local Codex review: a regranted ID keeps its new lifetime. The
+    /// expiry entry of the copy it replaced is stale, and handling it must
+    /// not revoke the new grant.
+    #[test]
+    fn test_a_regranted_vs_visa_outlives_its_predecessors_expiry() {
+        let addr: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let peer_table = crate::peer_table::PeerTable::new();
+        let mut visa_table = VisaTable::new();
+        for mut visa in self_granted_vs_visas(&addr) {
+            visa.expires = ALREADY_EXPIRED + Duration::from_secs(1);
+            visa_table.insert_visa(visa).unwrap();
+        }
+        visa_table.regrant_vs_visas(&peer_table, &addr);
+        visa_table.handle_expirations(&peer_table);
+        assert!(visa_table.contains(1) && visa_table.contains(2));
+    }
+
+    /// A visa whose expiry chrono cannot represent (a visa service bug, or
+    /// a hostile push) is refused, not a panic, and leaves nothing behind.
+    /// Every insert path (VSS push, `visaRequest`, fetch by ID, hand-off)
+    /// goes through this insert, so one guard covers them all.
+    #[test]
+    fn test_insert_refuses_an_expiry_out_of_chrono_range() {
+        // About 317,000 years after 1970: past chrono's year 262,143. Windows'
+        // `SystemTime` cannot hold it at all, so there is nothing to test there.
+        let Some(far_future) = UNIX_EPOCH.checked_add(Duration::from_secs(10_000_000_000_000))
+        else {
+            return;
+        };
+        let mut visa_table = VisaTable::new();
+        let visa = new_vsapi_visa_tcp_default(5300, far_future);
+
+        assert!(matches!(
+            visa_table.insert_visa(visa),
+            Err(VisaTableError::ParseError(_))
+        ));
+        assert!(!visa_table.contains(5300));
+        assert!(visa_table.timeout_queue.is_empty());
     }
 
     /// F3 (zl-zipline#251): losing the egress side of a binding revokes the

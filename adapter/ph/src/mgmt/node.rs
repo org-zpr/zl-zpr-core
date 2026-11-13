@@ -2317,6 +2317,21 @@ mod tests {
         assert!(hairpin_rx.try_recv().is_err(), "nothing is withdrawn");
     }
 
+    /// J5a meets J11 on the joiner (zl-zipline#252 t207): the visa service
+    /// delivers the new VS-API visa by VSS push, and that push alone starts
+    /// the rebind of the live stream. The VS worker needs no extra call.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_pushed_successor_rebinds_the_live_stream() {
+        let (asm, mut egress_rx, _hairpin_rx, zode_link, _streams) = ingress_with_live_streams(1);
+
+        crate::vss_worker::process_visaop(
+            &asm,
+            zpr::vsapi_types::VisaOp::Grant(own_visa(NEW_VISA)),
+        )
+        .unwrap();
+        expect_rebind_request(&asm, &mut egress_rx, zode_link);
+    }
+
     /// J11 is per stream: every live stream of the old visa at the ingress
     /// gets its own rebind and commits on its own answer.
     #[tokio::test(flavor = "local")]

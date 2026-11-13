@@ -737,7 +737,6 @@ pub mod test {
                 port: 5000,
             },
             role: zpr::vsapi_types::LinkRole::Active,
-            visas: Vec::new(),
             zpr_addr,
             peer_cn: peer_cn.to_owned(),
         }

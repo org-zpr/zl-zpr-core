@@ -1046,6 +1046,8 @@ fn abandon_next_hop_bind(
 ///   cached, it would match the requestor's next bind, which would then be
 ///   refused for want of an egress link instead of asking for a new visa
 ///   (F6). The visa itself is never edited, only removed.
+/// - A J11 rebind waiting on `lost` as its next hop revokes its new visa,
+///   for the same reason.
 /// - A next-hop bind on another link issued for a bind from `lost`, or
 ///   for a J11 rebind of a stream from `lost`, is marked abandoned, so its
 ///   answer cannot reach whatever peer takes the link ID next.
@@ -1056,6 +1058,16 @@ pub fn clear_pending_binds_for_lost_link(asm: &Arc<Assembly>, lost: LinkId) {
     let mut revoke = Vec::new();
     asm.peer_table.for_each(|(link_id, peer)| {
         if link_id.get() == lost {
+            // A J11 rebind waiting on `lost` as its next hop has the same
+            // fate as a pending bind: its new visa is revoked. The old
+            // visa had a binding over `lost`, so `revoke_for_link` already
+            // revoked it, and with it the stream. Nothing to refuse: the
+            // stream's requestor never asked for the rebind.
+            for originator in peer.node_state.awaiting_next_hop_bind_table.iter() {
+                if let NextHopBindOriginator::Rebind { new, .. } = *originator {
+                    revoke.push(new);
+                }
+            }
             return;
         }
         for st in peer.node_state.bind_request_state.iter() {
@@ -2374,7 +2386,10 @@ mod tests {
 
     /// J11 and F3: losing the next-hop link while a rebind is in flight
     /// revokes the old visa with its binding, as any loss does, and the new
-    /// visa gets no binding.
+    /// visa too, as for any pending bind that loses its next hop (rule 9).
+    /// Left held, the new visa would take over the lookup and match the
+    /// next packet, whose bind would then be refused for want of an egress
+    /// instead of asking for a new visa (F6).
     #[tokio::test(flavor = "local")]
     async fn test_losing_the_next_hop_during_a_rebind_clears_the_bindings() {
         use zpr::packet_info::LOCAL_ACTOR_LINK_ID;
@@ -2387,7 +2402,7 @@ mod tests {
 
         let visa_table = asm.visa_table.read().unwrap();
         assert!(!visa_table.contains(OLD_VISA));
-        assert!(visa_table.bindings(NEW_VISA).is_empty());
+        assert!(!visa_table.contains(NEW_VISA));
         assert_eq!(
             asm.peer_table.get(LOCAL_ACTOR_LINK_ID).unwrap().pft.len(),
             0

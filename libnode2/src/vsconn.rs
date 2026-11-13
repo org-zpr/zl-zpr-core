@@ -47,6 +47,12 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for connect/challenge/authenticate — longer due to crypto.
 const DEFAULT_CONNECT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a `requestBootstrapVisas` call may take (zl-zipline#252, J7):
+/// the relay closes the joiner's link if no answer comes by then. The RPC
+/// itself is bounded by it, so an unanswered request holds the serial
+/// command loop no longer than the relay waits for it.
+pub const BOOTSTRAP_VISAS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 4 no error if call to VSAPI authenticate was successful.
 type VSVisaResponse = Result<VisaDecision, VSApiError>;
 type VSConnectResponse = Result<(), VSApiError>;
@@ -752,6 +758,12 @@ impl VSConn {
 
             VS2Command::RequestBootstrapVisas(peer_cn, resp_tx) => {
                 debug!(target: VS_RPC, "VSConn: request_bootstrap_visas for {peer_cn}");
+                if resp_tx.is_closed() {
+                    // The relay gave up waiting (J7) and closed the link:
+                    // asking now would only delay the commands behind it.
+                    debug!(target: VS_RPC, "VSConn: request_bootstrap_visas for {peer_cn} abandoned by its caller; not sent");
+                    return Ok(());
+                }
                 let resp = if !cmd_state.is_connected() {
                     Err(VSApiError::CommandFailed(
                         "not connected to VS-API".to_string(),
@@ -1034,7 +1046,7 @@ impl VSConn {
         debug!(target: VS_RPC, "VS-API -> request_bootstrap_visas");
         let response = rpc_with_timeout(
             "request_bootstrap_visas",
-            DEFAULT_RPC_TIMEOUT,
+            BOOTSTRAP_VISAS_TIMEOUT,
             request.send().promise,
         )
         .await?;
@@ -1838,6 +1850,10 @@ mod tests {
                 .borrow_mut()
                 .bootstrap_requests
                 .push(peer_cn.clone());
+            if peer_cn == SLOW_JOINER_CN {
+                // Never answers within a test: the caller's bound decides.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
             if peer_cn == FAKE_JOINER_CN {
                 fake_bootstrap_visas().write_to(&mut results.get().init_res().init_ok());
             } else {
@@ -1854,6 +1870,9 @@ mod tests {
 
     /// The CN the fake visa service mints bootstrap visas for.
     const FAKE_JOINER_CN: &str = "joiner.zpr";
+
+    /// A CN the fake visa service takes a minute to answer for.
+    const SLOW_JOINER_CN: &str = "slow.zpr";
 
     /// The answer the fake visa service gives for [FAKE_JOINER_CN]: two
     /// distinct visas in each list, so a test can check the order survives.
@@ -2069,6 +2088,64 @@ mod tests {
                     .await
                     .expect("the fake VS mints for its joiner CN");
                 assert_eq!(answer, fake_bootstrap_visas());
+                assert_eq!(state.borrow().bootstrap_requests, vec![FAKE_JOINER_CN]);
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#252 (J7): a bootstrap-visa request the visa service does
+    /// not answer fails after [BOOTSTRAP_VISAS_TIMEOUT], not the default RPC
+    /// timeout, so it holds the serial command loop no longer than the relay
+    /// waits for it.
+    #[tokio::test]
+    async fn request_bootstrap_visas_is_bounded_by_its_own_timeout() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, _state, task) = connected_vsconn_against_fake_vs().await;
+
+                let started = tokio::time::Instant::now();
+                let err = handle
+                    .request_bootstrap_visas(SLOW_JOINER_CN.to_string())
+                    .await
+                    .expect_err("the fake VS does not answer in time");
+                assert!(matches!(err, VSApiError::Timeout(_)), "got {err:?}");
+                assert!(
+                    started.elapsed() < BOOTSTRAP_VISAS_TIMEOUT + Duration::from_secs(2),
+                    "bounded by BOOTSTRAP_VISAS_TIMEOUT, took {:?}",
+                    started.elapsed()
+                );
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#252 (J7): a bootstrap-visa request whose caller has
+    /// already given up (its answer would be dropped) is not sent: a stale
+    /// request never delays the ones behind it.
+    #[tokio::test]
+    async fn request_bootstrap_visas_skips_an_abandoned_request() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+
+                let (resp_tx, resp_rx) = oneshot::channel();
+                drop(resp_rx);
+                handle
+                    .send_command(VS2Command::RequestBootstrapVisas(
+                        SLOW_JOINER_CN.to_string(),
+                        resp_tx,
+                    ))
+                    .await
+                    .unwrap();
+                handle
+                    .request_bootstrap_visas(FAKE_JOINER_CN.to_string())
+                    .await
+                    .expect("the request behind the abandoned one is answered");
                 assert_eq!(state.borrow().bootstrap_requests, vec![FAKE_JOINER_CN]);
 
                 handle.stop(false).await.unwrap();

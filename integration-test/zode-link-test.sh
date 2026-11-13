@@ -90,6 +90,8 @@ if [[ "$PASS" == 0 ]]; then
   wait_log_after 10 relay.log "$HANDED_ZB" 0 "the relay hands them off (J4)" || PASS=1
   HANDOFF=$(last_handoff_ids relay.log zb)
   assert_issued_ids "$HANDOFF" "the hand-off holds two visa-service IDs" || PASS=1
+  # The relay's log shows message 146 queued, not received: wait for zb.
+  wait_log_after 10 zb.log "$INSTALLED" 0 "zb installs the hand-off (J4)" || PASS=1
   assert_joiner_table zb.log "$HANDOFF" || PASS=1
   wait_log_after 30 zb.log "$GRANTED" 0 "zb authenticates over its bootstrap visas (J5)" || PASS=1
   wait_log_after 10 zb.log "$REPORT_RELAY_UP" 0 "zb reports its initial link up itself" || PASS=1

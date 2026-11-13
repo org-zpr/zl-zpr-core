@@ -329,26 +329,79 @@ impl VisaTable {
         visa_table
     }
 
-    /// Grant this node its VS-API pair ([self_granted_vs_visas]) afresh:
-    /// any held copies are revoked first and new ones inserted, so the pair
-    /// is current for its five-tuples even after the visas that superseded
-    /// it (J5a) were revoked: removal never promotes an older visa. The
-    /// relay calls this when its VS-API session is lost, its equivalent of
-    /// J10 (zl-zipline#252, gate question 7). Returns the forwarding entries
-    /// the revocation withdrew; the caller handles them after it releases
-    /// the visa-table lock (zipline#9).
+    /// Grant this node its VS-API pair ([self_granted_vs_visas]) afresh.
+    /// The relay calls this when its VS-API session is lost, its equivalent
+    /// of J10 (zl-zipline#252, gate question 7). Every visa held for its
+    /// VS-API flows (the pair itself, and the J5a visas that superseded it)
+    /// belonged to the lost session and is revoked first, even one with a
+    /// live binding: the dock link to the visa service stays up, so that
+    /// binding would otherwise keep a dead session's visa current, and its
+    /// expiry would leave the flow with no visa (removal never promotes an
+    /// older visa). The fresh pair is then the only visa for those flows.
+    /// Returns the forwarding entries the revocation withdrew; the caller
+    /// handles them after it releases the visa-table lock (zipline#9).
     pub fn regrant_vs_visas(
         &mut self,
         peer_table: &peer_table::PeerTable,
         node_addr: &IpAddr,
     ) -> Vec<ForwardingEntry> {
-        let mut withdrawn = Vec::new();
+        let withdrawn = self.revoke_by_vs_api_flow(peer_table, node_addr, true);
         for visa in self_granted_vs_visas(node_addr) {
-            // `revoke` succeeds whether or not the ID is held.
-            withdrawn.extend(self.revoke(peer_table, visa.issuer_id).unwrap_or_default());
             self.insert_visa(visa)
                 .expect("a self-granted VS-API visa is well formed");
         }
+        withdrawn
+    }
+
+    /// R16 (zl-zipline#252): this node is about to connect to the visa
+    /// service as `reset`, declaring that it holds no state. Revoke every
+    /// visa except those for its own VS-API flows, which carry the reset
+    /// itself: nothing the visa service granted it earlier may stay usable
+    /// here once the service no longer counts it as installed. Returns the
+    /// withdrawn forwarding entries; the caller handles them after it
+    /// releases the visa-table lock (zipline#9).
+    pub fn retain_vs_api_visas(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        node_addr: &IpAddr,
+    ) -> Vec<ForwardingEntry> {
+        self.revoke_by_vs_api_flow(peer_table, node_addr, false)
+    }
+
+    /// Revoke every held visa whose dock-PEP five-tuple is one of the VS-API
+    /// flows of the node at `node_addr` (`vs_api` true), or every visa whose
+    /// five-tuple is not (`vs_api` false). The VS-API flows are those of
+    /// [self_granted_vs_visas]; the bootstrap and J5a visas share them.
+    /// Returns the withdrawn forwarding entries.
+    fn revoke_by_vs_api_flow(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        node_addr: &IpAddr,
+        vs_api: bool,
+    ) -> Vec<ForwardingEntry> {
+        let vs_api_flows: Vec<FlowKey> = self_granted_vs_visas(node_addr)
+            .into_iter()
+            .filter_map(|visa| Visa::new(visa).ok()?.ftuple.as_ref().map(FlowKey::from))
+            .collect();
+        let doomed: Vec<VisaId> = self
+            .table
+            .keys()
+            .copied()
+            .filter(|id| {
+                let is_vs_api = self
+                    .flow_key(*id)
+                    .is_some_and(|key| vs_api_flows.contains(&key));
+                is_vs_api == vs_api
+            })
+            .collect();
+        let mut withdrawn = Vec::new();
+        for visa_id in doomed {
+            withdrawn.extend(
+                self.revoke_no_rebuild(peer_table, visa_id)
+                    .unwrap_or_default(),
+            );
+        }
+        self.rebuild_lookup_table();
         withdrawn
     }
 
@@ -1701,6 +1754,75 @@ pub mod tests {
         visa_table.regrant_vs_visas(&peer_table, &addr);
         assert_eq!(visa_table.match_traffic(&packet), Some(1));
         assert!(visa_table.contains(2));
+    }
+
+    /// A VS-API packet from the node at `addr` to the visa service.
+    fn vs_api_packet(addr: &IpAddr) -> crate::defs::FiveTuple {
+        crate::defs::FiveTuple {
+            src_address: IpAddress::new_from_std(addr),
+            dst_address: IpAddress::new_from_std(&VISA_SERVICE_ADDR),
+            l3_type: zpr::packet_info::L3Type::Ipv6,
+            l4_protocol: net_defs::ip_number::TCP,
+            src_port: 40000,
+            dst_port: VISA_SERVICE_PORT,
+        }
+    }
+
+    /// Hosted review (Copilot): the session is lost while the J5a visa
+    /// that superseded the pair still has a live binding (the dock link to
+    /// the visa service stays up). The regrant must still make the pair
+    /// current: the dead session's J5a visas are revoked, so their expiry
+    /// cannot leave the flow with no visa at all.
+    #[test]
+    fn test_regranting_drops_a_bound_j5a_visa() {
+        let addr: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let peer_table = crate::peer_table::PeerTable::new();
+        let mut visa_table = VisaTable::new_with_vs_visas(&addr);
+        visa_table.bind(1, binding_on(4, 7)).unwrap();
+        let mut j5a = visa_table.get(1).unwrap().visa().clone();
+        j5a.issuer_id = 5000;
+        visa_table.insert_visa(j5a).unwrap();
+        visa_table.bind(5000, binding_on(4, 8)).unwrap();
+
+        visa_table.regrant_vs_visas(&peer_table, &addr);
+        assert!(
+            !visa_table.contains(5000),
+            "the old session's J5a visa is gone"
+        );
+        assert_eq!(visa_table.match_traffic(&vs_api_packet(&addr)), Some(1));
+    }
+
+    /// Hosted review (Codex): before connecting as `reset` (R16), a node
+    /// keeps only the visas for its own VS-API flows, which carry the
+    /// reset; every other visa the visa service granted before is revoked.
+    #[test]
+    fn test_a_reset_keeps_only_the_vs_api_visas() {
+        let addr: IpAddr = "fd5a:5052::3".parse().unwrap();
+        let peer_table = crate::peer_table::PeerTable::new();
+        let mut visa_table = VisaTable::new();
+        let [forward, reverse] = self_granted_vs_visas(&addr);
+        for (mut visa, id) in [(forward, 1500), (reverse, 1501)] {
+            visa.issuer_id = id;
+            visa_table.insert_visa(visa).unwrap();
+        }
+        insert_full_visa(&mut visa_table, 5200);
+        visa_table.bind(5200, binding_on(4, 9)).unwrap();
+        visa_table
+            .insert_visa(new_vsapi_visa_forward_only(
+                5201,
+                never_expires(),
+                next_hop_addr(),
+            ))
+            .unwrap();
+
+        let withdrawn = visa_table.retain_vs_api_visas(&peer_table, &addr);
+        assert!(
+            withdrawn == vec![ForwardingEntry(4, 9)],
+            "the bound visa's stream is withdrawn"
+        );
+        assert!(!visa_table.contains(5200) && !visa_table.contains(5201));
+        assert!(visa_table.contains(1500) && visa_table.contains(1501));
+        assert_eq!(visa_table.match_traffic(&vs_api_packet(&addr)), Some(1500));
     }
 
     /// Local Codex review: a regranted ID keeps its new lifetime. The

@@ -99,7 +99,16 @@ pub async fn launch(
                         {
                             state = StateFlag::NoState;
                             info!(target: STARTUP, "visa service refused a reconnect ({:?}); clearing adapters and visas, connecting as reset", err.code);
-                            asm.disconnect_adapters().await; // drops visas too
+                            asm.disconnect_adapters().await;
+                            // A reset declares no state: keep only the
+                            // visas that carry the VS-API session itself.
+                            let withdrawn = asm
+                                .visa_table
+                                .write()
+                                .unwrap()
+                                .retain_vs_api_visas(&asm.peer_table, &node_zpr_addr);
+                            // Outside the visa-table lock (zipline#9).
+                            asm.withdraw_streams(withdrawn, None);
                             false
                         }
                         Err(e) if joiner => {
@@ -945,7 +954,8 @@ mod tests {
     }
 
     /// R16: a `reconnect` the visa service refuses with `outOfSync` or
-    /// `invalidOperation` is followed by a `reset`.
+    /// `invalidOperation` is followed by a `reset`, and the node then holds
+    /// no visa from before but those for its VS-API flows (hosted review).
     #[tokio::test]
     async fn test_a_refused_reconnect_connects_as_reset() {
         for code in [
@@ -968,6 +978,15 @@ mod tests {
                             == 1)
                         .await
                     );
+                    let policy_visa = crate::visa_table::tests::new_vsapi_visa_tcp_default(
+                        5000,
+                        crate::visa_table::tests::never_expires(),
+                    );
+                    asm.visa_table
+                        .write()
+                        .unwrap()
+                        .insert_visa(policy_visa)
+                        .unwrap();
                     vs_handle.restart().await.unwrap();
                     assert!(
                         eventually(Duration::from_secs(10), || state.borrow().register_calls
@@ -976,6 +995,9 @@ mod tests {
                         "registered again after {code:?}"
                     );
                     assert_eq!(state.borrow().connects, vec![false, true, false]);
+                    let visa_table = asm.visa_table.read().unwrap();
+                    assert!(!visa_table.contains(5000), "the reset dropped the old visa");
+                    assert!(visa_table.contains(1) && visa_table.contains(2));
                 })
                 .await;
         }

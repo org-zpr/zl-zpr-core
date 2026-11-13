@@ -68,9 +68,11 @@ pub const HANDOFF_VISA_COUNT: usize = 2;
 /// on the relay, so the answer is one local round trip and a policy lookup;
 /// five seconds is far beyond that, yet short enough that a joiner whose
 /// relay cannot reach its visa service redials (R11) instead of sitting on
-/// a link that will never carry its VS-API session. Shorter than the VS-API
-/// call's own timeout, so this is the bound that applies.
-pub const BOOTSTRAP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// a link that will never carry its VS-API session. It is the VS-API call's
+/// own bound too, so a request the relay gave up on does not hold VSConn's
+/// serial command loop any longer, and one still queued when the relay gives
+/// up is never sent.
+pub const BOOTSTRAP_REQUEST_TIMEOUT: Duration = libnode::vsconn::BOOTSTRAP_VISAS_TIMEOUT;
 
 /// Why a hand-off was refused.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]

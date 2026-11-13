@@ -397,7 +397,7 @@ mod tests {
             refused,
             Err(visa_table::VisaTableError::ForwardingDisabled(7001))
         ));
-        assert!(asm.visa_table.read().unwrap().table.is_empty());
+        assert!(asm.visa_table.read().unwrap().is_empty());
 
         let asm = assembly_with_forwarding(true);
         let stored = insert_visa(
@@ -405,7 +405,7 @@ mod tests {
             new_vsapi_visa_forward_only(7002, never_expires(), next_hop),
         );
         assert_eq!(stored.unwrap(), 7002);
-        assert!(asm.visa_table.read().unwrap().table.contains_key(&7002));
+        assert!(asm.visa_table.read().unwrap().contains(7002));
     }
 
     /// Explicit denials are terminal and kept distinct from service failures

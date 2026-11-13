@@ -210,6 +210,15 @@ pub struct ZodeLinkTable {
     report_pending: std::sync::atomic::AtomicBool,
     /// Wakes the reporter after [ZodeLinkTable::request_report].
     report_wakeup: tokio::sync::Notify,
+    /// Set with a report request that must skip the coalescing window: a
+    /// `down` or `failed` outcome (F6, zl-zipline#251).
+    report_urgent: std::sync::atomic::AtomicBool,
+    /// The loss epoch: how many Zode link losses (and moves to `failed`)
+    /// this Zode has registered (F6). See [ZodeLinkTable::register_loss].
+    loss_epoch: std::sync::atomic::AtomicU64,
+    /// The highest loss epoch the reporter has sent a snapshot for: one
+    /// taken at or after that epoch, whose send has returned (Ok or error).
+    reported_epoch: tokio::sync::watch::Sender<u64>,
 }
 
 #[derive(Default)]
@@ -236,6 +245,41 @@ impl ZodeLinkTable {
         self.report_pending
             .store(true, std::sync::atomic::Ordering::Release);
         self.report_wakeup.notify_one();
+    }
+
+    /// F6 (zl-zipline#251): register a Zode link loss, or a link moving to
+    /// `failed`, and ask for a report that skips the coalescing window.
+    /// Bumps the loss epoch, so visa requests made from now on wait for
+    /// that report ([ZodeLinkTable::wait_for_loss_reports]).
+    ///
+    /// `Assembly::drop_peer` calls this first, before it revokes anything,
+    /// and the record's `down` follows in the same call
+    /// (`zode_links::link_dropped`). `drop_peer`, the reporter and the visa
+    /// requests all run on the node's LocalSet, so no snapshot can be taken
+    /// between the two.
+    pub fn register_loss(&self) {
+        self.loss_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.report_urgent
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.request_report();
+    }
+
+    /// F6 (zl-zipline#251): wait until the reporter has sent a snapshot
+    /// covering every loss registered so far, including any loss registered
+    /// while waiting: the current loss epoch is read again each time the
+    /// reported epoch moves, so a request never overtakes the report of a
+    /// second loss that happened before it was released (core#110 review).
+    /// Returns at once when none is pending. Each send is bounded by the
+    /// VS-API RPC timeout, and fails at once with no VS-API session, so this
+    /// never hangs on a live reporter.
+    pub async fn wait_for_loss_reports(&self) {
+        let mut reported = self.reported_epoch.subscribe();
+        // The sender lives in this table, which outlives the borrow, so
+        // wait_for cannot fail.
+        let _ = reported
+            .wait_for(|epoch| *epoch >= self.loss_epoch.load(std::sync::atomic::Ordering::Acquire))
+            .await;
     }
 
     /// Whether a report has been asked for and not yet sent.
@@ -298,6 +342,16 @@ impl ZodeLinkTable {
         self.insert(peer_cn, record);
     }
 
+    /// Whether `link_id` is the current connection of a record that is up:
+    /// losing it is a link loss (F6). A dial attempt that never came up, or
+    /// a connection a newer one replaced (rule 5), is not.
+    pub fn is_up_on(&self, link_id: LinkId) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.records.values().any(|(_, r)| {
+            r.link_id == Some(link_id) && r.state == crate::zode_link_record::RecordState::Up
+        })
+    }
+
     /// The CN of the record whose current connection is `link_id`.
     fn peer_cn_of_link(&self, link_id: LinkId) -> Option<String> {
         let inner = self.inner.lock().unwrap();
@@ -327,8 +381,20 @@ impl ZodeLinkTable {
         let actions = record.handle(event, now);
         let (serial, dial_addr, changed) =
             (*record_serial, record.dial_addr, record.outcome != before);
+        let loss = changed
+            && matches!(
+                record.outcome,
+                Some(
+                    crate::zode_link_record::Outcome::Down
+                        | crate::zode_link_record::Outcome::Failed
+                )
+            );
         drop(inner);
-        if changed {
+        if loss {
+            // F6: `down` and `failed` go out at once, and visa requests
+            // wait for them.
+            self.register_loss();
+        } else if changed {
             self.request_report();
         }
         Some((actions, serial, dial_addr))
@@ -538,7 +604,9 @@ pub const REPORT_QUEUE_MAX: usize = 32;
 /// Send this Zode's link-state snapshot whenever one is asked for
 /// ([ZodeLinkTable::request_report]), with `send` (in production,
 /// `VSConnHandle::report_link_states`). Requests within [REPORT_COALESCE] of
-/// each other coalesce into one snapshot. Runs for the life of the node.
+/// each other coalesce into one snapshot, except that an urgent request
+/// ([ZodeLinkTable::register_loss]: a `down` or `failed`) is snapshotted at
+/// once (F6, zl-zipline#251). Runs for the life of the node.
 ///
 /// Taking snapshots and sending them are two loops joined by a queue, so a
 /// send that waits on the visa service (up to the RPC timeout) never merges
@@ -547,37 +615,57 @@ pub const REPORT_QUEUE_MAX: usize = 32;
 /// contract"): failed -> retry (not listed) -> failed must arrive as three
 /// snapshots, not two `failed` ones. A failed send is logged; the next change
 /// or VS-API registration asks for a fresh snapshot.
+///
+/// Each snapshot carries the loss epoch read just before it was taken. Once
+/// its send returns, with Ok or an error, the reporter publishes that epoch,
+/// which releases the visa requests waiting in
+/// [ZodeLinkTable::wait_for_loss_reports] (F6).
 pub async fn run_link_state_reporter<F, Fut>(asm: Arc<Assembly>, send: F)
 where
     F: Fn(Vec<zpr::vsapi_types::LinkStateReport>) -> Fut,
     Fut: std::future::Future<Output = Result<(), VSApiError>>,
 {
+    use std::sync::atomic::Ordering;
+
     // Both loops run on this one task (`join!` below), so a RefCell is
     // enough. `queued` wakes the sender; a wake-up sent while it is busy is
     // kept as a permit, so none is lost.
     let queue = std::cell::RefCell::new(VecDeque::new());
     let queued = tokio::sync::Notify::new();
 
+    let links = &asm.zode_links;
     let take_snapshots = async {
         loop {
-            asm.zode_links.report_wakeup.notified().await;
-            tokio::time::sleep(REPORT_COALESCE).await;
-            if asm
-                .zode_links
-                .report_pending
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
-            {
-                let snapshot = asm.zode_links.snapshot();
+            links.report_wakeup.notified().await;
+            // Coalesce for REPORT_COALESCE, unless a request is urgent: then
+            // snapshot at once, even if the window already started.
+            let deadline = tokio::time::Instant::now() + REPORT_COALESCE;
+            while !links.report_urgent.load(Ordering::Acquire) {
+                if tokio::time::timeout_at(deadline, links.report_wakeup.notified())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            links.report_urgent.store(false, Ordering::Release);
+            if links.report_pending.swap(false, Ordering::AcqRel) {
+                // Read the epoch before the snapshot, so the snapshot
+                // reflects every loss up to it.
+                let epoch = links.loss_epoch.load(Ordering::Acquire);
+                let snapshot = links.snapshot();
                 let mut queue = queue.borrow_mut();
                 // ponytail: a stall longer than REPORT_QUEUE_MAX snapshots
                 // merges the newest changes into the last queued snapshot,
                 // so transitions inside that tail can be lost. Bounded
                 // memory wins over that corner; each send is bounded by the
                 // RPC timeout, so only a long run of stalls gets there.
+                // The merged snapshot carries the newest epoch, so the
+                // merge stays epoch-correct.
                 if queue.len() >= REPORT_QUEUE_MAX {
                     queue.pop_back();
                 }
-                queue.push_back(snapshot);
+                queue.push_back((epoch, snapshot));
                 drop(queue);
                 queued.notify_one();
             }
@@ -589,7 +677,7 @@ where
             // Take the next snapshot without holding the borrow across the
             // await below.
             let next = queue.borrow_mut().pop_front();
-            let Some(snapshot) = next else {
+            let Some((epoch, snapshot)) = next else {
                 queued.notified().await;
                 continue;
             };
@@ -612,6 +700,11 @@ where
                 // warning. The next change or reconnect sends a fresh snapshot.
                 Err(e) => warn!(target: LINK_STATE, "link-state report failed: {e}"),
             }
+            // F6: the send has returned, so visa requests waiting on this
+            // epoch may go.
+            links
+                .reported_epoch
+                .send_modify(|reported| *reported = (*reported).max(epoch));
         }
     };
 
@@ -1596,6 +1689,205 @@ mod tests {
                 tokio::time::sleep(REPORT_COALESCE * 3).await;
                 assert_eq!(sent.borrow().len(), 2, "a reconnect sends again");
                 assert!(!asm.zode_links.report_pending());
+            })
+            .await
+    }
+
+    // ---- F6: urgent reports and the loss barrier (zl-zipline#251) ----
+
+    /// Snapshots a reporter sent, each with the paused-clock instant its
+    /// send started.
+    type SentLog =
+        std::rc::Rc<std::cell::RefCell<Vec<(tokio::time::Instant, Vec<LinkStateReport>)>>>;
+
+    /// Run the reporter for `asm` with a send that logs each snapshot and
+    /// answers `ConnClosed`, as with no VS-API session.
+    fn logging_reporter(asm: &Arc<Assembly>) -> SentLog {
+        let sent: SentLog = Default::default();
+        let log = sent.clone();
+        tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |reports| {
+            log.borrow_mut()
+                .push((tokio::time::Instant::now(), reports));
+            async { Err(VSApiError::ConnClosed) }
+        }));
+        sent
+    }
+
+    /// F6: a link going `down` is reported at once, without the coalescing
+    /// window, while an `up` still coalesces.
+    #[tokio::test(start_paused = true)]
+    async fn test_down_is_reported_without_coalescing_and_up_coalesces() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let sent = logging_reporter(&asm);
+                set_topology(&asm, vec![peer("b", "fd5a::9", 7150)]);
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+                let before = sent.borrow().len();
+
+                let link = answered_up(&asm, "b", 7250);
+                tokio::time::sleep(REPORT_COALESCE / 2).await;
+                assert_eq!(sent.borrow().len(), before, "up waits for the window");
+                tokio::time::sleep(REPORT_COALESCE).await;
+                assert_eq!(sent.borrow().len(), before + 1, "then up is sent");
+
+                let dropped_at = tokio::time::Instant::now();
+                asm.drop_peer(link);
+                settle().await;
+                let sent = sent.borrow();
+                let (at, last) = sent.last().unwrap();
+                assert_eq!(last[0].state, Reported::Down);
+                assert!(*at - dropped_at < REPORT_COALESCE, "down skips the window");
+            })
+            .await
+    }
+
+    /// F6: a link moving to `failed` when its window ends is reported at
+    /// once, without the coalescing window.
+    #[tokio::test(start_paused = true)]
+    async fn test_failed_is_reported_without_coalescing() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let sent = logging_reporter(&asm);
+                set_topology(&asm, vec![peer("b", "fd5a::20", 7151)]);
+                let window_end =
+                    tokio::time::Instant::now() + crate::zode_link_record::LINK_UP_WINDOW;
+                tokio::time::sleep(crate::zode_link_record::LINK_UP_WINDOW + REPORT_COALESCE / 2)
+                    .await;
+                let sent = sent.borrow();
+                let (at, last) = sent.last().unwrap();
+                assert_eq!(last[0].state, Reported::Failed);
+                assert!(
+                    *at - window_end < REPORT_COALESCE,
+                    "failed skips the window"
+                );
+            })
+            .await
+    }
+
+    /// F6: with no loss registered, the loss barrier is open.
+    #[tokio::test]
+    async fn test_loss_barrier_is_open_with_no_loss() {
+        let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+        assert!(futures::FutureExt::now_or_never(asm.zode_links.wait_for_loss_reports()).is_some());
+    }
+
+    /// F6: after a loss, the barrier opens only once a snapshot taken after
+    /// it has been sent and its send returned, and the waiter sees the
+    /// snapshot with the link `down` first.
+    #[tokio::test(start_paused = true)]
+    async fn test_loss_barrier_opens_when_the_down_report_returns() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(&asm, vec![peer("b", "fd5a::9", 7152)]);
+                let link = answered_up(&asm, "b", 7252);
+
+                let sent: std::rc::Rc<std::cell::RefCell<Vec<Vec<LinkStateReport>>>> =
+                    Default::default();
+                let release = std::rc::Rc::new(tokio::sync::Notify::new());
+                let (log, gate) = (sent.clone(), release.clone());
+                tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |reports| {
+                    log.borrow_mut().push(reports);
+                    let gate = gate.clone();
+                    async move {
+                        gate.notified().await;
+                        Ok(())
+                    }
+                }));
+                // Let the `up` report reach the (blocked) send, and release it.
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+                release.notify_one();
+                settle().await;
+
+                asm.drop_peer(link);
+                let opened = std::rc::Rc::new(std::cell::Cell::new(false));
+                let (flag, waiter_asm, seen) = (opened.clone(), asm.clone(), sent.clone());
+                tokio::task::spawn_local(async move {
+                    waiter_asm.zode_links.wait_for_loss_reports().await;
+                    let down_sent = seen
+                        .borrow()
+                        .last()
+                        .is_some_and(|r| r.iter().any(|r| r.state == Reported::Down));
+                    flag.set(down_sent);
+                });
+
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                assert!(!opened.get(), "closed while the down report is in flight");
+                release.notify_one();
+                settle().await;
+                assert!(opened.get(), "open once it returned, with down sent first");
+            })
+            .await
+    }
+
+    /// F6: with no VS-API session the report fails locally at once, so the
+    /// barrier opens at once too: a visa request never hangs on it.
+    #[tokio::test(start_paused = true)]
+    async fn test_loss_barrier_opens_at_once_with_no_vs_api_session() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                let _sent = logging_reporter(&asm);
+                set_topology(&asm, vec![peer("b", "fd5a::9", 7153)]);
+                let link = answered_up(&asm, "b", 7253);
+
+                asm.drop_peer(link);
+                tokio::time::timeout(REPORT_COALESCE / 2, asm.zode_links.wait_for_loss_reports())
+                    .await
+                    .expect("the barrier opens without waiting for the window");
+            })
+            .await
+    }
+
+    /// F6 with overlapping losses (core#110 review): a visa request that
+    /// waits on the first loss must keep waiting when a second link is lost
+    /// meanwhile, until the second loss's report has returned too.
+    /// Otherwise it could overtake that report and be planned over the
+    /// second dead link.
+    #[tokio::test(start_paused = true)]
+    async fn test_loss_barrier_waits_for_a_loss_registered_while_waiting() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(
+                    &asm,
+                    vec![peer("b", "fd5a::9", 7154), peer("c", "fd5a::8", 7155)],
+                );
+                let link_b = answered_up(&asm, "b", 7254);
+                let link_c = answered_up(&asm, "c", 7255);
+
+                // Every send blocks until the test releases it.
+                let release = std::rc::Rc::new(tokio::sync::Notify::new());
+                let gate = release.clone();
+                tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |_| {
+                    let gate = gate.clone();
+                    async move {
+                        gate.notified().await;
+                        Ok(())
+                    }
+                }));
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+                release.notify_one(); // the `up` report
+                settle().await;
+
+                asm.drop_peer(link_b);
+                let opened = std::rc::Rc::new(std::cell::Cell::new(false));
+                let (flag, waiter_asm) = (opened.clone(), asm.clone());
+                tokio::task::spawn_local(async move {
+                    waiter_asm.zode_links.wait_for_loss_reports().await;
+                    flag.set(true);
+                });
+                settle().await;
+                asm.drop_peer(link_c);
+
+                release.notify_one(); // b's report returns
+                settle().await;
+                assert!(!opened.get(), "still closed: c's report has not returned");
+                release.notify_one(); // c's report returns
+                settle().await;
+                assert!(opened.get(), "open once every registered loss is reported");
             })
             .await
     }

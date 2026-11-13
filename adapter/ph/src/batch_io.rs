@@ -2481,7 +2481,10 @@ mod tests {
     /// finished, so that a blocked call can return even when several ops
     /// were left in flight and each one consumes a wake (core#116 review).
     /// The receiver ends the run at the first `WAKE` it sees, and reports a
-    /// stall if k arrived, or a lost datagram if it never arrived.  A false
+    /// stall if k arrived, or a lost datagram if it never arrived.  If k is
+    /// the last datagram, the released call completes the run before any
+    /// `WAKE` is seen, so the recorded timeout is checked again after the
+    /// sender is joined and fails the run all the same.  A false
     /// failure needs the receiver thread to make no progress at all for the
     /// whole `liveness` bound.
     ///
@@ -2565,20 +2568,7 @@ mod tests {
                         "[{engine_name}] received a wake datagram, but no ack timed out"
                     ));
                 }
-                break Err(if seen[k as usize] {
-                    format!(
-                        "[{engine_name}] stall: datagram {k} of {RECV_STRESS_DATAGRAMS} \
-                         was not received within {liveness:?} while the sender was \
-                         silent, and arrived only after a wake datagram: a batch call \
-                         returned only when new traffic arrived (an operation was left \
-                         in flight, zipline#117)"
-                    )
-                } else {
-                    format!(
-                        "[{engine_name}] lost datagram {k} of {RECV_STRESS_DATAGRAMS}: \
-                         not received within {liveness:?}, nor after a wake datagram"
-                    )
-                });
+                break Err(recv_stress_timeout_error(engine_name, k, &seen, liveness));
             }
 
             if std::time::Instant::now() >= deadline {
@@ -2622,6 +2612,19 @@ mod tests {
         drop(ack_tx);
         sender.join().unwrap();
 
+        // A stall on the last datagram ends the loop with every datagram
+        // received, before it looks at the wake: the wake released the
+        // stalled call, which returned that last datagram.  So a recorded
+        // timeout fails the run even when every datagram arrived.  The
+        // sender has been joined, so its store is visible here.
+        let k = timed_out.load(Ordering::SeqCst);
+        let outcome = match outcome {
+            Ok(_) if k != RECV_STRESS_NO_TIMEOUT => {
+                Err(recv_stress_timeout_error(engine_name, k, &seen, liveness))
+            }
+            outcome => outcome,
+        };
+
         if let Ok(stats) = &outcome {
             println!(
                 "engine {engine_name}: received all {RECV_STRESS_DATAGRAMS} datagrams, \
@@ -2630,6 +2633,33 @@ mod tests {
             );
         }
         outcome
+    }
+
+    /// `run_recv_stress`'s failure message once the ack of datagram `k`
+    /// timed out after `liveness`: a stall if `k` arrived later (only after
+    /// a wake datagram), or a lost datagram if it never arrived.  `seen`
+    /// marks every datagram the receiver received.
+    #[cfg(unix)]
+    fn recv_stress_timeout_error(
+        engine_name: &str,
+        k: u64,
+        seen: &[bool],
+        liveness: Duration,
+    ) -> String {
+        if seen[k as usize] {
+            format!(
+                "[{engine_name}] stall: datagram {k} of {RECV_STRESS_DATAGRAMS} \
+                 was not received within {liveness:?} while the sender was \
+                 silent, and arrived only after a wake datagram: a batch call \
+                 returned only when new traffic arrived (an operation was left \
+                 in flight, zipline#117)"
+            )
+        } else {
+            format!(
+                "[{engine_name}] lost datagram {k} of {RECV_STRESS_DATAGRAMS}: \
+                 not received within {liveness:?}, nor after a wake datagram"
+            )
+        }
     }
 
     /// `run_recv_stress`'s sender after an ack timed out: send a `WAKE`

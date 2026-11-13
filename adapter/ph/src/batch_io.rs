@@ -2738,41 +2738,70 @@ mod tests {
         }
     }
 
-    /// How long `test_recv_stress_detects_multi_op_stall` waits for its run
-    /// to finish before it fails instead of hanging.
+    /// How long a watched stall-injection run (`run_faulty_watched`) may
+    /// take before its test fails instead of hanging.
     #[cfg(unix)]
     const RECV_STRESS_WATCHDOG: Duration = Duration::from_secs(30);
+
+    /// Run `run_recv_stress` with a 500 ms liveness bound on a
+    /// `FaultyEngine` that applies `fault` after `fault_after` datagrams.
+    /// The run happens on its own thread under `RECV_STRESS_WATCHDOG`, so a
+    /// run that never returns fails the calling test cleanly; the blocked
+    /// thread is left behind.  Returns the run's outcome.
+    #[cfg(unix)]
+    fn run_faulty_watched(
+        fault: Fault,
+        fault_after: usize,
+    ) -> std::result::Result<RecvStressStats, String> {
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bio = FaultyEngine::instantiate(RECV_STRESS_BATCH, fault, fault_after);
+            let _ = outcome_tx.send(run_recv_stress(&mut bio, Duration::from_millis(500)));
+        });
+        match outcome_rx.recv_timeout(RECV_STRESS_WATCHDOG) {
+            Ok(outcome) => outcome,
+            Err(_) => panic!(
+                "the stress run with fault {fault:?} after {fault_after} datagrams did not \
+                 finish within {RECV_STRESS_WATCHDOG:?}: the run hangs"
+            ),
+        }
+    }
+
+    /// Assert that a stall-injection run reported a stall.
+    #[cfg(unix)]
+    fn assert_stall_reported(outcome: std::result::Result<RecvStressStats, String>) {
+        match outcome {
+            Ok(stats) => panic!("an injected stall went undetected: {stats:?}"),
+            Err(err) => assert!(
+                err.contains("] stall: datagram"),
+                "the run must fail with a stall, not: {err}"
+            ),
+        }
+    }
 
     /// A stall with more than one op left in flight must still be reported,
     /// not hang (core#116 review): when several ops stay pending, one wake
     /// datagram completes only one of them and the call stays blocked.  The
     /// injected fault needs three new datagrams before the call returns.
-    /// The run happens on its own thread under a watchdog, so a run that
-    /// never returns fails this test cleanly; the blocked thread is left
-    /// behind.
     #[cfg(unix)]
     #[test]
     fn test_recv_stress_detects_multi_op_stall() {
-        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut bio = FaultyEngine::instantiate(
-                RECV_STRESS_BATCH,
-                Fault::StallOnce(3),
-                RECV_STRESS_FAULT_AFTER,
-            );
-            let _ = outcome_tx.send(run_recv_stress(&mut bio, Duration::from_millis(500)));
-        });
-        match outcome_rx.recv_timeout(RECV_STRESS_WATCHDOG) {
-            Ok(Ok(stats)) => panic!("an injected multi-op stall went undetected: {stats:?}"),
-            Ok(Err(err)) => assert!(
-                err.contains("] stall: datagram"),
-                "the run must fail with a stall, not: {err}"
-            ),
-            Err(_) => panic!(
-                "the stress run did not finish within {RECV_STRESS_WATCHDOG:?}: a stall \
-                 that needs more than one wake datagram hangs the run"
-            ),
-        }
+        assert_stall_reported(run_faulty_watched(
+            Fault::StallOnce(3),
+            RECV_STRESS_FAULT_AFTER,
+        ));
+    }
+
+    /// A stall on the last datagram must still be reported (core#116
+    /// review): there the wake releases the call, the run has then
+    /// received every datagram, and that must not count as success.
+    #[cfg(unix)]
+    #[test]
+    fn test_recv_stress_detects_stall_on_last_datagram() {
+        assert_stall_reported(run_faulty_watched(
+            Fault::StallOnce(1),
+            RECV_STRESS_DATAGRAMS as usize,
+        ));
     }
 
     /// Minimal PRNG for `run_recv_stress`'s send jitter.

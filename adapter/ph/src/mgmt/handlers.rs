@@ -1127,6 +1127,17 @@ pub async fn handle_bind_egress_stream_response(
     }
 }
 
+/// Handle an Unbind Egress Stream Indication (ZdpPacketType 13).
+///
+/// Only an adapter accepts it, from its node: the node no longer sends on
+/// the stream, so the adapter removes it from its DLT. A node refuses it
+/// from everyone:
+///
+/// - from a Zode, by F5 (zl-zipline#251): Zode links carry no teardown
+///   messages. A refusal closes the link (gate g88 q2).
+/// - from an adapter or the local actor (gate g88 q3): no core component
+///   sends it, and F4 lists the only causes of teardown (expiry, a visa
+///   service revocation, a lost link).
 pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
     let Some(ingress_link_id) = NonZero::new(pkt.metadata().ingress_link_id) else {
         // who sent this??
@@ -1143,10 +1154,14 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
 
     match (link_type, ingress_link_id.get()) {
         (LinkType::NodeToAdapter, _) | (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
-            // We are the node
-            debug!(target: ZDP, "{}: unbind actor address, node -> adapter", asm.formatted_link_id(ingress_link_id.get()));
-            // Remove from PFT
-            node::unbind_stream(asm, ingress_link_id, pkt.metadata().ingress_stream_id);
+            // We are the node; an adapter (or the local actor) does not
+            // unbind streams with us.
+            warn!(
+                target: ZDP,
+                "{}: refusing UnbindEgressStreamIndication from an adapter or the local actor: F4 lists the only teardown causes",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            return Err(HandleMgmtError::MessageNotPermitted);
         }
         (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
             // We are the adapter
@@ -1159,12 +1174,11 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
             adapter::unbind_stream(asm, ingress_link_id, pkt.metadata().ingress_stream_id);
         }
         (LinkType::NodeToNode, _) => {
-            debug!(
-                target: ZDP,
-                "{}: node -> node UNIMPLEMENTED",
-                asm.formatted_link_id(ingress_link_id.get())
-            );
-            return Err(HandleMgmtError::MessageNotPermitted);
+            return Err(refuse_zode_teardown(
+                asm,
+                ingress_link_id,
+                zdp::ZdpPacketType::UnbindEgressStreamIndication,
+            ));
         }
         (LinkType::Internal, _) => {
             error!(
@@ -1237,12 +1251,11 @@ pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> Ha
             return Err(HandleMgmtError::MessageNotPermitted);
         }
         (LinkType::NodeToNode, _) => {
-            debug!(
-                target: ZDP,
-                "{}: node -> node UNIMPLEMENTED",
-                asm.formatted_link_id(ingress_link_id.get())
-            );
-            return Err(HandleMgmtError::MessageNotPermitted);
+            return Err(refuse_zode_teardown(
+                asm,
+                ingress_link_id,
+                zdp::ZdpPacketType::StreamIdWithdrawal,
+            ));
         }
         (LinkType::Internal, _) => {
             error!(
@@ -1255,6 +1268,24 @@ pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> Ha
     }
 
     Ok(())
+}
+
+/// Refuse a teardown message (`packet_type`, ZDP type 5 or 13) that
+/// arrived on Zode link `link_id`, by F5 (zl-zipline#251): Zode links carry
+/// no teardown messages; the visa service tears bindings down. Logs the
+/// refusal and returns the error the handler fails with, which closes the
+/// link and counts it (gate g88 q2).
+fn refuse_zode_teardown(
+    asm: &Assembly,
+    link_id: NonZero<LinkId>,
+    packet_type: zdp::ZdpPacketType,
+) -> HandleMgmtError {
+    warn!(
+        target: ZDP,
+        "{}: refusing {packet_type:?}: F5: Zode links carry no teardown messages",
+        asm.formatted_link_id(link_id.get())
+    );
+    HandleMgmtError::MessageNotPermitted
 }
 
 fn peer_type_by_id(asm: &Assembly, link_id: NonZero<LinkId>) -> PeerType {
@@ -1437,6 +1468,165 @@ mod test {
             asm.elt.get(&five_tuple).is_none(),
             "stale ELT entry must be removed"
         );
+    }
+}
+
+/// F5 (zl-zipline#251): Zode links carry no teardown messages. A Stream ID
+/// Withdrawal (type 5) or an Unbind Egress Stream Indication (type 13)
+/// arriving on one is refused, which closes the link; a type 13 from an
+/// adapter or the local actor is refused too (gate g88 q3).
+#[cfg(test)]
+mod teardown_test {
+    use super::*;
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+    use crate::forwarding_tables::PftPep;
+    use crate::link_state::LinkState;
+    use crate::mgmt::core;
+
+    type EgressRx = crate::packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
+
+    /// A Node-mode assembly whose management egress we can read back.
+    fn node() -> (Arc<Assembly>, EgressRx) {
+        let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(8);
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(crate::assembly::PhMode::Node),
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        (asm, egress_rx)
+    }
+
+    /// Give link `link` a PFT entry and return its stream ID.
+    fn bind_stream(asm: &Assembly, link: LinkId) -> StreamId {
+        asm.peer_table
+            .get(link)
+            .unwrap()
+            .pft
+            .insert(PftPep {
+                next_hop: ForwardingEntry(link, 1),
+                visa_id: 3000,
+            })
+            .unwrap()
+    }
+
+    /// A per-flow management packet for `stream` as the handlers see it:
+    /// arrived on `link`, with the headers already read.
+    fn arriving(link: LinkId, stream: StreamId) -> Packet {
+        let mut pkt = core::new_heap_packet();
+        pkt.metadata_mut().ingress_link_id = link;
+        pkt.metadata_mut().ingress_stream_id = stream;
+        pkt
+    }
+
+    /// Both teardown types on an Active Zode link are refused, and the
+    /// link's forwarding entry is untouched.
+    #[tokio::test]
+    async fn test_teardown_messages_on_zode_link_are_refused() {
+        let (asm, _egress_rx) = node();
+        let zode = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            LinkState::Active,
+        );
+        let stream = bind_stream(&asm, zode);
+
+        assert!(matches!(
+            handle_stream_id_withdrawal(&asm, arriving(zode, stream)).await,
+            Err(HandleMgmtError::MessageNotPermitted)
+        ));
+        assert!(matches!(
+            handle_unbind_indication(&asm, arriving(zode, stream)).await,
+            Err(HandleMgmtError::MessageNotPermitted)
+        ));
+        assert_eq!(asm.peer_table.get(zode).unwrap().pft.len(), 1);
+    }
+
+    /// Gate g88 q2: the refusal goes through the strict handler-error path,
+    /// so a teardown message from a Zode closes the link. Each type is sent
+    /// as a real management packet through the link's processor.
+    #[tokio::test(flavor = "local")]
+    async fn test_teardown_message_on_zode_link_closes_it() {
+        for packet_type in [
+            zdp::ZdpPacketType::StreamIdWithdrawal,
+            zdp::ZdpPacketType::UnbindEgressStreamIndication,
+        ] {
+            let (asm, mut egress_rx) = node();
+            let zode = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                &asm,
+                "b.zpr",
+                LinkState::Active,
+            );
+            let stream = bind_stream(&asm, zode);
+
+            // Build the packet the way a sender would, and take it off the
+            // egress queue as the received packet.
+            core::send_per_flow_mgmt(&asm, zode, packet_type, stream, core::new_heap_packet())
+                .enqueue();
+            let buf = vec![0u8; crate::config::PACKET_BUFFER_SIZE].into_boxed_slice();
+            let Ok(mut pkt) = egress_rx.try_recv(buf) else {
+                panic!("the packet is on the egress queue");
+            };
+            pkt.metadata_mut().ingress_link_id = zode;
+
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(crate::queues::MgmtProcessorMessage::Packet(pkt))
+                .await
+                .unwrap();
+            drop(tx);
+            crate::mgmt_processor_worker::launch(
+                crate::mgmt_processor_worker::Config {
+                    link_id: NonZero::new(zode).unwrap(),
+                },
+                asm.clone(),
+                rx,
+            )
+            .await;
+
+            let state = asm
+                .peer_table
+                .get(zode)
+                .map(|p| p.link_state_machine.get_state());
+            assert_ne!(state, Some(LinkState::Active), "{packet_type:?}");
+            assert_eq!(asm.peer_table.get(zode).map_or(0, |p| p.pft.len()), 1);
+        }
+    }
+
+    /// Gate g88 q3: a node refuses an Unbind Egress Stream Indication from
+    /// an adapter, as it refuses a withdrawal from one. No core component
+    /// sends it, and F4 lists the only causes of teardown. The adapter's
+    /// forwarding entry is untouched.
+    #[tokio::test]
+    async fn test_unbind_indication_from_adapter_is_refused() {
+        let (asm, _egress_rx) = node();
+        let adapter = crate::peer_table::test::insert_peer_with_verified_cn(
+            &asm,
+            LinkType::NodeToAdapter,
+            "adapter",
+            LinkState::Active,
+        );
+        let stream = bind_stream(&asm, adapter);
+
+        assert!(matches!(
+            handle_unbind_indication(&asm, arriving(adapter, stream)).await,
+            Err(HandleMgmtError::MessageNotPermitted)
+        ));
+        assert_eq!(asm.peer_table.get(adapter).unwrap().pft.len(), 1);
+    }
+
+    /// Gate g88 q3: the same refusal for an Unbind Egress Stream Indication
+    /// on the local actor link.
+    #[tokio::test(flavor = "local")]
+    async fn test_unbind_indication_from_local_actor_is_refused() {
+        let (asm, _egress_rx) = node();
+        let local_actor = asm.peer_table.insert_internal_peer().get();
+        assert_eq!(local_actor, zpr::packet_info::LOCAL_ACTOR_LINK_ID);
+        let stream = bind_stream(&asm, local_actor);
+
+        assert!(matches!(
+            handle_unbind_indication(&asm, arriving(local_actor, stream)).await,
+            Err(HandleMgmtError::MessageNotPermitted)
+        ));
+        assert_eq!(asm.peer_table.get(local_actor).unwrap().pft.len(), 1);
     }
 }
 

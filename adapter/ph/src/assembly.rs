@@ -534,18 +534,18 @@ impl Assembly {
             // Revoke visas under the write lock, but hold the withdrawn
             // entries until the lock is released: the send path takes the
             // peer's `zdpr_send` mutex, which must never nest under the
-            // visa-table lock (and `unbind_stream` itself re-acquires the
-            // visa-table lock, which is why it is not usable here).
+            // visa-table lock.
             let withdrawn = self
                 .visa_table
                 .write()
                 .unwrap()
                 .revoke_for_link(link_id, &self.peer_table);
 
-            // Withdraw each revoked stream from the *surviving* peers so
+            // Withdraw each revoked stream from the *surviving* adapters so
             // they drop their egress bindings and re-request visas instead
             // of blackholing traffic on dead streams (zipline#21). The
-            // dying link's own entries are skipped — that peer is gone.
+            // dying link's own entries are skipped — that peer is gone —
+            // and so are Zode links, which carry no teardown messages (F5).
             self.withdraw_streams(withdrawn, Some(link_id));
         }
         let zode_link = self
@@ -572,6 +572,12 @@ impl Assembly {
     /// (that peer is gone) — `drop_peer` passes it. Entries whose link has
     /// already left the peer table are skipped as well.
     ///
+    /// Entries on Zode links are skipped too, by F5 (zl-zipline#251): Zode
+    /// links carry no teardown messages. A Zode upstream loses its binding
+    /// when the visa service revokes the visa there, which it does on
+    /// every Zode on the path. Withdrawals still go to adapters and the
+    /// local dock.
+    ///
     /// Lock ordering (zipline#9): call this only AFTER releasing the
     /// visa-table write lock — the send path takes the peer's `zdpr_send`
     /// mutex, which must never nest under it.
@@ -586,7 +592,10 @@ impl Assembly {
         excluded_link: Option<LinkId>,
     ) {
         for entry in withdrawn {
-            if Some(entry.0) == excluded_link || self.peer_table.get(entry.0).is_none() {
+            let to_adapter = self.peer_table.get(entry.0).is_some_and(|peer| {
+                peer.link_state_machine.get_link_type() != LinkType::NodeToNode
+            });
+            if Some(entry.0) == excluded_link || !to_adapter {
                 continue;
             }
             mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
@@ -1740,8 +1749,9 @@ pub mod test {
     #[cfg(test)]
     mod drop_peer_notify {
         //! Tests for zipline#21: revoking visas for a dying link must
-        //! withdraw the streams from *surviving* peers by sending them an
-        //! `UnbindEgressStreamIndication`; expiry deliberately does not.
+        //! withdraw the streams from *surviving* adapters by sending them a
+        //! `StreamIdWithdrawal` (none goes on a Zode link, F5); expiry
+        //! deliberately does not.
 
         use super::*;
         use crate::forwarding_tables::PftPep;
@@ -1756,8 +1766,65 @@ pub mod test {
         use zpr_utils::net_defs;
 
         /// Build a Node-mode assembly whose mgmt substrate egress queue we
-        /// can read back, plus two dummy peers, and one visa (id >=
-        /// MIN_VISA_ID) with forwarding entries on both links.
+        /// can read back, plus one dummy peer per entry of `link_types`, and
+        /// one visa (id 3000, >= MIN_VISA_ID) with a forwarding entry on
+        /// each of those links.
+        ///
+        /// Returns (asm, egress queue receiver, (link, tether) per peer).
+        fn setup_visa_on_links(
+            link_types: &[LinkType],
+        ) -> (
+            Arc<Assembly>,
+            packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+            Vec<(LinkId, StreamId)>,
+        ) {
+            let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
+
+            let mut builder = TestAssemblyBuilder::new();
+            builder.ph_mode = Some(PhMode::Node);
+            builder.visa_table = Some(VisaTable::new());
+            builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
+            let asm = Arc::new(create_assembly(builder));
+
+            let visa_id = 3000;
+            let mut visa_table = asm.visa_table.write().unwrap();
+            let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
+            let _ = visa_table.insert_visa(v);
+
+            let mut bound = Vec::new();
+            for (i, link_type) in link_types.iter().enumerate() {
+                let octet = i as u8 + 1;
+                let entry = asm.peer_table.vacant_entry().unwrap();
+                let key = entry.key();
+                let link = entry
+                    .insert(create_dummy_peer_state(
+                        key,
+                        *link_type,
+                        SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(octet, 2, 3, 4)), 443),
+                        net_defs::ScopedIpAddr::V4(Ipv4Addr::new(octet, 2, 3, 5)),
+                    ))
+                    .get();
+                let tether = asm
+                    .peer_table
+                    .get(link)
+                    .unwrap()
+                    .pft
+                    .insert(PftPep {
+                        next_hop: ForwardingEntry(link, 1),
+                        visa_id,
+                    })
+                    .unwrap();
+                visa_table
+                    .link_forwarding_entry(visa_id, ForwardingEntry(link, tether))
+                    .unwrap();
+                bound.push((link, tether));
+            }
+            drop(visa_table);
+
+            (asm, egress_rx, bound)
+        }
+
+        /// [setup_visa_on_links] on two internal links.
         ///
         /// Returns (asm, egress queue receiver, link_a, link_b, tether_a, tether_b).
         fn setup_two_link_visa() -> (
@@ -1768,70 +1835,56 @@ pub mod test {
             StreamId,
             StreamId,
         ) {
-            let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
-
-            let mut builder = TestAssemblyBuilder::new();
-            builder.ph_mode = Some(PhMode::Node);
-            builder.visa_table = Some(VisaTable::new());
-            builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
-            let asm = Arc::new(create_assembly(builder));
-
-            let entry_a = asm.peer_table.vacant_entry().unwrap();
-            let key_a = entry_a.key();
-            let link_a = entry_a
-                .insert(create_dummy_peer_state(
-                    key_a,
-                    LinkType::Internal,
-                    SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
-                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
-                ))
-                .get();
-
-            let entry_b = asm.peer_table.vacant_entry().unwrap();
-            let key_b = entry_b.key();
-            let link_b = entry_b
-                .insert(create_dummy_peer_state(
-                    key_b,
-                    LinkType::Internal,
-                    SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(2, 2, 3, 4)), 443),
-                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(2, 2, 3, 5)),
-                ))
-                .get();
-
-            let visa_id = 3000;
-            let mut visa_table = asm.visa_table.write().unwrap();
-            let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
-            let _ = visa_table.insert_visa(v);
-
-            let peer_a = asm.peer_table.get(link_a).unwrap();
-            let tether_a = peer_a
-                .pft
-                .insert(PftPep {
-                    next_hop: ForwardingEntry(link_a, 1),
-                    visa_id,
-                })
-                .unwrap();
-            visa_table
-                .link_forwarding_entry(visa_id, ForwardingEntry(link_a, tether_a))
-                .unwrap();
-
-            let peer_b = asm.peer_table.get(link_b).unwrap();
-            let tether_b = peer_b
-                .pft
-                .insert(PftPep {
-                    next_hop: ForwardingEntry(link_b, 1),
-                    visa_id,
-                })
-                .unwrap();
-            visa_table
-                .link_forwarding_entry(visa_id, ForwardingEntry(link_b, tether_b))
-                .unwrap();
-
-            drop(visa_table);
-            drop(peer_a);
-            drop(peer_b);
-
+            let (asm, egress_rx, bound) =
+                setup_visa_on_links(&[LinkType::Internal, LinkType::Internal]);
+            let [(link_a, tether_a), (link_b, tether_b)] = bound[..] else {
+                unreachable!("two links were bound");
+            };
             (asm, egress_rx, link_a, link_b, tether_a, tether_b)
+        }
+
+        /// The StreamIdWithdrawals on the egress queue, as (link, stream).
+        fn withdrawals_sent(
+            rx: &mut packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+        ) -> Vec<(LinkId, StreamId)> {
+            let mut got = Vec::new();
+            while let Some(pkt) = try_recv_packet(rx) {
+                let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+                assert_eq!(base_hdr.packet_type, zdp::ZdpPacketType::StreamIdWithdrawal);
+                let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+                let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
+                got.push((pkt.metadata().egress_link_id, per_flow_hdr.stream_id.into()));
+            }
+            got
+        }
+
+        /// F5 (zl-zipline#251): a revocation of a visa bound adapter -> Zode
+        /// link sends exactly one withdrawal, to the adapter, and none on the
+        /// Zode link.
+        #[tokio::test]
+        async fn test_revocation_sends_no_withdrawal_on_zode_link() {
+            let (asm, mut egress_rx, bound) =
+                setup_visa_on_links(&[LinkType::NodeToAdapter, LinkType::NodeToNode]);
+
+            crate::visa_mgmt::handle_revocation(&asm, 3000).unwrap();
+
+            assert_eq!(withdrawals_sent(&mut egress_rx), vec![bound[0]]);
+        }
+
+        /// F5 (zl-zipline#251): dropping another link that holds the same
+        /// visa sends exactly one withdrawal, to the adapter, and none on the
+        /// surviving Zode link.
+        #[tokio::test]
+        async fn test_drop_peer_sends_no_withdrawal_on_zode_link() {
+            let (asm, mut egress_rx, bound) = setup_visa_on_links(&[
+                LinkType::NodeToAdapter,
+                LinkType::NodeToNode,
+                LinkType::NodeToNode,
+            ]);
+
+            asm.drop_peer(bound[2].0);
+
+            assert_eq!(withdrawals_sent(&mut egress_rx), vec![bound[0]]);
         }
 
         fn try_recv_packet(

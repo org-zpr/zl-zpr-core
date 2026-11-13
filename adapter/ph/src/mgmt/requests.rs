@@ -705,24 +705,6 @@ pub fn send_report<'a>(asm: &'a Assembly, link_id: LinkId, report: &'_ str) -> S
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::Report, pkt)
 }
 
-pub fn send_unbind_egress_stream_request<'a>(
-    asm: &'a Assembly,
-    link_id: LinkId,
-    stream_id: StreamId,
-) -> Sent<'a> {
-    debug!(target: ZDP, "{}: sending UnbindEgressStreamIndication", asm.formatted_link_id(link_id));
-
-    let req = core::new_heap_packet();
-
-    core::send_per_flow_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::UnbindEgressStreamIndication,
-        stream_id,
-        req,
-    )
-}
-
 /// send a Stream ID Withdrawal message (ZdpPacketType 5)
 ///
 /// Node -> peer adapter, per-flow: "the stream id you send with has been

@@ -911,41 +911,6 @@ fn resolve_next_hop_bind_originator(
     Ok((ingress_link_id, ingress_txn_id))
 }
 
-pub fn unbind_stream(asm: &Arc<Assembly>, ingress_link_id: NonZero<LinkId>, stream_id: StreamId) {
-    let Some(peer_table) = asm.peer_table.get(ingress_link_id.get()) else {
-        return;
-    };
-
-    // Get visa id of next hop
-    let Some(pft_pep) = peer_table.pft.get(stream_id) else {
-        warn!(target: FLOW_MGMT, "{}: unbind request: no pft pep for stream {stream_id}", asm.formatted_link_id(ingress_link_id.get()));
-        return;
-    };
-
-    // Remove entry from peer forwarding table
-    peer_table.pft.remove(stream_id);
-
-    // Remove stream id from visa
-    match asm
-        .visa_table
-        .write()
-        .unwrap()
-        .unlink_forwarding_entry(pft_pep.visa_id, &pft_pep.next_hop)
-    {
-        Ok(b) => {
-            if !b {
-                warn!(target: FLOW_MGMT, "{}: stream {} not found in visa {}", asm.formatted_link_id(ingress_link_id.get()), pft_pep.next_hop.1, pft_pep.visa_id)
-            }
-        }
-        Err(e) => {
-            warn!(target: FLOW_MGMT, "{}: error removing stream from visa: {}", asm.formatted_link_id(ingress_link_id.get()), e)
-        }
-    }
-
-    // Issue unbind request to next hop
-    requests::send_unbind_egress_stream_request(asm, pft_pep.next_hop.0, stream_id).enqueue();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,7 +1249,7 @@ mod tests {
         // A full visa (it has a traffic classifier, as the local actor
         // binds by one) whose forwarding PEP names the Zode as next hop.
         let own_visa: VisaId = VISA_ID + 1;
-        let mut visa = new_vsapi_visa_tcp_default(own_visa.into(), never_expires());
+        let mut visa = new_vsapi_visa_tcp_default(own_visa, never_expires());
         visa.fwd_pep = Some(zpr::vsapi_types::FwdPep {
             next_hop: next_hop(),
             style: zpr::vsapi_types::FwdPepStyle::OneWay,

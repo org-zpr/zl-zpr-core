@@ -31,7 +31,8 @@
 //! to find the relay by. The forward visa's next hop is the relay's ZPR
 //! address, so it is held on the record as the initial link's peer address
 //! ([pre_topology_relay_cn]) until that `setTopology` arrives
-//! ([topology_names_relay]). It is the one exception to F1's "address from
+//! ([topology_names_relay]), and is never used while the topology names
+//! the relay. It is the one exception to F1's "address from
 //! topology", and it is never taken from Hello.
 //!
 //! **Visas are immutable** (core tenet). Installing a visa ID this Zode
@@ -386,11 +387,22 @@ pub fn revoke_for_lost_link(
 
 /// The joiner's egress before topology: the initial-link CN, if `addr` is
 /// the relay address a hand-off recorded on the initial link's current
-/// connection. `Assembly::find_zode_egress_link` asks this only when no
-/// topology entry has `addr`, and then checks the link as it does any
-/// other (up record, Active, verified CN).
+/// connection and the topology does not name the relay. A hand-off that
+/// arrives after topology named the relay (a redial) never overrides it.
+/// `Assembly::find_zode_egress_link` asks this only when no topology entry
+/// has `addr`, and then checks the link as it does any other (up record,
+/// Active, verified CN).
 pub fn pre_topology_relay_cn(asm: &Assembly, addr: IpAddress) -> Option<String> {
     let relay_cn = asm.config.get().initial_link.as_ref()?.cn.clone();
+    let topology_names_it = asm
+        .topology
+        .read()
+        .unwrap()
+        .iter()
+        .any(|link| link.peer_cn == relay_cn);
+    if topology_names_it {
+        return None;
+    }
     let link_id = asm.zode_links.record(&relay_cn)?.link_id?;
     let peer = asm.peer_table.get(link_id)?;
     let held = peer.bootstrap_handoff.lock().unwrap().as_ref()?.relay_addr;
@@ -940,6 +952,33 @@ mod tests {
                 .unwrap();
                 let relay = IpAddress::new_from_std(&ip(RELAY));
                 assert_eq!(asm.find_egress_link(relay), None);
+            })
+            .await
+    }
+
+    /// Local Codex review: a hand-off that arrives when the topology already
+    /// names the relay (a redial after the joiner had topology) does not
+    /// bring the pre-topology address back; the topology still decides.
+    #[tokio::test(start_paused = true)]
+    async fn test_handoff_after_topology_does_not_override_it() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, _egress) = joiner(7308);
+                let moved = ip("fd5a:5052::3");
+                set_topology(
+                    &asm,
+                    vec![crate::peer_table::test::topology_link_at("relay", moved)],
+                );
+                accept(&asm, link, &good_body()).unwrap();
+                assert_eq!(
+                    asm.find_egress_link(IpAddress::new_from_std(&ip(RELAY))),
+                    None
+                );
+                assert_eq!(
+                    asm.find_egress_link(IpAddress::new_from_std(&moved))
+                        .map(|l| l.get()),
+                    Some(link)
+                );
             })
             .await
     }

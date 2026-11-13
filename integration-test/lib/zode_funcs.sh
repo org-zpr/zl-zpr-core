@@ -408,19 +408,19 @@ function assert_issued_ids() {
 }
 
 # Succeed when the hand-off $1 holds two visa-service IDs ([assert_issued_ids])
-# that share none with the earlier hand-off $2: every join gets new visas
-# (J6). $3 names the hand-off in the message.
+# that share none with the other hand-off $2: every join gets new visas
+# (J6), and no joiner gets another's. $3 names the hand-off in the message.
 function assert_new_ids() {
   assert_issued_ids "$1" "$3 holds two visa-service IDs" || return 1
   local ID
   for ID in $1
   do
     if [[ " $2 " == *" $ID "* ]]; then
-      echo "ASSERTION FAILED: $3 reuses visa $ID of the earlier hand-off ($2)"
+      echo "ASSERTION FAILED: $3 reuses visa $ID of the other hand-off ($2)"
       return 1
     fi
   done
-  echo "assertion OK: $3 has new IDs ($1, earlier $2)"
+  echo "assertion OK: $3 shares no ID with the other hand-off ($1; other $2)"
 }
 
 # Check the joiner's visa table as it starts (J1, J4), from its log $1:
@@ -483,28 +483,34 @@ function assert_no_refusals() {
   return "$RESULT"
 }
 
-# Ping $3 from Zode $1's namespace, from its own ZPR address, and assert
-# that it answers ($2 is the assertion message). The first echo makes the
-# Zode request a visa, so a few unanswered warm-up echoes are allowed
-# before the five that must all be answered.
+# Ping $2 from Zode $1's namespace, from its own ZPR address, and assert
+# that it answers ($3 is the assertion message). The first echo makes the
+# Zode request a visa, so up to $4 (default 3) one-second warm-up echoes
+# may go unanswered before the five that must all be answered.
 function zode_ping() {
-  in_ns "zpr-$1" ping -q -c 3 -W 1 "$3" > /dev/null 2>&1 || true
-  if in_ns "zpr-$1" ping -q -c 5 -w 10 "$3" > /dev/null; then
-    echo "assertion OK: $2"
+  wait_for "${4:-3}" in_ns "zpr-$1" ping -q -n -c 1 -W 1 "$2" > /dev/null 2>&1 || true
+  if in_ns "zpr-$1" ping -q -n -c 5 -w 10 "$2" > /dev/null; then
+    echo "assertion OK: $3"
   else
-    echo "ASSERTION FAILED: $2 ($1 got no echo reply from $3)"
+    echo "ASSERTION FAILED: $3 ($1 did not get all five echo replies from $2)"
     return 1
   fi
 }
 
-# Ping $3 from Zode $1's namespace and assert that none of the echoes is
-# answered ($2 is the assertion message).
+# Ping $2 from Zode $1's namespace and assert that none of five echoes is
+# answered ($3 is the assertion message). ping's exit status cannot tell
+# "no reply" from "some replies", so this reads the received count from its
+# summary; no summary (ping itself failed) fails the assertion too.
 function zode_no_ping() {
-  if in_ns "zpr-$1" ping -q -c 5 -w 10 "$3" > /dev/null 2>&1; then
-    echo "ASSERTION FAILED: $2 ($1 got an echo reply from $3)"
+  local OUT RECEIVED
+  OUT=$(in_ns "zpr-$1" ping -q -n -c 5 -W 1 "$2" 2>&1 || true)
+  RECEIVED=$(sed -nE 's/.*, ([0-9]+) received.*/\1/p' <<< "$OUT")
+  if [[ "$RECEIVED" == 0 ]]; then
+    echo "assertion OK: $3"
+  else
+    echo "ASSERTION FAILED: $3 ($1 pinging $2: $(tail -n 2 <<< "$OUT" | head -n 1))"
     return 1
   fi
-  echo "assertion OK: $2"
 }
 
 # Drop the substrate traffic between Zodes $1 and $2 only (names with a

@@ -28,7 +28,7 @@ use zpr::vsapi_types::{
 use zpr::write_to::WriteTo;
 
 /// Boxed async connect factory: given a SocketAddr, returns a future that resolves to a TcpStream.
-/// The default implementation calls `tokio::net::TcpStream::connect`; tests may inject a stub.
+/// The default implementation is [connect_from] with the node's own address; tests may inject a stub.
 type ConnectFn = Box<
     dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = std::io::Result<tokio::net::TcpStream>>>>,
 >;
@@ -187,6 +187,10 @@ pub struct VSConn {
     /// future) but only one can be advertised, so the choice belongs to the
     /// operator, not to a socket-derived guess.
     substrate_addr: SocketAddr,
+    /// The local address the VS-API connection is bound to before it dials
+    /// (zl-zipline#229): the node's own ZPR address, `zpr_addr[0]`. Only the
+    /// default `connect_fn` uses it; see [connect_from].
+    local_addr: IpAddr,
 }
 
 /// Handle for sending commands to a running [VSConn].
@@ -253,12 +257,17 @@ impl VSConn {
     /// `substrate_addr` is the substrate address this node advertises to the VS — the
     /// address peers dial (see the field docs). It must be concrete and reachable;
     /// there is deliberately no auto-derivation fallback.
+    ///
+    /// `local_addr` is the node's own ZPR address. Every dial binds it as the
+    /// source of the VS-API connection (see [connect_from]); a dial that cannot
+    /// bind it fails, and [VSConn::run_with_reconnect] retries.
     pub fn new(
         buffer_size: usize,
         vs_addr: SocketAddr,
         node_cn: String,
         node_private_key: RsaKeyPair,
         substrate_addr: SocketAddr,
+        local_addr: IpAddr,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(buffer_size);
         let (life_tx, _) = broadcast::channel(LIFECYCLE_EVENT_BUFFER_SIZE);
@@ -269,8 +278,9 @@ impl VSConn {
             node_cn,
             node_private_key,
             life_tx,
-            connect_fn: Box::new(|addr| Box::pin(tokio::net::TcpStream::connect(addr))),
+            connect_fn: Box::new(move |addr| Box::pin(connect_from(local_addr, addr))),
             substrate_addr,
+            local_addr,
         }
     }
 
@@ -335,6 +345,7 @@ impl VSConn {
     pub async fn run(&mut self) -> Result<(), VSApiError> {
         // First spin up a connection to the Capn Proto service on the VS.
         info!(target: VS_RPC, "VS RPC service connecting to {} (capnp)", self.vs_addr);
+        debug!(target: VS_RPC, "VS RPC connection source address {}", self.local_addr);
 
         // Interruptible TCP connect: poll cmd_rx alongside the connect future so that a Stop
         // command received while blocked in connect (e.g. during a 2-minute TCP ETIMEDOUT) causes
@@ -1458,6 +1469,37 @@ impl ServerCertVerifier for NoVerification {
     }
 }
 
+/// Open a TCP connection to `remote` from the local address `local`.
+///
+/// The node must originate its VS-API connection from its own ZPR address
+/// (zl-zipline#229): the visa service refuses a `connect` whose source is not
+/// the claimed node address, and `open` takes the node address from the
+/// source. On a relay whose TUN also carries `vs.zpr`, the kernel would pick
+/// `vs.zpr` as the source of a connection to `vs.zpr` (RFC 6724 rule 1, "prefer
+/// the same address"). Binding first removes the choice. This mirrors the
+/// visa service's own VSS dial (zl-zipline#228).
+///
+/// A `local` that is not a local address, or of a different family than
+/// `remote`, is an error that names the bind. There is no fallback to a
+/// kernel-chosen source: the caller's reconnect loop retries.
+pub(crate) async fn connect_from(
+    local: IpAddr,
+    remote: SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let sock = if local.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    sock.bind(SocketAddr::new(local, 0)).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot bind VS-API source address {local}: {e}"),
+        )
+    })?;
+    sock.connect(remote).await
+}
+
 // Create a dangerous connector - the verifier will always approve
 // TODO decide if we want to use an actual certificate
 fn tls_connect() -> TlsConnector {
@@ -1495,6 +1537,7 @@ mod tests {
                 life_tx,
                 connect_fn,
                 substrate_addr: "127.0.0.1:5000".parse().unwrap(),
+                local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
             }
         }
     }
@@ -1962,6 +2005,7 @@ mod tests {
             "test-node".to_string(),
             test_key(),
             "127.0.0.1:5000".parse().unwrap(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
         );
         let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
         let handle = vsconn.handle();
@@ -2260,5 +2304,70 @@ mod tests {
                     .expect("run_with_reconnect returned an error");
             })
             .await;
+    }
+
+    /// Build a [VSConn] with the **default** `connect_fn`, whose VS-API
+    /// source is `local_addr`. The VS address is irrelevant: the tests call
+    /// `connect_fn` directly with their own listener's address.
+    fn vsconn_from(local_addr: IpAddr) -> VSConn {
+        VSConn::new(
+            4,
+            "127.0.0.1:1".parse().unwrap(),
+            "test-node".to_string(),
+            test_key(),
+            "127.0.0.1:5000".parse().unwrap(),
+            local_addr,
+        )
+    }
+
+    /// zl-zipline#229: the VS-API connection leaves from the node's own
+    /// address, not from one the kernel picks. On a relay whose TUN also
+    /// carries `vs.zpr`, the kernel would pick `vs.zpr` (RFC 6724 rule 1),
+    /// and the visa service refuses a `connect` whose source is not the
+    /// claimed node address. 127.0.0.2 stands in for the node address and
+    /// 127.0.0.1 for the kernel's choice: both are on `lo` on Linux.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn vs_api_connection_originates_from_local_addr() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let node_addr: IpAddr = "127.0.0.2".parse().unwrap();
+
+        let vsconn = vsconn_from(node_addr);
+        let _sock = tokio::time::timeout(Duration::from_secs(5), (vsconn.connect_fn)(listen_addr))
+            .await
+            .expect("dial hung")
+            .expect("dial from a local address must succeed");
+
+        let (_peer_sock, peer) = listener.accept().await.unwrap();
+        assert_eq!(
+            peer.ip(),
+            node_addr,
+            "the VS-API connection must originate from the node's own address"
+        );
+    }
+
+    /// zl-zipline#229: a source address that cannot be bound fails the dial;
+    /// there is no fallback to an unbound connect. The error names the bind,
+    /// and the listener never sees a connection.
+    #[tokio::test]
+    async fn vs_api_dial_fails_when_local_addr_cannot_be_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737): never assigned to a host.
+        let not_local: IpAddr = "192.0.2.1".parse().unwrap();
+
+        let vsconn = vsconn_from(not_local);
+        let res = tokio::time::timeout(Duration::from_secs(5), (vsconn.connect_fn)(listen_addr))
+            .await
+            .expect("dial hung");
+        let err = res.expect_err("binding a non-local source must fail the dial");
+        assert!(
+            err.to_string().contains("bind"),
+            "the error must name the bind, got: {err}"
+        );
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(accepted.is_err(), "no connection may reach the listener");
     }
 }

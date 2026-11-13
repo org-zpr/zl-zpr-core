@@ -35,7 +35,15 @@ async fn main() {
     let private_key = libnode2::cli::crypto::load_private_key(&args.private_key)
         .expect("failed to load private key");
 
-    let mut vsc = VSConn::new(8, vs_sa, args.node_cn, private_key, substrate_addr);
+    let mut vsc = VSConn::new(
+        8,
+        vs_sa,
+        args.node_cn,
+        private_key,
+        substrate_addr,
+        // The VS-API connection leaves from the node's own address (zl-zipline#229).
+        node_zpr_addr,
+    );
     let life_rx = vsc.subscribe_lifecycle_events();
     let handle = vsc.handle();
 

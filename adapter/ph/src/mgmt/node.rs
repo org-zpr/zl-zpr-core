@@ -1421,6 +1421,7 @@ mod tests {
             "test-node".to_string(),
             key,
             "127.0.0.1:5000".parse().unwrap(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
         );
         let (asm, egress_rx, _hairpin_rx) = node_assembly(Some(vsconn.handle()));
         (asm, egress_rx)

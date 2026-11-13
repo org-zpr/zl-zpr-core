@@ -513,6 +513,10 @@ fn main() -> ExitCode {
             node_name,
             auth_private_key,
             advertised_substrate,
+            // The VS-API connection leaves from the node's own address
+            // (zl-zipline#229): on a relay that hosts the visa service the
+            // kernel would otherwise pick vs.zpr as the source.
+            node_zpr_addr,
         ));
     } else {
         vsconn = None;

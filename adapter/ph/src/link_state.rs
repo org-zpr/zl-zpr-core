@@ -2764,6 +2764,7 @@ mod tests {
             "test-node".to_string(),
             key,
             "127.0.0.1:5000".parse().unwrap(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
         );
         // Observable egress: the close path puts a Terminate on the mgmt
         // substrate queue, which must have a live receiver.

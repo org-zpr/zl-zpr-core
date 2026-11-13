@@ -425,6 +425,16 @@ fn requested_visa_granted(
         return requested_visa_denied(asm, ingress_link_id, txn_id);
     };
 
+    // F2 loop guard (zl-zipline#251): a bind that would go back out the
+    // link it came in on is a loop. Asking the requestor for a stream for
+    // its own request would burn transaction IDs on both Zodes, request
+    // after request, and it means the visa or the route is bad. Refuse it.
+    if egress_link_id == ingress_link_id {
+        error!(target: FLOW_MGMT, "visa {visa_id}: next hop is the requestor {} itself; refusing the bind",
+            asm.formatted_link_id(ingress_link_id.get()));
+        return requested_visa_denied(asm, ingress_link_id, txn_id);
+    }
+
     let Some(egress_peer_state) = asm.peer_table.get(egress_link_id.get()) else {
         // egress link was racily deleted; consider visa denied
         return requested_visa_denied(asm, ingress_link_id, txn_id);
@@ -490,10 +500,15 @@ fn requested_visa_granted(
 
     // Open a transaction on the egress link and move into AwaitingNextHopBind state.
 
-    let egress_bind_txn = egress_peer_state
-        .txn_mgr
-        .try_open()
-        .expect("FIXME TODO: bind backpressure #1176");
+    // F2 (zl-zipline#251): with every transaction ID on the egress link in
+    // use, refuse the bind. Never panic or block: the request comes from a
+    // peer, and a refused flow is simply requested again by its next
+    // packet, so real backpressure is not needed.
+    let Some(egress_bind_txn) = egress_peer_state.txn_mgr.try_open() else {
+        error!(target: FLOW_MGMT, "visa {visa_id}: no free transaction ID on {}; refusing the bind",
+            asm.formatted_link_id(egress_link_id.get()));
+        return requested_visa_denied(asm, ingress_link_id, txn_id);
+    };
 
     let Some(ingress_peer_state) = asm.peer_table.get(ingress_link_id.get()) else {
         // requestor went away, bail!
@@ -961,11 +976,22 @@ mod tests {
     /// the forward-only visa [VISA_ID] (next hop [NEXT_HOP]) in its visa
     /// table and no links yet.
     fn node_with_visa() -> (Arc<Assembly>, EgressRx) {
+        let (asm, egress_rx, _hairpin_rx) = node_with_visa_and_hairpin();
+        (asm, egress_rx)
+    }
+
+    /// [node_with_visa], plus the receiving end of the management hairpin,
+    /// where packets sent on an internal link (such as the local actor
+    /// link) arrive.
+    fn node_with_visa_and_hairpin() -> (Arc<Assembly>, EgressRx, tokio::sync::mpsc::Receiver<Packet>)
+    {
         let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
+        let (hairpin_tx, hairpin_rx) = tokio::sync::mpsc::channel(8);
         let mut builder = TestAssemblyBuilder::new();
         builder.ph_mode = Some(PhMode::Node);
         builder.visa_table = Some(VisaTable::new());
         builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
+        builder.mgmt_hairpin_dispatch = Some(crate::queues::MgmtHairpinDispatch::new(hairpin_tx));
         let asm = Arc::new(create_assembly(builder));
         asm.visa_table
             .write()
@@ -976,7 +1002,7 @@ mod tests {
                 next_hop(),
             ))
             .unwrap();
-        (asm, egress_rx)
+        (asm, egress_rx, hairpin_rx)
     }
 
     /// [NEXT_HOP] as an address.
@@ -1181,5 +1207,139 @@ mod tests {
                 .awaiting_next_hop_bind_table
                 .is_empty()
         );
+    }
+
+    /// The error response a bind on link `link` got: the next packet on the
+    /// egress queue must be a failed StreamIdResponse on `link`, and nothing
+    /// may follow it.
+    fn assert_only_stream_id_error_response(rx: &mut EgressRx, link: LinkId) {
+        let pkt = try_recv_packet(rx).expect("an error response to the requestor");
+        assert_eq!(pkt.metadata().egress_link_id, link);
+        let rsp = decode_per_flow_txn(&pkt);
+        assert_eq!(rsp.packet_type, zdp::ZdpPacketType::StreamIdResponse);
+        let (rsp_hdr, _) = zdp::ZdpStreamIdResponseHeader::ref_from_prefix(&rsp.payload).unwrap();
+        assert_ne!(rsp_hdr.status_code, zdp::ResponseCode::Success);
+        assert!(try_recv_packet(rx).is_none(), "nothing else is sent");
+    }
+
+    /// Whether link `link` holds no bind state: no inbound bind request and
+    /// no outstanding next-hop bind.
+    fn no_bind_state(asm: &Assembly, link: LinkId) -> bool {
+        let peer = asm.peer_table.get(link).unwrap();
+        peer.node_state.bind_request_state.is_empty()
+            && peer.node_state.awaiting_next_hop_bind_table.is_empty()
+    }
+
+    /// F2 loop guard (zl-zipline#251): a StreamIdRequest on Zode link A for
+    /// a visa whose next hop resolves (F1) back to A is refused with an
+    /// error response. No StreamIdRequest goes back out on A, and no bind
+    /// state is left.
+    #[tokio::test]
+    async fn test_bind_back_out_the_ingress_link_is_refused() {
+        let (asm, mut egress_rx) = node_with_visa();
+        let link_a = insert_up_zode_link(&asm, "a.zpr", next_hop());
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+
+        assert_only_stream_id_error_response(&mut egress_rx, link_a);
+        assert!(no_bind_state(&asm, link_a));
+    }
+
+    /// F2 (zl-zipline#251): when every transaction ID on the egress link is
+    /// open, the bind is refused with an error response instead of a panic,
+    /// nothing is sent on the egress link, and the ingress bind state is
+    /// gone.
+    #[tokio::test]
+    async fn test_bind_is_refused_when_egress_transaction_ids_run_out() {
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let txn_mgr = asm.peer_table.get(link_b).unwrap().txn_mgr.clone();
+        let open: Vec<_> = std::iter::from_fn(|| txn_mgr.try_open()).collect();
+        assert_eq!(open.len(), usize::from(TxnId::MAX) + 1);
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+
+        assert_only_stream_id_error_response(&mut egress_rx, link_a);
+        assert!(no_bind_state(&asm, link_a));
+        assert!(no_bind_state(&asm, link_b));
+    }
+
+    /// F8 (zl-zipline#251): a Zode's own traffic, bound by its local actor
+    /// link, leaves through a Zode link under F1. The visa's next hop is the
+    /// topology address of an up Zode link: the StreamIdRequest goes out on
+    /// that link, and its grant points the local actor link's PFT entry at
+    /// the link's stream.
+    #[tokio::test(flavor = "local")]
+    async fn test_own_traffic_binds_out_a_zode_link() {
+        use crate::visa_table::tests::new_vsapi_visa_tcp_default;
+        use zpr::packet_info::LOCAL_ACTOR_LINK_ID;
+
+        let (asm, mut egress_rx, mut hairpin_rx) = node_with_visa_and_hairpin();
+        let (local_actor, _dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+        assert_eq!(local_actor.get(), LOCAL_ACTOR_LINK_ID);
+        let zode_link = insert_up_zode_link(&asm, "b.zpr", next_hop());
+
+        // A full visa (it has a traffic classifier, as the local actor
+        // binds by one) whose forwarding PEP names the Zode as next hop.
+        let own_visa: VisaId = VISA_ID + 1;
+        let mut visa = new_vsapi_visa_tcp_default(own_visa.into(), never_expires());
+        visa.fwd_pep = Some(zpr::vsapi_types::FwdPep {
+            next_hop: next_hop(),
+            style: zpr::vsapi_types::FwdPepStyle::OneWay,
+        });
+        asm.visa_table.write().unwrap().insert_visa(visa).unwrap();
+
+        requested_visa_granted(&asm, local_actor, 7, own_visa);
+
+        let pkt = try_recv_packet(&mut egress_rx).expect("a StreamIdRequest to the Zode");
+        assert_eq!(pkt.metadata().egress_link_id, zode_link);
+        let req = decode_per_flow_txn(&pkt);
+        assert_eq!(req.packet_type, zdp::ZdpPacketType::StreamIdRequest);
+        let (body, _) = zdp::ZdpStreamIdRequest::ref_from_prefix(&req.payload).unwrap();
+        assert_eq!(VisaId::from(body.visa_id), own_visa);
+
+        let egress_txn = asm
+            .peer_table
+            .get(zode_link)
+            .unwrap()
+            .node_state
+            .awaiting_next_hop_bind_table
+            .iter()
+            .next()
+            .expect("the next-hop bind is outstanding")
+            .key()
+            .clone();
+        // The stream the grant installs on the local actor link is the
+        // next free PFT slot there.
+        let local_stream = asm
+            .peer_table
+            .get(LOCAL_ACTOR_LINK_ID)
+            .unwrap()
+            .pft
+            .vacant_entry()
+            .unwrap()
+            .key();
+        install_tether(&asm, NonZero::new(zode_link).unwrap(), &egress_txn, 42).unwrap();
+
+        // The local actor is told its bind succeeded, with that stream.
+        let rsp = hairpin_rx
+            .try_recv()
+            .expect("a bind response to the local actor");
+        let (base_hdr, _) = zdp::ZdpBaseHeader::ref_from_prefix(rsp.body()).unwrap();
+        assert_eq!(
+            base_hdr.packet_type,
+            zdp::ZdpPacketType::BindActorAddressResponse
+        );
+        assert_eq!(decode_per_flow_txn(&rsp).stream_id, local_stream);
+
+        let local_peer = asm.peer_table.get(LOCAL_ACTOR_LINK_ID).unwrap();
+        assert_eq!(local_peer.pft.len(), 1);
+        let pep = local_peer
+            .pft
+            .inspect(local_stream, |pep| (pep.next_hop.clone(), pep.visa_id))
+            .expect("a PFT entry on the local actor link");
+        assert!(pep == (ForwardingEntry(zode_link, 42), own_visa));
     }
 }

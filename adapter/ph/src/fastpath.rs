@@ -1238,6 +1238,63 @@ mod test {
         ));
     }
 
+    /// F7 (zl-zipline#251): a transit packet arriving on a Zode link with a
+    /// stream ID that has no PFT entry is dropped silently and counted as
+    /// `UnknownStreamId`. Nothing is forwarded, and nothing goes back
+    /// upstream: no `Destination Unreachable`, which would let a peer probe
+    /// which stream IDs are live.
+    #[tokio::test(flavor = "local")]
+    async fn test_unknown_stream_id_on_zode_link_is_dropped_silently() {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        let (mgmt_tx, mut mgmt_rx) = crate::packet_queue::packet_queue(8);
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(PhMode::Node),
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(mgmt_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        let zode = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        let mut worker = FastpathWorker::new(
+            FastpathWorkerConfig {
+                batch_io_engine: crate::batch_io::auto_select_engine(),
+                buffer_count: 4,
+                batch_size: 4,
+                #[cfg(feature = "enable-security-testing")]
+                mangle_forwarded_pings: false,
+                #[cfg(feature = "enable-security-testing")]
+                unkeyed_a2a_micv: false,
+                #[cfg(feature = "enable-security-testing")]
+                recompute_micvs: false,
+            },
+            0,
+            asm.clone(),
+        );
+
+        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
+        pkt.put(&b"a transit payload"[..]);
+        pkt.metadata_mut().ingress_link_id = zode;
+        pkt.metadata_mut().ingress_stream_id = 77;
+        worker.forward(pkt);
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::UnknownStreamId].get_count(),
+            1
+        );
+        assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+        let buf = vec![0u8; PACKET_BUFFER_SIZE].into_boxed_slice();
+        assert!(
+            matches!(
+                mgmt_rx.try_recv(buf),
+                Err(crate::packet_queue::TryRecvError::Empty(_))
+            ),
+            "nothing is sent upstream"
+        );
+    }
+
     #[test]
     fn test_decrypt_null_rejects_short_packet() {
         for body in [&[][..], &[0u8][..], &[0u8, 0][..]] {

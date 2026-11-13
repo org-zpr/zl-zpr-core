@@ -266,16 +266,20 @@ impl ZodeLinkTable {
     }
 
     /// F6 (zl-zipline#251): wait until the reporter has sent a snapshot
-    /// covering every loss registered so far (the loss epoch read now).
-    /// Returns at once when none is pending. A send is bounded by the
-    /// VS-API RPC timeout, and fails at once with no VS-API session, so
-    /// this never hangs on a live reporter.
+    /// covering every loss registered so far, including any loss registered
+    /// while waiting: the current loss epoch is read again each time the
+    /// reported epoch moves, so a request never overtakes the report of a
+    /// second loss that happened before it was released (core#110 review).
+    /// Returns at once when none is pending. Each send is bounded by the
+    /// VS-API RPC timeout, and fails at once with no VS-API session, so this
+    /// never hangs on a live reporter.
     pub async fn wait_for_loss_reports(&self) {
-        let target = self.loss_epoch.load(std::sync::atomic::Ordering::Acquire);
         let mut reported = self.reported_epoch.subscribe();
         // The sender lives in this table, which outlives the borrow, so
         // wait_for cannot fail.
-        let _ = reported.wait_for(|epoch| *epoch >= target).await;
+        let _ = reported
+            .wait_for(|epoch| *epoch >= self.loss_epoch.load(std::sync::atomic::Ordering::Acquire))
+            .await;
     }
 
     /// Whether a report has been asked for and not yet sent.
@@ -1833,6 +1837,57 @@ mod tests {
                 tokio::time::timeout(REPORT_COALESCE / 2, asm.zode_links.wait_for_loss_reports())
                     .await
                     .expect("the barrier opens without waiting for the window");
+            })
+            .await
+    }
+
+    /// F6 with overlapping losses (core#110 review): a visa request that
+    /// waits on the first loss must keep waiting when a second link is lost
+    /// meanwhile, until the second loss's report has returned too.
+    /// Otherwise it could overtake that report and be planned over the
+    /// second dead link.
+    #[tokio::test(start_paused = true)]
+    async fn test_loss_barrier_waits_for_a_loss_registered_while_waiting() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(
+                    &asm,
+                    vec![peer("b", "fd5a::9", 7154), peer("c", "fd5a::8", 7155)],
+                );
+                let link_b = answered_up(&asm, "b", 7254);
+                let link_c = answered_up(&asm, "c", 7255);
+
+                // Every send blocks until the test releases it.
+                let release = std::rc::Rc::new(tokio::sync::Notify::new());
+                let gate = release.clone();
+                tokio::task::spawn_local(run_link_state_reporter(asm.clone(), move |_| {
+                    let gate = gate.clone();
+                    async move {
+                        gate.notified().await;
+                        Ok(())
+                    }
+                }));
+                tokio::time::sleep(REPORT_COALESCE * 3).await;
+                release.notify_one(); // the `up` report
+                settle().await;
+
+                asm.drop_peer(link_b);
+                let opened = std::rc::Rc::new(std::cell::Cell::new(false));
+                let (flag, waiter_asm) = (opened.clone(), asm.clone());
+                tokio::task::spawn_local(async move {
+                    waiter_asm.zode_links.wait_for_loss_reports().await;
+                    flag.set(true);
+                });
+                settle().await;
+                asm.drop_peer(link_c);
+
+                release.notify_one(); // b's report returns
+                settle().await;
+                assert!(!opened.get(), "still closed: c's report has not returned");
+                release.notify_one(); // c's report returns
+                settle().await;
+                assert!(opened.get(), "open once every registered loss is reported");
             })
             .await
     }

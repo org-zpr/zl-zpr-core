@@ -21,8 +21,9 @@ use crate::error::VSApiError;
 use crate::logging::targets::VS_RPC;
 
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, DisconnectNotice, LinkStateReport, Param,
-    ReauthRequest, VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse, pname,
+    BootstrapVisas, ConnectRequest, ConnectType, Connection, DisconnectNotice, LinkStateReport,
+    Param, ReauthRequest, VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse,
+    pname,
 };
 use zpr::write_to::WriteTo;
 
@@ -56,6 +57,7 @@ type VSPingResponse = Result<(), VSApiError>;
 type VSVisaIdsResponse = Result<Vec<u64>, VSApiError>;
 type VSVisaByIdResponse = Result<Vec<Visa>, VSApiError>;
 type VSReportLinkStatesResponse = Result<(), VSApiError>;
+type VSBootstrapVisasResponse = Result<BootstrapVisas, VSApiError>;
 
 #[derive(Debug)]
 pub struct NodeConnect {
@@ -143,6 +145,11 @@ enum VS2Command {
         Vec<LinkStateReport>,
         oneshot::Sender<VSReportLinkStatesResponse>,
     ),
+
+    /// Ask for a joining Zode's bootstrap visas on its behalf,
+    /// `VSHandle.requestBootstrapVisas` (zl-zipline#252, ZODE_LINKS.md J2).
+    /// The `String` is the joiner's link-verified certificate CN.
+    RequestBootstrapVisas(String, oneshot::Sender<VSBootstrapVisasResponse>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -742,6 +749,22 @@ impl VSConn {
                 }
                 Ok(())
             }
+
+            VS2Command::RequestBootstrapVisas(peer_cn, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: request_bootstrap_visas for {peer_cn}");
+                let resp = if !cmd_state.is_connected() {
+                    Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    ))
+                } else {
+                    self.do_request_bootstrap_visas(cmd_state.vs_handle.as_ref().unwrap(), &peer_cn)
+                        .await
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send request_bootstrap_visas response: {:?}", e);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -991,6 +1014,33 @@ impl VSConn {
         match response.get()?.get_res()?.which()? {
             vsapi2::ok_or_error::Which::Ok(_) => Ok(()),
             vsapi2::ok_or_error::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
+        }
+    }
+
+    /// Ask for the bootstrap visas of the joining Zode whose link-verified CN
+    /// is `peer_cn`, with `VSHandle.requestBootstrapVisas` (zl-zipline#252,
+    /// ZODE_LINKS.md J2). The decoder already refuses any answer that is not
+    /// exactly two `peer` and two `relay` visas.
+    async fn do_request_bootstrap_visas(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+        peer_cn: &str,
+    ) -> Result<BootstrapVisas, VSApiError> {
+        let mut request = vs_h.request_bootstrap_visas_request();
+        request.get().set_peer_cn(peer_cn);
+        debug!(target: VS_RPC, "VS-API -> request_bootstrap_visas");
+        let response = rpc_with_timeout(
+            "request_bootstrap_visas",
+            DEFAULT_RPC_TIMEOUT,
+            request.send().promise,
+        )
+        .await?;
+        match response.get()?.get_res()?.which()? {
+            vsapi2::result::Which::Ok(visas) => Ok(BootstrapVisas::try_from(visas?)?),
+            vsapi2::result::Which::Error(err_obj) => {
                 let err_obj = err_obj?;
                 Err(ApiResponseError::try_from(err_obj)?.into())
             }
@@ -1267,6 +1317,20 @@ impl VSConnHandle {
     ) -> Result<(), VSApiError> {
         let (resp_tx, resp_rx) = oneshot::channel();
         let cmd = VS2Command::ReportLinkStates(reports, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
+    /// Ask the visa service for the bootstrap visas of a joining Zode whose
+    /// link-verified certificate CN is `peer_cn` (zl-zipline#252, J2). Only the
+    /// node the visa service docks on may ask. The answer holds exactly two
+    /// visas for the joiner (`peer`) and two for this node (`relay`).
+    pub async fn request_bootstrap_visas(
+        &self,
+        peer_cn: String,
+    ) -> Result<BootstrapVisas, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::RequestBootstrapVisas(peer_cn, resp_tx);
         self.send_command(cmd).await?;
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
@@ -1674,6 +1738,9 @@ mod tests {
         /// Handle ids are 1-based in `authenticate` order, so after a
         /// successful re-auth a ping must arrive on id 2.
         last_ping_handle: Option<u32>,
+        /// The `peerCn` of every `requestBootstrapVisas` the fake served, in
+        /// order (zl-zipline#252).
+        bootstrap_requests: Vec<String>,
     }
 
     struct FakeVs {
@@ -1757,6 +1824,61 @@ mod tests {
             results.get().init_res().set_ok(());
             Ok(())
         }
+
+        /// Answer for [FAKE_JOINER_CN] with [fake_bootstrap_visas]; refuse any
+        /// other CN with `notFound`, as the real visa service does for a CN
+        /// that is not a peer in the caller's topology (zl-zipline#252 J3).
+        async fn request_bootstrap_visas(
+            self: Rc<Self>,
+            params: vsapi2::v_s_handle::RequestBootstrapVisasParams,
+            mut results: vsapi2::v_s_handle::RequestBootstrapVisasResults,
+        ) -> Result<(), capnp::Error> {
+            let peer_cn = params.get()?.get_peer_cn()?.to_string()?;
+            self.state
+                .borrow_mut()
+                .bootstrap_requests
+                .push(peer_cn.clone());
+            if peer_cn == FAKE_JOINER_CN {
+                fake_bootstrap_visas().write_to(&mut results.get().init_res().init_ok());
+            } else {
+                let mut err = results.get().init_res().init_error();
+                ApiResponseError::new_code_msg(
+                    zpr::vsapi_types::ErrorCode::NotFound,
+                    "no such peer",
+                )
+                .write_to(&mut err);
+            }
+            Ok(())
+        }
+    }
+
+    /// The CN the fake visa service mints bootstrap visas for.
+    const FAKE_JOINER_CN: &str = "joiner.zpr";
+
+    /// The answer the fake visa service gives for [FAKE_JOINER_CN]: two
+    /// distinct visas in each list, so a test can check the order survives.
+    fn fake_bootstrap_visas() -> BootstrapVisas {
+        use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, TcpUdpPep};
+        let visa = |id: u64| {
+            Visa::new(
+                id,
+                0,
+                UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                "10.1.1.9".parse().unwrap(),
+                "10.1.1.1".parse().unwrap(),
+                DockPepType::TCP(TcpUdpPep {
+                    source_port: 0,
+                    dest_port: 5002,
+                    endpoint: EndpointT::Client,
+                }),
+                KeySet::default(),
+                None,
+            )
+        };
+        BootstrapVisas {
+            peer: vec![visa(101), visa(102)],
+            relay: vec![visa(101), visa(102)],
+        }
     }
 
     /// Spawn the fake VS: TLS + capnp RPC, bootstrap capability is a
@@ -1768,6 +1890,7 @@ mod tests {
             auth_calls: 0,
             fail_next_auth: false,
             last_ping_handle: None,
+            bootstrap_requests: Vec::new(),
         }));
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -1931,6 +2054,77 @@ mod tests {
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
+    }
+
+    /// zl-zipline#252 (t205): `request_bootstrap_visas` sends the CN as given
+    /// and returns the visa service's answer, both lists in order.
+    #[tokio::test]
+    async fn request_bootstrap_visas_returns_the_answer() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+
+                let answer = handle
+                    .request_bootstrap_visas(FAKE_JOINER_CN.to_string())
+                    .await
+                    .expect("the fake VS mints for its joiner CN");
+                assert_eq!(answer, fake_bootstrap_visas());
+                assert_eq!(state.borrow().bootstrap_requests, vec![FAKE_JOINER_CN]);
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#252 (t205): a visa-service refusal comes back as the coded
+    /// error, so the relay can log the code and close the link (J7).
+    #[tokio::test]
+    async fn request_bootstrap_visas_maps_a_refusal_to_its_code() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, _state, task) = connected_vsconn_against_fake_vs().await;
+
+                let err = handle
+                    .request_bootstrap_visas("stranger.zpr".to_string())
+                    .await
+                    .expect_err("the fake VS refuses an unknown CN");
+                assert!(
+                    matches!(
+                        &err,
+                        VSApiError::CodedError(e) if e.code == zpr::vsapi_types::ErrorCode::NotFound
+                    ),
+                    "expected notFound, got {err:?}"
+                );
+
+                handle.stop(false).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#252 (t205): with no VS-API session the run loop refuses a
+    /// bootstrap-visa request locally and sends nothing.
+    #[tokio::test]
+    async fn request_bootstrap_visas_without_session_is_refused_locally() {
+        let mut conn = VSConn::new_for_test(
+            "127.0.0.1:1".parse().unwrap(),
+            "node".to_string(),
+            test_key(),
+            refusing_connect_fn(),
+        );
+        let mut cmd_state = VSCommandState::new(capnp_rpc::new_client(NoSessionVs));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        conn.handle_command(
+            &mut cmd_state,
+            VS2Command::RequestBootstrapVisas(FAKE_JOINER_CN.to_string(), resp_tx),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
     }
 
     /// Before fix: run_with_reconnect blocks in tokio::time::sleep(reconnect_after) even when a

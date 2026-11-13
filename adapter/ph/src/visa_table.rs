@@ -408,7 +408,10 @@ impl VisaTable {
             return Ok((visa_id, false));
         }
 
-        let expiration = DateTime::from(visa.expires);
+        // `DateTime::from` panics past chrono's range, so convert checked.
+        // Refusing here covers every insert path at once.
+        let expiration =
+            expiry_as_utc(visa.expires).ok_or(VisaTableError::ParseError("expiration"))?;
 
         info!(target: VISA_MGMT,
             "Visa inserted into VisaTable ID: {visa_id}, Type: {:?}, Expiration: {}",
@@ -907,6 +910,14 @@ fn make_tcp_visa(
         // previous hop (zl-zipline#245).
         prev_hop: None,
     }
+}
+
+/// `expires` as a chrono timestamp, or `None` if chrono cannot represent it
+/// or it lies before the Unix epoch (no visa service issues either).
+fn expiry_as_utc(expires: SystemTime) -> Option<DateTime<Utc>> {
+    let since_epoch = expires.duration_since(UNIX_EPOCH).ok()?;
+    let secs = i64::try_from(since_epoch.as_secs()).ok()?;
+    DateTime::from_timestamp(secs, since_epoch.subsec_nanos())
 }
 
 #[cfg(test)]
@@ -1604,6 +1615,29 @@ pub mod tests {
         assert_eq!(visa_table.bindings(5200), &[binding]);
         assert_eq!(visa_table.timeout_queue.len(), 1);
         assert_eq!(visa_table.match_traffic(&full_tuple), Some(5200));
+    }
+
+    /// A visa whose expiry chrono cannot represent (a visa service bug, or
+    /// a hostile push) is refused, not a panic, and leaves nothing behind.
+    /// Every insert path (VSS push, `visaRequest`, fetch by ID, hand-off)
+    /// goes through this insert, so one guard covers them all.
+    #[test]
+    fn test_insert_refuses_an_expiry_out_of_chrono_range() {
+        // About 317,000 years after 1970: past chrono's year 262,143. Windows'
+        // `SystemTime` cannot hold it at all, so there is nothing to test there.
+        let Some(far_future) = UNIX_EPOCH.checked_add(Duration::from_secs(10_000_000_000_000))
+        else {
+            return;
+        };
+        let mut visa_table = VisaTable::new();
+        let visa = new_vsapi_visa_tcp_default(5300, far_future);
+
+        assert!(matches!(
+            visa_table.insert_visa(visa),
+            Err(VisaTableError::ParseError(_))
+        ));
+        assert!(!visa_table.contains(5300));
+        assert!(visa_table.timeout_queue.is_empty());
     }
 
     /// F3 (zl-zipline#251): losing the egress side of a binding revokes the

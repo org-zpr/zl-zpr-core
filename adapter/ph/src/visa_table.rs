@@ -181,6 +181,17 @@ impl Visa {
         self.ftuple.map(|ftuple| tc::Ip5TupleTc::new(ftuple.into()))
     }
 
+    /// The visa's previous hop: the ZPR address of the Zode the visa
+    /// service put just before this one on the visa's path, or `None` for
+    /// an ingress copy (or a path of fewer than two nodes). Read-only, like
+    /// the rest of the visa: a visa is never edited once granted.
+    ///
+    /// A Zode binds the visa only for a `Stream ID Request` from this hop
+    /// (gap 7, zl-zipline#253; see `mgmt::node::check_prev_hop`).
+    pub fn prev_hop(&self) -> Option<IpAddr> {
+        self.visa.prev_hop
+    }
+
     /// Whether this visa and `other` carry the same A2A session keys (J11):
     /// a stream rebound from one onto the other keeps the keys its
     /// requestor and the far adapter got at bind time, so they must match.
@@ -1067,6 +1078,19 @@ pub mod tests {
         expires: SystemTime,
         next_hop: IpAddr,
     ) -> vsapi_types::Visa {
+        new_vsapi_visa_forward_only_from(issuer_id, expires, None, next_hop)
+    }
+
+    /// [new_vsapi_visa_forward_only], with `prev_hop` as its previous hop,
+    /// as the visa service fills it for every copy but the ingress copy
+    /// (gap 7, zl-zipline#253). The previous hop is set here, at creation:
+    /// a test never edits a visa after it is installed.
+    pub fn new_vsapi_visa_forward_only_from(
+        issuer_id: u64,
+        expires: SystemTime,
+        prev_hop: Option<IpAddr>,
+        next_hop: IpAddr,
+    ) -> vsapi_types::Visa {
         vsapi_types::Visa {
             issuer_id,
             config: 1,
@@ -1078,7 +1102,7 @@ pub mod tests {
                 style: vsapi_types::FwdPepStyle::OneWay,
             }),
             cons: None,
-            prev_hop: None,
+            prev_hop,
         }
     }
 

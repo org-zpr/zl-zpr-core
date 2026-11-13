@@ -117,6 +117,10 @@ pub enum HandoffError {
     /// The visa table refused the visa.
     #[error("could not install visa {0}")]
     InstallFailed(VisaId),
+    /// Gap 7 (zl-zipline#253): the reverse visa's previous hop is unset,
+    /// or is not the relay, the forward visa's next hop.
+    #[error("reverse visa {0}'s previous hop is not the relay (the forward visa's next hop)")]
+    PrevHopMismatch(VisaId),
 }
 
 /// Encode a hand-off body: a count byte, then for each visa a big-endian
@@ -195,7 +199,9 @@ pub struct HandoffContext<'a> {
 /// 6. neither with a reserved ID ([HandoffError::ReservedId]),
 /// 7. which are exactly one forward and one reverse VS-API visa for this
 ///    Zode, with distinct IDs ([HandoffError::WrongShape]),
-/// 8. and neither has expired ([HandoffError::Expired]).
+/// 8. the reverse visa's previous hop is the relay, the forward visa's
+///    next hop ([HandoffError::PrevHopMismatch]),
+/// 9. and neither has expired ([HandoffError::Expired]).
 ///
 /// An expiry out of the range this node can hold never gets here: [decode]
 /// refuses it ([crate::tlv::unpack_visa]).
@@ -236,6 +242,16 @@ pub fn check_handoff(
     // Two IDs for two visas: an ID always names one visa.
     if pair[0].issuer_id == pair[1].issuer_id {
         return Err(HandoffError::WrongShape);
+    }
+    // Gap 7 (zl-zipline#253): the relay's `Stream ID Request` for the
+    // reverse visa is bound only if the visa's previous hop is the relay
+    // address this hand-off records, the forward visa's next hop. A pair
+    // that disagrees would let authentication start and then fail at bind
+    // time, a silent J10 rejoin loop. Refuse it here, visibly and at once.
+    let [forward, reverse] = &pair;
+    let relay_addr = forward.fwd_pep.as_ref().map(|fwd| fwd.next_hop);
+    if reverse.prev_hop.is_none() || reverse.prev_hop != relay_addr {
+        return Err(HandoffError::PrevHopMismatch(reverse.issuer_id));
     }
     if let Some(stale) = pair.iter().find(|visa| visa.expires <= ctx.now) {
         return Err(HandoffError::Expired(stale.issuer_id));
@@ -975,6 +991,31 @@ mod tests {
         assert_eq!(check_pair(forward(), twin), Err(HandoffError::WrongShape));
     }
 
+    /// J4 and gap 7 (zl-zipline#253): the joiner accepts the relay's
+    /// `Stream ID Request` for the reverse visa only from the reverse
+    /// visa's previous hop, by the relay address this hand-off records (the
+    /// forward visa's next hop). A reverse visa with no previous hop, or
+    /// another one, is refused here, before authentication starts.
+    #[test]
+    fn test_check_refuses_a_reverse_visa_not_from_the_relay() {
+        let no_prev_hop = Visa {
+            prev_hop: None,
+            ..reverse()
+        };
+        assert_eq!(
+            check_pair(forward(), no_prev_hop),
+            Err(HandoffError::PrevHopMismatch(REV_ID))
+        );
+        let elsewhere = Visa {
+            prev_hop: Some(ip("fd5a:5052::77")),
+            ..reverse()
+        };
+        assert_eq!(
+            check_pair(forward(), elsewhere),
+            Err(HandoffError::PrevHopMismatch(REV_ID))
+        );
+    }
+
     #[test]
     fn test_check_refuses_an_expired_visa() {
         let mut stale = reverse();
@@ -1292,6 +1333,53 @@ mod tests {
                 assert_eq!(
                     asm.find_egress_link(IpAddress::new_from_std(&ip(RELAY))),
                     None
+                );
+            })
+            .await
+    }
+
+    /// Gap 7 (zl-zipline#253) on a joiner: before its first topology, the
+    /// relay's requests on the initial link pass the previous-hop check by
+    /// the hand-off's relay address; after a topology names the relay at
+    /// that address, by the topology. A visa whose previous hop is
+    /// another address is refused on the same link.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_is_the_previous_hop_before_and_after_topology() {
+        use crate::mgmt::node::check_prev_hop;
+        const ELSEWHERE_ID: VisaId = 9003;
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, _egress) = joiner(7310);
+                let link_id = std::num::NonZero::new(link).unwrap();
+                accept(&asm, link, &good_body()).unwrap();
+                let elsewhere = Visa {
+                    issuer_id: ELSEWHERE_ID,
+                    prev_hop: Some(ip("fd5a:5052::77")),
+                    ..reverse()
+                };
+                asm.visa_table
+                    .write()
+                    .unwrap()
+                    .insert_visa(elsewhere)
+                    .unwrap();
+
+                assert_eq!(check_prev_hop(&asm, REV_ID, link_id), Ok(()));
+                assert_eq!(
+                    check_prev_hop(&asm, ELSEWHERE_ID, link_id),
+                    Err(Some(ip("fd5a:5052::77")))
+                );
+
+                set_topology(
+                    &asm,
+                    vec![crate::peer_table::test::topology_link_at(
+                        "relay",
+                        ip(RELAY),
+                    )],
+                );
+                assert_eq!(check_prev_hop(&asm, REV_ID, link_id), Ok(()));
+                assert_eq!(
+                    check_prev_hop(&asm, ELSEWHERE_ID, link_id),
+                    Err(Some(ip("fd5a:5052::77")))
                 );
             })
             .await

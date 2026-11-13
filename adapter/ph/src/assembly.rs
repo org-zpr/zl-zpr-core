@@ -844,9 +844,15 @@ impl Assembly {
     /// match by the relay address of its bootstrap hand-off, until a
     /// `setTopology` names the relay ([crate::bootstrap_handoff]).
     ///
+    /// The same lookup, run in reverse, is how a Zode tells which link a
+    /// previous hop's `Stream ID Request` must arrive on (gap 7,
+    /// zl-zipline#253, `mgmt::node::check_prev_hop`): the one link this
+    /// Zode would send to an address is the one link that address may
+    /// request on. One definition serves both directions.
+    ///
     /// Each lock (topology, then `zode_links`, then the peer entry) is
     /// released before the next is taken.
-    fn find_zode_egress_link(&self, addr: IpAddress) -> Option<NonZero<LinkId>> {
+    pub(crate) fn find_zode_egress_link(&self, addr: IpAddress) -> Option<NonZero<LinkId>> {
         let topology_cn = self
             .topology
             .read()

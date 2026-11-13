@@ -20,6 +20,7 @@ use crate::visa_table::{StreamBinding, VisaTable, VisaTableError};
 use dashmap::DashMap;
 use std::num::NonZero;
 use zpr::vsapi_types::{CommFlag, PacketDesc, VisaRequest, VsapiFiveTuple, vsapi_ip_number};
+use zpr_utils::net_defs::IpAddress;
 
 /// State of an in-progress inbound bind or stream ID request.
 enum BindRequestState {
@@ -443,7 +444,7 @@ async fn visa_push_request_task(
             // `visas` should only have the visa we requested, or none, but let's confirm that
             let Some(visa) = visas.into_iter().find(|visa| visa.issuer_id == req_visa_id) else {
                 asm.counters.management[ManagementCounterType::VisaRequestDenied].increment();
-                debug!(target: FLOW_MGMT, "visa {req_visa_id} not found");
+                warn!(target: FLOW_MGMT, "visa {req_visa_id} not found");
                 return requested_visa_denied(&asm, ingress_link_id, txn_id);
             };
 
@@ -543,9 +544,33 @@ fn prepare_next_hop_bind(
 
     let Ok(egress_link_id) = visa_mgmt::get_egress_link_for_visa(asm, visa_id) else {
         // visa or egress link was deleted; consider visa denied
-        debug!(target: FLOW_MGMT, "visa {visa_id}: no visa or no egress link; refusing the bind");
+        warn!(target: FLOW_MGMT, "visa {visa_id}: no visa or no egress link; refusing the bind");
         return Err(());
     };
+
+    // F2 previous-hop guard (gap 7, zl-zipline#253): a Zode binds a visa
+    // for a Zode link only if that link is the visa's previous hop, the
+    // neighbour the visa service put just before this Zode on the path.
+    // Otherwise any neighbour could pull a flow onto a path it is not on.
+    // The address is F1's (see [check_prev_hop]), never what the peer
+    // claims. A visa with no `prev_hop` is never bound from a Zode link:
+    // there is no fallback. An adapter or the local actor is the stream's
+    // ingress and has no previous hop, so the guard does not apply to it.
+    let ingress_is_zode = asm
+        .peer_table
+        .get(ingress_link_id.get())
+        .is_some_and(|peer| matches!(peer.peer_type(), PeerType::Node));
+    if ingress_is_zode && let Err(prev_hop) = check_prev_hop(asm, visa_id, ingress_link_id) {
+        let peer_cn = asm
+            .peer_table
+            .get(ingress_link_id.get())
+            .and_then(|peer| peer.verified_peer_cn());
+        // `zode-link-test.sh` greps for "not the visa's previous hop".
+        error!(target: FLOW_MGMT,
+            "visa {visa_id}: refusing Stream ID Request from {} (CN {peer_cn:?}): not the visa's previous hop {prev_hop:?}",
+            asm.formatted_link_id(ingress_link_id.get()));
+        return Err(());
+    }
 
     // F2 loop guard (zl-zipline#251): a bind that would go back out the
     // link it came in on is a loop. Asking the requestor for a stream for
@@ -559,6 +584,8 @@ fn prepare_next_hop_bind(
 
     let Some(egress_peer_state) = asm.peer_table.get(egress_link_id.get()) else {
         // egress link was racily deleted; consider visa denied
+        warn!(target: FLOW_MGMT, "visa {visa_id}: egress link {} is gone; refusing the bind",
+            asm.formatted_link_id(egress_link_id.get()));
         return Err(());
     };
 
@@ -631,6 +658,41 @@ fn prepare_next_hop_bind(
         txn,
         adapter_request,
     })
+}
+
+/// Gap 7 (zl-zipline#253, ZODE_LINKS.md F2): whether a `Stream ID
+/// Request` for the visa `visa_id` that arrived on the Zode link
+/// `ingress_link_id` came from the visa's previous hop.
+///
+/// It did only if the visa has a `prev_hop` and F1's egress lookup for that
+/// address gives exactly `ingress_link_id`
+/// ([Assembly::find_zode_egress_link]): the topology `zprAddr` keyed by the
+/// link's verified CN, or, on a joiner until a `setTopology` names its
+/// relay, the relay address its hand-off recorded. The record must be up and point at
+/// this connection, so the old connection of a CN that has been replaced
+/// (rule 5) fails. The address never comes from anything the peer claims.
+///
+/// On failure, returns the visa's `prev_hop` for the log: `None` if the
+/// visa has none (an ingress copy, a path of fewer than two nodes) or is
+/// not held.
+///
+/// Lock order: the visa-table read lock is released before the lookup,
+/// which takes the topology lock, `zode_links` and the peer entry in turn.
+pub(crate) fn check_prev_hop(
+    asm: &Assembly,
+    visa_id: VisaId,
+    ingress_link_id: NonZero<LinkId>,
+) -> Result<(), Option<std::net::IpAddr>> {
+    let prev_hop = asm
+        .visa_table
+        .read()
+        .unwrap()
+        .get(visa_id)
+        .and_then(|visa| visa.prev_hop());
+    let from_prev_hop = prev_hop.is_some_and(|addr| {
+        asm.find_zode_egress_link(IpAddress::new_from_std(&addr)) == Some(ingress_link_id)
+    });
+    if from_prev_hop { Ok(()) } else { Err(prev_hop) }
 }
 
 /// Send the prepared next-hop bind of the visa `visa_id`, first noting in
@@ -964,6 +1026,12 @@ fn response_classifier(
 /// Removes this bind request from the `bind_request_state` table, and
 /// sends an error reply back to the requestor.
 ///
+/// Every refused `Stream ID Request` (a Zode requestor) ends here, so this
+/// is where `StreamIdRequestRejected` is counted, once per refusal,
+/// whatever the reason (gate g106 q3). The refusal is logged with
+/// `reason`; where the bind was refused, the site also logs why in detail.
+/// The link stays open: a refusal is an answer, not a link error.
+///
 /// If the request was still waiting on its next hop, that next-hop bind is
 /// marked abandoned, so the next hop's answer is ignored when it comes
 /// (see [NextHopBindOriginator::Abandoned]). A peer can get here with a
@@ -1006,6 +1074,9 @@ fn bind_reject(asm: &Arc<Assembly>, ingress_link_id: NonZero<LinkId>, txn_id: Tx
         .enqueue(),
 
         PeerType::Node => {
+            asm.counters.management[ManagementCounterType::StreamIdRequestRejected].increment();
+            warn!(target: FLOW_MGMT, "refused Stream ID Request {txn_id} from {}: {reason}",
+                asm.formatted_link_id(ingress_link_id.get()));
             requests::send_stream_id_error_response(asm, ingress_link_id.get(), txn_id, reason)
                 .enqueue()
         }
@@ -1301,12 +1372,14 @@ mod tests {
     use crate::peer_table::test::{create_dummy_peer_state, insert_up_zode_link};
     use crate::queues::MgmtSubstrateEgress;
     use crate::visa_table::VisaTable;
-    use crate::visa_table::tests::{never_expires, new_vsapi_visa_forward_only};
+    use crate::visa_table::tests::{
+        never_expires, new_vsapi_visa_forward_only, new_vsapi_visa_forward_only_from,
+    };
     use crate::zdp;
     use std::net::{IpAddr, Ipv4Addr};
     use zerocopy::FromBytes;
     use zpr::packet_info::SubstrateAddr;
-    use zpr_utils::net_defs::{self, IpAddress};
+    use zpr_utils::net_defs;
 
     /// The forward-only visa every test in this module binds.
     const VISA_ID: VisaId = 9000;
@@ -1314,11 +1387,16 @@ mod tests {
     /// The ZPR address the forward-only visa names as its next hop.
     const NEXT_HOP: &str = "fd5a:5052:8::99";
 
+    /// The ZPR address the forward-only visa names as its previous hop
+    /// (gap 7, zl-zipline#253): the topology address of the upstream Zode
+    /// link of a [middle_node].
+    const PREV_HOP: &str = "fd5a:5052:8::11";
+
     type EgressRx = packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>;
 
     /// A Node-mode assembly whose management egress we can read back, with
-    /// the forward-only visa [VISA_ID] (next hop [NEXT_HOP]) in its visa
-    /// table and no links yet.
+    /// the forward-only visa [VISA_ID] (previous hop [PREV_HOP], next hop
+    /// [NEXT_HOP]) in its visa table and no links yet.
     fn node_with_visa() -> (Arc<Assembly>, EgressRx) {
         let (asm, egress_rx, _hairpin_rx) = node_with_visa_and_hairpin();
         (asm, egress_rx)
@@ -1365,9 +1443,10 @@ mod tests {
         asm.visa_table
             .write()
             .unwrap()
-            .insert_visa(new_vsapi_visa_forward_only(
+            .insert_visa(new_vsapi_visa_forward_only_from(
                 VISA_ID,
                 never_expires(),
+                Some(prev_hop()),
                 next_hop(),
             ))
             .unwrap();
@@ -1379,11 +1458,23 @@ mod tests {
         NEXT_HOP.parse().unwrap()
     }
 
+    /// [PREV_HOP] as an address.
+    fn prev_hop() -> IpAddr {
+        PREV_HOP.parse().unwrap()
+    }
+
+    /// The `Stream ID Request Rejected` counter.
+    fn rejected(asm: &Assembly) -> u64 {
+        asm.counters.management[ManagementCounterType::StreamIdRequestRejected].get_count()
+    }
+
     /// Build a middle node ([node_with_visa]) with an upstream peer of type
     /// `upstream` on link A and a downstream peer of type `downstream` on
-    /// link B that `find_egress_link` resolves [NEXT_HOP] to. A downstream
-    /// Zode is reached the way F1 says (zl-zipline#251): an up Zode link
-    /// whose CN has [NEXT_HOP] in the topology. A downstream adapter owns
+    /// link B that `find_egress_link` resolves [NEXT_HOP] to. A Zode is
+    /// reached the way F1 says (zl-zipline#251): an up Zode link whose CN
+    /// has its address in the topology. An upstream Zode is at [PREV_HOP],
+    /// so it is the visa's previous hop (gap 7, zl-zipline#253); a
+    /// downstream Zode is at [NEXT_HOP]. A downstream adapter owns
     /// [NEXT_HOP] as an actor address.
     ///
     /// Returns (asm, egress queue receiver, link A, link B).
@@ -1392,7 +1483,11 @@ mod tests {
         downstream: LinkType,
     ) -> (Arc<Assembly>, EgressRx, LinkId, LinkId) {
         let (asm, egress_rx) = node_with_visa();
-        let link_a = add_peer(&asm, upstream, 1);
+        let link_a = if upstream == LinkType::NodeToNode {
+            insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop())
+        } else {
+            add_peer(&asm, upstream, 1)
+        };
         let link_b = if downstream == LinkType::NodeToNode {
             insert_up_zode_link(&asm, "next-hop.zpr", next_hop())
         } else {
@@ -1544,6 +1639,7 @@ mod tests {
             try_recv_packet(&mut egress_rx).is_none(),
             "nothing goes to the adapter"
         );
+        assert_eq!(rejected(&asm), 1);
     }
 
     /// An adapter cannot bind a forward-only visa either: it binds by traffic
@@ -1576,6 +1672,11 @@ mod tests {
                 .awaiting_next_hop_bind_table
                 .is_empty()
         );
+        assert_eq!(
+            rejected(&asm),
+            0,
+            "an adapter's bind is no Stream ID Request"
+        );
     }
 
     /// The error response a bind on link `link` got: the next packet on the
@@ -1602,16 +1703,29 @@ mod tests {
     /// F2 loop guard (zl-zipline#251): a StreamIdRequest on Zode link A for
     /// a visa whose next hop resolves (F1) back to A is refused with an
     /// error response. No StreamIdRequest goes back out on A, and no bind
-    /// state is left.
+    /// state is left. The visa names A as its previous hop as well, so the
+    /// request gets past the previous-hop guard (gap 7) to the loop guard.
     #[tokio::test]
     async fn test_bind_back_out_the_ingress_link_is_refused() {
         let (asm, mut egress_rx) = node_with_visa();
         let link_a = insert_up_zode_link(&asm, "a.zpr", next_hop());
+        let loop_visa: VisaId = VISA_ID + 3;
+        asm.visa_table
+            .write()
+            .unwrap()
+            .insert_visa(new_vsapi_visa_forward_only_from(
+                loop_visa,
+                never_expires(),
+                Some(next_hop()),
+                next_hop(),
+            ))
+            .unwrap();
 
-        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, loop_visa);
 
         assert_only_stream_id_error_response(&mut egress_rx, link_a);
         assert!(no_bind_state(&asm, link_a));
+        assert_eq!(rejected(&asm), 1);
     }
 
     /// F2 (zl-zipline#251): when every transaction ID on the egress link is
@@ -1631,6 +1745,7 @@ mod tests {
         assert_only_stream_id_error_response(&mut egress_rx, link_a);
         assert!(no_bind_state(&asm, link_a));
         assert!(no_bind_state(&asm, link_b));
+        assert_eq!(rejected(&asm), 1);
     }
 
     /// F8 (zl-zipline#251): a Zode's own traffic, bound by its local actor
@@ -1710,6 +1825,11 @@ mod tests {
             .inspect(local_stream, |pep| (pep.next_hop(), pep.visa_id()))
             .expect("a PFT entry on the local actor link");
         assert!(pep == (ForwardingEntry(zode_link, 42), own_visa));
+        assert_eq!(
+            rejected(&asm),
+            0,
+            "the local actor's bind is no Stream ID Request"
+        );
     }
 
     // ---- F3 and R9: link loss (zl-zipline#251) ----
@@ -1905,6 +2025,7 @@ mod tests {
 
         assert_only_stream_id_error_response(&mut egress_rx, link_a);
         assert!(no_bind_state(&asm, link_a));
+        assert_eq!(rejected(&asm), 1);
     }
 
     /// F3 for a bind that has not finished (core#110 review, g93): when a
@@ -1918,7 +2039,8 @@ mod tests {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
-                let link_a = NonZero::new(add_peer(&asm, LinkType::NodeToNode, 1)).unwrap();
+                let link_a =
+                    NonZero::new(insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop())).unwrap();
                 let link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
                 request_stream(&asm, link_a, 7, VISA_ID);
                 assert!(
@@ -1984,27 +2106,18 @@ mod tests {
     async fn test_reused_transaction_id_of_a_pending_bind_does_not_panic() {
         let (asm, mut egress_rx, link_a, link_b) =
             middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
-        // A is a Zode link whose topology address is the next hop of a
-        // second visa: a bind of that visa from A loops back to A.
-        let a_addr: IpAddr = "fd5a:5052:8::aa".parse().unwrap();
-        crate::peer_table::test::set_verified_peer_cn(&asm, link_a, "a.zpr");
-        asm.topology
-            .write()
-            .unwrap()
-            .push(crate::peer_table::test::topology_link_at("a.zpr", a_addr));
-        asm.zode_links.test_put(
-            "a.zpr",
-            crate::zode_link_record::RecordState::Up,
-            Some(link_a),
-        );
+        // A second visa names A's topology address as both its previous
+        // and its next hop: a bind of it from A passes the previous-hop
+        // guard (gap 7) and loops back to A.
         let loop_visa: VisaId = VISA_ID + 2;
         asm.visa_table
             .write()
             .unwrap()
-            .insert_visa(new_vsapi_visa_forward_only(
+            .insert_visa(new_vsapi_visa_forward_only_from(
                 loop_visa,
                 never_expires(),
-                a_addr,
+                Some(prev_hop()),
+                prev_hop(),
             ))
             .unwrap();
 
@@ -2160,6 +2273,167 @@ mod tests {
                 );
             })
             .await
+    }
+
+    // ---- Gap 7: a Stream ID Request only from the previous hop (zl-zipline#253) ----
+
+    /// Assert that the `Stream ID Request` on `link` was refused the way
+    /// every gap 7 refusal is: one error StreamIdResponse on `link`,
+    /// nothing toward the next hop `next_hop_link`, no bind state left on
+    /// either link, and one rejection counted. The link stays open.
+    fn assert_refused(asm: &Assembly, rx: &mut EgressRx, link: LinkId, next_hop_link: LinkId) {
+        assert_only_stream_id_error_response(rx, link);
+        assert!(no_bind_state(asm, link));
+        assert!(no_bind_state(asm, next_hop_link));
+        assert_eq!(rejected(asm), 1);
+        assert!(asm.peer_table.get(link).is_some(), "the link stays open");
+    }
+
+    /// Negative, wrong link: a request for [VISA_ID] from an up Zode link
+    /// that is not its previous hop (another CN at another topology
+    /// address) is refused.
+    #[tokio::test]
+    async fn test_a_request_from_a_zode_that_is_not_the_previous_hop_is_refused() {
+        let (asm, mut egress_rx, _link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let other = insert_up_zode_link(&asm, "other.zpr", "fd5a:5052:8::22".parse().unwrap());
+
+        request_stream(&asm, NonZero::new(other).unwrap(), 7, VISA_ID);
+
+        assert_refused(&asm, &mut egress_rx, other, link_b);
+    }
+
+    /// Negative, no address: a Zode link whose verified CN is in no
+    /// topology entry, and which carries no hand-off address, has no ZPR
+    /// address, so it is no visa's previous hop.
+    #[tokio::test]
+    async fn test_a_request_from_a_zode_link_with_no_address_is_refused() {
+        let (asm, mut egress_rx) = node_with_visa();
+        let link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
+        let nameless = add_peer(&asm, LinkType::NodeToNode, 1);
+
+        request_stream(&asm, NonZero::new(nameless).unwrap(), 7, VISA_ID);
+
+        assert_refused(&asm, &mut egress_rx, nameless, link_b);
+    }
+
+    /// Negative, no `prev_hop`: a visa with no previous hop (an ingress
+    /// copy) is never bound from a Zode link, even on the link that would
+    /// match. There is no fallback. The visa is installed under its own ID,
+    /// not edited.
+    #[tokio::test]
+    async fn test_a_request_for_a_visa_with_no_previous_hop_is_refused() {
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let no_prev_hop: VisaId = VISA_ID + 4;
+        asm.visa_table
+            .write()
+            .unwrap()
+            .insert_visa(new_vsapi_visa_forward_only(
+                no_prev_hop,
+                never_expires(),
+                next_hop(),
+            ))
+            .unwrap();
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, no_prev_hop);
+
+        assert_refused(&asm, &mut egress_rx, link_a, link_b);
+    }
+
+    /// Negative, replaced connection (rule 5): the previous hop's CN now has
+    /// a new connection, and its record points there. A request on the old
+    /// connection is refused, though its verified CN is still right.
+    #[tokio::test]
+    async fn test_a_request_on_a_replaced_connection_is_refused() {
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let replacement = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "prev-hop.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        asm.zode_links.test_put(
+            "prev-hop.zpr",
+            crate::zode_link_record::RecordState::Up,
+            Some(replacement),
+        );
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+
+        assert_refused(&asm, &mut egress_rx, link_a, link_b);
+    }
+
+    /// Positive, after topology: the previous hop, found by its topology
+    /// address, gets its stream (the full bind is
+    /// [test_middle_node_binds_forward_only_visa_between_node_links]), and
+    /// nothing is counted.
+    #[tokio::test]
+    async fn test_a_request_from_the_previous_hop_is_bound() {
+        let (asm, mut egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+
+        let pkt = try_recv_packet(&mut egress_rx).expect("a StreamIdRequest to the next hop");
+        assert_eq!(pkt.metadata().egress_link_id, link_b);
+        assert_eq!(
+            check_prev_hop(&asm, VISA_ID, NonZero::new(link_a).unwrap()),
+            Ok(())
+        );
+        assert_eq!(rejected(&asm), 0);
+    }
+
+    /// The previous-hop check itself: it passes only on the link
+    /// `find_zode_egress_link` gives for the visa's `prev_hop`, and reports
+    /// that `prev_hop` (or its absence) when it fails.
+    #[tokio::test]
+    async fn test_check_prev_hop_reports_the_visas_previous_hop() {
+        let (asm, _egress_rx, link_a, link_b) =
+            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let link_a = NonZero::new(link_a).unwrap();
+        let link_b = NonZero::new(link_b).unwrap();
+        assert_eq!(check_prev_hop(&asm, VISA_ID, link_a), Ok(()));
+        assert_eq!(check_prev_hop(&asm, VISA_ID, link_b), Err(Some(prev_hop())));
+        // A visa this Zode does not hold has no previous hop to match.
+        assert_eq!(check_prev_hop(&asm, VISA_ID + 99, link_a), Err(None));
+    }
+
+    /// Positive, J11 at a hop that is not the ingress: the upstream
+    /// ingress's rebind reaches this Zode as a `Stream ID Request` for the
+    /// successor from the previous hop, which binds it beside the old
+    /// entry. The same request from another Zode link is refused.
+    #[tokio::test]
+    async fn test_a_successor_is_bound_only_from_the_previous_hop() {
+        let (asm, mut egress_rx, link_a, link_b, a_stream) = middle_node_with_successor();
+        let other = insert_up_zode_link(&asm, "other.zpr", "fd5a:5052:8::22".parse().unwrap());
+
+        request_stream(&asm, NonZero::new(other).unwrap(), 9, NEW_VISA);
+        assert_only_stream_id_error_response(&mut egress_rx, other);
+        assert_eq!(rejected(&asm), 1);
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 8, NEW_VISA);
+        let pkt = try_recv_packet(&mut egress_rx).expect("a StreamIdRequest for the successor");
+        assert_eq!(pkt.metadata().egress_link_id, link_b);
+        let egress_txn = outstanding_next_hop_txn(&asm, link_b);
+        install_tether(&asm, NonZero::new(link_b).unwrap(), &egress_txn, 43).unwrap();
+        let new_stream =
+            decode_per_flow_txn(&try_recv_packet(&mut egress_rx).expect("a StreamIdResponse"))
+                .stream_id;
+
+        let a_peer = asm.peer_table.get(link_a).unwrap();
+        let entry = |stream| {
+            a_peer
+                .pft
+                .inspect(stream, |pep| (pep.next_hop(), pep.visa_id()))
+        };
+        assert!(entry(a_stream) == Some((ForwardingEntry(link_b, 42), OLD_VISA)));
+        assert!(entry(new_stream) == Some((ForwardingEntry(link_b, 43), NEW_VISA)));
+        assert_eq!(
+            rejected(&asm),
+            1,
+            "the previous hop's request is not counted"
+        );
     }
 
     // ---- J11: rebind a live stream onto a superseding visa (zl-zipline#252) ----
@@ -2449,16 +2723,27 @@ mod tests {
         assert!(asm.visa_table.read().unwrap().bindings(NEW_VISA).is_empty());
     }
 
-    /// J11: a Zode that is not the ingress of the old visa's stream sends
-    /// nothing when the successor arrives. The upstream ingress's rebind
-    /// binds the new visa here under F2, and the old binding stays until the
-    /// old visa goes (gate question 10).
-    #[tokio::test]
-    async fn test_a_hop_that_is_not_the_ingress_does_not_rebind() {
+    /// [own_visa] as the copy a Zode further down the path holds: its
+    /// previous hop is [PREV_HOP], set at creation (gap 7,
+    /// zl-zipline#253).
+    fn transit_visa(visa_id: VisaId) -> zpr::vsapi_types::Visa {
+        zpr::vsapi_types::Visa {
+            prev_hop: Some(prev_hop()),
+            ..own_visa(visa_id)
+        }
+    }
+
+    /// A [middle_node] with a stream from A bound out B under [OLD_VISA]
+    /// (B granted stream 42), and then [NEW_VISA], its successor,
+    /// installed. Both visas name A's Zode as their previous hop.
+    ///
+    /// Returns (asm, egress queue, link A, link B, A's stream).
+    fn middle_node_with_successor() -> (Arc<Assembly>, EgressRx, LinkId, LinkId, StreamId) {
         let (asm, mut egress_rx, link_a, link_b) =
             middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        widen_zdpr_window(&asm, link_a);
         widen_zdpr_window(&asm, link_b);
-        visa_mgmt::insert_visa(&asm, own_visa(OLD_VISA)).unwrap();
+        visa_mgmt::insert_visa(&asm, transit_visa(OLD_VISA)).unwrap();
         request_stream(&asm, NonZero::new(link_a).unwrap(), 7, OLD_VISA);
         assert!(
             try_recv_packet(&mut egress_rx).is_some(),
@@ -2468,7 +2753,17 @@ mod tests {
         install_tether(&asm, NonZero::new(link_b).unwrap(), &egress_txn, 42).unwrap();
         let a_stream = decode_per_flow_txn(&try_recv_packet(&mut egress_rx).unwrap()).stream_id;
 
-        visa_mgmt::insert_visa(&asm, own_visa(NEW_VISA)).unwrap();
+        visa_mgmt::insert_visa(&asm, transit_visa(NEW_VISA)).unwrap();
+        (asm, egress_rx, link_a, link_b, a_stream)
+    }
+
+    /// J11: a Zode that is not the ingress of the old visa's stream sends
+    /// nothing when the successor arrives. The upstream ingress's rebind
+    /// binds the new visa here under F2, and the old binding stays until the
+    /// old visa goes (gate question 10).
+    #[tokio::test]
+    async fn test_a_hop_that_is_not_the_ingress_does_not_rebind() {
+        let (asm, mut egress_rx, link_a, link_b, a_stream) = middle_node_with_successor();
 
         assert!(try_recv_packet(&mut egress_rx).is_none(), "nothing is sent");
         let entry = asm

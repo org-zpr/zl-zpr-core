@@ -153,6 +153,12 @@ pub enum ManagementCounterType {
     RebindFailed,
     /// A bootstrap-visa hand-off (ZDP 146) refused (zl-zipline#252, J4).
     BootstrapHandoffRefused,
+    /// A `Stream ID Request` from a Zode link answered with an error, for
+    /// any reason: not from the visa's previous hop (gap 7,
+    /// zl-zipline#253), an F2 guard, no visa or no egress, a visa denial,
+    /// or a pending bind whose next hop was lost (rule 9). The log line of
+    /// each refusal names its reason.
+    StreamIdRequestRejected,
 }
 
 impl FastpathCounterType {
@@ -247,6 +253,7 @@ impl ManagementCounterType {
             Self::VisaRequestError => "Visa Request Error",
             Self::RebindFailed => "Rebind Failed",
             Self::BootstrapHandoffRefused => "Bootstrap Hand-offs Refused",
+            Self::StreamIdRequestRejected => "Stream ID Request Rejected",
         }
     }
 }

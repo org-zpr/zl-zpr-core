@@ -453,7 +453,7 @@ impl FastpathWorker {
         // public key out of the visa. (Either adapter's key would do.)
         let (five_tuple, compression_mode, peer_a2a_pubkey) = {
             let visa_table = self.asm.visa_table.read().unwrap();
-            let Some(visa) = visa_table.table.get(&visa_id) else {
+            let Some(visa) = visa_table.get(visa_id) else {
                 return;
             };
             // A forward-only visa has no flow to inspect.

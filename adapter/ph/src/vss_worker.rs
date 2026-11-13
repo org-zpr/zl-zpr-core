@@ -393,14 +393,54 @@ mod tests {
         assert!(process_visaop(&asm, full).is_ok());
 
         let table = asm.visa_table.read().unwrap();
+        assert!(!table.contains(8001), "the refused visa is not stored");
+        assert!(table.contains(8002), "later ops are still processed");
+    }
+
+    /// A visa ID always names the same visa (operator, g88 q4; ZODE_LINKS.md
+    /// "visas are immutable"). A pushed grant for an ID this Zode already
+    /// holds is acked and dropped: the stored visa, its bindings and the
+    /// timeout queue stay exactly as they were, and the two visas' contents
+    /// are never compared.
+    #[test]
+    fn test_pushed_grant_for_a_held_visa_id_is_acked_and_dropped() {
+        use crate::visa_table::StreamBinding;
+        use crate::visa_table::tests::{never_expires, new_vsapi_visa_tcp_default};
+        use zpr::packet_info::ForwardingEntry;
+        let mut builder = node_builder("10.1.1.1".parse().unwrap());
+        builder.visa_table = Some(visa_table::VisaTable::new());
+        let asm = Arc::new(create_assembly(builder));
+
+        let original = new_vsapi_visa_tcp_default(8101, never_expires());
+        process_visaop(&asm, VisaOp::Grant(original.clone())).unwrap();
+        let binding = StreamBinding {
+            ingress: ForwardingEntry(1, 5),
+            egress: ForwardingEntry(2, 6),
+        };
+        asm.visa_table
+            .write()
+            .unwrap()
+            .bind(8101, binding.clone())
+            .unwrap();
+
+        // Same ID, different contents: another configuration, a next hop,
+        // and an expiry already past. (A full visa: a forward-only one
+        // would be refused earlier, with forwarding off on this node.)
+        let mut other = new_vsapi_visa_tcp_default(8101, crate::visa_table::tests::ALREADY_EXPIRED);
+        other.fwd_pep = Some(zpr::vsapi_types::FwdPep {
+            next_hop: "fd5a:5052:8::99".parse().unwrap(),
+            style: zpr::vsapi_types::FwdPepStyle::OneWay,
+        });
+        other.config = original.config + 1;
         assert!(
-            !table.table.contains_key(&8001),
-            "the refused visa is not stored"
+            process_visaop(&asm, VisaOp::Grant(other)).is_ok(),
+            "the duplicate push is acked"
         );
-        assert!(
-            table.table.contains_key(&8002),
-            "later ops are still processed"
-        );
+
+        let table = asm.visa_table.read().unwrap();
+        assert_eq!(table.get(8101).unwrap().visa(), &original);
+        assert_eq!(table.bindings(8101), &[binding]);
+        assert_eq!(table.timeout_queue.len(), 1, "no second timeout entry");
     }
 
     /// A node-mode assembly whose own (configured) ZPR address is `own`:
@@ -669,7 +709,7 @@ mod tests {
                     "the adapter's link must stay Active"
                 );
                 assert!(
-                    asm.visa_table.read().unwrap().table.contains_key(&77),
+                    asm.visa_table.read().unwrap().contains(77),
                     "visas must be untouched"
                 );
 

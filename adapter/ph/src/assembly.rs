@@ -530,11 +530,22 @@ impl Assembly {
         } else {
             debug!(target: PEER_MGMT, "Removing peer {}", self.formatted_link_id(link_id));
         }
+        let zode_link = self
+            .peer_table
+            .get(link_id)
+            .is_some_and(|p| p.link_state_machine.get_link_type() == LinkType::NodeToNode);
+        if zode_link && self.zode_links.is_up_on(link_id) {
+            // F6 (zl-zipline#251): register the loss with the reporter
+            // FIRST, before any revocation, so a visa request that a
+            // withdrawal below triggers already waits for the `down` report.
+            self.zode_links.register_loss();
+        }
         if self.ph_mode == PhMode::Node {
-            // Revoke visas under the write lock, but hold the withdrawn
-            // entries until the lock is released: the send path takes the
-            // peer's `zdpr_send` mutex, which must never nest under the
-            // visa-table lock.
+            // F3 (zl-zipline#251): revoke every visa with a stream bound
+            // over this link, on either side. Revoke under the write lock,
+            // but hold the withdrawn entries until the lock is released: the
+            // send path takes the peer's `zdpr_send` mutex, which must never
+            // nest under the visa-table lock (zipline#9).
             let withdrawn = self
                 .visa_table
                 .write()
@@ -548,10 +559,10 @@ impl Assembly {
             // and so are Zode links, which carry no teardown messages (F5).
             self.withdraw_streams(withdrawn, Some(link_id));
         }
-        let zode_link = self
-            .peer_table
-            .get(link_id)
-            .is_some_and(|p| p.link_state_machine.get_link_type() == LinkType::NodeToNode);
+        // Rule 9: pending binds on other links that involve this link, in
+        // either direction, are cleared while the link is still in the
+        // peer table. Its own bind tables go with its entry below.
+        mgmt::node::clear_pending_binds_for_lost_link(self, link_id);
         self.peer_table.remove(link_id);
         info!(target: PEER_MGMT, "Removed peer {}", self.formatted_link_id(link_id));
         if zode_link {
@@ -1759,7 +1770,7 @@ pub mod test {
         use crate::peer_table::test::create_dummy_peer_state;
         use crate::visa_table::VisaTable;
         use crate::visa_table::tests::{
-            ALREADY_EXPIRED, never_expires, new_vsapi_visa_tcp_default,
+            ALREADY_EXPIRED, binding_on, never_expires, new_vsapi_visa_tcp_default,
         };
         use crate::zdp;
         use std::net::Ipv4Addr;
@@ -1814,9 +1825,7 @@ pub mod test {
                         visa_id,
                     })
                     .unwrap();
-                visa_table
-                    .link_forwarding_entry(visa_id, ForwardingEntry(link, tether))
-                    .unwrap();
+                visa_table.bind(visa_id, binding_on(link, tether)).unwrap();
                 bound.push((link, tether));
             }
             drop(visa_table);
@@ -2008,11 +2017,11 @@ pub mod test {
                 })
                 .unwrap();
             visa_table
-                .link_forwarding_entry(visa_id, ForwardingEntry(link_id, tether_id))
+                .bind(visa_id, binding_on(link_id, tether_id))
                 .unwrap();
 
             visa_table.handle_expirations(&asm.peer_table);
-            assert!(!visa_table.table.contains_key(&visa_id));
+            assert!(!visa_table.contains(visa_id));
             assert_eq!(peer.pft.len(), 0);
             drop(visa_table);
 

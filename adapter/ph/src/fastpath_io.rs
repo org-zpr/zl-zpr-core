@@ -1,7 +1,8 @@
 use crate::batch_io::{self, BatchIo};
 use crate::config;
 use crate::counters::*;
-use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
+use crate::fastpath::{FastpathWorker, FastpathWorkerConfig, QueuedEgressPacket};
+use crate::logging::targets::DATAPATH;
 use crate::packet_queue;
 #[cfg(windows)]
 use crate::sys::wait::SocketWaitable;
@@ -11,6 +12,8 @@ use crate::zprtun;
 use std::io::{ErrorKind, Result};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::warn;
 use zpr_utils::net_defs;
 
 #[allow(unused_imports)]
@@ -34,6 +37,9 @@ pub struct FastpathIo {
     io_results: Vec<Result<usize>>,
     /// temporary recv result storage during I/O batch operations
     recv_results: Vec<Result<batch_io::ReceivedPacket>>,
+    /// When this worker last warned of a substrate send dropped after a
+    /// network change (see [warn_send_dropped]).
+    send_drop_warned_at: Option<Instant>,
 }
 
 impl FastpathIo {
@@ -70,6 +76,7 @@ impl FastpathIo {
             packets: Vec::with_capacity(config.batch_size),
             io_results: Vec::with_capacity(config.batch_size),
             recv_results: Vec::with_capacity(config.batch_size),
+            send_drop_warned_at: None,
         }
     }
 
@@ -316,77 +323,188 @@ impl FastpathIo {
 
     /// Egress queued substrate egress packets only.
     fn process_substrate_egress_queue(&mut self, worker: &mut FastpathWorker) {
-        // (Try to) send packets.
-        self.io_results.clear();
-
-        let n = wouldblock_as_empty_batch(self.batch_io.try_send_to_from_batch(
+        send_substrate_egress_queue(
+            &mut self.batch_io,
             &self.substrate_socket,
-            worker.substrate_egress_q.iter().map(|pkt| {
-                (
-                    pkt.pkt.body(),
-                    pkt.dst,
-                    Some(pkt.src),
-                    Self::get_confirm_flag(&pkt.pkt),
-                )
-            }),
             &mut self.io_results,
-        ))
-        .unwrap_or_else(|err| panic!("unrecoverable I/O error: {err}"));
-
-        // Tally results.
-        let mut dropped = 0;
-        let mut retained = 0;
-
-        for i in 0..worker.substrate_egress_q.len() {
-            // Determine whether the packet was in fact sent.
-            // If it was, leave it in place and skip to the next packet.
-            if i < n {
-                match &self.io_results[i] {
-                    Ok(_) => continue,
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => (),
-                    // TODO: pending <https://github.com/rust-lang/rust/issues/86442>, provide more info to user
-                    // (or potentially recover from certain errors)
-                    Err(err) => panic!("unrecoverable I/O error: {err}"),
-                }
-            }
-
-            // Packet was not sent.
-
-            if worker.substrate_egress_q[i].pkt.metadata().flags & packet::flags::PRIORITY != 0 {
-                // This was a priority packet.  Move it to the front of the queue.
-                worker.substrate_egress_q.swap(i, retained);
-                retained += 1;
-            } else {
-                // This was a normal packet.  Leave it to get dropped.
-                dropped += 1;
-            }
-        }
-        self.io_results.clear();
-
-        // Now all un-sent priority packets are at the head of the queue.
-
-        worker.batch_counters[FastpathCounterType::OutPacksSent]
-            .increase_by((worker.substrate_egress_q.len() - dropped - retained) as u64);
-        worker.batch_counters[FastpathCounterType::OutPacksDrop].increase_by(dropped as u64);
-
-        // Return buffers to buffer stack, except for un-sent priority packets, which are retained for next time.
-        worker.buffers.extend(
-            worker
-                .substrate_egress_q
-                .drain(retained..)
-                .map(|pkt| pkt.pkt.destroy()),
+            worker,
+            &mut self.send_drop_warned_at,
         );
     }
+}
 
-    /// Send flags for a substrate egress packet: `MSG_CONFIRM` when the
-    /// packet's metadata asks for link-layer confirmation (a no-op off
-    /// Linux, where the flag does not exist).
-    fn get_confirm_flag(pkt: &Packet) -> batch_io::SendFlags {
-        match pkt.metadata().flags & flags::CONFIRM != 0 {
-            true => batch_io::SendFlags::confirm(),
-            false => batch_io::SendFlags::none(),
+/// Send flags for a substrate egress packet: `MSG_CONFIRM` when the
+/// packet's metadata asks for link-layer confirmation (a no-op off
+/// Linux, where the flag does not exist).
+fn get_confirm_flag(pkt: &Packet) -> batch_io::SendFlags {
+    match pkt.metadata().flags & flags::CONFIRM != 0 {
+        true => batch_io::SendFlags::confirm(),
+        false => batch_io::SendFlags::none(),
+    }
+}
+
+/// The shortest gap between two "send dropped after a network change"
+/// warnings from one fastpath worker: a dead source address fails every
+/// packet until the keep-alive closes the link, and one line a second is
+/// enough to show it.
+const SEND_DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Send the worker's queued substrate egress packets and tally the results:
+/// sent packets count in `OutPacksSent`, dropped ones in `OutPacksDrop`, and
+/// un-sent PRIORITY packets stay at the head of the queue for the next call.
+///
+/// A send that fails because the network changed under it (see
+/// [is_network_change_send_error]) drops its packet, even a PRIORITY one,
+/// which would only fail the same way again. A batch-level error of that
+/// kind drops the whole batch. Any other send error is fatal.
+///
+/// This is a free function rather than a [FastpathIo] method so a test can
+/// drive it with a real socket and no TUN.
+fn send_substrate_egress_queue(
+    batch_io: &mut BatchIo,
+    substrate_socket: &UdpSocket,
+    io_results: &mut Vec<Result<usize>>,
+    worker: &mut FastpathWorker,
+    send_drop_warned_at: &mut Option<Instant>,
+) {
+    // Every queued packet names its link's local address as the source
+    // (`Some(pkt.src)` below), which matters to the classifier.
+    const SENDS_CARRY_SOURCE: bool = true;
+
+    // (Try to) send packets.
+    io_results.clear();
+
+    let batch = wouldblock_as_empty_batch(batch_io.try_send_to_from_batch(
+        substrate_socket,
+        worker.substrate_egress_q.iter().map(|pkt| {
+            (
+                pkt.pkt.body(),
+                pkt.dst,
+                Some(pkt.src),
+                get_confirm_flag(&pkt.pkt),
+            )
+        }),
+        io_results,
+    ));
+    let n = match batch {
+        Ok(n) => n,
+        Err(err) if is_network_change_send_error(&err, SENDS_CARRY_SOURCE) => {
+            // The engines report a failed first packet as the batch error
+            // (the sendmmsg(2) emulation), with nothing sent. Drop the whole
+            // batch: its packets share the vanished source address.
+            if let Some(first) = worker.substrate_egress_q.first() {
+                warn_send_dropped(send_drop_warned_at, first, &err);
+            }
+            let dropped = worker.substrate_egress_q.len();
+            worker.batch_counters[FastpathCounterType::OutPacksDrop].increase_by(dropped as u64);
+            worker.buffers.extend(
+                worker
+                    .substrate_egress_q
+                    .drain(..)
+                    .map(|pkt| pkt.pkt.destroy()),
+            );
+            return;
+        }
+        Err(err) => panic!("unrecoverable I/O error: {err}"),
+    };
+
+    // Tally results.
+    let mut dropped = 0;
+    let mut retained = 0;
+
+    for i in 0..worker.substrate_egress_q.len() {
+        // Determine whether the packet was in fact sent.
+        // If it was, leave it in place and skip to the next packet.
+        if i < n {
+            match &io_results[i] {
+                Ok(_) => continue,
+                Err(err) if err.kind() == ErrorKind::WouldBlock => (),
+                Err(err) if is_network_change_send_error(err, SENDS_CARRY_SOURCE) => {
+                    // Dropped, PRIORITY or not: leave it in place to be freed.
+                    warn_send_dropped(send_drop_warned_at, &worker.substrate_egress_q[i], err);
+                    dropped += 1;
+                    continue;
+                }
+                // TODO: pending <https://github.com/rust-lang/rust/issues/86442>, provide more info to user
+                Err(err) => panic!("unrecoverable I/O error: {err}"),
+            }
+        }
+
+        // Packet was not sent.
+
+        if worker.substrate_egress_q[i].pkt.metadata().flags & packet::flags::PRIORITY != 0 {
+            // This was a priority packet.  Move it to the front of the queue.
+            worker.substrate_egress_q.swap(i, retained);
+            retained += 1;
+        } else {
+            // This was a normal packet.  Leave it to get dropped.
+            dropped += 1;
         }
     }
+    io_results.clear();
+
+    // Now all un-sent priority packets are at the head of the queue.
+
+    worker.batch_counters[FastpathCounterType::OutPacksSent]
+        .increase_by((worker.substrate_egress_q.len() - dropped - retained) as u64);
+    worker.batch_counters[FastpathCounterType::OutPacksDrop].increase_by(dropped as u64);
+
+    // Return buffers to buffer stack, except for un-sent priority packets, which are retained for next time.
+    worker.buffers.extend(
+        worker
+            .substrate_egress_q
+            .drain(retained..)
+            .map(|pkt| pkt.pkt.destroy()),
+    );
+}
+
+/// Whether a substrate send error means the network changed under the
+/// Zode, so the packet is dropped instead of stopping `ph` (zl-zipline#230,
+/// gate g114 q6). `had_source` says whether the send named a source address
+/// (`IP_PKTINFO`/`IPV6_PKTINFO`).
+///
+/// After a Wi-Fi switch, the link's local address, which every egress packet
+/// carries as its source, is gone until the keep-alive closes the link and
+/// the redial picks the new one. Measured for a send from a source address
+/// that is not local (p39):
+///
+/// - Linux IPv4: `ENETUNREACH` (`NetworkUnreachable`).
+/// - Linux IPv6: `EINVAL` (`InvalidInput`). That is also what a malformed
+///   send returns, so it counts only when the send carried a source.
+/// - macOS 26.5.2, both families: `EADDRNOTAVAIL` (`AddrNotAvailable`).
+///
+/// `HostUnreachable` and `NetworkDown` are the same event seen from the
+/// route or the interface: no route to the peer from here, or the interface
+/// went down. Every other error is a bug or a broken socket, and stays fatal.
+fn is_network_change_send_error(err: &std::io::Error, had_source: bool) -> bool {
+    match err.kind() {
+        ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable
+        | ErrorKind::NetworkDown
+        | ErrorKind::AddrNotAvailable => true,
+        ErrorKind::InvalidInput => had_source,
+        _ => false,
+    }
+}
+
+/// Log a send dropped by [is_network_change_send_error], at most once per
+/// [SEND_DROP_WARN_INTERVAL] per worker (`warned_at` is the worker's last
+/// warning). Every drop is counted in `OutPacksDrop` either way.
+fn warn_send_dropped(
+    warned_at: &mut Option<Instant>,
+    pkt: &QueuedEgressPacket,
+    err: &std::io::Error,
+) {
+    let now = Instant::now();
+    if warned_at.is_some_and(|at| now.duration_since(at) < SEND_DROP_WARN_INTERVAL) {
+        return;
+    }
+    *warned_at = Some(now);
+    warn!(
+        target: DATAPATH,
+        "dropping substrate send from {} to {}: {err} (the local address may be gone after a network change; the link's keep-alive will close it)",
+        pkt.src, pkt.dst
+    );
 }
 
 fn is_ip(pi: TunPi) -> bool {
@@ -527,6 +645,208 @@ mod tests {
                     .all(|r| matches!(r, Err(e) if e.kind() == ErrorKind::WouldBlock)),
                 "engine {name}: nothing to receive"
             );
+        }
+    }
+
+    // ---- zl-zipline#230 gap 1: send errors after a network change ----
+
+    use super::{is_network_change_send_error, send_substrate_egress_queue};
+
+    /// The classifier accepts exactly the errors a vanished source address
+    /// or a changed network causes, `InvalidInput` only for a send that
+    /// named its source (the Linux IPv6 `EINVAL`), and nothing else.
+    #[test]
+    fn network_change_send_errors_are_classified() {
+        for kind in [
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkDown,
+            ErrorKind::AddrNotAvailable,
+        ] {
+            let err = Error::from(kind);
+            assert!(
+                is_network_change_send_error(&err, true),
+                "{kind:?} with a source"
+            );
+            assert!(
+                is_network_change_send_error(&err, false),
+                "{kind:?} without a source"
+            );
+        }
+        let einval = Error::from(ErrorKind::InvalidInput);
+        assert!(is_network_change_send_error(&einval, true));
+        assert!(
+            !is_network_change_send_error(&einval, false),
+            "EINVAL without a source is a malformed send, not a network change"
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::BrokenPipe,
+            ErrorKind::Other,
+        ] {
+            assert!(
+                !is_network_change_send_error(&Error::from(kind), true),
+                "{kind:?} must stay fatal"
+            );
+        }
+    }
+
+    /// A wildcard-bound socket, a receiver it can reach, and a source
+    /// address that is not local (a documentation prefix): IPv6 if `v6`,
+    /// else IPv4.
+    #[cfg(unix)]
+    fn vanished_source_setup(
+        v6: bool,
+    ) -> (UdpSocket, UdpSocket, zpr_utils::net_defs::ScopedIpAddr) {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        let (any, loopback, gone): (std::net::IpAddr, std::net::IpAddr, std::net::IpAddr) = if v6 {
+            (
+                Ipv6Addr::UNSPECIFIED.into(),
+                Ipv6Addr::LOCALHOST.into(),
+                "2001:db8::1".parse::<Ipv6Addr>().unwrap().into(),
+            )
+        } else {
+            (
+                Ipv4Addr::UNSPECIFIED.into(),
+                Ipv4Addr::LOCALHOST.into(),
+                Ipv4Addr::new(192, 0, 2, 1).into(),
+            )
+        };
+        let sender = UdpSocket::bind((any, 0)).unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let receiver = UdpSocket::bind((loopback, 0)).unwrap();
+        (sender, receiver, gone.into())
+    }
+
+    /// A send's error from engine `name`: the batch error, or the first
+    /// packet's own result (io_uring reports per packet).
+    #[cfg(unix)]
+    fn first_send_error(
+        name: &str,
+        sender: &UdpSocket,
+        dst: std::net::SocketAddr,
+        src: zpr_utils::net_defs::ScopedIpAddr,
+    ) -> Error {
+        let mut bio = batch_io::select_engine_by_name(name)
+            .unwrap()
+            .instantiate(4)
+            .unwrap();
+        let mut results = Vec::new();
+        let payload = b"keep-alive";
+        match bio.try_send_to_from_batch(
+            sender,
+            [(&payload[..], dst, Some(src), batch_io::SendFlags::none())],
+            &mut results,
+        ) {
+            Err(err) => err,
+            Ok(n) => match results.into_iter().take(n).next() {
+                Some(Err(err)) => err,
+                other => panic!("engine {name}: a send from {src} must fail, got {other:?}"),
+            },
+        }
+    }
+
+    /// zl-zipline#230 gap 1: a send whose source address is no longer
+    /// local, as after a Wi-Fi switch, fails with an error the classifier
+    /// accepts, for both families and every engine. This pins the real
+    /// errno of each platform (Linux, macOS).
+    #[cfg(unix)]
+    #[test]
+    fn send_from_vanished_source_is_a_network_change_error() {
+        for name in batch_io::engine_names() {
+            for v6 in [false, true] {
+                let (sender, receiver, gone) = vanished_source_setup(v6);
+                let err = first_send_error(name, &sender, receiver.local_addr().unwrap(), gone);
+                assert!(
+                    is_network_change_send_error(&err, true),
+                    "engine {name}: a send from {gone} failed with {err} ({:?}, errno {:?}), \
+                     which the classifier does not accept",
+                    err.kind(),
+                    err.raw_os_error()
+                );
+            }
+        }
+    }
+
+    /// zl-zipline#230 gap 1: with a packet from a vanished source address
+    /// in the substrate egress queue, the fastpath drops and counts it in
+    /// `OutPacksDrop` instead of panicking, and frees its buffer. A
+    /// PRIORITY packet is dropped too: it would only fail again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "local")]
+    async fn substrate_send_from_vanished_source_drops_and_counts() {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::counters::FastpathCounterType;
+        use crate::fastpath::{FastpathWorker, FastpathWorkerConfig, QueuedEgressPacket};
+        use crate::packet::{Packet, flags};
+        use bytes::BufMut as _;
+        use std::sync::Arc;
+
+        for name in batch_io::engine_names() {
+            for priority in [false, true] {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+                let engine = batch_io::select_engine_by_name(name).unwrap();
+                let mut worker = FastpathWorker::new(
+                    FastpathWorkerConfig {
+                        batch_io_engine: engine,
+                        buffer_count: 4,
+                        batch_size: 4,
+                        #[cfg(feature = "enable-security-testing")]
+                        mangle_forwarded_pings: false,
+                        #[cfg(feature = "enable-security-testing")]
+                        unkeyed_a2a_micv: false,
+                        #[cfg(feature = "enable-security-testing")]
+                        recompute_micvs: false,
+                    },
+                    0,
+                    asm,
+                );
+                let (sender, receiver, gone) = vanished_source_setup(false);
+                let buffers_before = worker.buffers.len();
+                let mut pkt = Packet::new(worker.buffers.pop().unwrap(), 64);
+                pkt.put(&b"a keep-alive"[..]);
+                if priority {
+                    pkt.metadata_mut().flags |= flags::PRIORITY;
+                }
+                worker.substrate_egress_q.push(QueuedEgressPacket {
+                    pkt,
+                    dst: receiver.local_addr().unwrap(),
+                    src: gone,
+                });
+
+                let mut bio = engine.instantiate(4).unwrap();
+                let mut results = Vec::new();
+                let mut warned_at = None;
+                send_substrate_egress_queue(
+                    &mut bio,
+                    &sender,
+                    &mut results,
+                    &mut worker,
+                    &mut warned_at,
+                );
+
+                let what = format!("engine {name}, priority {priority}");
+                assert_eq!(
+                    worker.batch_counters[FastpathCounterType::OutPacksDrop].get_count(),
+                    1,
+                    "{what}: the packet is counted as dropped"
+                );
+                assert_eq!(
+                    worker.batch_counters[FastpathCounterType::OutPacksSent].get_count(),
+                    0,
+                    "{what}: nothing was sent"
+                );
+                assert!(
+                    worker.substrate_egress_q.is_empty(),
+                    "{what}: nothing is retained"
+                );
+                assert_eq!(
+                    worker.buffers.len(),
+                    buffers_before,
+                    "{what}: the buffer is freed"
+                );
+                assert!(warned_at.is_some(), "{what}: the drop is logged");
+            }
         }
     }
 }

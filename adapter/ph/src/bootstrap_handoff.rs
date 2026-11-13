@@ -31,8 +31,8 @@
 //! to find the relay by. The forward visa's next hop is the relay's ZPR
 //! address, so it is held on the record as the initial link's peer address
 //! ([pre_topology_relay_cn]) until that `setTopology` arrives
-//! ([topology_names_relay]), and is never used while the topology names
-//! the relay. It is the one exception to F1's "address from
+//! ([topology_names_relay]); after that, never again, even across
+//! redials. It is the one exception to F1's "address from
 //! topology", and it is never taken from Hello.
 //!
 //! **Visas are immutable** (core tenet). Installing a visa ID this Zode
@@ -92,6 +92,9 @@ pub enum HandoffError {
     /// The visa has expired.
     #[error("visa {0} has expired")]
     Expired(VisaId),
+    /// The visa's expiry is out of the range the visa table can hold.
+    #[error("visa {0} has an expiry out of range")]
+    BadExpiry(VisaId),
     /// This link already has its hand-off: there is one per link.
     #[error("this link already has a hand-off")]
     AlreadyHandedOff,
@@ -178,7 +181,8 @@ pub struct HandoffContext<'a> {
 /// 6. neither with a reserved ID ([HandoffError::ReservedId]),
 /// 7. which are exactly one forward and one reverse VS-API visa for this
 ///    Zode, with distinct IDs ([HandoffError::WrongShape]),
-/// 8. and neither has expired ([HandoffError::Expired]).
+/// 8. and neither has expired ([HandoffError::Expired]) or expires out of
+///    the range the visa table can hold ([HandoffError::BadExpiry]).
 ///
 /// Returns the visas as `[forward, reverse]`, whatever order they came in.
 pub fn check_handoff(
@@ -220,7 +224,22 @@ pub fn check_handoff(
     if let Some(stale) = pair.iter().find(|visa| visa.expires <= ctx.now) {
         return Err(HandoffError::Expired(stale.issuer_id));
     }
+    if let Some(far) = pair.iter().find(|visa| !expiry_in_range(visa.expires)) {
+        return Err(HandoffError::BadExpiry(far.issuer_id));
+    }
     Ok(pair)
+}
+
+/// Can the visa table hold `expires`? It keeps expiries as chrono
+/// timestamps, and converting one out of chrono's range panics, so the
+/// peer's value is checked here, at the trust boundary.
+fn expiry_in_range(expires: SystemTime) -> bool {
+    expires
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|since_epoch| i64::try_from(since_epoch.as_millis()).ok())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .is_some()
 }
 
 /// The flow a full TCP visa admits, from its dock PEP, as `(source,
@@ -350,11 +369,13 @@ pub fn accept(asm: &Assembly, link_id: LinkId, body: &[u8]) -> Result<(), Handof
         };
         check_handoff(&ctx, visas)?
     };
-    // check_handoff guarantees the forward visa's next hop.
+    // check_handoff guarantees the forward visa's next hop. Once a
+    // topology has named the relay, F1 alone decides: no address is held.
     let relay_addr = checked[0]
         .fwd_pep
         .as_ref()
-        .map(|fwd| IpAddress::new_from_std(&fwd.next_hop));
+        .map(|fwd| IpAddress::new_from_std(&fwd.next_hop))
+        .filter(|_| !relay_named_by_topology(asm));
     install_bound_to_link(asm, link_id, &checked, relay_addr)?;
     asm.bootstrap_handoff.send_replace(Some(link_id));
     Ok(())
@@ -387,33 +408,36 @@ pub fn revoke_for_lost_link(
 
 /// The joiner's egress before topology: the initial-link CN, if `addr` is
 /// the relay address a hand-off recorded on the initial link's current
-/// connection and the topology does not name the relay. A hand-off that
-/// arrives after topology named the relay (a redial) never overrides it.
+/// connection, and no topology has named the relay yet.
 /// `Assembly::find_zode_egress_link` asks this only when no topology entry
 /// has `addr`, and then checks the link as it does any other (up record,
 /// Active, verified CN).
 pub fn pre_topology_relay_cn(asm: &Assembly, addr: IpAddress) -> Option<String> {
-    let relay_cn = asm.config.get().initial_link.as_ref()?.cn.clone();
-    let topology_names_it = asm
-        .topology
-        .read()
-        .unwrap()
-        .iter()
-        .any(|link| link.peer_cn == relay_cn);
-    if topology_names_it {
+    if relay_named_by_topology(asm) {
         return None;
     }
+    let relay_cn = asm.config.get().initial_link.as_ref()?.cn.clone();
     let link_id = asm.zode_links.record(&relay_cn)?.link_id?;
     let peer = asm.peer_table.get(link_id)?;
     let held = peer.bootstrap_handoff.lock().unwrap().as_ref()?.relay_addr;
     (held == Some(addr)).then_some(relay_cn)
 }
 
+/// Whether a `setTopology` has named this Zode's relay
+/// (`Assembly::relay_named_by_topology`, set by [topology_names_relay]).
+fn relay_named_by_topology(asm: &Assembly) -> bool {
+    asm.relay_named_by_topology
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A `setTopology` named the relay `relay_cn` at `topology_addr`: from now
-/// on F1 alone decides, so forget the relay address the hand-off recorded
-/// on the initial link. If the two differ, the topology wins, with a
-/// warning. Called by `zode_links::apply_topology`.
+/// on, for the life of this node and across redials, F1 alone decides. So
+/// remember that, and forget the relay address the hand-off recorded on
+/// the initial link. If the two differ, the topology wins, with a warning.
+/// Called by `zode_links::apply_topology`.
 pub fn topology_names_relay(asm: &Assembly, relay_cn: &str, topology_addr: IpAddr) {
+    asm.relay_named_by_topology
+        .store(true, std::sync::atomic::Ordering::Release);
     let Some(link_id) = asm.zode_links.record(relay_cn).and_then(|r| r.link_id) else {
         return;
     };
@@ -802,6 +826,18 @@ mod tests {
         );
     }
 
+    /// Local Codex review: an expiry the visa table cannot represent is
+    /// refused here; installing it would panic.
+    #[test]
+    fn test_check_refuses_an_unrepresentable_expiry() {
+        let mut far = reverse();
+        far.expires = SystemTime::UNIX_EPOCH + Duration::from_millis(u64::MAX);
+        assert_eq!(
+            check_pair(forward(), far),
+            Err(HandoffError::BadExpiry(REV_ID))
+        );
+    }
+
     // ---- install, rule 9 and egress (t202) ----
 
     /// A joiner at [OWN] whose initial link to `relay` is up. Returns the
@@ -979,6 +1015,38 @@ mod tests {
                         .map(|l| l.get()),
                     Some(link)
                 );
+            })
+            .await
+    }
+
+    /// Local Codex review: once a topology has named the relay, a later
+    /// hand-off never brings the pre-topology address back, even after a
+    /// topology without the relay and a redial.
+    #[tokio::test(start_paused = true)]
+    async fn test_topology_naming_the_relay_ends_the_exception_for_good() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link, _egress) = joiner(7309);
+                let relay = IpAddress::new_from_std(&ip(RELAY));
+                set_topology(
+                    &asm,
+                    vec![crate::peer_table::test::topology_link_at(
+                        "relay",
+                        ip(RELAY),
+                    )],
+                );
+                set_topology(&asm, vec![]);
+                asm.drop_peer(link);
+                // The initial link redials with backoff (rule 11).
+                let again = loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if let Some(id) = record_of(&asm, "relay").link_id {
+                        break id;
+                    }
+                };
+                bring_up(&asm, again, "relay");
+                accept(&asm, again, &good_body()).unwrap();
+                assert_eq!(asm.find_egress_link(relay), None);
             })
             .await
     }

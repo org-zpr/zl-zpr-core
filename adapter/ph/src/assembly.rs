@@ -87,6 +87,11 @@ pub struct Assembly {
     /// installed and cleared when that link is lost (rule 9), so the VS-API
     /// worker can wait for one before it connects (J5).
     pub bootstrap_handoff: tokio::sync::watch::Sender<Option<LinkId>>,
+    /// Node only (zl-zipline#252): set once a `setTopology` has named this
+    /// joiner's relay. From then on F1 alone finds the relay, and a
+    /// hand-off's next hop is never used as its address again
+    /// ([crate::bootstrap_handoff::topology_names_relay]).
+    pub relay_named_by_topology: std::sync::atomic::AtomicBool,
 
     pub visa_table: std::sync::RwLock<visa_table::VisaTable>, // Only for nodes
 
@@ -1767,6 +1772,7 @@ pub mod test {
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
             vs_session_up: std::sync::atomic::AtomicBool::new(false),
             bootstrap_handoff: Default::default(),
+            relay_named_by_topology: std::sync::atomic::AtomicBool::new(false),
             capture_queue,
             capture_worker,
             flow_control,

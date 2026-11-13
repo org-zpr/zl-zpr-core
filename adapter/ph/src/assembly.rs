@@ -534,18 +534,18 @@ impl Assembly {
             // Revoke visas under the write lock, but hold the withdrawn
             // entries until the lock is released: the send path takes the
             // peer's `zdpr_send` mutex, which must never nest under the
-            // visa-table lock (and `unbind_stream` itself re-acquires the
-            // visa-table lock, which is why it is not usable here).
+            // visa-table lock.
             let withdrawn = self
                 .visa_table
                 .write()
                 .unwrap()
                 .revoke_for_link(link_id, &self.peer_table);
 
-            // Withdraw each revoked stream from the *surviving* peers so
+            // Withdraw each revoked stream from the *surviving* adapters so
             // they drop their egress bindings and re-request visas instead
             // of blackholing traffic on dead streams (zipline#21). The
-            // dying link's own entries are skipped — that peer is gone.
+            // dying link's own entries are skipped — that peer is gone —
+            // and so are Zode links, which carry no teardown messages (F5).
             self.withdraw_streams(withdrawn, Some(link_id));
         }
         let zode_link = self
@@ -572,6 +572,12 @@ impl Assembly {
     /// (that peer is gone) — `drop_peer` passes it. Entries whose link has
     /// already left the peer table are skipped as well.
     ///
+    /// Entries on Zode links are skipped too, by F5 (zl-zipline#251): Zode
+    /// links carry no teardown messages. A Zode upstream loses its binding
+    /// when the visa service revokes the visa there, which it does on
+    /// every Zode on the path. Withdrawals still go to adapters and the
+    /// local dock.
+    ///
     /// Lock ordering (zipline#9): call this only AFTER releasing the
     /// visa-table write lock — the send path takes the peer's `zdpr_send`
     /// mutex, which must never nest under it.
@@ -586,7 +592,10 @@ impl Assembly {
         excluded_link: Option<LinkId>,
     ) {
         for entry in withdrawn {
-            if Some(entry.0) == excluded_link || self.peer_table.get(entry.0).is_none() {
+            let to_adapter = self.peer_table.get(entry.0).is_some_and(|peer| {
+                peer.link_state_machine.get_link_type() != LinkType::NodeToNode
+            });
+            if Some(entry.0) == excluded_link || !to_adapter {
                 continue;
             }
             mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
@@ -731,24 +740,80 @@ impl Assembly {
         Ok(())
     }
 
-    /// Temporary? function to find a link based on the actor address
-    pub fn find_egress_link(&self, actor_addr: IpAddress) -> Option<NonZero<LinkId>> {
+    /// Find the link toward ZPR address `addr`, the next hop of a visa:
+    ///
+    /// 1. one of this ph's own addresses: the local actor link;
+    /// 2. an adapter link (any link but a Zode link) whose authenticated
+    ///    actor addresses or AAA address include `addr`;
+    /// 3. a Zode link (F1, zl-zipline#251): see [Assembly::find_zode_egress_link].
+    ///
+    /// `None` if nothing matches. The caller then refuses the bind
+    /// (`get_egress_link_for_visa` returns `DestNotFound`).
+    ///
+    /// A Zode link is never matched by actor addresses or an AAA address:
+    /// those come from what the peer presents on the link, and F1 forbids
+    /// taking a Zode's address from the peer (gap 5).
+    ///
+    /// Lock order: takes the topology read lock, then the `zode_links`
+    /// mutex, then peer-table entries, releasing each before taking the
+    /// next. Never call it while holding the visa-table lock: its callers
+    /// (`visa_mgmt::insert_visa`, `visa_mgmt::get_egress_link_for_visa`)
+    /// release that lock first.
+    pub fn find_egress_link(&self, addr: IpAddress) -> Option<NonZero<LinkId>> {
         // First check the local actor addresses to see if it's a locally-destined packet
         if self
             .get_local_zpr_addrs_std()
             .iter()
-            .any(|addr| IpAddress::new_from_std(addr) == actor_addr)
+            .any(|local| IpAddress::new_from_std(local) == addr)
         {
             return Some(NonZero::new(LOCAL_ACTOR_LINK_ID).unwrap());
         }
 
-        // Check peer actor addresses to see if one of them matches
-        self.peer_table
+        // Adapter links (and the internal links) own the actor addresses
+        // they authenticated. Zode links are left out here: see above.
+        let adapter = self
+            .peer_table
             .find(|(_id, peer)| {
-                peer.actor_auth.owns_address(&actor_addr)
-                    || peer.link_state_machine.aaa_address() == Some(actor_addr)
+                peer.link_state_machine.get_link_type() != LinkType::NodeToNode
+                    && (peer.actor_auth.owns_address(&addr)
+                        || peer.link_state_machine.aaa_address() == Some(addr))
             })
-            .map(|(id, _peer)| id)
+            .map(|(id, _peer)| id);
+        adapter.or_else(|| self.find_zode_egress_link(addr))
+    }
+
+    /// F1 (zl-zipline#251, ZODE_LINKS.md "Forwarding over Zode links"): the
+    /// up Zode link to the Zode whose topology `zprAddr` is `addr`.
+    ///
+    /// A Zode's ZPR address is known only from the visa service's
+    /// `setTopology`, which ties it to the CN its certificate must carry.
+    /// So the lookup goes address -> topology entry -> CN -> that CN's link
+    /// record, which must be up (rule 5 keeps one record per CN). The
+    /// record's connection must then be an Active Zode link whose verified
+    /// CN is that CN. Anything else is `None`.
+    ///
+    /// Each lock (topology, then `zode_links`, then the peer entry) is
+    /// released before the next is taken.
+    fn find_zode_egress_link(&self, addr: IpAddress) -> Option<NonZero<LinkId>> {
+        let peer_cn = self
+            .topology
+            .read()
+            .unwrap()
+            .iter()
+            .find(|link| IpAddress::new_from_std(&link.zpr_addr) == addr)
+            .map(|link| link.peer_cn.clone())?;
+        let record = self.zode_links.record(&peer_cn)?;
+        if record.state != crate::zode_link_record::RecordState::Up {
+            return None;
+        }
+        let link_id = record.link_id?;
+        let usable = self.peer_table.get(link_id).is_some_and(|peer| {
+            let fsm = &peer.link_state_machine;
+            fsm.get_link_type() == LinkType::NodeToNode
+                && fsm.get_state() == crate::link_state::LinkState::Active
+                && peer.verified_peer_cn().as_deref() == Some(peer_cn.as_str())
+        });
+        if usable { NonZero::new(link_id) } else { None }
     }
 
     // Formats link IDs for display purposes
@@ -1684,8 +1749,9 @@ pub mod test {
     #[cfg(test)]
     mod drop_peer_notify {
         //! Tests for zipline#21: revoking visas for a dying link must
-        //! withdraw the streams from *surviving* peers by sending them an
-        //! `UnbindEgressStreamIndication`; expiry deliberately does not.
+        //! withdraw the streams from *surviving* adapters by sending them a
+        //! `StreamIdWithdrawal` (none goes on a Zode link, F5); expiry
+        //! deliberately does not.
 
         use super::*;
         use crate::forwarding_tables::PftPep;
@@ -1700,8 +1766,65 @@ pub mod test {
         use zpr_utils::net_defs;
 
         /// Build a Node-mode assembly whose mgmt substrate egress queue we
-        /// can read back, plus two dummy peers, and one visa (id >=
-        /// MIN_VISA_ID) with forwarding entries on both links.
+        /// can read back, plus one dummy peer per entry of `link_types`, and
+        /// one visa (id 3000, >= MIN_VISA_ID) with a forwarding entry on
+        /// each of those links.
+        ///
+        /// Returns (asm, egress queue receiver, (link, tether) per peer).
+        fn setup_visa_on_links(
+            link_types: &[LinkType],
+        ) -> (
+            Arc<Assembly>,
+            packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+            Vec<(LinkId, StreamId)>,
+        ) {
+            let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
+
+            let mut builder = TestAssemblyBuilder::new();
+            builder.ph_mode = Some(PhMode::Node);
+            builder.visa_table = Some(VisaTable::new());
+            builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
+            let asm = Arc::new(create_assembly(builder));
+
+            let visa_id = 3000;
+            let mut visa_table = asm.visa_table.write().unwrap();
+            let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
+            let _ = visa_table.insert_visa(v);
+
+            let mut bound = Vec::new();
+            for (i, link_type) in link_types.iter().enumerate() {
+                let octet = i as u8 + 1;
+                let entry = asm.peer_table.vacant_entry().unwrap();
+                let key = entry.key();
+                let link = entry
+                    .insert(create_dummy_peer_state(
+                        key,
+                        *link_type,
+                        SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(octet, 2, 3, 4)), 443),
+                        net_defs::ScopedIpAddr::V4(Ipv4Addr::new(octet, 2, 3, 5)),
+                    ))
+                    .get();
+                let tether = asm
+                    .peer_table
+                    .get(link)
+                    .unwrap()
+                    .pft
+                    .insert(PftPep {
+                        next_hop: ForwardingEntry(link, 1),
+                        visa_id,
+                    })
+                    .unwrap();
+                visa_table
+                    .link_forwarding_entry(visa_id, ForwardingEntry(link, tether))
+                    .unwrap();
+                bound.push((link, tether));
+            }
+            drop(visa_table);
+
+            (asm, egress_rx, bound)
+        }
+
+        /// [setup_visa_on_links] on two internal links.
         ///
         /// Returns (asm, egress queue receiver, link_a, link_b, tether_a, tether_b).
         fn setup_two_link_visa() -> (
@@ -1712,70 +1835,56 @@ pub mod test {
             StreamId,
             StreamId,
         ) {
-            let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
-
-            let mut builder = TestAssemblyBuilder::new();
-            builder.ph_mode = Some(PhMode::Node);
-            builder.visa_table = Some(VisaTable::new());
-            builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
-            let asm = Arc::new(create_assembly(builder));
-
-            let entry_a = asm.peer_table.vacant_entry().unwrap();
-            let key_a = entry_a.key();
-            let link_a = entry_a
-                .insert(create_dummy_peer_state(
-                    key_a,
-                    LinkType::Internal,
-                    SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
-                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
-                ))
-                .get();
-
-            let entry_b = asm.peer_table.vacant_entry().unwrap();
-            let key_b = entry_b.key();
-            let link_b = entry_b
-                .insert(create_dummy_peer_state(
-                    key_b,
-                    LinkType::Internal,
-                    SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(2, 2, 3, 4)), 443),
-                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(2, 2, 3, 5)),
-                ))
-                .get();
-
-            let visa_id = 3000;
-            let mut visa_table = asm.visa_table.write().unwrap();
-            let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
-            let _ = visa_table.insert_visa(v);
-
-            let peer_a = asm.peer_table.get(link_a).unwrap();
-            let tether_a = peer_a
-                .pft
-                .insert(PftPep {
-                    next_hop: ForwardingEntry(link_a, 1),
-                    visa_id,
-                })
-                .unwrap();
-            visa_table
-                .link_forwarding_entry(visa_id, ForwardingEntry(link_a, tether_a))
-                .unwrap();
-
-            let peer_b = asm.peer_table.get(link_b).unwrap();
-            let tether_b = peer_b
-                .pft
-                .insert(PftPep {
-                    next_hop: ForwardingEntry(link_b, 1),
-                    visa_id,
-                })
-                .unwrap();
-            visa_table
-                .link_forwarding_entry(visa_id, ForwardingEntry(link_b, tether_b))
-                .unwrap();
-
-            drop(visa_table);
-            drop(peer_a);
-            drop(peer_b);
-
+            let (asm, egress_rx, bound) =
+                setup_visa_on_links(&[LinkType::Internal, LinkType::Internal]);
+            let [(link_a, tether_a), (link_b, tether_b)] = bound[..] else {
+                unreachable!("two links were bound");
+            };
             (asm, egress_rx, link_a, link_b, tether_a, tether_b)
+        }
+
+        /// The StreamIdWithdrawals on the egress queue, as (link, stream).
+        fn withdrawals_sent(
+            rx: &mut packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+        ) -> Vec<(LinkId, StreamId)> {
+            let mut got = Vec::new();
+            while let Some(pkt) = try_recv_packet(rx) {
+                let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+                assert_eq!(base_hdr.packet_type, zdp::ZdpPacketType::StreamIdWithdrawal);
+                let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+                let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
+                got.push((pkt.metadata().egress_link_id, per_flow_hdr.stream_id.into()));
+            }
+            got
+        }
+
+        /// F5 (zl-zipline#251): a revocation of a visa bound adapter -> Zode
+        /// link sends exactly one withdrawal, to the adapter, and none on the
+        /// Zode link.
+        #[tokio::test]
+        async fn test_revocation_sends_no_withdrawal_on_zode_link() {
+            let (asm, mut egress_rx, bound) =
+                setup_visa_on_links(&[LinkType::NodeToAdapter, LinkType::NodeToNode]);
+
+            crate::visa_mgmt::handle_revocation(&asm, 3000).unwrap();
+
+            assert_eq!(withdrawals_sent(&mut egress_rx), vec![bound[0]]);
+        }
+
+        /// F5 (zl-zipline#251): dropping another link that holds the same
+        /// visa sends exactly one withdrawal, to the adapter, and none on the
+        /// surviving Zode link.
+        #[tokio::test]
+        async fn test_drop_peer_sends_no_withdrawal_on_zode_link() {
+            let (asm, mut egress_rx, bound) = setup_visa_on_links(&[
+                LinkType::NodeToAdapter,
+                LinkType::NodeToNode,
+                LinkType::NodeToNode,
+            ]);
+
+            asm.drop_peer(bound[2].0);
+
+            assert_eq!(withdrawals_sent(&mut egress_rx), vec![bound[0]]);
         }
 
         fn try_recv_packet(
@@ -1910,6 +2019,133 @@ pub mod test {
             assert!(
                 try_recv_packet(&mut egress_rx).is_none(),
                 "expiry must not emit any unbind indication"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod egress_link {
+        //! F1 (zl-zipline#251, ZODE_LINKS.md "Forwarding over Zode links"):
+        //! a next hop that is another Zode resolves to the up Zode link whose
+        //! verified CN has that ZPR address in the topology, and to nothing
+        //! the peer claims about itself.
+
+        use super::*;
+        use crate::link_state::LinkState;
+        use crate::peer_table::test::{insert_up_zode_link, insert_zode_peer_with_verified_cn};
+        use crate::zode_link_record::RecordState;
+
+        /// The topology ZPR address of the peer Zode in these tests.
+        const ZODE_ADDR: &str = "fd5a:5052:8::99";
+
+        fn zode_addr() -> IpAddress {
+            IpAddress::new_from_std(&ZODE_ADDR.parse().unwrap())
+        }
+
+        /// A Node-mode assembly with no links.
+        fn node() -> Assembly {
+            create_assembly(TestAssemblyBuilder {
+                ph_mode: Some(PhMode::Node),
+                ..TestAssemblyBuilder::new()
+            })
+        }
+
+        /// A next hop equal to the topology `zprAddr` of an up Zode link
+        /// resolves to that link.
+        #[tokio::test]
+        async fn test_next_hop_resolves_to_up_zode_link_by_topology_address() {
+            let asm = node();
+            let link = insert_up_zode_link(&asm, "b.zpr", ZODE_ADDR.parse().unwrap());
+            assert_eq!(
+                asm.find_egress_link(zode_addr()).map(NonZero::get),
+                Some(link)
+            );
+        }
+
+        /// A link record that is not up does not resolve, even though its
+        /// connection and topology entry are there.
+        #[tokio::test]
+        async fn test_zode_link_whose_record_is_not_up_does_not_resolve() {
+            for state in [
+                RecordState::Idle,
+                RecordState::Dialing { window_ends: None },
+                RecordState::Failed,
+                RecordState::Down,
+            ] {
+                let asm = node();
+                let link = insert_up_zode_link(&asm, "b.zpr", ZODE_ADDR.parse().unwrap());
+                asm.zode_links.test_put("b.zpr", state, Some(link));
+                assert_eq!(asm.find_egress_link(zode_addr()), None, "record {state:?}");
+            }
+        }
+
+        /// An up record whose connection is not Active does not resolve.
+        #[tokio::test]
+        async fn test_zode_link_whose_peer_is_not_active_does_not_resolve() {
+            let asm = node();
+            let link = insert_up_zode_link(&asm, "b.zpr", ZODE_ADDR.parse().unwrap());
+            asm.peer_table
+                .get(link)
+                .unwrap()
+                .link_state_machine
+                .test_set_state(LinkState::Closing);
+            assert_eq!(asm.find_egress_link(zode_addr()), None);
+        }
+
+        /// Gap 5: a Zode link whose actor addresses hold the next hop (as if
+        /// the peer claimed it in its Hello) and that has no topology entry
+        /// for that address does not resolve.
+        #[tokio::test]
+        async fn test_zode_link_claimed_address_does_not_resolve() {
+            let asm = node();
+            let link = insert_zode_peer_with_verified_cn(&asm, "b.zpr", LinkState::Active);
+            asm.zode_links
+                .test_put("b.zpr", RecordState::Up, Some(link));
+            asm.peer_table
+                .get(link)
+                .unwrap()
+                .actor_auth
+                .test_set_addresses(vec![zode_addr()]);
+            assert_eq!(asm.find_egress_link(zode_addr()), None);
+        }
+
+        /// A topology entry for CN X does not resolve to a link whose
+        /// verified CN is Y, even when X's record names that link.
+        #[tokio::test]
+        async fn test_topology_entry_does_not_resolve_to_link_with_another_cn() {
+            let asm = node();
+            let link_y = insert_zode_peer_with_verified_cn(&asm, "y.zpr", LinkState::Active);
+            asm.topology
+                .write()
+                .unwrap()
+                .push(crate::peer_table::test::topology_link_at(
+                    "x.zpr",
+                    ZODE_ADDR.parse().unwrap(),
+                ));
+            asm.zode_links
+                .test_put("x.zpr", RecordState::Up, Some(link_y));
+            assert_eq!(asm.find_egress_link(zode_addr()), None);
+        }
+
+        /// Adapter links still resolve by their authenticated actor
+        /// addresses.
+        #[tokio::test]
+        async fn test_adapter_link_resolves_by_actor_address() {
+            let asm = node();
+            let link = crate::peer_table::test::insert_peer_with_verified_cn(
+                &asm,
+                LinkType::NodeToAdapter,
+                "adapter",
+                LinkState::Active,
+            );
+            asm.peer_table
+                .get(link)
+                .unwrap()
+                .actor_auth
+                .test_set_addresses(vec![zode_addr()]);
+            assert_eq!(
+                asm.find_egress_link(zode_addr()).map(NonZero::get),
+                Some(link)
             );
         }
     }

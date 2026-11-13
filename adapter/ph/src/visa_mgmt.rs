@@ -304,9 +304,11 @@ pub fn handle_revocation(
 ) -> Result<(), visa_table::VisaTableError> {
     // Revoke under the write lock, but hold the withdrawn forwarding
     // entries until the lock is released, then withdraw each stream from
-    // the peers still bound to it — same rule and same helper as
+    // the adapters still bound to it — same rule and same helper as
     // `Assembly::drop_peer` (zipline#21, zipline#85): the send path must
-    // never nest under the visa-table lock.
+    // never nest under the visa-table lock. Zode links get no withdrawal
+    // (F5, zl-zipline#251): the visa service revokes the visa on every
+    // Zode on the path itself.
     let withdrawn = asm
         .visa_table
         .write()

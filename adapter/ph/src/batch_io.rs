@@ -2444,11 +2444,22 @@ mod tests {
     #[cfg(unix)]
     const RECV_STRESS_NO_TIMEOUT: u64 = u64::MAX;
 
-    /// Payload of the one datagram `run_recv_stress`'s sender sends after an
+    /// Payload of the datagrams `run_recv_stress`'s sender sends after an
     /// ack timed out, so that a blocked batch call can return.  It is never a
     /// valid sequence number.
     #[cfg(unix)]
     const RECV_STRESS_WAKE: u64 = u64::MAX;
+
+    /// How often `run_recv_stress`'s sender repeats the `WAKE` datagram
+    /// after an ack timed out, until the receiver has finished.
+    #[cfg(unix)]
+    const RECV_STRESS_WAKE_INTERVAL: Duration = Duration::from_millis(100);
+
+    /// Overall bound of one `run_recv_stress` run.  The receiver checks it
+    /// between batch calls, and the sender stops repeating `WAKE` datagrams
+    /// at it, so the sender can never run forever.
+    #[cfg(unix)]
+    const RECV_STRESS_DEADLINE: Duration = Duration::from_secs(120);
 
     /// Drive `bio` through the receive stress run of zipline#117 and report
     /// the first failure as `Err`, naming the engine.
@@ -2465,14 +2476,18 @@ mod tests {
     /// not stalled returns k with no new traffic, however slow the call is.
     /// A stalled call (an op left in flight) returns only when another
     /// datagram arrives, which never happens during the wait.  So if no ack
-    /// comes within `liveness`, the sender records k, sends one `WAKE`
-    /// datagram so that a blocked call can return, and stops.  The receiver
-    /// then reports a stall if k arrived after the wake, or a lost datagram
-    /// if it never arrived.  A false failure needs the receiver thread to
-    /// make no progress at all for the whole `liveness` bound.
+    /// comes within `liveness`, the sender records k and then sends a `WAKE`
+    /// datagram every `RECV_STRESS_WAKE_INTERVAL` until the receiver has
+    /// finished, so that a blocked call can return even when several ops
+    /// were left in flight and each one consumes a wake (core#116 review).
+    /// The receiver ends the run at the first `WAKE` it sees, and reports a
+    /// stall if k arrived, or a lost datagram if it never arrived.  A false
+    /// failure needs the receiver thread to make no progress at all for the
+    /// whole `liveness` bound.
     ///
-    /// The receiver also keeps an overall deadline, as a backstop for a lost
-    /// datagram that no wake reveals.
+    /// Both threads also keep the overall `RECV_STRESS_DEADLINE`: the
+    /// receiver as a backstop for a lost datagram that no wake reveals, the
+    /// sender as the upper bound of its wake loop.
     #[cfg(unix)]
     fn run_recv_stress(
         bio: &mut BatchIo,
@@ -2491,9 +2506,11 @@ mod tests {
 
         let (ack_tx, ack_rx) = std::sync::mpsc::channel::<u64>();
         // The sequence number whose ack timed out, or RECV_STRESS_NO_TIMEOUT.
-        // The sender stores it before it sends the wake datagram, so the
-        // receiver always sees it once it has received the wake.
+        // The sender stores it before it sends the first wake datagram, so
+        // the receiver always sees it once it has received a wake.
         let timed_out = std::sync::Arc::new(AtomicU64::new(RECV_STRESS_NO_TIMEOUT));
+        // The overall deadline, shared by both threads.
+        let deadline = std::time::Instant::now() + RECV_STRESS_DEADLINE;
 
         let sender_timed_out = timed_out.clone();
         let sender = std::thread::spawn(move || {
@@ -2513,9 +2530,10 @@ mod tests {
                     Ok(acked) => assert_eq!(acked, seq, "acks arrive in send order"),
                     Err(RecvTimeoutError::Timeout) => {
                         // No progress without new traffic: record k, then
-                        // wake a possibly blocked call, and stop.
+                        // wake a possibly blocked call until the receiver
+                        // has finished.
                         sender_timed_out.store(seq, Ordering::SeqCst);
-                        inq.send(&RECV_STRESS_WAKE.to_le_bytes()).unwrap();
+                        send_wakes_until_done(&inq, &ack_rx, deadline);
                         return;
                     }
                     // The receiver gave up (it reported a failure).
@@ -2530,7 +2548,6 @@ mod tests {
         let mut max_elapsed = Duration::ZERO;
         let mut bufs = vec![Vec::with_capacity(64); RECV_STRESS_BATCH];
         let mut results = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
 
         let outcome = loop {
             if nseen == RECV_STRESS_DATAGRAMS as usize {
@@ -2613,6 +2630,38 @@ mod tests {
             );
         }
         outcome
+    }
+
+    /// `run_recv_stress`'s sender after an ack timed out: send a `WAKE`
+    /// datagram on `inq` every `RECV_STRESS_WAKE_INTERVAL` until the receiver
+    /// has finished, which it signals by dropping its end of `ack_rx`, or
+    /// until `deadline`, whichever comes first.  One wake is not enough: if
+    /// several ops of a stalled batch call are in flight, each one can
+    /// consume a wake, and the call returns only after the last of them
+    /// completes (core#116 review).  Acks that still arrive (the late ack of
+    /// the timed-out datagram) are ignored.  A full receive queue is not an
+    /// error here: it already holds wakes for the receiver to find.
+    #[cfg(unix)]
+    fn send_wakes_until_done(
+        inq: &UdpSocket,
+        ack_rx: &std::sync::mpsc::Receiver<u64>,
+        deadline: std::time::Instant,
+    ) {
+        use std::sync::mpsc::RecvTimeoutError;
+
+        while std::time::Instant::now() < deadline {
+            match inq.send(&RECV_STRESS_WAKE.to_le_bytes()) {
+                Ok(_) => (),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => (),
+                Err(err) => panic!("sending a wake datagram failed: {err}"),
+            }
+            match ack_rx.recv_timeout(RECV_STRESS_WAKE_INTERVAL) {
+                // The receiver is still running: wake it again.
+                Ok(_) | Err(RecvTimeoutError::Timeout) => (),
+                // The receiver has finished.
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 
     /// The liveness bound of `test_recv_stress_no_stall` and

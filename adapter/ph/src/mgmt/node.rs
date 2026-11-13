@@ -25,21 +25,19 @@ use zpr::vsapi_types::{CommFlag, PacketDesc, VisaRequest, VsapiFiveTuple, vsapi_
 enum BindRequestState {
     /// We have issued a visa request and are currently awaiting a response.
     /// The parameter is a join handle for the task which is performing the
-    /// visa request.  Note that this join handle is mostly only useful for
-    /// monitoring, since the subsequent state transitions are issued from
-    /// within the task it references, so we can't usefully join it.
-    AwaitingVisaResponse(#[allow(dead_code)] tokio::task::JoinHandle<()>),
+    /// visa request.  The subsequent state transitions are issued from within
+    /// that task, so it is never joined; its task ID tells the task whether
+    /// this request is still the one it serves (`bind_awaits_visa`).
+    AwaitingVisaResponse(tokio::task::JoinHandle<()>),
 
     /// We have issued a visa ID request for the indicated visa and are
     /// currently awaiting a response or racing push.  The join handle is for
-    /// the task which is issuing the request and awaiting the push.  Note
-    /// that this join handle is mostly only useful for monitoring, since
-    /// the subsequent state transitions are issued from within the task it
-    /// references, so we can't usefully join it.
+    /// the task which is issuing the request and awaiting the push.  It is
+    /// never joined; its task ID tells the task whether this request is
+    /// still the one it serves (`bind_awaits_visa`).
     AwaitingVisaPush {
         #[allow(dead_code)]
         visa_id: VisaId,
-        #[allow(dead_code)]
         worker: tokio::task::JoinHandle<()>,
     },
 
@@ -325,21 +323,22 @@ async fn wait_for_loss_reports(asm: &Assembly) {
 }
 
 /// Whether the inbound bind request `txn_id` on `link_id` is still waiting
-/// for the visa a visa-request task is fetching. It is not if its link was
-/// lost meanwhile (rule 9), even if a new peer has since taken the link ID:
-/// the new peer's table holds no such request. The task then drops its
-/// result, so nothing is sent to a peer that never asked.
+/// for the visa that THIS visa-request task (the caller) is fetching: the
+/// bind state must name the calling task as its worker. It does not if the
+/// link was lost meanwhile (rule 9), even if a new peer has since taken the
+/// link ID and reused the transaction ID, nor if the requestor reused the
+/// transaction ID for a newer request (core#110 review). The task then drops
+/// its result, so it never advances or answers a request it did not serve.
 fn bind_awaits_visa(asm: &Assembly, link_id: NonZero<LinkId>, txn_id: TxnId) -> bool {
+    let this_task = tokio::task::id();
     let awaits = asm.peer_table.get(link_id.get()).is_some_and(|peer| {
         peer.node_state
             .bind_request_state
             .get(&txn_id)
-            .is_some_and(|st| {
-                matches!(
-                    *st,
-                    BindRequestState::AwaitingVisaResponse(_)
-                        | BindRequestState::AwaitingVisaPush { .. }
-                )
+            .is_some_and(|st| match &*st {
+                BindRequestState::AwaitingVisaResponse(worker)
+                | BindRequestState::AwaitingVisaPush { worker, .. } => worker.id() == this_task,
+                BindRequestState::AwaitingNextHopBind { .. } => false,
             })
     });
     if !awaits {
@@ -1818,6 +1817,54 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 assert!(try_recv_packet(&mut egress_rx).is_none(), "nothing is sent");
                 assert!(no_bind_state(&asm, link_a));
+            })
+            .await
+    }
+
+    /// A visa result belongs to the request that asked for it (core#110
+    /// review). If the requestor reuses the transaction ID of a bind whose
+    /// visa request is still in flight, the bind state names the newer
+    /// request's worker, and the older worker's result must not advance it.
+    /// The guard passes only for the worker the bind state names.
+    #[tokio::test]
+    async fn test_visa_result_only_advances_the_request_that_asked_for_it() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, _egress_rx) = node_with_visa();
+                let link_a = NonZero::new(add_peer(&asm, LinkType::NodeToNode, 1)).unwrap();
+
+                // Each worker records its task ID and the guard's verdict.
+                let verdicts: std::rc::Rc<std::cell::RefCell<Vec<(tokio::task::Id, bool)>>> =
+                    Default::default();
+                let worker = || {
+                    let (asm, verdicts) = (asm.clone(), verdicts.clone());
+                    async move {
+                        let verdict = bind_awaits_visa(&asm, link_a, 7);
+                        verdicts.borrow_mut().push((tokio::task::id(), verdict));
+                    }
+                };
+                let older = tokio::task::spawn_local(worker());
+                let newer = tokio::task::spawn_local(worker());
+                let (older_id, newer_id) = (older.id(), newer.id());
+                asm.peer_table
+                    .get(link_a.get())
+                    .unwrap()
+                    .node_state
+                    .bind_request_state
+                    .insert(7, BindRequestState::AwaitingVisaResponse(newer));
+
+                older.await.unwrap();
+                tokio::task::yield_now().await;
+
+                let verdicts = verdicts.borrow();
+                assert!(
+                    verdicts.contains(&(older_id, false)),
+                    "the older result is dropped"
+                );
+                assert!(
+                    verdicts.contains(&(newer_id, true)),
+                    "the named worker's result is used"
+                );
             })
             .await
     }

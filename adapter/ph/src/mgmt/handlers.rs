@@ -1502,10 +1502,7 @@ mod teardown_test {
             .get(link)
             .unwrap()
             .pft
-            .insert(PftPep {
-                next_hop: ForwardingEntry(link, 1),
-                visa_id: 3000,
-            })
+            .insert(PftPep::new(ForwardingEntry(link, 1), 3000))
             .unwrap()
     }
 

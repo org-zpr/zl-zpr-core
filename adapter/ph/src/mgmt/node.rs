@@ -704,11 +704,8 @@ fn requested_tether_granted(
                 match visa_table.bind(visa_id, binding.clone()) {
                     Err(_) => Err("policy error"),
                     Ok(()) => {
-                        let ingress_tether_id =
-                            ingress_tether_entry.insert(forwarding_tables::PftPep {
-                                next_hop: binding.egress,
-                                visa_id,
-                            });
+                        let ingress_tether_id = ingress_tether_entry
+                            .insert(forwarding_tables::PftPep::new(binding.egress, visa_id));
                         Ok((ingress_tether_id, tc, peer_a2a_dh_pubkey))
                     }
                 }
@@ -1290,7 +1287,7 @@ mod tests {
             .get(link_a)
             .unwrap()
             .pft
-            .inspect(upstream_stream, |pep| (pep.next_hop.clone(), pep.visa_id))
+            .inspect(upstream_stream, |pep| (pep.next_hop(), pep.visa_id()))
             .expect("a PFT entry for the upstream stream");
         assert!(pep == (ForwardingEntry(link_b, next_hop_stream), VISA_ID));
 
@@ -1485,7 +1482,7 @@ mod tests {
         assert_eq!(local_peer.pft.len(), 1);
         let pep = local_peer
             .pft
-            .inspect(local_stream, |pep| (pep.next_hop.clone(), pep.visa_id))
+            .inspect(local_stream, |pep| (pep.next_hop(), pep.visa_id()))
             .expect("a PFT entry on the local actor link");
         assert!(pep == (ForwardingEntry(zode_link, 42), own_visa));
     }
@@ -1531,7 +1528,7 @@ mod tests {
             for stream in 0..=u16::MAX as StreamId {
                 if peer
                     .pft
-                    .inspect(stream, |pep| pep.next_hop.0 == link)
+                    .inspect(stream, |pep| pep.next_hop().0 == link)
                     .unwrap_or(false)
                 {
                     found = true;
@@ -1627,10 +1624,10 @@ mod tests {
             .get(adapter)
             .unwrap()
             .pft
-            .insert(forwarding_tables::PftPep {
-                next_hop: ForwardingEntry(zode_link, 42),
-                visa_id: own_visa,
-            })
+            .insert(forwarding_tables::PftPep::new(
+                ForwardingEntry(zode_link, 42),
+                own_visa,
+            ))
             .unwrap();
         visa_table
             .bind(

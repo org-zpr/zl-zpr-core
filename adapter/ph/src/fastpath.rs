@@ -401,8 +401,11 @@ impl FastpathWorker {
 
                 // TODO: policy enforcement
 
-                egress_link_id = pep.next_hop.0;
-                egress_stream_id = pep.next_hop.1;
+                // One load: a J11 rebind may swap the entry's target at
+                // any moment, and both IDs must come from the same target.
+                let next_hop = pep.next_hop();
+                egress_link_id = next_hop.0;
+                egress_stream_id = next_hop.1;
 
                 // Security Testing: if this is an adapter-to-adapter transit
                 // stream, corrupt forwarded ICMP echo requests to prove the A2A
@@ -417,7 +420,7 @@ impl FastpathWorker {
                         matches!(p.peer_type(), crate::peer_table::PeerType::Adapter)
                     })
                 {
-                    self.security_testing_mangle_ping(&mut pkt, pep.visa_id);
+                    self.security_testing_mangle_ping(&mut pkt, pep.visa_id());
                 }
             }
         }

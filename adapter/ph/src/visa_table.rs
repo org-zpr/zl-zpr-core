@@ -38,6 +38,10 @@ pub enum VisaTableError {
     InsertError,
     #[error("Visa {0} is forward-only and forwarding is off on this node")]
     ForwardingDisabled(VisaId),
+    #[error("Visa {1} is not the waiting successor of visa {0}")]
+    NotSuccessor(VisaId, VisaId),
+    #[error("Visa {0} has no stream bound from link {1} stream {2}")]
+    NoSuchBinding(VisaId, LinkId, StreamId),
 }
 
 /// A granted visa as this Zode holds it.
@@ -205,17 +209,61 @@ impl Visa {
 /// expiry and link loss) the only one that removes bindings, together with
 /// their PFT entries. Both run under the one visa-table lock.
 ///
-/// #252's J11 (supersede and rebind) adds one more writer under that same
-/// lock: a `rebind(old, new)` that moves a binding from the old visa ID to
-/// the new one and swaps the `visa_id` of its ingress PFT entry. It
-/// replaces the visa by a new one; it never edits either.
+/// J11 (supersede and rebind, zl-zipline#252) adds one more writer under
+/// that same lock: [VisaTable::commit_supersede] moves a binding from an
+/// old visa ID to the visa that supersedes it, and swaps the target of its
+/// ingress PFT entry. It replaces the visa by a new one; it never edits
+/// either. Which visa the five-tuple lookup answers, and which visa waits
+/// to supersede which, is likewise kept beside the visas, in `current` and
+/// `successors`.
 pub struct VisaTable {
     /// Granted visas by ID. Private, so no `&mut Visa` escapes.
     table: HashMap<VisaId, Visa>,
     /// Stream bindings by visa ID (F3, zl-zipline#251).
     bindings: HashMap<VisaId, Vec<StreamBinding>>,
+    /// J11: for each dock-PEP five-tuple, the one visa the lookup answers
+    /// for it. A visa superseded by a newer one for the same five-tuple
+    /// leaves this map and never comes back; it is kept only until it
+    /// expires or is revoked.
+    current: HashMap<FlowKey, VisaId>,
+    /// J11: `old -> new` while `old` still has live bindings and `new`, a
+    /// newer visa for the same five-tuple, is to take them over. At this
+    /// Zode's ingress, rebinds move them one by one
+    /// ([VisaTable::commit_supersede]). Elsewhere `new` waits for `old` to
+    /// expire or be revoked. Both visas are always held while the entry
+    /// exists.
+    successors: HashMap<VisaId, VisaId>,
     pub timeout_queue: BinaryHeap<VisaTimeout>,
-    pub lookup_table: FiveTupleLookupTable,
+    /// The five-tuple lookup, built only from the visas in `current`.
+    lookup_table: FiveTupleLookupTable,
+}
+
+/// A dock-PEP five-tuple as a map key (J11): two visas supersede one
+/// another only if every field is identical. A wildcard port (0) is equal
+/// only to another wildcard, and swapping source and destination gives a
+/// different key, so the two directions of a flow never supersede each
+/// other.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FlowKey {
+    l3_type: L3Type,
+    source_addr: IpAddr,
+    dest_addr: IpAddr,
+    l4_protocol: u8,
+    source_port: u16,
+    dest_port: u16,
+}
+
+impl From<&VsapiFiveTuple> for FlowKey {
+    fn from(ft: &VsapiFiveTuple) -> Self {
+        Self {
+            l3_type: ft.l3_type,
+            source_addr: ft.source_addr,
+            dest_addr: ft.dest_addr,
+            l4_protocol: ft.l4_protocol,
+            source_port: ft.source_port,
+            dest_port: ft.dest_port,
+        }
+    }
 }
 
 impl VisaTable {
@@ -223,6 +271,8 @@ impl VisaTable {
         Self {
             table: HashMap::new(),
             bindings: HashMap::new(),
+            current: HashMap::new(),
+            successors: HashMap::new(),
             timeout_queue: BinaryHeap::new(),
             lookup_table: FiveTupleLookupTable::new(),
         }
@@ -316,13 +366,143 @@ impl VisaTable {
         };
         // Only a visa with a five-tuple goes in the lookup table: a
         // forward-only visa must never match a new flow.
-        if let Some(ftuple) = visa.ftuple {
-            self.lookup_table.insert_visa(visa_id, ftuple);
-        }
+        let ftuple = visa.ftuple;
         self.table.insert(visa_id, visa);
         self.timeout_queue.push(timeout);
+        if let Some(ftuple) = ftuple {
+            self.supersede_on_insert(visa_id, ftuple);
+        }
 
         Ok(visa_id)
+    }
+
+    /// J11 (zl-zipline#252): give the newly inserted visa `new`, whose
+    /// dock-PEP five-tuple is `ftuple`, its place in the lookup.
+    ///
+    /// - No held visa answers for that five-tuple: `new` does, at once.
+    /// - The visa `old` that answers has no live binding here: `new`
+    ///   supersedes it at once. `old` stays held, out of the lookup, until
+    ///   it expires or is revoked.
+    /// - `old` has a live binding: `new` becomes its waiting successor and
+    ///   the lookup keeps answering `old`, so packets never lose a binding.
+    ///   At this Zode's ingress the caller now rebinds each stream onto
+    ///   `new` ([VisaTable::supersedes] says which visa `new` replaces).
+    ///   Anywhere else `new` takes over when `old` goes. A successor that
+    ///   was still waiting is replaced by `new`, and is never used.
+    fn supersede_on_insert(&mut self, new: VisaId, ftuple: VsapiFiveTuple) {
+        let key = FlowKey::from(&ftuple);
+        match self.current.get(&key).copied() {
+            None => {
+                self.current.insert(key, new);
+                self.lookup_table.insert_visa(new, ftuple);
+            }
+            Some(old) if self.bindings(old).is_empty() => {
+                info!(target: VISA_MGMT, "visa {new} supersedes visa {old}, which has no live binding");
+                self.successors.remove(&old);
+                self.current.insert(key, new);
+                self.rebuild_lookup_table();
+            }
+            Some(old) => {
+                info!(target: VISA_MGMT, "visa {new} supersedes visa {old} once its live bindings move");
+                if let Some(earlier) = self.successors.insert(old, new) {
+                    info!(target: VISA_MGMT, "visa {earlier}, the earlier successor of visa {old}, will not be used");
+                }
+            }
+        }
+    }
+
+    /// J11: the newer visa waiting to take over the live bindings of the
+    /// visa `old`, if any.
+    pub fn successor_of(&self, old: VisaId) -> Option<VisaId> {
+        self.successors.get(&old).copied()
+    }
+
+    /// J11: the visa whose live bindings the visa `new` is waiting to take
+    /// over, if any. The inverse of [VisaTable::successor_of].
+    pub fn supersedes(&self, new: VisaId) -> Option<VisaId> {
+        self.successors
+            .iter()
+            .find(|(_, successor)| **successor == new)
+            .map(|(old, _)| *old)
+    }
+
+    /// J11: commit the rebind of one live stream from the visa `old` onto
+    /// its waiting successor `new`, once the next hop has granted the stream
+    /// `new_egress` for `new`. In one step under the visa-table lock:
+    ///
+    /// - the PFT entry of the stream at `ingress` forwards to `new_egress`
+    ///   under `new`, keeping its stream ID, so the requestor notices
+    ///   nothing and its next packet takes the new path;
+    /// - the binding moves from `old` to `new`, with its new egress;
+    /// - the five-tuple lookup answers `new`. `old` stays held, out of the
+    ///   lookup, until it expires or is revoked; with no binding left, its
+    ///   removal touches nothing live.
+    ///
+    /// Neither visa is edited. Refused, with nothing changed, unless `new`
+    /// is still `old`'s waiting successor and `old` still has a stream bound
+    /// from `ingress` with its PFT entry in place. The old binding then
+    /// stays until the old visa goes.
+    pub fn commit_supersede(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        old: VisaId,
+        new: VisaId,
+        ingress: ForwardingEntry,
+        new_egress: ForwardingEntry,
+    ) -> Result<(), VisaTableError> {
+        if self.successor_of(old) != Some(new) {
+            return Err(VisaTableError::NotSuccessor(old, new));
+        }
+        let Some(position) = self
+            .bindings(old)
+            .iter()
+            .position(|binding| binding.ingress == ingress)
+        else {
+            return Err(VisaTableError::NoSuchBinding(old, ingress.0, ingress.1));
+        };
+        let Some(ftuple) = self.table.get(&new).and_then(|visa| visa.ftuple) else {
+            // `successors` only names held visas with a five-tuple.
+            return Err(VisaTableError::NotFound(new));
+        };
+        // A binding is only ever created together with its PFT entry, so
+        // this is the last check; nothing has changed yet.
+        let Some(peer) = peer_table.get(ingress.0) else {
+            return Err(VisaTableError::NoSuchBinding(old, ingress.0, ingress.1));
+        };
+        let Some(pep) = peer.pft.get(ingress.1) else {
+            return Err(VisaTableError::NoSuchBinding(old, ingress.0, ingress.1));
+        };
+
+        // Swap the stream's target: from the next packet on, it takes the
+        // new path. Until this store it took the old one, so it never
+        // lacks a binding.
+        pep.rebind(new_egress.clone(), new);
+        drop(pep);
+        drop(peer);
+
+        // Move the binding.
+        let old_bindings = self
+            .bindings
+            .get_mut(&old)
+            .expect("the binding was found above");
+        old_bindings.remove(position);
+        if old_bindings.is_empty() {
+            self.bindings.remove(&old);
+            self.successors.remove(&old);
+        }
+        self.bindings.entry(new).or_default().push(StreamBinding {
+            ingress,
+            egress: new_egress,
+        });
+
+        // The first commit moves the lookup.
+        let key = FlowKey::from(&ftuple);
+        if self.current.get(&key) != Some(&new) {
+            self.current.insert(key, new);
+            self.rebuild_lookup_table();
+        }
+        info!(target: VISA_MGMT, "rebound a stream from visa {old} onto visa {new}");
+        Ok(())
     }
 
     /// The visa with ID `visa_id`, if this Zode holds it. Read-only: a
@@ -477,15 +657,21 @@ impl VisaTable {
         withdrawn
     }
 
-    /// Rebuild the five-tuple lookup table from the visas in the table.
+    /// Rebuild the five-tuple lookup table from the visas in `current`, the
+    /// one visa per five-tuple that is not superseded (J11).
     ///
-    /// Only visas with a five-tuple are added: a forward-only visa has none
-    /// and must never match a new flow (zl-zipline#219).
+    /// Only visas with a five-tuple are ever there: a forward-only visa has
+    /// none and must never match a new flow (zl-zipline#219).
     fn rebuild_lookup_table(&mut self) {
         let five_tuples: HashMap<VisaId, VsapiFiveTuple> = self
-            .table
-            .iter()
-            .filter_map(|(visa_id, visa)| visa.ftuple.map(|ftuple| (*visa_id, ftuple)))
+            .current
+            .values()
+            .filter_map(|visa_id| {
+                self.table
+                    .get(visa_id)
+                    .and_then(|visa| visa.ftuple)
+                    .map(|ftuple| (*visa_id, ftuple))
+            })
             .collect();
         self.lookup_table = FiveTupleLookupTable::new();
         self.lookup_table.add_hash_to_table(&five_tuples);
@@ -503,9 +689,10 @@ impl VisaTable {
         peer_table: &peer_table::PeerTable,
         visa_id: VisaId,
     ) -> Result<Vec<ForwardingEntry>, VisaTableError> {
-        if self.table.remove(&visa_id).is_none() {
+        let Some(visa) = self.table.remove(&visa_id) else {
             return Err(VisaTableError::NotFound(visa_id));
-        }
+        };
+        self.forget_supersede_state(visa_id, &visa);
         let withdrawn: Vec<ForwardingEntry> = self
             .bindings
             .remove(&visa_id)
@@ -518,6 +705,32 @@ impl VisaTable {
         }
         info!(target: VISA_MGMT, "Revoked visa {visa_id}");
         Ok(withdrawn)
+    }
+
+    /// J11: drop the supersede state of the visa `visa_id`, which is being
+    /// removed. If it answered the lookup, its waiting successor (if any)
+    /// takes over; otherwise its five-tuple has no visa in the lookup until
+    /// a new one arrives. If it was itself waiting to supersede a visa, it
+    /// stops waiting, so a rebind onto it in flight cannot commit. The
+    /// caller rebuilds the lookup table.
+    fn forget_supersede_state(&mut self, visa_id: VisaId, visa: &Visa) {
+        let successor = self.successors.remove(&visa_id);
+        self.successors.retain(|_, waiting| *waiting != visa_id);
+        let Some(ftuple) = visa.ftuple else {
+            return;
+        };
+        let key = FlowKey::from(&ftuple);
+        if self.current.get(&key) == Some(&visa_id) {
+            match successor {
+                Some(successor) => {
+                    info!(target: VISA_MGMT, "visa {successor} takes over from visa {visa_id}, which is gone");
+                    self.current.insert(key, successor);
+                }
+                None => {
+                    self.current.remove(&key);
+                }
+            }
+        }
     }
 
     /// Given a visa ID, look up the visa and return the next hop address.
@@ -749,10 +962,7 @@ pub mod tests {
                 .unwrap();
             let tether = peer_a
                 .pft
-                .insert(PftPep {
-                    next_hop: ForwardingEntry(link_a, 1),
-                    visa_id,
-                })
+                .insert(PftPep::new(ForwardingEntry(link_a, 1), visa_id))
                 .unwrap();
             visa_table
                 .bind(visa_id, binding_on(link_a, tether))
@@ -894,15 +1104,9 @@ pub mod tests {
         let one_second = std::time::Duration::from_secs(1);
         let visa1 = 12345;
         let visa2 = 986;
-        let pep1 = PftPep {
-            next_hop: ForwardingEntry(link_id, 1),
-            visa_id: visa1,
-        };
+        let pep1 = PftPep::new(ForwardingEntry(link_id, 1), visa1);
 
-        let pep2 = PftPep {
-            next_hop: ForwardingEntry(link_id, 2),
-            visa_id: visa2,
-        };
+        let pep2 = PftPep::new(ForwardingEntry(link_id, 2), visa2);
 
         let peer_state = asm
             .peer_table
@@ -962,10 +1166,7 @@ pub mod tests {
         let _ = visa_table.insert_visa(v);
 
         let peer_state = asm.peer_table.get(link_a).unwrap();
-        let pep = PftPep {
-            next_hop: ForwardingEntry(link_a, 1),
-            visa_id,
-        };
+        let pep = PftPep::new(ForwardingEntry(link_a, 1), visa_id);
         let tether_id = peer_state.pft.insert(pep).unwrap();
         visa_table
             .bind(visa_id, binding_on(link_a, tether_id))
@@ -1011,10 +1212,7 @@ pub mod tests {
         let _ = visa_table.insert_visa(v);
 
         let peer_b = asm.peer_table.get(link_b).unwrap();
-        let pep = PftPep {
-            next_hop: ForwardingEntry(link_b, 1),
-            visa_id,
-        };
+        let pep = PftPep::new(ForwardingEntry(link_b, 1), visa_id);
         let tether_id = peer_b.pft.insert(pep).unwrap();
         visa_table
             .bind(visa_id, binding_on(link_b, tether_id))
@@ -1060,20 +1258,14 @@ pub mod tests {
         let _ = visa_table.insert_visa(v);
 
         let peer_a = asm.peer_table.get(link_a).unwrap();
-        let pep_a = PftPep {
-            next_hop: ForwardingEntry(link_a, 1),
-            visa_id,
-        };
+        let pep_a = PftPep::new(ForwardingEntry(link_a, 1), visa_id);
         let tether_a = peer_a.pft.insert(pep_a).unwrap();
         visa_table
             .bind(visa_id, binding_on(link_a, tether_a))
             .unwrap();
 
         let peer_b = asm.peer_table.get(link_b).unwrap();
-        let pep_b = PftPep {
-            next_hop: ForwardingEntry(link_b, 1),
-            visa_id,
-        };
+        let pep_b = PftPep::new(ForwardingEntry(link_b, 1), visa_id);
         let tether_b = peer_b.pft.insert(pep_b).unwrap();
         visa_table
             .bind(visa_id, binding_on(link_b, tether_b))
@@ -1123,20 +1315,14 @@ pub mod tests {
         let _ = visa_table.insert_visa(v);
 
         let peer_a = asm.peer_table.get(link_a).unwrap();
-        let pep_a = PftPep {
-            next_hop: ForwardingEntry(link_a, 1),
-            visa_id,
-        };
+        let pep_a = PftPep::new(ForwardingEntry(link_a, 1), visa_id);
         let tether_a = peer_a.pft.insert(pep_a).unwrap();
         visa_table
             .bind(visa_id, binding_on(link_a, tether_a))
             .unwrap();
 
         let peer_b = asm.peer_table.get(link_b).unwrap();
-        let pep_b = PftPep {
-            next_hop: ForwardingEntry(link_b, 1),
-            visa_id,
-        };
+        let pep_b = PftPep::new(ForwardingEntry(link_b, 1), visa_id);
         let tether_b = peer_b.pft.insert(pep_b).unwrap();
         visa_table
             .bind(visa_id, binding_on(link_b, tether_b))
@@ -1196,20 +1382,14 @@ pub mod tests {
         let visa2_id = visa_table.insert_visa(visa2_raw).unwrap();
 
         let peer_a = asm.peer_table.get(link_a).unwrap();
-        let pep_a = PftPep {
-            next_hop: ForwardingEntry(link_a, 1),
-            visa_id: visa1_id,
-        };
+        let pep_a = PftPep::new(ForwardingEntry(link_a, 1), visa1_id);
         let tether_a = peer_a.pft.insert(pep_a).unwrap();
         visa_table
             .bind(visa1_id, binding_on(link_a, tether_a))
             .unwrap();
 
         let peer_b = asm.peer_table.get(link_b).unwrap();
-        let pep_b = PftPep {
-            next_hop: ForwardingEntry(link_b, 1),
-            visa_id: visa2_id,
-        };
+        let pep_b = PftPep::new(ForwardingEntry(link_b, 1), visa2_id);
         let tether_b = peer_b.pft.insert(pep_b).unwrap();
         visa_table
             .bind(visa2_id, binding_on(link_b, tether_b))
@@ -1330,10 +1510,7 @@ pub mod tests {
         let peer_a = asm.peer_table.get(link_a).unwrap();
         let tether = peer_a
             .pft
-            .insert(PftPep {
-                next_hop: ForwardingEntry(link_b, 42),
-                visa_id: 5300,
-            })
+            .insert(PftPep::new(ForwardingEntry(link_b, 42), 5300))
             .unwrap();
         visa_table
             .bind(
@@ -1371,10 +1548,7 @@ pub mod tests {
                 .get(link)
                 .unwrap()
                 .pft
-                .insert(PftPep {
-                    next_hop: ForwardingEntry(link, 1),
-                    visa_id,
-                })
+                .insert(PftPep::new(ForwardingEntry(link, 1), visa_id))
                 .unwrap();
             visa_table.bind(visa_id, binding_on(link, tether)).unwrap();
         }
@@ -1389,6 +1563,286 @@ pub mod tests {
                 .unwrap();
             assert!(visa_table.bindings(visa_id).is_empty());
         }
+    }
+
+    // ---- J11: a newer same-five-tuple visa supersedes (zl-zipline#252) ----
+
+    const CLIENT: &str = "fd5a:5052:8::1";
+    const SERVICE: &str = "fd5a:5052:8::10";
+
+    /// A full TCP visa `src:src_port -> dst:dst_port` (port 0 is any port)
+    /// that expires in an hour.
+    fn tcp_visa(
+        visa_id: VisaId,
+        src: &str,
+        src_port: u16,
+        dst: &str,
+        dst_port: u16,
+    ) -> vsapi_types::Visa {
+        let expires_ms = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+            + Duration::from_secs(3600))
+        .as_millis() as i64;
+        make_tcp_visa(
+            visa_id,
+            &src.parse().unwrap(),
+            src_port,
+            &dst.parse().unwrap(),
+            dst_port,
+            100,
+            expires_ms,
+        )
+    }
+
+    /// The flow CLIENT:20345 -> SERVICE:80 over TCP.
+    fn client_to_service() -> FiveTuple {
+        tcp_tuple(CLIENT, SERVICE, 80)
+    }
+
+    /// A visa table with the visa `old` (CLIENT:any -> SERVICE:80) bound at
+    /// this Zode's ingress: its stream arrives on link A and leaves on link
+    /// B as stream 42, with a PFT entry on A. Returns the assembly, links A
+    /// and B, and A's stream.
+    fn bound_old_visa(old: VisaId) -> (Arc<Assembly>, LinkId, LinkId, StreamId) {
+        let mut builder = TestAssemblyBuilder::new();
+        builder.visa_table = Some(VisaTable::new());
+        let asm = Arc::new(create_assembly(builder));
+        let link_a = add_dummy_peer(&asm, 1);
+        let link_b = add_dummy_peer(&asm, 2);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        visa_table
+            .insert_visa(tcp_visa(old, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        let tether = asm
+            .peer_table
+            .get(link_a)
+            .unwrap()
+            .pft
+            .insert(PftPep::new(ForwardingEntry(link_b, 42), old))
+            .unwrap();
+        visa_table
+            .bind(
+                old,
+                StreamBinding {
+                    ingress: ForwardingEntry(link_a, tether),
+                    egress: ForwardingEntry(link_b, 42),
+                },
+            )
+            .unwrap();
+        drop(visa_table);
+        (asm, link_a, link_b, tether)
+    }
+
+    /// Where the PFT entry for `stream` on `link` forwards, and under which
+    /// visa.
+    fn pft_entry(
+        asm: &Assembly,
+        link: LinkId,
+        stream: StreamId,
+    ) -> Option<(ForwardingEntry, VisaId)> {
+        asm.peer_table
+            .get(link)
+            .unwrap()
+            .pft
+            .inspect(stream, |pep| (pep.next_hop(), pep.visa_id()))
+    }
+
+    /// J11: a visa supersedes a held one only if its dock-PEP five-tuple is
+    /// identical: the same addresses, the same ports (a wildcard matches
+    /// only a wildcard), the same protocol, and so the same direction.
+    #[test]
+    fn test_supersede_needs_an_identical_five_tuple() {
+        let mut visa_table = VisaTable::new();
+        visa_table
+            .insert_visa(tcp_visa(7000, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        visa_table.bind(7000, binding_on(1, 10)).unwrap();
+
+        let mut udp = tcp_visa(7004, CLIENT, 0, SERVICE, 80);
+        if let Some(dock_pep) = udp.dock_pep.as_mut() {
+            dock_pep.pep = vsapi_types::DockPepType::UDP(vsapi_types::TcpUdpPep {
+                source_port: 0,
+                dest_port: 80,
+                endpoint: vsapi_types::EndpointT::Any,
+            });
+        }
+        let not_identical = [
+            tcp_visa(7001, CLIENT, 0, SERVICE, 81),     // other port
+            tcp_visa(7002, CLIENT, 20345, SERVICE, 80), // a port where the old has a wildcard
+            tcp_visa(7003, SERVICE, 80, CLIENT, 0),     // the reverse direction
+            udp,                                        // other protocol
+        ];
+        for visa in not_identical {
+            let visa_id = visa_table.insert_visa(visa).unwrap();
+            assert_eq!(visa_table.supersedes(visa_id), None, "visa {visa_id}");
+        }
+        assert_eq!(visa_table.successor_of(7000), None);
+
+        // Identical, wildcard source port and all.
+        visa_table
+            .insert_visa(tcp_visa(7005, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        assert_eq!(visa_table.supersedes(7005), Some(7000));
+        assert_eq!(visa_table.successor_of(7000), Some(7005));
+    }
+
+    /// J11: while the old visa has a live binding, the lookup keeps
+    /// answering it. `commit_supersede` moves the binding and the lookup in
+    /// one step, swapping the ingress PFT entry onto the new visa's next-hop
+    /// stream under the same stream ID. The old visa stays held until it
+    /// expires; removing it then leaves the moved binding alone. Neither
+    /// visa's stored fields ever change (tenet).
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_lookup_moves_to_the_successor_only_on_commit() {
+        let (asm, link_a, link_b, tether) = bound_old_visa(7100);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        let granted_old = visa_table.get(7100).unwrap().visa().clone();
+        let new_visa = tcp_visa(7101, CLIENT, 0, SERVICE, 80);
+        visa_table.insert_visa(new_visa.clone()).unwrap();
+
+        // Before the commit: everything still on the old visa.
+        assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7100));
+        assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 42), 7100)));
+
+        visa_table
+            .commit_supersede(
+                &asm.peer_table,
+                7100,
+                7101,
+                ForwardingEntry(link_a, tether),
+                ForwardingEntry(link_b, 43),
+            )
+            .unwrap();
+
+        let moved = StreamBinding {
+            ingress: ForwardingEntry(link_a, tether),
+            egress: ForwardingEntry(link_b, 43),
+        };
+        assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7101));
+        assert!(visa_table.bindings(7100).is_empty());
+        assert_eq!(visa_table.bindings(7101), &[moved.clone()]);
+        assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 43), 7101)));
+        assert_eq!(asm.peer_table.get(link_a).unwrap().pft.len(), 1);
+        assert!(
+            visa_table.contains(7100),
+            "the old visa is kept until it expires"
+        );
+        assert_eq!(visa_table.successor_of(7100), None);
+        // Tenet: both visas exactly as granted.
+        assert_eq!(visa_table.get(7100).unwrap().visa(), &granted_old);
+        assert_eq!(visa_table.get(7101).unwrap().visa(), &new_visa);
+
+        // The old visa going away touches nothing that moved.
+        let withdrawn = visa_table.revoke(&asm.peer_table, 7100).unwrap();
+        assert!(withdrawn.is_empty());
+        assert_eq!(visa_table.bindings(7101), &[moved]);
+        assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 43), 7101)));
+        assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7101));
+        assert_eq!(visa_table.get(7101).unwrap().visa(), &new_visa);
+    }
+
+    /// J11: the successor of a visa with no live binding takes over the
+    /// lookup at once; there is nothing to rebind. The old visa is kept.
+    #[test]
+    fn test_successor_of_an_unbound_visa_takes_over_at_once() {
+        let mut visa_table = VisaTable::new();
+        visa_table
+            .insert_visa(tcp_visa(7200, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        let granted_old = visa_table.get(7200).unwrap().visa().clone();
+        visa_table
+            .insert_visa(tcp_visa(7201, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+
+        assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7201));
+        assert_eq!(visa_table.supersedes(7201), None, "nothing waits to commit");
+        assert!(visa_table.contains(7200));
+        assert_eq!(visa_table.get(7200).unwrap().visa(), &granted_old);
+
+        // The superseded visa never comes back into the lookup, even when
+        // its successor goes first.
+        visa_table.revoke(&asm_less_peer_table(), 7201).unwrap();
+        assert_eq!(visa_table.match_traffic(&client_to_service()), None);
+    }
+
+    /// An empty peer table, for removals that touch no PFT entry.
+    fn asm_less_peer_table() -> peer_table::PeerTable {
+        peer_table::PeerTable::new()
+    }
+
+    /// J11: a commit that does not match the waiting successor and a live
+    /// binding of the old visa is refused, and changes nothing: the old
+    /// binding, its PFT entry and the lookup stay on the old visa. That
+    /// includes a successor revoked while its rebind was in flight.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_a_refused_commit_leaves_the_old_binding() {
+        let (asm, link_a, link_b, tether) = bound_old_visa(7300);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        visa_table
+            .insert_visa(tcp_visa(7301, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        let old_binding = visa_table.bindings(7300).to_vec();
+        let unchanged = |visa_table: &VisaTable| {
+            assert_eq!(visa_table.bindings(7300), old_binding.as_slice());
+            assert!(visa_table.bindings(7301).is_empty());
+            assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 42), 7300)));
+            assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7300));
+        };
+
+        let new_egress = ForwardingEntry(link_b, 43);
+        let ingress = ForwardingEntry(link_a, tether);
+        // Not the successor.
+        assert!(
+            visa_table
+                .commit_supersede(
+                    &asm.peer_table,
+                    7300,
+                    7399,
+                    ingress.clone(),
+                    new_egress.clone()
+                )
+                .is_err()
+        );
+        unchanged(&visa_table);
+        // No such binding of the old visa.
+        assert!(
+            visa_table
+                .commit_supersede(
+                    &asm.peer_table,
+                    7300,
+                    7301,
+                    ForwardingEntry(link_a, tether + 1),
+                    new_egress.clone()
+                )
+                .is_err()
+        );
+        unchanged(&visa_table);
+        // The successor was revoked meanwhile.
+        visa_table.revoke(&asm.peer_table, 7301).unwrap();
+        assert_eq!(visa_table.successor_of(7300), None);
+        assert!(
+            visa_table
+                .commit_supersede(&asm.peer_table, 7300, 7301, ingress, new_egress)
+                .is_err()
+        );
+        unchanged(&visa_table);
+    }
+
+    /// J11: when the old visa goes (expiry or revocation) while its
+    /// successor still waits, the successor takes over the lookup.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_removing_the_old_visa_hands_the_lookup_to_its_successor() {
+        let (asm, link_a, _link_b, _tether) = bound_old_visa(7400);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        visa_table
+            .insert_visa(tcp_visa(7401, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+
+        visa_table.revoke(&asm.peer_table, 7400).unwrap();
+
+        assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7401));
+        assert_eq!(visa_table.successor_of(7400), None);
+        assert_eq!(visa_table.supersedes(7401), None);
+        assert_eq!(asm.peer_table.get(link_a).unwrap().pft.len(), 0);
     }
 
     #[test]

@@ -271,17 +271,17 @@ pub fn insert_visa(
         ));
     }
 
-    // J11 (zl-zipline#252): a new visa with the same five-tuple as one
-    // held may supersede it. Only a fresh insert can: installing an ID
+    // J11 (zl-zipline#252): a new visa with the same five-tuple as visas
+    // held supersedes them. Only a fresh insert can: installing an ID
     // already held is a no-op, and must not start a second rebind.
     let (visa_id, superseded) = {
         let mut visa_table = asm.visa_table.write().unwrap();
         let fresh = !visa_table.contains(visa.issuer_id);
         let visa_id = visa_table.insert_visa(visa)?;
         let superseded = if fresh {
-            visa_table.supersedes(visa_id)
+            visa_table.superseded_bindings(visa_id)
         } else {
-            None
+            Vec::new()
         };
         (visa_id, superseded)
     };
@@ -293,11 +293,11 @@ pub fn insert_visa(
             "visa {visa_id}: no egress link to next hop {next_hop} yet; storing it anyway");
     }
 
-    // The superseded visa still has live streams: move the ones this Zode
-    // is the ingress of. That sends, so only now that the lock is released
-    // (zipline#9).
-    if let Some(old) = superseded {
-        crate::mgmt::node::rebind_ingress_streams(asm, old, visa_id);
+    // The superseded visas' live streams move onto the new one, at the
+    // Zode that is their ingress. That sends, so only now that the lock is
+    // released (zipline#9).
+    for (old, ingress) in superseded {
+        crate::mgmt::node::rebind_stream(asm, old, visa_id, ingress);
     }
     Ok(visa_id)
 }

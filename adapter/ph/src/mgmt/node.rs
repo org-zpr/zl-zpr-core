@@ -671,45 +671,25 @@ fn send_next_hop_bind(
     }
 }
 
-/// J11 (zl-zipline#252): the visa `new` supersedes the visa `old`, which
-/// still has live streams here. Rebind each stream this Zode is the
-/// ingress of, that is each one that arrives from an adapter (the local
-/// actor included), onto `new`.
+/// J11 (zl-zipline#252): the visa `new`, the newest for its five-tuple,
+/// supersedes the visa `old`, which has the live stream `ingress` here.
+/// Rebind it onto `new` if this Zode is its ingress (the stream arrives
+/// from an adapter or the local actor). Otherwise do nothing: the stream's
+/// own ingress rebinds it, and this Zode binds `new` when asked (gate
+/// question 10).
 ///
-/// Each rebind asks the next hop for a stream for `new`, exactly as a bind
+/// The rebind asks the next hop for a stream for `new`, exactly as a bind
 /// does (F2, guards included); every hop down the path binds `new` the same
 /// way. The stream keeps its old binding until the answer comes back, and
-/// [rebind_granted] then moves it in one step. A stream that arrives from
-/// another Zode is not rebound here: its own ingress rebinds it, and this
-/// Zode binds `new` when asked (gate question 10).
+/// [rebind_granted] then moves it in one step. A successor with other A2A
+/// session keys is refused: the requestor would not know them.
 ///
-/// A stream bound under `old` after this call (its bind was on its way)
-/// is rebound when its binding is recorded: [VisaTable::bind] names the
-/// successor.
-///
-/// Sends, so never call it under the visa-table lock (zipline#9).
-pub fn rebind_ingress_streams(asm: &Assembly, old: VisaId, new: VisaId) {
-    let ingresses: Vec<ForwardingEntry> = asm
-        .visa_table
-        .read()
-        .unwrap()
-        .bindings(old)
-        .iter()
-        .map(|binding| binding.ingress.clone())
-        .collect();
-    for ingress in ingresses {
-        rebind_stream(asm, old, new, ingress);
-    }
-}
-
-/// J11: rebind the stream `ingress` from visa `old` onto visa `new`, if
-/// this Zode is its ingress (the stream arrives from an adapter or the
-/// local actor). Otherwise do nothing: the stream's own ingress rebinds it.
-/// A successor with other A2A session keys is refused: the requestor would
-/// not know them.
+/// Called for every stream of the superseded visas when `new` is installed,
+/// and for a stream bound under a superseded visa after that (its bind was
+/// on its way): [VisaTable::bind] names its successor.
 ///
 /// Sends, so never call it under the visa-table lock (zipline#9).
-fn rebind_stream(asm: &Assembly, old: VisaId, new: VisaId, ingress: ForwardingEntry) {
+pub fn rebind_stream(asm: &Assembly, old: VisaId, new: VisaId, ingress: ForwardingEntry) {
     let Some(ingress_link_id) = NonZero::new(ingress.0) else {
         return;
     };
@@ -2371,7 +2351,11 @@ mod tests {
         let visa_table = asm.visa_table.read().unwrap();
         assert!(visa_table.bindings(OLD_VISA).is_empty());
         assert_eq!(visa_table.bindings(NEW_VISA).len(), 2);
-        assert_eq!(visa_table.successor_of(OLD_VISA), None);
+        assert_eq!(
+            visa_table.successor_of(OLD_VISA),
+            Some(NEW_VISA),
+            "still superseded"
+        );
     }
 
     /// J11: a denied rebind keeps the old binding, logs and counts the
@@ -2559,5 +2543,73 @@ mod tests {
             asm.counters.management[ManagementCounterType::RebindFailed].get_count(),
             1
         );
+    }
+
+    /// A third visa with the same five-tuple, newer than [NEW_VISA].
+    const NEWEST_VISA: VisaId = VISA_ID + 102;
+
+    /// The outstanding rebind of the local actor's `stream` onto `new`, if
+    /// any.
+    fn outstanding_rebind(
+        asm: &Assembly,
+        zode_link: LinkId,
+        stream: StreamId,
+        new: VisaId,
+    ) -> Option<TxnHandle> {
+        asm.peer_table
+            .get(zode_link)
+            .unwrap()
+            .node_state
+            .awaiting_next_hop_bind_table
+            .iter()
+            .find(|entry| {
+                matches!(*entry.value(), NextHopBindOriginator::Rebind { new: target, ingress_stream_id, .. }
+                    if ingress_stream_id == stream && target == new)
+            })
+            .map(|entry| entry.key().clone())
+    }
+
+    /// J11 with overlapping successors (core#112 review): streams 1 and 2
+    /// run under A, B arrives, and stream 1 moves onto B. C then arrives
+    /// before stream 2's A -> B grant: every stream not yet on C, stream 2
+    /// included, is rebound onto C, and stream 2's late A -> B grant is
+    /// refused, so no stream is left on a superseded visa.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_newer_successor_takes_over_every_stream_still_moving() {
+        let (asm, mut egress_rx, _hairpin_rx, zode_link, streams) = ingress_with_live_streams(2);
+        let (stream_1, stream_2) = (streams[0], streams[1]);
+        let zode = NonZero::new(zode_link).unwrap();
+
+        visa_mgmt::insert_visa(&asm, own_visa(NEW_VISA)).unwrap();
+        let to_b_1 = outstanding_rebind(&asm, zode_link, stream_1, NEW_VISA).unwrap();
+        let to_b_2 = outstanding_rebind(&asm, zode_link, stream_2, NEW_VISA).unwrap();
+        install_tether(&asm, zode, &to_b_1, 43).unwrap();
+
+        visa_mgmt::insert_visa(&asm, own_visa(NEWEST_VISA)).unwrap();
+        let to_c_1 = outstanding_rebind(&asm, zode_link, stream_1, NEWEST_VISA)
+            .expect("stream 1 is rebound from B onto C");
+        let to_c_2 = outstanding_rebind(&asm, zode_link, stream_2, NEWEST_VISA)
+            .expect("stream 2 is rebound from A onto C");
+
+        install_tether(&asm, zode, &to_b_2, 44).unwrap();
+        assert!(
+            local_actor_entry(&asm, stream_2) == Some((ForwardingEntry(zode_link, 42), OLD_VISA))
+        );
+        assert_eq!(
+            asm.counters.management[ManagementCounterType::RebindFailed].get_count(),
+            1
+        );
+
+        install_tether(&asm, zode, &to_c_1, 45).unwrap();
+        install_tether(&asm, zode, &to_c_2, 46).unwrap();
+        assert!(
+            local_actor_entry(&asm, stream_1)
+                == Some((ForwardingEntry(zode_link, 45), NEWEST_VISA))
+        );
+        assert!(
+            local_actor_entry(&asm, stream_2)
+                == Some((ForwardingEntry(zode_link, 46), NEWEST_VISA))
+        );
+        while try_recv_packet(&mut egress_rx).is_some() {}
     }
 }

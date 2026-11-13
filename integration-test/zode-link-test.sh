@@ -34,6 +34,16 @@
 #      visas, so it closes zb's link instead of handing off (J7).
 #   7. The relay never dials (rule 4).
 #
+# Every Stream ID Request in the run crosses the relay-zb Zode link, in both
+# directions: the join, the J11 rebinds, the VSS flow, the restart and the
+# rejoin. Each is bound only if it comes from the visa's previous hop (gap
+# 7, zl-zipline#253), so the run also shows that the check refuses none of
+# them: no previous-hop refusal is logged on either Zode, and no Stream ID
+# Request is refused at all until scenario 2 starts breaking links. After
+# that some refusals are by design: a request pending over a lost link
+# (rule 9), or the relay asking the restarted zb for a stream for a visa
+# of the zb that crashed, which the visa service no longer has.
+#
 # Joins wait 20-30 s: the joiner's TCP dial to the visa service starts
 # before the hand-off and relies on SYN retransmits, so it connects a few
 # seconds after the bootstrap visas are installed.
@@ -77,6 +87,10 @@ REPORT_RELAY_UP='reported Zode link states to the visa service: \[.*relay=Up'
 REJOIN='rejoining \(J10\)'
 # J11: a failed rebind (mgmt/node.rs rebind_failed).
 REBIND_FAILED='its rebind onto visa [0-9]+ failed'
+# Gap 7: a Stream ID Request refused as not from the visa's previous hop
+# (mgmt/node.rs prepare_next_hop_bind), and the counter of every refusal.
+PREV_HOP_REFUSED="refusing Stream ID Request from .*: not the visa's previous hop"
+REJECTED='Stream ID Request Rejected'
 
 if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
@@ -99,6 +113,10 @@ if [[ "$PASS" == 0 ]]; then
   wait_log_after 20 zb.log "$TOPOLOGY" 0 "zb receives its topology" || PASS=1
   assert_superseded 20 zb "$HANDOFF" || PASS=1
   assert_no_log zb.log "$REJOIN" "zb has not rejoined" || PASS=1
+  # Gap 7: the join, both directions and J11 ran under the previous-hop
+  # check, and no Stream ID Request was refused on either Zode.
+  assert_counter_zero relay "$REJECTED" || PASS=1
+  assert_counter_zero zb "$REJECTED" || PASS=1
 
   echo "== 2. zb restarts on the same address"
   UP_REPORTS=$(log_count relay.log "$REPORT_ZB_UP")
@@ -183,6 +201,9 @@ if [[ "$PASS" == 0 ]]; then
   assert_no_log relay.log "$DIAL" "the relay started no link as the dialer" || PASS=1
   assert_no_log relay.log "$REBIND_FAILED" "no rebind failed at the relay (J11)" || PASS=1
   assert_counter_zero relay "Rebind Failed" || PASS=1
+  # Gap 7, over the whole run (zb.log spans every zb process).
+  assert_no_log relay.log "$PREV_HOP_REFUSED" "the relay refused no request from a previous hop" || PASS=1
+  assert_no_log zb.log "$PREV_HOP_REFUSED" "zb refused no request from a previous hop" || PASS=1
 fi
 
 zode_report "$PASS"

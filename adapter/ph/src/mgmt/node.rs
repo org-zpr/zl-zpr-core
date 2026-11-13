@@ -683,6 +683,10 @@ fn send_next_hop_bind(
 /// another Zode is not rebound here: its own ingress rebinds it, and this
 /// Zode binds `new` when asked (gate question 10).
 ///
+/// A stream bound under `old` after this call (its bind was on its way)
+/// is rebound when its binding is recorded: [VisaTable::bind] names the
+/// successor.
+///
 /// Sends, so never call it under the visa-table lock (zipline#9).
 pub fn rebind_ingress_streams(asm: &Assembly, old: VisaId, new: VisaId) {
     let ingresses: Vec<ForwardingEntry> = asm
@@ -694,32 +698,41 @@ pub fn rebind_ingress_streams(asm: &Assembly, old: VisaId, new: VisaId) {
         .map(|binding| binding.ingress.clone())
         .collect();
     for ingress in ingresses {
-        let Some(ingress_link_id) = NonZero::new(ingress.0) else {
-            continue;
-        };
-        let from_adapter = asm
-            .peer_table
-            .get(ingress.0)
-            .is_some_and(|peer| matches!(peer.peer_type(), PeerType::Adapter));
-        if !from_adapter {
-            continue;
-        }
-        info!(target: FLOW_MGMT, "rebinding stream {} on {} from visa {old} onto visa {new}",
-            ingress.1, asm.formatted_link_id(ingress.0));
-        match prepare_next_hop_bind(asm, ingress_link_id, new) {
-            Ok(next_hop_bind) => send_next_hop_bind(
-                asm,
+        rebind_stream(asm, old, new, ingress);
+    }
+}
+
+/// J11: rebind the stream `ingress` from visa `old` onto visa `new`, if
+/// this Zode is its ingress (the stream arrives from an adapter or the
+/// local actor). Otherwise do nothing: the stream's own ingress rebinds it.
+///
+/// Sends, so never call it under the visa-table lock (zipline#9).
+fn rebind_stream(asm: &Assembly, old: VisaId, new: VisaId, ingress: ForwardingEntry) {
+    let Some(ingress_link_id) = NonZero::new(ingress.0) else {
+        return;
+    };
+    let from_adapter = asm
+        .peer_table
+        .get(ingress.0)
+        .is_some_and(|peer| matches!(peer.peer_type(), PeerType::Adapter));
+    if !from_adapter {
+        return;
+    }
+    info!(target: FLOW_MGMT, "rebinding stream {} on {} from visa {old} onto visa {new}",
+        ingress.1, asm.formatted_link_id(ingress.0));
+    match prepare_next_hop_bind(asm, ingress_link_id, new) {
+        Ok(next_hop_bind) => send_next_hop_bind(
+            asm,
+            new,
+            next_hop_bind,
+            NextHopBindOriginator::Rebind {
+                old,
                 new,
-                next_hop_bind,
-                NextHopBindOriginator::Rebind {
-                    old,
-                    new,
-                    ingress_link_id,
-                    ingress_stream_id: ingress.1,
-                },
-            ),
-            Err(()) => rebind_failed(asm, old, new, &ingress, "no next-hop bind"),
-        }
+                ingress_link_id,
+                ingress_stream_id: ingress.1,
+            },
+        ),
+        Err(()) => rebind_failed(asm, old, new, &ingress, "no next-hop bind"),
     }
 }
 
@@ -849,17 +862,17 @@ fn requested_tether_granted(
                 };
                 match visa_table.bind(visa_id, binding.clone()) {
                     Err(_) => Err("policy error"),
-                    Ok(()) => {
+                    Ok(successor) => {
                         let ingress_tether_id = ingress_tether_entry
                             .insert(forwarding_tables::PftPep::new(binding.egress, visa_id));
-                        Ok((ingress_tether_id, tc, peer_a2a_dh_pubkey))
+                        Ok((ingress_tether_id, tc, peer_a2a_dh_pubkey, successor))
                     }
                 }
             }
         }
     };
 
-    let (ingress_tether_id, tc, peer_a2a_dh_pubkey) = match granted {
+    let (ingress_tether_id, tc, peer_a2a_dh_pubkey, successor) = match granted {
         Ok(granted) => granted,
         Err(reason) => return bind_reject(asm, ingress_link_id, txn_id, reason),
     };
@@ -883,6 +896,17 @@ fn requested_tether_granted(
             peer_a2a_dh_pubkey.as_ref(), // peer key passes through success response
         )
         .enqueue(),
+    }
+
+    // J11: the visa was superseded while this bind was on its way, so the
+    // new stream moves onto the successor like every other live stream.
+    if let Some(new) = successor {
+        rebind_stream(
+            asm,
+            visa_id,
+            new,
+            ForwardingEntry(ingress_link_id.get(), ingress_tether_id),
+        );
     }
 }
 
@@ -2423,5 +2447,59 @@ mod tests {
             asm.visa_table.read().unwrap().successor_of(OLD_VISA),
             Some(NEW_VISA)
         );
+    }
+
+    /// J11 (local Codex review): a bind of the old visa that completes
+    /// after its successor arrived is rebound too, whether the successor
+    /// was waiting on other live streams or took over at once.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_bind_completing_after_the_successor_is_rebound() {
+        use zpr::packet_info::LOCAL_ACTOR_LINK_ID;
+        let local_actor = NonZero::new(LOCAL_ACTOR_LINK_ID).unwrap();
+
+        for live_streams in [0, 1] {
+            let (asm, mut egress_rx, mut hairpin_rx, zode_link, _streams) =
+                ingress_with_live_streams(live_streams);
+            requested_visa_granted(&asm, local_actor, 20, OLD_VISA);
+            assert!(
+                try_recv_packet(&mut egress_rx).is_some(),
+                "the bind's StreamIdRequest"
+            );
+            let bind_txn = outstanding_next_hop_txn(&asm, zode_link);
+
+            visa_mgmt::insert_visa(&asm, own_visa(NEW_VISA)).unwrap();
+            for _ in 0..live_streams {
+                expect_rebind_request(&asm, &mut egress_rx, zode_link);
+            }
+
+            install_tether(&asm, NonZero::new(zode_link).unwrap(), &bind_txn, 60).unwrap();
+            let stream =
+                decode_per_flow_txn(&hairpin_rx.try_recv().expect("the bind response")).stream_id;
+            let pkt = try_recv_packet(&mut egress_rx)
+                .unwrap_or_else(|| panic!("a rebind of the late stream ({live_streams} live)"));
+            let req = decode_per_flow_txn(&pkt);
+            let (body, _) = zdp::ZdpStreamIdRequest::ref_from_prefix(&req.payload).unwrap();
+            assert_eq!(VisaId::from(body.visa_id), NEW_VISA);
+
+            // Grant it: the late stream moves onto the new visa.
+            let rebind_txn = asm
+                .peer_table
+                .get(zode_link)
+                .unwrap()
+                .node_state
+                .awaiting_next_hop_bind_table
+                .iter()
+                .find(|entry| {
+                    matches!(*entry.value(), NextHopBindOriginator::Rebind { ingress_stream_id, .. }
+                        if ingress_stream_id == stream)
+                })
+                .expect("the late stream's rebind is outstanding")
+                .key()
+                .clone();
+            install_tether(&asm, NonZero::new(zode_link).unwrap(), &rebind_txn, 61).unwrap();
+            assert!(
+                local_actor_entry(&asm, stream) == Some((ForwardingEntry(zode_link, 61), NEW_VISA))
+            );
+        }
     }
 }

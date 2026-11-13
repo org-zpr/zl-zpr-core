@@ -439,9 +439,11 @@ impl VisaTable {
     ///   removal touches nothing live.
     ///
     /// Neither visa is edited. Refused, with nothing changed, unless `new`
-    /// is still `old`'s waiting successor and `old` still has a stream bound
-    /// from `ingress` with its PFT entry in place. The old binding then
-    /// stays until the old visa goes.
+    /// is still `old`'s waiting successor, the lookup still answers `old` or
+    /// `new` (a late commit must never move it back from a newer visa that
+    /// superseded `new` meanwhile), and `old` still has a stream bound from
+    /// `ingress` with its PFT entry in place. The old binding then stays
+    /// until the old visa goes.
     pub fn commit_supersede(
         &mut self,
         peer_table: &peer_table::PeerTable,
@@ -464,6 +466,14 @@ impl VisaTable {
             // `successors` only names held visas with a five-tuple.
             return Err(VisaTableError::NotFound(new));
         };
+        let key = FlowKey::from(&ftuple);
+        if self
+            .current
+            .get(&key)
+            .is_some_and(|current| *current != old && *current != new)
+        {
+            return Err(VisaTableError::NotSuccessor(old, new));
+        }
         // A binding is only ever created together with its PFT entry, so
         // this is the last check; nothing has changed yet.
         let Some(peer) = peer_table.get(ingress.0) else {
@@ -496,7 +506,6 @@ impl VisaTable {
         });
 
         // The first commit moves the lookup.
-        let key = FlowKey::from(&ftuple);
         if self.current.get(&key) != Some(&new) {
             self.current.insert(key, new);
             self.rebuild_lookup_table();
@@ -529,13 +538,39 @@ impl VisaTable {
     /// Record a stream bound under the visa `visa_id` (F3, zl-zipline#251).
     /// The only writer that adds a binding; the visa itself is untouched.
     /// Fails with [VisaTableError::NotFound] if the visa is not held.
-    pub fn bind(&mut self, visa_id: VisaId, binding: StreamBinding) -> Result<(), VisaTableError> {
+    ///
+    /// Returns the visa that supersedes `visa_id`, if one already does
+    /// (J11): the stream must be rebound onto it, at its ingress.
+    pub fn bind(
+        &mut self,
+        visa_id: VisaId,
+        binding: StreamBinding,
+    ) -> Result<Option<VisaId>, VisaTableError> {
         if !self.table.contains_key(&visa_id) {
             error!(target: VISA_MGMT, "cannot bind a stream to visa {visa_id}, which is not held");
             return Err(VisaTableError::NotFound(visa_id));
         }
         self.bindings.entry(visa_id).or_default().push(binding);
-        Ok(())
+        Ok(self.successor_for_new_binding(visa_id))
+    }
+
+    /// J11: the visa a stream just bound under `visa_id` must move onto, if
+    /// `visa_id` is already superseded. Its bind was on its way when the
+    /// successor arrived, so the rebinds started then did not include it.
+    /// That is the waiting successor, or, if `visa_id` had no binding when
+    /// it was superseded, the visa that took over its five-tuple, which
+    /// from now on waits to take over this binding.
+    fn successor_for_new_binding(&mut self, visa_id: VisaId) -> Option<VisaId> {
+        if let Some(successor) = self.successor_of(visa_id) {
+            return Some(successor);
+        }
+        let ftuple = self.table.get(&visa_id)?.ftuple?;
+        let current = *self.current.get(&FlowKey::from(&ftuple))?;
+        if current == visa_id {
+            return None;
+        }
+        self.successors.insert(visa_id, current);
+        Some(current)
     }
 
     /// The streams bound under the visa `visa_id`, if any.
@@ -1843,6 +1878,96 @@ pub mod tests {
         assert_eq!(visa_table.successor_of(7400), None);
         assert_eq!(visa_table.supersedes(7401), None);
         assert_eq!(asm.peer_table.get(link_a).unwrap().pft.len(), 0);
+    }
+
+    /// J11 with overlapping successors (local Codex review): a late commit
+    /// of an older generation never moves the lookup backward. Streams 1
+    /// and 2 run under A; B supersedes A and stream 1 moves; C supersedes
+    /// B and stream 1 moves again; then stream 2's late A -> B grant must be
+    /// refused, leaving the lookup on C and stream 2 on A.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_a_late_commit_never_restores_an_older_visa() {
+        let (asm, link_a, link_b, stream_1) = bound_old_visa(7500);
+        let stream_2 = asm
+            .peer_table
+            .get(link_a)
+            .unwrap()
+            .pft
+            .insert(PftPep::new(ForwardingEntry(link_b, 50), 7500))
+            .unwrap();
+        let mut visa_table = asm.visa_table.write().unwrap();
+        visa_table
+            .bind(
+                7500,
+                StreamBinding {
+                    ingress: ForwardingEntry(link_a, stream_2),
+                    egress: ForwardingEntry(link_b, 50),
+                },
+            )
+            .unwrap();
+        visa_table
+            .insert_visa(tcp_visa(7501, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        visa_table
+            .commit_supersede(
+                &asm.peer_table,
+                7500,
+                7501,
+                ForwardingEntry(link_a, stream_1),
+                ForwardingEntry(link_b, 43),
+            )
+            .unwrap();
+        visa_table
+            .insert_visa(tcp_visa(7502, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        visa_table
+            .commit_supersede(
+                &asm.peer_table,
+                7501,
+                7502,
+                ForwardingEntry(link_a, stream_1),
+                ForwardingEntry(link_b, 44),
+            )
+            .unwrap();
+
+        assert!(
+            visa_table
+                .commit_supersede(
+                    &asm.peer_table,
+                    7500,
+                    7501,
+                    ForwardingEntry(link_a, stream_2),
+                    ForwardingEntry(link_b, 45),
+                )
+                .is_err()
+        );
+
+        assert_eq!(visa_table.match_traffic(&client_to_service()), Some(7502));
+        assert!(pft_entry(&asm, link_a, stream_2) == Some((ForwardingEntry(link_b, 50), 7500)));
+        assert_eq!(visa_table.bindings(7500).len(), 1);
+    }
+
+    /// J11 (local Codex review): a stream bound under a visa that is
+    /// already superseded, because its bind was still on its way when the
+    /// successor arrived, is told which visa to move onto, whether the old
+    /// visa still had other bindings or none.
+    #[test]
+    fn test_binding_a_superseded_visa_names_its_successor() {
+        let mut visa_table = VisaTable::new();
+        // Unbound when superseded: the successor took over at once.
+        visa_table
+            .insert_visa(tcp_visa(7600, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        visa_table
+            .insert_visa(tcp_visa(7601, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        assert_eq!(
+            visa_table.bind(7600, binding_on(1, 10)).unwrap(),
+            Some(7601)
+        );
+        assert_eq!(visa_table.successor_of(7600), Some(7601));
+        // Not superseded: nothing to move onto.
+        assert_eq!(visa_table.bind(7601, binding_on(1, 11)).unwrap(), None);
     }
 
     #[test]

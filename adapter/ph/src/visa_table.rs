@@ -181,6 +181,19 @@ impl Visa {
         self.ftuple.map(|ftuple| tc::Ip5TupleTc::new(ftuple.into()))
     }
 
+    /// Whether this visa and `other` carry the same A2A session keys (J11):
+    /// a stream rebound from one onto the other keeps the keys its
+    /// requestor and the far adapter got at bind time, so they must match.
+    pub fn has_same_session_keys(&self, other: &Visa) -> bool {
+        let keys = |visa: &Visa| {
+            visa.visa
+                .dock_pep
+                .as_ref()
+                .map(|pep| pep.session_key.clone())
+        };
+        keys(self) == keys(other)
+    }
+
     /// Get the ingress A2A DH public key from the visa, if present.
     /// Keys are 32 bytes long, so we attempt to convert the key slice to a 32-byte array
     pub fn get_ingress_a2a_dh_pubkey(&self) -> Option<x25519_dalek::PublicKey> {

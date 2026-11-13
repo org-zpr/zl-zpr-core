@@ -705,6 +705,8 @@ pub fn rebind_ingress_streams(asm: &Assembly, old: VisaId, new: VisaId) {
 /// J11: rebind the stream `ingress` from visa `old` onto visa `new`, if
 /// this Zode is its ingress (the stream arrives from an adapter or the
 /// local actor). Otherwise do nothing: the stream's own ingress rebinds it.
+/// A successor with other A2A session keys is refused: the requestor would
+/// not know them.
 ///
 /// Sends, so never call it under the visa-table lock (zipline#9).
 fn rebind_stream(asm: &Assembly, old: VisaId, new: VisaId, ingress: ForwardingEntry) {
@@ -717,6 +719,25 @@ fn rebind_stream(asm: &Assembly, old: VisaId, new: VisaId, ingress: ForwardingEn
         .is_some_and(|peer| matches!(peer.peer_type(), PeerType::Adapter));
     if !from_adapter {
         return;
+    }
+    // The requestor keeps the A2A keys it got from the old visa, and the
+    // far adapter gets the new visa's: a rebind is silent only if they are
+    // the same.
+    let same_keys = {
+        let visa_table = asm.visa_table.read().unwrap();
+        match (visa_table.get(old), visa_table.get(new)) {
+            (Some(old_visa), Some(new_visa)) => old_visa.has_same_session_keys(new_visa),
+            _ => false,
+        }
+    };
+    if !same_keys {
+        return rebind_failed(
+            asm,
+            old,
+            new,
+            &ingress,
+            "the visas' session keys differ, or one is gone",
+        );
     }
     info!(target: FLOW_MGMT, "rebinding stream {} on {} from visa {old} onto visa {new}",
         ingress.1, asm.formatted_link_id(ingress.0));
@@ -2516,5 +2537,27 @@ mod tests {
                 local_actor_entry(&asm, stream) == Some((ForwardingEntry(zode_link, 61), NEW_VISA))
             );
         }
+    }
+
+    /// J11 (local Codex review): the requestor keeps the A2A keys it got
+    /// from the old visa when its stream is rebound, so a successor with
+    /// other session keys cannot take the stream over silently: nothing is
+    /// sent, the failure is counted, and the stream stays on the old visa.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_successor_with_other_session_keys_is_not_rebound_onto() {
+        let (asm, mut egress_rx, _hairpin_rx, zode_link, streams) = ingress_with_live_streams(1);
+        let mut successor = own_visa(NEW_VISA);
+        successor.dock_pep.as_mut().unwrap().session_key.egress_key = vec![7; 32];
+
+        visa_mgmt::insert_visa(&asm, successor).unwrap();
+
+        assert!(try_recv_packet(&mut egress_rx).is_none(), "nothing is sent");
+        assert!(
+            local_actor_entry(&asm, streams[0]) == Some((ForwardingEntry(zode_link, 42), OLD_VISA))
+        );
+        assert_eq!(
+            asm.counters.management[ManagementCounterType::RebindFailed].get_count(),
+            1
+        );
     }
 }

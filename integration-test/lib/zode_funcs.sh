@@ -12,8 +12,9 @@
 # The visa service runs as an adapter docked on the relay, as in
 # one-node-test.sh. The other Zodes sit on one substrate segment (a bridge
 # in the relay's namespace) and dial the relay through their configured
-# initial link. Before zl-zipline#252 only the relay has a visa-service
-# session: zb and zc link to the relay but cannot reach the visa service.
+# initial link. A Zode in the relay's topology joins through it
+# (zl-zipline#252): the relay hands it bootstrap visas for its own
+# visa-service session.
 #
 # Each Zode is a `ph node` with its own certificate (CN = its policy node
 # name), signed by the test CA.
@@ -342,7 +343,93 @@ function assert_no_log() {
   echo "assertion OK: $3"
 }
 
+# The visa IDs of the relay's last hand-off to Zode $2, as "FORWARD REVERSE",
+# from the relay's log $1 (bootstrap_handoff.rs: `handed bootstrap visas
+# [A, B] to "CN"`). Prints nothing if there was none.
+function last_handoff_ids() {
+  grep -oE "handed bootstrap visas \[[0-9, ]+\] to \"$2\"" "$1" | tail -n 1 \
+    | grep -oE '\[[0-9, ]+\]' | tr -d '[],' || true
+}
+
+# Succeed when $1 is exactly two different visa IDs, both from the visa
+# service: at least MIN_VISA_ID (config.rs), so never ph's self-granted
+# VS-API pair, IDs 1 and 2. $2 is the assertion message.
+function assert_issued_ids() {
+  local IDS
+  read -r -a IDS <<< "$1"
+  if (( ${#IDS[@]} == 2 )) && (( IDS[0] >= 1000 && IDS[1] >= 1000 )) \
+    && (( IDS[0] != IDS[1] )); then
+    echo "assertion OK: $2 ($1)"
+  else
+    echo "ASSERTION FAILED: $2 (got '$1')"
+    return 1
+  fi
+}
+
+# Succeed when the hand-off $1 holds two visa-service IDs ([assert_issued_ids])
+# that share none with the earlier hand-off $2: every join gets new visas
+# (J6). $3 names the hand-off in the message.
+function assert_new_ids() {
+  assert_issued_ids "$1" "$3 holds two visa-service IDs" || return 1
+  local ID
+  for ID in $1
+  do
+    if [[ " $2 " == *" $ID "* ]]; then
+      echo "ASSERTION FAILED: $3 reuses visa $ID of the earlier hand-off ($2)"
+      return 1
+    fi
+  done
+  echo "assertion OK: $3 has new IDs ($1, earlier $2)"
+}
+
+# Check the joiner's visa table as it starts (J1, J4), from its log $1:
+# every visa inserted into its table (visa_table.rs logs each insert) up to
+# the first installed hand-off is exactly the hand-off $2, and the log never
+# shows ph's self-granted VS-API pair, IDs 1 and 2.
+function assert_joiner_table() {
+  local INSERTED
+  INSERTED=$(sed -nE '/installed bootstrap visas/q; s/.*Visa inserted into VisaTable ID: ([0-9]+),.*/\1/p' "$1" \
+    | sort -n | tr '\n' ' ')
+  if [[ "$INSERTED" == "$(tr ' ' '\n' <<< "$2" | sort -n | tr '\n' ' ')" ]]; then
+    echo "assertion OK: the joiner's table holds only its bootstrap visas ($2)"
+  else
+    echo "ASSERTION FAILED: the joiner's table holds [$INSERTED], not only its bootstrap visas ($2)"
+    return 1
+  fi
+  assert_no_log "$1" 'Visa inserted into VisaTable ID: [12],' "the joiner never grants itself VS-API visas 1 and 2"
+}
+
+# J11 after a join of Zode $2 with the hand-off $3 ("FORWARD REVERSE"): wait
+# up to $1 seconds for the Zode's own VS-API visa (J5a) to supersede the
+# forward bootstrap visa and for its VS-API stream to be rebound onto it.
+# Then check that no rebind failed on that Zode, in its log and its
+# `Rebind Failed` counter. With the stream off the bootstrap visa, its
+# expiry (5 minutes) does not break the session, so there is no J10 rejoin.
+function assert_superseded() {
+  local FORWARD=${3%% *}
+  wait_log_after "$1" "$2.log" "visa [0-9]+ supersedes visa ${FORWARD}([^0-9]|\$)" 0 \
+    "$2's own VS-API visa supersedes bootstrap visa $FORWARD (J5a)" || return 1
+  wait_log_after "$1" "$2.log" "rebound a stream from visa $FORWARD onto visa [0-9]+" 0 \
+    "$2's VS-API stream moves off bootstrap visa $FORWARD (J11)" || return 1
+  assert_no_log "$2.log" 'its rebind onto visa [0-9]+ failed' "no rebind failed on $2" || return 1
+  assert_counter_zero "$2" "Rebind Failed"
+}
+
+# Succeed when Zode $1's management counter $2 (as `ph-cli counters` names
+# it) is zero.
+function assert_counter_zero() {
+  local VALUE
+  VALUE=$("$PH_DEBUG_BIN" -p "$1.sock" counters | sed -nE "s/^$2: ([0-9]+)\$/\\1/p")
+  if [[ "$VALUE" == 0 ]]; then
+    echo "assertion OK: $1's '$2' counter is 0"
+  else
+    echo "ASSERTION FAILED: $1's '$2' counter is '$VALUE', not 0"
+    return 1
+  fi
+}
+
 # Drop all substrate traffic of Zode NAME ($1), both ways, or restore it.
+# NAME "vs" cuts the visa service off from the relay.
 function block_substrate() {
   in_ns "zpr-$1" tc qdisc add dev veth0 root netem loss 100%
   in_ns zpr-relay tc qdisc add dev "veth-$1" root netem loss 100%

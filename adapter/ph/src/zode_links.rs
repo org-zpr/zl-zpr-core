@@ -574,6 +574,20 @@ pub fn apply_topology(asm: &Arc<Assembly>) {
     }
     close_refused_zode_links(asm);
 
+    // The joiner's egress before topology (zl-zipline#252): once the
+    // topology names the relay, F1 alone decides.
+    let relay_entry = initial_cn.as_ref().and_then(|cn| {
+        asm.topology
+            .read()
+            .unwrap()
+            .iter()
+            .find(|link| &link.peer_cn == cn)
+            .map(|link| link.zpr_addr)
+    });
+    if let (Some(cn), Some(zpr_addr)) = (&initial_cn, relay_entry) {
+        crate::bootstrap_handoff::topology_names_relay(asm, cn, zpr_addr);
+    }
+
     if let Some(cn) = initial_link_missing_from_topology(&config, &asm.topology.read().unwrap()) {
         warn!(target: LINK_STATE,
             "the topology has no entry for the initial link's CN {cn:?}: F1 cannot reach the relay through it; the policy must peer this Zode with its relay");
@@ -759,7 +773,7 @@ pub fn close_refused_zode_links(asm: &Arc<Assembly>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::config::InitialLink;
@@ -965,12 +979,12 @@ mod tests {
     use tokio::task::LocalSet;
 
     /// The substrate egress queue a driver test keeps open.
-    type EgressRx = crate::packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
+    pub(crate) type EgressRx = crate::packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
 
     /// A Zode named `self_cn` at ZPR address `self_addr`, bound to
     /// 127.0.0.1, with CA-signed link keys. `initial_link`, if given, is
     /// its initial link.
-    fn driven_zode(
+    pub(crate) fn driven_zode(
         self_addr: &str,
         self_cn: &str,
         initial_link: Option<&str>,
@@ -1004,7 +1018,7 @@ mod tests {
     }
 
     /// Store `links` as the topology and apply it, as `setTopology` does.
-    fn set_topology(asm: &Arc<Assembly>, links: Vec<zpr::vsapi_types::Link>) {
+    pub(crate) fn set_topology(asm: &Arc<Assembly>, links: Vec<zpr::vsapi_types::Link>) {
         *asm.topology.write().unwrap() = links;
         apply_topology(asm);
     }
@@ -1022,7 +1036,7 @@ mod tests {
 
     /// Bring the Zode connection `link_id` up as if keying verified `cn`
     /// and Hello completed.
-    fn bring_up(asm: &Arc<Assembly>, link_id: LinkId, cn: &str) {
+    pub(crate) fn bring_up(asm: &Arc<Assembly>, link_id: LinkId, cn: &str) {
         crate::peer_table::test::set_verified_peer_cn(asm, link_id, cn);
         asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
             .unwrap();
@@ -1074,7 +1088,7 @@ mod tests {
     }
 
     /// The record for `cn`.
-    fn record_of(asm: &Arc<Assembly>, cn: &str) -> LinkRecord {
+    pub(crate) fn record_of(asm: &Arc<Assembly>, cn: &str) -> LinkRecord {
         asm.zode_links.record(cn).expect("a record")
     }
 

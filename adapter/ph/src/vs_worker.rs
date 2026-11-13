@@ -24,7 +24,7 @@ pub async fn launch(
 
     loop {
         // This acts as a gate -- waiting for runloop to start.
-        wait_for_runloop_start(&mut lifecycle_rx).await;
+        wait_for_runloop_start(&asm, &mut lifecycle_rx).await;
 
         loop {
             // Kick off a connect request to the VS, if it succeeds, notify the VS about our VSS endpoint.
@@ -61,6 +61,8 @@ pub async fn launch(
                 evt = lifecycle_rx.recv() => {
                     match evt {
                         Ok(VSConnLifecycleEvent::RunLoopExits) => {
+                            asm.vs_session_up
+                                .store(false, std::sync::atomic::Ordering::Release);
                             info!(target: STARTUP, "VSConn runloop exited; aborting connect attempts and re-gating");
                             break; // break inner connect loop, go re-gate on RunLoopStarts
                         }
@@ -87,6 +89,9 @@ pub async fn launch(
             };
 
             if connected {
+                // From here a bootstrap-visa hand-off is refused (J4).
+                asm.vs_session_up
+                    .store(true, std::sync::atomic::Ordering::Release);
                 // VSS registration snapshots both actors' A2A keys into its callback
                 // visa. Register the bootstrapped VS adapter before minting that visa.
                 let deferred = asm.deferred_vs_connect.lock().unwrap().take();
@@ -159,10 +164,20 @@ pub async fn launch(
     }
 }
 
-async fn wait_for_runloop_start(lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>) {
+/// Wait for the VSConn run loop to (re)start. A run loop that exits
+/// meanwhile ends this node's VS-API session, so `vs_session_up` is cleared
+/// (zl-zipline#252).
+async fn wait_for_runloop_start(
+    asm: &Assembly,
+    lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>,
+) {
     loop {
         match lifecycle_rx.recv().await {
             Ok(VSConnLifecycleEvent::RunLoopStarts) => return,
+            Ok(VSConnLifecycleEvent::RunLoopExits) => {
+                asm.vs_session_up
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
             Ok(_) => {
                 // ignored
             }
@@ -441,6 +456,20 @@ mod tests {
                     run_worker_until_registered(0, false, Duration::from_secs(20)).await;
                 assert!(registered);
                 assert!(asm.zode_links.report_pending());
+            })
+            .await;
+    }
+
+    /// zl-zipline#252: a node that has connected has a VS-API session, so
+    /// it refuses a bootstrap-visa hand-off from then on (J4).
+    #[tokio::test]
+    async fn test_connecting_marks_the_vs_session_up() {
+        LocalSet::new()
+            .run_until(async {
+                let (registered, _, asm) =
+                    run_worker_until_registered(0, false, Duration::from_secs(20)).await;
+                assert!(registered);
+                assert!(asm.vs_session_up.load(std::sync::atomic::Ordering::Acquire));
             })
             .await;
     }

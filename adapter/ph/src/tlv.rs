@@ -284,13 +284,38 @@ fn put_x25519_pubkey(
     buf.put_slice(value.as_bytes());
 }
 
-fn put_visa(buf: &mut dyn bytes::BufMut, tlv_type: TlvType, visa: &zpr::vsapi_types::Visa) {
+/// Encode `visa` as a packed Cap'n Proto `Visa` message: the form a visa
+/// takes inside a ZDP message (this TLV, and the Bootstrap Visas message,
+/// [crate::bootstrap_handoff]).
+pub fn pack_visa(visa: &zpr::vsapi_types::Visa) -> Vec<u8> {
     let mut builder = capnp::message::TypedBuilder::<zpr::vsapi::v1::visa::Owned>::new_default();
     let mut builder_root = builder.init_root();
     visa.write_to(&mut builder_root);
 
     let mut msg_buf = Vec::new();
-    capnp::serialize_packed::write_message(&mut msg_buf, builder.borrow_inner()).unwrap();
+    capnp::serialize_packed::write_message(&mut msg_buf, builder.borrow_inner())
+        .expect("writing to a Vec cannot fail");
+    msg_buf
+}
+
+/// Decode a visa written by [pack_visa]. `None` if `bytes` is not exactly
+/// one well-formed packed `Visa` message. The bytes come from a peer, so
+/// nothing here panics.
+pub fn unpack_visa(bytes: &[u8]) -> Option<zpr::vsapi_types::Visa> {
+    let mut rest = bytes;
+    let reader =
+        capnp::serialize_packed::read_message(&mut rest, capnp::message::ReaderOptions::new())
+            .ok()?;
+    // Bytes left over after the message are not part of it: refuse them.
+    if !rest.is_empty() {
+        return None;
+    }
+    let typed_reader = capnp::message::TypedReader::<_, zpr::vsapi::v1::visa::Owned>::new(reader);
+    typed_reader.get().ok()?.try_into().ok()
+}
+
+fn put_visa(buf: &mut dyn bytes::BufMut, tlv_type: TlvType, visa: &zpr::vsapi_types::Visa) {
+    let msg_buf = pack_visa(visa);
     assert!(msg_buf.len() <= u8::MAX as usize);
 
     let hdr = TLVHdr {
@@ -379,18 +404,7 @@ pub fn parse_from_buf(
                 let mut msg_buf = Vec::new();
                 msg_buf.resize(tlv_length as usize, 0);
                 buf.copy_to_slice(&mut msg_buf);
-                let Ok(reader) = capnp::serialize_packed::read_message(
-                    msg_buf.as_slice(),
-                    capnp::message::ReaderOptions::new(),
-                ) else {
-                    return Err(TlvError::BadStructure);
-                };
-                let typed_reader =
-                    capnp::message::TypedReader::<_, zpr::vsapi::v1::visa::Owned>::new(reader);
-                let Ok(reader_root) = typed_reader.get() else {
-                    return Err(TlvError::BadStructure);
-                };
-                let Ok(visa) = reader_root.try_into() else {
+                let Some(visa) = unpack_visa(&msg_buf) else {
                     return Err(TlvError::BadStructure);
                 };
                 tlv_map

@@ -50,6 +50,11 @@ pub struct PeerState {
     pub zdpr_retry_timer_reset: Notify,
     pub txn_mgr: Arc<txn_mgr::TxnMgr>,
     km_state: PeerKmState,
+    /// The bootstrap visas installed for this Zode link (zl-zipline#252,
+    /// ZODE_LINKS.md J4): on a joiner, the ones its relay handed over; on a
+    /// relay, its own copies for the joiner. `Assembly::drop_peer` revokes
+    /// them with the link (rule 9). See [crate::bootstrap_handoff].
+    pub bootstrap_handoff: Mutex<Option<crate::bootstrap_handoff::HandoffRecord>>,
 }
 
 // Key Management state per peer.
@@ -133,6 +138,7 @@ impl PeerState {
             zdpr_retry_timer_reset: Notify::new(),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),
+            bootstrap_handoff: Mutex::new(None),
         }
     }
 
@@ -636,6 +642,7 @@ pub mod test {
             zdpr_retry_timer_reset: Notify::new(),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),
+            bootstrap_handoff: Mutex::new(None),
         }
     }
 

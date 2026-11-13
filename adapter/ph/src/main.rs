@@ -23,6 +23,7 @@ mod assembly;
 mod auth;
 mod auth_agent;
 mod batch_io;
+mod bootstrap_handoff;
 mod capture_worker;
 mod classifier;
 mod compress;
@@ -536,6 +537,8 @@ fn main() -> ExitCode {
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
+        vs_session_up: std::sync::atomic::AtomicBool::new(false),
+        bootstrap_handoff: Default::default(),
         capture_queue: cap_inq,
         capture_worker: CaptureWorker::new(),
         flow_control: FlowControl::new(),

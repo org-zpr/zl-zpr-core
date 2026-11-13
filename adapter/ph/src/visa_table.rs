@@ -594,7 +594,9 @@ impl VisaTable {
         let Some(key) = self.flow_key(visa_id) else {
             return;
         };
-        if self.current.contains_key(&key) {
+        // Having no successor is not enough: a superseded visa whose newer
+        // visa is gone has none either, and must never come back.
+        if self.newest.get(&key) != Some(&visa_id) || self.current.contains_key(&key) {
             return;
         }
         self.current.insert(key, visa_id);
@@ -2083,6 +2085,24 @@ pub mod tests {
         assert_eq!(visa_table.bind(7801, binding_on(1, 11)).unwrap(), None);
         assert_eq!(visa_table.successor_of(7801), None);
         assert_eq!(visa_table.successor_of(7800), Some(7801));
+    }
+
+    /// J11 (local Codex review): a late bind of a superseded visa whose
+    /// newer visa was revoked meanwhile does not bring it back into the
+    /// lookup: only the newest visa ever fills an empty place.
+    #[test]
+    fn test_a_late_bind_of_a_superseded_visa_does_not_restore_it() {
+        let mut visa_table = VisaTable::new();
+        visa_table
+            .insert_visa(tcp_visa(7900, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        visa_table
+            .insert_visa(tcp_visa(7901, CLIENT, 0, SERVICE, 80))
+            .unwrap();
+        visa_table.revoke(&asm_less_peer_table(), 7901).unwrap();
+
+        assert_eq!(visa_table.bind(7900, binding_on(1, 10)).unwrap(), None);
+        assert_eq!(visa_table.match_traffic(&client_to_service()), None);
     }
 
     #[test]

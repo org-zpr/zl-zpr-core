@@ -2266,11 +2266,16 @@ mod tests {
         /// normally.  This simulates scheduler preemption of the calling
         /// thread on a loaded runner: slow, but not stalled.
         SlowOnce(Duration),
-        /// Receive the batch, then block in `poll(2)` until another datagram
-        /// arrives on the socket, then return the batch.  This simulates the
-        /// zipline#117 stall: an op left in flight makes the call return
-        /// only when unrelated traffic arrives.
-        StallOnce,
+        /// Receive the batch, then block until the given number (at least
+        /// one) of further datagrams has arrived on the socket, then return
+        /// the batch.  This simulates the zipline#117 stall: an op left in
+        /// flight makes the call return only when unrelated traffic
+        /// arrives.  `StallOnce(1)` is one op left in flight: the first new
+        /// datagram releases the call and stays queued for the next call.
+        /// `StallOnce(n)` is n ops left in flight: each of the first n - 1
+        /// new datagrams completes (and so consumes) one of them, and only
+        /// the n-th releases the call and stays queued.
+        StallOnce(usize),
     }
 
     /// Test-only batch I/O engine: `posix_unbatched` with one injected fault.
@@ -2320,16 +2325,36 @@ mod tests {
             self.fired = true;
             match self.fault {
                 Fault::SlowOnce(delay) => std::thread::sleep(delay),
-                Fault::StallOnce => {
-                    // Hold the received batch until the next datagram is
-                    // readable.  The datagram stays queued for the next call.
-                    let mut fds = [nix::poll::PollFd::new(
-                        handle.as_fd(),
-                        nix::poll::PollFlags::POLLIN,
-                    )];
-                    nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE).unwrap();
+                Fault::StallOnce(datagrams) => {
+                    assert!(datagrams >= 1, "a stall needs at least one datagram");
+                    // Hold the received batch.  Each of the first
+                    // `datagrams - 1` new datagrams is consumed, as a
+                    // leftover in-flight op would consume it.
+                    for _ in 1..datagrams {
+                        Self::wait_readable(handle);
+                        let mut discard = [0u8; 64];
+                        nix::sys::socket::recv(
+                            handle.as_fd().as_raw_fd(),
+                            &mut discard,
+                            nix::sys::socket::MsgFlags::empty(),
+                        )
+                        .unwrap();
+                    }
+                    // The last one releases the call and stays queued for
+                    // the next call.
+                    Self::wait_readable(handle);
                 }
             }
+        }
+
+        /// Block in `poll(2)`, with no timeout, until a datagram is readable
+        /// on `handle`.
+        fn wait_readable(handle: WaitHandle<'_>) {
+            let mut fds = [nix::poll::PollFd::new(
+                handle.as_fd(),
+                nix::poll::PollFlags::POLLIN,
+            )];
+            nix::poll::poll(&mut fds, nix::poll::PollTimeout::NONE).unwrap();
         }
     }
 
@@ -2338,7 +2363,7 @@ mod tests {
         fn engine_name(&self) -> &'static str {
             match self.fault {
                 Fault::SlowOnce(_) => "posix_unbatched+slow_once",
-                Fault::StallOnce => "posix_unbatched+stall_once",
+                Fault::StallOnce(_) => "posix_unbatched+stall_once",
             }
         }
 
@@ -2650,13 +2675,53 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_recv_stress_detects_stall() {
-        let mut bio =
-            FaultyEngine::instantiate(RECV_STRESS_BATCH, Fault::StallOnce, RECV_STRESS_FAULT_AFTER);
+        let mut bio = FaultyEngine::instantiate(
+            RECV_STRESS_BATCH,
+            Fault::StallOnce(1),
+            RECV_STRESS_FAULT_AFTER,
+        );
         match run_recv_stress(&mut bio, Duration::from_millis(500)) {
             Ok(stats) => panic!("an injected stall went undetected: {stats:?}"),
             Err(err) => assert!(
                 err.contains("] stall: datagram"),
                 "the run must fail with a stall, not: {err}"
+            ),
+        }
+    }
+
+    /// How long `test_recv_stress_detects_multi_op_stall` waits for its run
+    /// to finish before it fails instead of hanging.
+    #[cfg(unix)]
+    const RECV_STRESS_WATCHDOG: Duration = Duration::from_secs(30);
+
+    /// A stall with more than one op left in flight must still be reported,
+    /// not hang (core#116 review): when several ops stay pending, one wake
+    /// datagram completes only one of them and the call stays blocked.  The
+    /// injected fault needs three new datagrams before the call returns.
+    /// The run happens on its own thread under a watchdog, so a run that
+    /// never returns fails this test cleanly; the blocked thread is left
+    /// behind.
+    #[cfg(unix)]
+    #[test]
+    fn test_recv_stress_detects_multi_op_stall() {
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bio = FaultyEngine::instantiate(
+                RECV_STRESS_BATCH,
+                Fault::StallOnce(3),
+                RECV_STRESS_FAULT_AFTER,
+            );
+            let _ = outcome_tx.send(run_recv_stress(&mut bio, Duration::from_millis(500)));
+        });
+        match outcome_rx.recv_timeout(RECV_STRESS_WATCHDOG) {
+            Ok(Ok(stats)) => panic!("an injected multi-op stall went undetected: {stats:?}"),
+            Ok(Err(err)) => assert!(
+                err.contains("] stall: datagram"),
+                "the run must fail with a stall, not: {err}"
+            ),
+            Err(_) => panic!(
+                "the stress run did not finish within {RECV_STRESS_WATCHDOG:?}: a stall \
+                 that needs more than one wake datagram hangs the run"
             ),
         }
     }

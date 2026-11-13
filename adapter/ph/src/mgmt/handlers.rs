@@ -43,6 +43,9 @@ pub enum HandleMgmtError {
 
     #[error("link closed")]
     LinkClosed,
+
+    #[error("bootstrap visa hand-off refused: {0}")]
+    HandoffRefused(#[from] crate::bootstrap_handoff::HandoffError),
 }
 
 const X25519_KEY_LEN: usize = 32;
@@ -56,6 +59,7 @@ impl From<&HandleMgmtError> for counters::ManagementCounterType {
             HandleMgmtError::UnknownTransaction => Self::UnknownTransaction,
             HandleMgmtError::LinkStateError(_) => Self::OtherError,
             HandleMgmtError::LinkClosed => Self::OtherError,
+            HandleMgmtError::HandoffRefused(_) => Self::BootstrapHandoffRefused,
         }
     }
 }
@@ -385,6 +389,23 @@ pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> Handl
     asm.process_link_state_event(ingress_link_id, LinkEvent::ReceivedHelloRequest)?;
 
     Ok(())
+}
+
+/// Handle a Bootstrap Visas message (ZDP 146, zl-zipline#252 J4): the
+/// relay handing this joining Zode its two bootstrap visas. Installed only
+/// if every check in [crate::bootstrap_handoff::check_handoff] passes.
+///
+/// A refusal is logged and returned as an error, which the management
+/// processor counts (`BootstrapHandoffRefused`) and turns into a link
+/// error that closes the link: the strict handler-error convention of
+/// #251 (gate g88 q2). On the initial link the joiner then redials with
+/// backoff, and the new link brings a fresh hand-off (rule 11a).
+pub async fn handle_bootstrap_visas(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
+    let link_id = pkt.metadata().ingress_link_id;
+    crate::bootstrap_handoff::accept(asm, link_id, pkt.body()).map_err(|e| {
+        warn!(target: ZDP, "{}: refused a bootstrap visa hand-off: {e}; closing the link", asm.formatted_link_id(link_id));
+        HandleMgmtError::from(e)
+    })
 }
 
 pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
@@ -1384,6 +1405,93 @@ mod test {
                         .link_state_machine
                         .get_state(),
                     crate::link_state::LinkState::Closing
+                );
+            })
+            .await
+    }
+
+    /// A node assembly whose initial link is to `relay.zpr`, with a Zode
+    /// link to `relay.zpr` in `state`. Returns it and the link.
+    fn joiner_with_link_in(state: crate::link_state::LinkState) -> (Arc<Assembly>, LinkId) {
+        let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(64);
+        let mut config = crate::config::Config::default();
+        config.zpr_addr = vec!["fd5a:5052::b".parse().unwrap()];
+        config.initial_link =
+            Some(crate::config::InitialLink::parse_cli("relay.zpr@10.9.9.9:5000").unwrap());
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            ph_mode: Some(crate::assembly::PhMode::Node),
+            config: Some(rcu::RcuBox::new(config)),
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        let link_id =
+            crate::peer_table::test::insert_zode_peer_with_verified_cn(&asm, "relay.zpr", state);
+        (asm, link_id)
+    }
+
+    /// zl-zipline#252 (J4, regression test kept from core#104): a bootstrap
+    /// visa carried inside a HelloResponse is never installed, even on a
+    /// joiner's link to its relay. Only the Bootstrap Visas message after
+    /// Hello can carry one.
+    #[tokio::test(start_paused = true)]
+    async fn test_bootstrap_visa_inside_hello_is_not_installed() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, link_id) = joiner_with_link_in(crate::link_state::LinkState::Helloing);
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .set_zode_end(crate::link_state::ZodeEnd::Dialer {
+                        peer_cn: "relay.zpr".to_owned(),
+                    })
+                    .unwrap();
+
+                let visa = crate::visa_table::tests::new_vsapi_visa_tcp_default(
+                    4242,
+                    crate::visa_table::tests::never_expires(),
+                );
+                let mut pkt = core::new_heap_packet();
+                zdp::ZdpHelloResponseHeader {
+                    status: zdp::ResponseCode::Success,
+                }
+                .write_to_buf(&mut pkt)
+                .unwrap();
+                tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
+                tlv::TlvEncoding::new_bootstrap_visa(visa).put(&mut pkt);
+                pkt.metadata_mut().ingress_link_id = link_id;
+
+                let _ = handle_hello_response(&asm, pkt).await;
+                assert!(
+                    !asm.visa_table.read().unwrap().contains(4242),
+                    "a visa inside Hello must not be installed"
+                );
+            })
+            .await
+    }
+
+    /// zl-zipline#252: a refused Bootstrap Visas message is an error the
+    /// management processor counts as `BootstrapHandoffRefused` and turns
+    /// into a link error (the strict handler-error convention). Here the
+    /// body is cut short.
+    #[tokio::test(start_paused = true)]
+    async fn test_refused_bootstrap_visas_is_a_counted_handler_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, link_id) = joiner_with_link_in(crate::link_state::LinkState::Helloing);
+                let mut pkt = core::new_heap_packet();
+                pkt.put_slice(&[2, 0]);
+                pkt.metadata_mut().ingress_link_id = link_id;
+                let err = handle_bootstrap_visas(&asm, pkt).await.unwrap_err();
+                assert!(matches!(
+                    err,
+                    HandleMgmtError::HandoffRefused(
+                        crate::bootstrap_handoff::HandoffError::Malformed
+                    )
+                ));
+                assert_eq!(
+                    counters::ManagementCounterType::from(&err),
+                    counters::ManagementCounterType::BootstrapHandoffRefused
                 );
             })
             .await

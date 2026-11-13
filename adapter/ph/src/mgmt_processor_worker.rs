@@ -206,6 +206,8 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
 
             ZdpPacketType::HelloResponse => handlers::handle_hello_response(asm, pkt).await,
 
+            ZdpPacketType::BootstrapVisas => handlers::handle_bootstrap_visas(asm, pkt).await,
+
             // Zipline renewal messages (zipline#66) are not transactions:
             // each response echoes its request's challenge for correlation.
             ZdpPacketType::RenewAuthenticationRequest => {

@@ -77,6 +77,21 @@ pub struct Assembly {
     /// attempt instead of queueing a second one; the spawned re-auth task
     /// clears it when the attempt resolves either way.
     pub self_reauth_in_flight: std::sync::atomic::AtomicBool,
+    /// Node only (zl-zipline#252): true while this node has a VS-API
+    /// session, from a successful `connect` until the VSConn run loop exits
+    /// (`vs_worker`). A joining Zode refuses a bootstrap-visa hand-off while
+    /// it is set (ZODE_LINKS.md J4).
+    pub vs_session_up: std::sync::atomic::AtomicBool,
+    /// Node only (zl-zipline#252): the Zode link whose bootstrap-visa
+    /// hand-off this joiner installed, or `None`. Set when a hand-off is
+    /// installed and cleared when that link is lost (rule 9), so the VS-API
+    /// worker can wait for one before it connects (J5).
+    pub bootstrap_handoff: tokio::sync::watch::Sender<Option<LinkId>>,
+    /// Node only (zl-zipline#252): set once a `setTopology` has named this
+    /// joiner's relay. From then on F1 alone finds the relay, and a
+    /// hand-off's next hop is never used as its address again
+    /// ([crate::bootstrap_handoff::topology_names_relay]).
+    pub relay_named_by_topology: std::sync::atomic::AtomicBool,
 
     pub visa_table: std::sync::RwLock<visa_table::VisaTable>, // Only for nodes
 
@@ -542,15 +557,30 @@ impl Assembly {
         }
         if self.ph_mode == PhMode::Node {
             // F3 (zl-zipline#251): revoke every visa with a stream bound
-            // over this link, on either side. Revoke under the write lock,
-            // but hold the withdrawn entries until the lock is released: the
-            // send path takes the peer's `zdpr_send` mutex, which must never
-            // nest under the visa-table lock (zipline#9).
-            let withdrawn = self
-                .visa_table
-                .write()
-                .unwrap()
-                .revoke_for_link(link_id, &self.peer_table);
+            // over this link, on either side. Rule 9 (zl-zipline#252): also
+            // revoke the bootstrap visas installed for it, bound or not.
+            // Revoke under the write lock, but hold the withdrawn entries
+            // until the lock is released: the send path takes the peer's
+            // `zdpr_send` mutex, which must never nest under the visa-table
+            // lock (zipline#9).
+            let withdrawn = {
+                let mut visa_table = self.visa_table.write().unwrap();
+                let mut withdrawn = visa_table.revoke_for_link(link_id, &self.peer_table);
+                withdrawn.extend(crate::bootstrap_handoff::revoke_for_lost_link(
+                    &mut visa_table,
+                    &self.peer_table,
+                    link_id,
+                ));
+                withdrawn
+            };
+            // The VS-API worker no longer has a hand-off on this link.
+            self.bootstrap_handoff.send_if_modified(|handoff| {
+                let lost = *handoff == Some(link_id);
+                if lost {
+                    *handoff = None;
+                }
+                lost
+            });
 
             // Withdraw each revoked stream from the *surviving* adapters so
             // they drop their egress bindings and re-request visas instead
@@ -803,16 +833,25 @@ impl Assembly {
     /// record's connection must then be an Active Zode link whose verified
     /// CN is that CN. Anything else is `None`.
     ///
+    /// When no topology entry has `addr`, a joiner's initial link may still
+    /// match by the relay address of its bootstrap hand-off, until a
+    /// `setTopology` names the relay ([crate::bootstrap_handoff]).
+    ///
     /// Each lock (topology, then `zode_links`, then the peer entry) is
     /// released before the next is taken.
     fn find_zode_egress_link(&self, addr: IpAddress) -> Option<NonZero<LinkId>> {
-        let peer_cn = self
+        let topology_cn = self
             .topology
             .read()
             .unwrap()
             .iter()
             .find(|link| IpAddress::new_from_std(&link.zpr_addr) == addr)
-            .map(|link| link.peer_cn.clone())?;
+            .map(|link| link.peer_cn.clone());
+        // The one exception to F1 (zl-zipline#252): before a `setTopology`
+        // names the relay, a joiner finds it by the address its bootstrap
+        // hand-off gave the initial link.
+        let peer_cn =
+            topology_cn.or_else(|| crate::bootstrap_handoff::pre_topology_relay_cn(self, addr))?;
         let record = self.zode_links.record(&peer_cn)?;
         if record.state != crate::zode_link_record::RecordState::Up {
             return None;
@@ -1731,6 +1770,9 @@ pub mod test {
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
             deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
+            vs_session_up: std::sync::atomic::AtomicBool::new(false),
+            bootstrap_handoff: Default::default(),
+            relay_named_by_topology: std::sync::atomic::AtomicBool::new(false),
             capture_queue,
             capture_worker,
             flow_control,

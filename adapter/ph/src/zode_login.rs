@@ -457,16 +457,35 @@ async fn obtain_login(
 /// Log out the Zode's own actor: send the device leg alone, which drops the
 /// user's attributes. An error when nobody is logged in. If the visa
 /// service refuses, the user stays logged in and the reason is returned.
+///
+/// Like [login], the logout runs as its own task, so the state follows the
+/// visa service even if the caller goes away once the request is queued.
 pub async fn logout(asm: &Arc<Assembly>) -> Result<(), LoginError> {
-    match asm.zode_login.state() {
-        LoginState::LoggedIn { .. } => {}
+    let generation = match asm.zode_login.state() {
+        LoginState::LoggedIn { .. } => asm.zode_login.current_generation(),
         LoginState::LoggingIn => return Err(LoginError::InProgress),
         LoginState::LoggedOut { .. } => return Err(LoginError::NotLoggedIn),
-    }
-    send_logout(asm).await.map_err(LoginError::Failed)?;
-    asm.zode_login.logged_out(None);
-    info!(target: RPC, "Zode login: logged out");
-    Ok(())
+    };
+    let task_asm = asm.clone();
+    tokio::task::spawn_local(async move {
+        send_logout(&task_asm).await.map_err(LoginError::Failed)?;
+        // A login that replaced this one meanwhile (after a session
+        // change) is left alone.
+        if generation
+            .and_then(|g| task_asm.zode_login.current(g))
+            .is_some()
+        {
+            task_asm.zode_login.logged_out(None);
+        }
+        info!(target: RPC, "Zode login: logged out");
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(LoginError::Failed(AuthFailureReason::AgentError(format!(
+            "the logout task failed: {e}"
+        ))))
+    })
 }
 
 /// Send `reauthorize` with the device leg alone (a logout).
@@ -658,6 +677,11 @@ pub fn answer_policy_reauth(asm: &Arc<Assembly>) -> bool {
         match renew(&asm, generation).await {
             Ok(()) => {
                 info!(target: RPC, "Zode login: policy re-authentication answered with a renewal")
+            }
+            // The login ended while the renewal waited (a logout, maybe a
+            // new login): K2 now would drop whoever is logged in now.
+            Err(reason) if asm.zode_login.current(generation).is_none() => {
+                info!(target: RPC, "Zode login: the policy renewal failed ({reason:?}) after its login ended; nothing to do");
             }
             Err(reason) => {
                 warn!(target: RPC, "Zode login: no renewal for the policy re-authentication ({reason:?}); re-authenticating the node, which drops the login");
@@ -1279,6 +1303,16 @@ pub(crate) mod tests {
 
     /// An agent that answers every request with [ID_TOKEN] after `delay`.
     fn slow_agent(delay: Duration) -> (AuthAgentHandle, Seen) {
+        delayed_agent(delay, |_| Ok(ID_TOKEN.to_string()))
+    }
+
+    /// An agent that answers each request with `answer(interactive)`,
+    /// after `delay` for a non-interactive one.
+    fn delayed_agent(
+        delay: Duration,
+        answer: impl Fn(bool) -> Result<String, AuthFailureReason> + 'static,
+    ) -> (AuthAgentHandle, Seen) {
+        let answer = Rc::new(answer);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OidcCredentialRequest>();
         let seen: Seen = Rc::default();
         let task_seen = seen.clone();
@@ -1287,9 +1321,12 @@ pub(crate) mod tests {
                 task_seen
                     .borrow_mut()
                     .push((req.nonce.clone(), req.interactive));
+                let answer = answer.clone();
                 tokio::task::spawn_local(async move {
-                    tokio::time::sleep(delay).await;
-                    let _ = req.reply.send(Ok(ID_TOKEN.to_string()));
+                    if !req.interactive {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let _ = req.reply.send(answer(req.interactive));
                 });
             }
         });
@@ -1448,6 +1485,72 @@ pub(crate) mod tests {
                     !reauth_shapes(&fake).contains(&device_only()),
                     "no logout: {:?}",
                     reauth_shapes(&fake)
+                );
+            })
+            .await;
+    }
+
+    /// A logout whose caller goes away still settles the state: the visa
+    /// service drops the user either way once the request is queued.
+    #[tokio::test]
+    async fn cancelled_logout_still_logs_out() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(FakeVsState::default(), true).await;
+                login(&asm, ok_agent().0).await.expect("login");
+                fake.borrow_mut().reauth_delay = Some(Duration::from_millis(500));
+
+                let task_asm = asm.clone();
+                let caller = tokio::task::spawn_local(async move { logout(&task_asm).await });
+                assert!(
+                    eventually(Duration::from_secs(5), || fake.borrow().reauths.len() == 2).await
+                );
+                caller.abort();
+                let _ = caller.await;
+
+                assert!(
+                    eventually(Duration::from_secs(5), || !asm.zode_login.is_logged_in()).await,
+                    "{:?}",
+                    asm.zode_login.state()
+                );
+                assert_eq!(last_failure(&asm), None);
+            })
+            .await;
+    }
+
+    /// A policy renewal that fails after its login ended (the user logged
+    /// out and someone logged in again) does not fall back to K2, which
+    /// would drop the new login.
+    #[tokio::test]
+    async fn stale_policy_renewal_failure_does_not_k2_a_new_login() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(FakeVsState::default(), true).await;
+                let (first, _) = delayed_agent(Duration::from_millis(500), |interactive| {
+                    if interactive {
+                        Ok(ID_TOKEN.to_string())
+                    } else {
+                        Err(AuthFailureReason::AgentError(
+                            "no refresh token".to_string(),
+                        ))
+                    }
+                });
+                login(&asm, first).await.expect("first login");
+                // Past the renewal spacing, so the renewal asks the agent.
+                tokio::time::sleep(MIN_RENEWAL_SPACING + Duration::from_millis(100)).await;
+                let own: IpAddr = NODE_ADDR.parse().unwrap();
+                crate::vss_worker::process_request_authentication(&asm, &[own]);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                logout(&asm).await.expect("logout");
+                login(&asm, ok_agent().0).await.expect("second login");
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+
+                assert_eq!(fake.borrow().connects.len(), 1, "no K2");
+                assert!(
+                    asm.zode_login.is_logged_in(),
+                    "{:?}",
+                    asm.zode_login.state()
                 );
             })
             .await;

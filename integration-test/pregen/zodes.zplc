@@ -2,7 +2,8 @@
 #
 # Zode links netns fixture (zl-zipline#250), used by zode-link-test.sh
 # through lib/zode_funcs.sh. The relay Zode docks the visa service and is
-# linked to Zode zb, so the relay's topology names zb (CN zb). A third Zode,
+# linked to Zode zb, so the relay's topology names zb (CN zb), with no peer
+# address until zb connects and reports one (zl-zipline#255). A third Zode,
 # zc, is signed by the same CA but is in no policy: the relay must refuse it.
 #
 # All Zodes share one substrate segment (a bridge in the relay's
@@ -26,9 +27,8 @@ i0 = "10.2.0.1:5000"
 [nodes.zb]
 provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
 zpr_address = "zb.zpr"
-
-[nodes.zb.substrate_addrs]
-i0 = "10.2.0.2:5000"
+# No substrate_addrs for zb (zl-zipline#255, W10): the visa service learns
+# zb's address only from what zb reports when it connects.
 
 [links.relay-zb]
 peers = [ { node = "relay" }, { node = "zb" } ]

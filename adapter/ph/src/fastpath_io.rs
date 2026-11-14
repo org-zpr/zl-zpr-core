@@ -359,6 +359,14 @@ const SEND_DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
 /// kind drops the first packet, the one that failed, and sends the rest.
 /// Any other send error is fatal.
 ///
+/// An engine that sends a prefix of the queue and then fails reports only
+/// the prefix (`Ok(n)`), not the error. The unsent rest is then handled as
+/// for any partial send, such as one that would block: PRIORITY packets
+/// stay queued, the others are dropped and counted. This was so before
+/// zl-zipline#230, and it is kept: retrying the rest at once would spin on
+/// a full socket. A vanished-source PRIORITY packet kept that way fails as
+/// the batch error on the next call, and is dropped and logged there.
+///
 /// This is a free function rather than a [FastpathIo] method so a test can
 /// drive it with a real socket and no TUN.
 fn send_substrate_egress_queue(

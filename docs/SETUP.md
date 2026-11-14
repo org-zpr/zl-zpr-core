@@ -382,16 +382,14 @@ accepts docking adapters, and forwards their traffic, exactly like
 
 **Windows node constraints** (deliberate, in this release):
 
-* **A concrete `self_addr` is required**, unconditionally: the Windows
-  substrate engine rejects a wildcard bind by design, and startup fails
-  cleanly with a message naming the fix. An explicit
-  `advertised_substrate_addr` is no substitute — the bind check runs before
-  the advertised address is selected, so a wildcard `self_addr` fails at
-  startup regardless. With a concrete `self_addr`, no separate
-  `advertised_substrate_addr` is needed.
-* **Single-homed only** — one substrate address, configured once at startup;
-  multi-homed hosts and address changes while running are
-  [zipline#150](https://github.com/org-zpr/zl-zipline/issues/150).
+* **Wildcard and multi-homed binds are allowed**, as on unix: the Windows
+  engine reads each datagram's destination and sets each send's source
+  with `IP_PKTINFO`/`IPV6_PKTINFO` (`WSARecvMsg`/`WSASendMsg`,
+  [zipline#150](https://github.com/org-zpr/zl-zipline/issues/150)). A
+  wildcard `self_addr` needs `advertised_substrate_addr`, as on every OS;
+  with a concrete `self_addr` it defaults to that. Following a network
+  change while running is
+  [zl-zipline#230](https://github.com/org-zpr/zl-zipline/issues/230).
 * **Elevated console** — Wintun device creation requires Run as
   administrator, same as the adapter role.
 * **A single, unbatched datapath worker** — Wintun enforces one queue and
@@ -567,7 +565,7 @@ subsection follows.
   Linux.
 * **A single, unbatched datapath worker** — the macOS `posix_unbatched`
   engine forces one worker (`new_mq` rejects more). Wildcard and
-  multi-homed binds are allowed (unix pktinfo), unlike the Windows node.
+  multi-homed binds are allowed (pktinfo), as on the Windows node.
   Measured single-worker numbers are in the test document below.
 * **One `ph` instance per user without `--control-path`**: the default
   control path is derived from the owner alone, so a node and an adapter

@@ -388,18 +388,19 @@ fn main() -> ExitCode {
 
     for _i in 0..topology_config.fastpath_concurrency {
         // Create, configure and bind one substrate socket; the platform
-        // differences (pktinfo and SO_REUSEPORT on unix, the wildcard
-        // bind check and SIO_UDP_CONNRESET on Windows) live behind
+        // differences (SO_REUSEPORT on unix, SIO_UDP_CONNRESET on
+        // Windows, and when pktinfo is enabled) live behind
         // `sys::substrate::open` (zipline#176). Any failure — including
-        // the bind, and Windows' wildcard-bind rejection — is a logged
-        // error and a clean exit, not a panic (zipline#160): a
-        // misconfigured node must fail with the message that names the
-        // fix, like the ZPR-address check below.
+        // the bind — is a logged error and a clean exit, not a panic
+        // (zipline#160): a misconfigured node must fail with the message
+        // that names the fix, like the ZPR-address check below.
         //
         // The bind is to our self address. If the port is unspecified,
         // one is selected by the OS. (The IP address may also be
         // unspecified -- a node with a wildcard self_addr -- in which
-        // case the socket receives on every local address.)
+        // case the socket receives on every local address, and pktinfo
+        // reports each datagram's real destination, on every OS since
+        // zipline#150.)
         let socket = match sys::substrate::open(config.self_addr) {
             Ok(socket) => socket,
             Err(err) => {

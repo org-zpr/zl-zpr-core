@@ -63,6 +63,7 @@ pub mod zdpr;
 pub mod zdpr_worker;
 pub mod zode_link_record;
 pub mod zode_links;
+pub mod zode_login;
 pub mod zprtun;
 
 #[cfg(test)]

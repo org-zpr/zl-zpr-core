@@ -93,9 +93,11 @@ fn serve_connection(
     capture_supported: bool,
 ) {
     let agent_registrations = Rc::new(RefCell::new(Vec::new()));
+    let login_agents = Rc::new(RefCell::new(Vec::new()));
     let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
         asm: asm.clone(),
         agent_registrations: agent_registrations.clone(),
+        login_agents: login_agents.clone(),
         capture_supported,
     });
 
@@ -117,8 +119,30 @@ fn serve_connection(
                 }
             }
         }
+        // The same for an agent a `login` registered (zl-zipline#233). The
+        // login itself is kept until it expires (g116 q5).
+        for handle in login_agents.borrow_mut().drain(..) {
+            if asm.zode_login.clear_agent_if(&handle) {
+                debug!(target: RPC, "Zode login: AuthAgent unregistered (admin connection closed)");
+            }
+        }
         err
     });
+}
+
+/// The refusal of the Zode-login RPCs on an adapter (zl-zipline#233).
+/// ponytail: one mode check; #234 removes adapter mode and this with it.
+const NOT_A_ZODE: &str = "not a Zode";
+
+/// Fill a `SuccessOrError` from a Zode-login result.
+fn set_login_result(
+    builder: cli::success_or_error::Builder<'_>,
+    result: Result<(), crate::zode_login::LoginError>,
+) {
+    match result {
+        Ok(()) => builder.init_success().set_none(()),
+        Err(e) => builder.init_error().set_txt(e.to_string()),
+    }
 }
 
 /// Run the admin RPC server until the control listener fails.
@@ -144,6 +168,9 @@ struct AdminServiceImpl {
     /// reflects reality again (zipline#45). Guarded clearing: a NEWER agent
     /// registered over another connection is left in place.
     agent_registrations: Rc<RefCell<Vec<(u32, AuthAgentHandle)>>>,
+    /// AuthAgents a `login` registered over THIS connection (zl-zipline#233),
+    /// unregistered from the Zode login when the connection drops.
+    login_agents: Rc<RefCell<Vec<AuthAgentHandle>>>,
     /// Whether `setCaptureFile` may open a capture file here
     /// ([sys::capture_supported]; injected so tests can exercise the
     /// unsupported path on unix).
@@ -683,6 +710,58 @@ impl svc::Server for AdminServiceImpl {
             }
         }
         rb.init_result().init_success().set_none(());
+        Ok(())
+    }
+
+    /// `ph-cli connect` / `auth-agent` on a Zode (zl-zipline#233): register
+    /// the agent for this connection and log the Zode's own actor in. The
+    /// agent is called back over this same connection while the call is
+    /// pending; the answer comes when the login finishes.
+    async fn login(
+        self: Rc<Self>,
+        params: svc::LoginParams,
+        mut results: svc::LoginResults,
+    ) -> Result<(), capnp::Error> {
+        info!(target: RPC, "Zode login requested");
+        if self.asm.ph_mode != PhMode::Node {
+            results.get().init_result().init_error().set_txt(NOT_A_ZODE);
+            return Ok(());
+        }
+        let agent = spawn_auth_agent_bridge(params.get()?.get_auth_agent()?);
+        self.login_agents.borrow_mut().push(agent.clone());
+        let result = crate::zode_login::login(&self.asm, agent).await;
+        set_login_result(results.get().init_result(), result);
+        Ok(())
+    }
+
+    /// `ph-cli logout` on a Zode (zl-zipline#233).
+    async fn logout(
+        self: Rc<Self>,
+        _: svc::LogoutParams,
+        mut results: svc::LogoutResults,
+    ) -> Result<(), capnp::Error> {
+        info!(target: RPC, "Zode logout requested");
+        if self.asm.ph_mode != PhMode::Node {
+            results.get().init_result().init_error().set_txt(NOT_A_ZODE);
+            return Ok(());
+        }
+        let result = crate::zode_login::logout(&self.asm).await;
+        set_login_result(results.get().init_result(), result);
+        Ok(())
+    }
+
+    /// `ph-cli login-status` on a Zode (zl-zipline#233).
+    async fn show_login(
+        self: Rc<Self>,
+        _: svc::ShowLoginParams,
+        mut results: svc::ShowLoginResults,
+    ) -> Result<(), capnp::Error> {
+        let text = if self.asm.ph_mode == PhMode::Node {
+            self.asm.zode_login.status_text()
+        } else {
+            NOT_A_ZODE.to_string()
+        };
+        results.get().set_result(text);
         Ok(())
     }
 }
@@ -1475,6 +1554,7 @@ mod test {
                 let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
                     asm,
                     agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    login_agents: Rc::default(),
                     capture_supported: false,
                 });
 
@@ -1615,6 +1695,7 @@ mod test {
                 let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
                     asm,
                     agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    login_agents: Rc::default(),
                     capture_supported: true,
                 });
 
@@ -1647,6 +1728,7 @@ mod test {
                 let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
                     asm,
                     agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    login_agents: Rc::default(),
                     capture_supported: true,
                 });
                 let err = match service.set_capture_file_request().send().promise.await {
@@ -1711,6 +1793,7 @@ mod test {
                 let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
                     asm: asm.clone(),
                     agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    login_agents: Rc::default(),
                     capture_supported: true,
                 });
                 let agent: cli::auth_agent::Client = capnp_rpc::new_client(FakeAuthAgent {
@@ -1797,6 +1880,7 @@ mod test {
                 let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
                     asm: asm.clone(),
                     agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    login_agents: Rc::default(),
                     capture_supported: true,
                 });
                 let mut request = service.start_link_request();
@@ -1872,6 +1956,7 @@ mod test {
                 let service: svc::Client = capnp_rpc::new_client(AdminServiceImpl {
                     asm,
                     agent_registrations: Rc::new(RefCell::new(Vec::new())),
+                    login_agents: Rc::default(),
                     capture_supported: false,
                 });
 
@@ -2185,5 +2270,208 @@ mod test {
         .expect("getTunInfo must succeed on a node");
         assert_eq!(name, "tun-node");
         assert_eq!(addrs, vec![ip("fd5a:5052:90de::1")]);
+    }
+
+    /// A capnp AuthAgent that answers every request at once with
+    /// [crate::zode_login::tests::ID_TOKEN], recording each nonce and
+    /// whether the request was interactive.
+    struct InstantAuthAgent {
+        seen: Rc<RefCell<Vec<(String, bool)>>>,
+    }
+
+    impl cli::auth_agent::Server for InstantAuthAgent {
+        async fn get_oidc_credential(
+            self: Rc<Self>,
+            params: cli::auth_agent::GetOidcCredentialParams,
+            mut results: cli::auth_agent::GetOidcCredentialResults,
+        ) -> Result<(), capnp::Error> {
+            let p = params.get()?;
+            self.seen
+                .borrow_mut()
+                .push((p.get_nonce()?.to_str()?.to_string(), p.get_interactive()));
+            let mut rb = results.get();
+            rb.set_id_token(crate::zode_login::tests::ID_TOKEN);
+            rb.init_result().init_success().set_none(());
+            Ok(())
+        }
+    }
+
+    /// Serve the admin RPC for `asm` over an in-memory duplex (standing in
+    /// for the unix socket and the named pipe alike) and return a client
+    /// plus the client RPC task, which a test aborts to close the
+    /// connection.
+    fn duplex_admin_client(asm: Arc<Assembly>) -> (svc::Client, tokio::task::JoinHandle<()>) {
+        let (client_end, server_end) = tokio::io::duplex(4096);
+        serve_connection(
+            asm,
+            byte_stream_network(server_end, capnp_rpc::rpc_twoparty_capnp::Side::Server),
+            true,
+        );
+        let mut client_rpc = capnp_rpc::RpcSystem::new(
+            byte_stream_network(client_end, capnp_rpc::rpc_twoparty_capnp::Side::Client),
+            None,
+        );
+        let service: svc::Client =
+            client_rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+        let task = tokio::task::spawn_local(async move {
+            let _ = client_rpc.await;
+        });
+        (service, task)
+    }
+
+    /// The error text of a `SuccessOrError`, or None on success.
+    fn error_text(result: cli::success_or_error::Reader<'_>) -> Option<String> {
+        match result.which().unwrap() {
+            cli::success_or_error::Which::Success(_) => None,
+            cli::success_or_error::Which::Error(e) => {
+                Some(e.unwrap().get_txt().unwrap().to_string().unwrap())
+            }
+        }
+    }
+
+    /// Call `login` with an [InstantAuthAgent]; returns the error text, if
+    /// any, and what the agent saw.
+    async fn call_login(
+        service: &svc::Client,
+    ) -> (Option<String>, Rc<RefCell<Vec<(String, bool)>>>) {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut request = service.login_request();
+        request
+            .get()
+            .set_auth_agent(capnp_rpc::new_client(InstantAuthAgent {
+                seen: seen.clone(),
+            }));
+        let response = request
+            .send()
+            .promise
+            .await
+            .expect("login must be answered");
+        (
+            error_text(response.get().unwrap().get_result().unwrap()),
+            seen,
+        )
+    }
+
+    /// zl-zipline#233: `login` over a byte stream logs the Zode in, with the
+    /// agent called back over the same connection with the visa-service
+    /// nonce; `showLogin` then reports it, and `logout` logs out.
+    #[tokio::test]
+    async fn test_login_logout_and_show_login_over_a_byte_stream() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _fake) =
+                    crate::zode_login::tests::zode(crate::fake_vs::FakeVsState::default(), true)
+                        .await;
+                let (service, _client) = duplex_admin_client(asm.clone());
+
+                let (err, seen) = call_login(&service).await;
+                assert_eq!(err, None);
+                assert_eq!(*seen.borrow(), vec![("vs-nonce-1".to_string(), true)]);
+                assert!(asm.zode_login.is_logged_in());
+
+                let response = service.show_login_request().send().promise.await.unwrap();
+                let text = response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .to_string()
+                    .unwrap();
+                assert!(text.starts_with("State: logged in\n"), "{text}");
+                assert!(text.contains("Auth agent: registered"), "{text}");
+
+                let response = service.logout_request().send().promise.await.unwrap();
+                assert_eq!(
+                    error_text(response.get().unwrap().get_result().unwrap()),
+                    None
+                );
+                assert!(!asm.zode_login.is_logged_in());
+
+                let response = service.logout_request().send().promise.await.unwrap();
+                assert_eq!(
+                    error_text(response.get().unwrap().get_result().unwrap()).as_deref(),
+                    Some("not logged in")
+                );
+            })
+            .await
+    }
+
+    /// A failed `login` answers with the AuthFailureReason Debug spelling,
+    /// which ph-cli maps onto its exit codes.
+    #[tokio::test]
+    async fn test_login_failure_text_is_the_reason_spelling() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _fake) =
+                    crate::zode_login::tests::zode(crate::fake_vs::FakeVsState::default(), false)
+                        .await;
+                let (service, _client) = duplex_admin_client(asm);
+                let (err, _) = call_login(&service).await;
+                assert_eq!(err.as_deref(), Some("AuthUnavailable"));
+            })
+            .await
+    }
+
+    /// The agent registered by `login` is unregistered when its admin
+    /// connection closes (zipline#45); the login itself is kept (q5).
+    #[tokio::test]
+    async fn test_login_agent_is_cleared_when_the_connection_closes() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _fake) =
+                    crate::zode_login::tests::zode(crate::fake_vs::FakeVsState::default(), true)
+                        .await;
+                let (service, client) = duplex_admin_client(asm.clone());
+                let (err, _) = call_login(&service).await;
+                assert_eq!(err, None);
+                assert!(asm.zode_login.has_agent());
+
+                client.abort();
+                drop(service);
+                assert!(
+                    wait_for(5000, || !asm.zode_login.has_agent()).await,
+                    "the agent must be unregistered when its connection closes"
+                );
+                assert!(
+                    asm.zode_login.is_logged_in(),
+                    "the login is kept until expiry"
+                );
+            })
+            .await
+    }
+
+    /// In adapter mode `login`, `logout` and `showLogin` refuse.
+    #[tokio::test]
+    async fn test_login_rpcs_refuse_in_adapter_mode() {
+        LocalSet::new()
+            .run_until(async {
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+                    ph_mode: Some(PhMode::Adapter),
+                    ..TestAssemblyBuilder::new()
+                }));
+                let (service, _client) = duplex_admin_client(asm.clone());
+
+                let (err, seen) = call_login(&service).await;
+                assert_eq!(err.as_deref(), Some("not a Zode"));
+                assert!(seen.borrow().is_empty());
+                assert!(!asm.zode_login.has_agent());
+
+                let response = service.logout_request().send().promise.await.unwrap();
+                assert_eq!(
+                    error_text(response.get().unwrap().get_result().unwrap()).as_deref(),
+                    Some("not a Zode")
+                );
+
+                let response = service.show_login_request().send().promise.await.unwrap();
+                let text = response
+                    .get()
+                    .unwrap()
+                    .get_result()
+                    .unwrap()
+                    .to_string()
+                    .unwrap();
+                assert_eq!(text, "not a Zode");
+            })
+            .await
     }
 }

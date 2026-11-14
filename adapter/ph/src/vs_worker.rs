@@ -167,6 +167,10 @@ pub async fn launch(
                 // From here a bootstrap-visa hand-off is refused (J4).
                 asm.vs_session_up
                     .store(true, std::sync::atomic::Ordering::Release);
+                // A node authentication replaces the node's actor on the
+                // visa service, so a Zode's own login is gone
+                // (zl-zipline#233).
+                crate::zode_login::session_replaced(&asm);
                 // A fresh VS-API session gets a fresh link-state snapshot
                 // (zl-zipline#250), sent before registerVss: the visa service
                 // routes a joiner's VSS only over a link both ends report up

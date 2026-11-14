@@ -73,6 +73,7 @@ mod zdpr;
 mod zdpr_worker;
 mod zode_link_record;
 mod zode_links;
+mod zode_login;
 mod zprtun;
 
 #[cfg(test)]
@@ -539,6 +540,7 @@ fn main() -> ExitCode {
         )),
         topology: Default::default(),
         zode_links: Default::default(),
+        zode_login: Default::default(),
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
         deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),

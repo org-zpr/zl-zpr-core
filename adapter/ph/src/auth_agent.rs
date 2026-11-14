@@ -73,6 +73,13 @@ pub enum AuthFailureReason {
     /// not clear on reconnect), so it is fatal for this connect request.
     /// Carries the failure text, which names the failed step.
     ActivationFailed(String),
+    /// A Zode's own login (zl-zipline#233): the node's VS-API session was
+    /// replaced (a reconnect, a visa-service restart, a rejoin or a K2
+    /// re-authentication), and the visa service dropped the login with it.
+    SessionReplaced,
+    /// A Zode's own login (zl-zipline#233): it expired without a successful
+    /// silent renewal, so ph logged the user out.
+    LoginExpired,
 }
 
 impl AuthFailureReason {
@@ -102,7 +109,9 @@ impl AuthFailureReason {
             | Self::DeviceBlobRejected
             | Self::LocalAuthError(_)
             | Self::GrantedAddressMismatch { .. }
-            | Self::ActivationFailed(_) => true,
+            | Self::ActivationFailed(_)
+            | Self::SessionReplaced
+            | Self::LoginExpired => true,
         }
     }
 
@@ -126,8 +135,9 @@ impl AuthFailureReason {
 pub struct OidcCredentialRequest {
     /// The advertised identity provider to authenticate against.
     pub idp: auth::OidcIdpInfo,
-    /// OIDC nonce derived from the link challenge
-    /// ([auth::oidc_nonce_for_challenge]).
+    /// The OIDC nonce: derived from the link challenge
+    /// ([auth::oidc_nonce_for_challenge]) for a docked actor, or minted by
+    /// the visa service for a Zode's own login (zl-zipline#233).
     pub nonce: String,
     /// `false` means "satisfy from a stored refresh token or fail"; the agent
     /// must never open a browser on a non-interactive request.
@@ -143,6 +153,14 @@ pub type AuthAgentHandle = tokio::sync::mpsc::UnboundedSender<OidcCredentialRequ
 /// (zipline#12) — one [auth::OidcIdpInfo] per auth service the visa service
 /// lists with `stype == OidcAuthentication` that carries a client config.
 pub fn advertised_oidc_idps(asm: &Assembly, link_id: LinkId) -> Vec<auth::OidcIdpInfo> {
+    oidc_idps(asm, &asm.formatted_link_id(link_id).to_string())
+}
+
+/// Node side: one [auth::OidcIdpInfo] per auth service the visa service
+/// lists with `stype == OidcAuthentication` that carries a client config.
+/// `context` names what they are for in the log: a link, or a Zode's own
+/// login (zl-zipline#233).
+pub fn oidc_idps(asm: &Assembly, context: &str) -> Vec<auth::OidcIdpInfo> {
     use zpr::vsapi_types::ServiceT;
 
     let svclist = asm.vs_auth_services.read().unwrap();
@@ -155,12 +173,11 @@ pub fn advertised_oidc_idps(asm: &Assembly, link_id: LinkId) -> Vec<auth::OidcId
         .filter(|service| service.stype == ServiceT::OidcAuthentication)
         .filter_map(|service| {
             let Some(cfg) = &service.oidc else {
-                warn!(target: LINK_STATE, "{}: HelloResponse - OIDC service {} has no client config",
-                    asm.formatted_link_id(link_id), service.service_id);
+                warn!(target: LINK_STATE, "{context}: OIDC service {} has no client config",
+                    service.service_id);
                 return None;
             };
-            debug!(target: LINK_STATE, "{}: HelloResponse - adding OIDC IdP: {}",
-                asm.formatted_link_id(link_id), cfg.issuer);
+            debug!(target: LINK_STATE, "{context}: OIDC IdP: {}", cfg.issuer);
             Some(auth::OidcIdpInfo {
                 issuer: cfg.issuer.clone(),
                 client_id: cfg.client_id.clone(),
@@ -185,10 +202,32 @@ pub async fn request_oidc_blob(
     timeout: std::time::Duration,
 ) -> Result<auth::ZdpOidcBlob, AuthFailureReason> {
     let issuer = idp.issuer.clone();
+    let nonce = auth::oidc_nonce_for_challenge(challenge);
+    let id_token = request_id_token(agent, idp, nonce, interactive, timeout).await?;
+    Ok(auth::ZdpOidcBlob {
+        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
+        issuer,
+        id_token,
+        challenge: BASE64_STANDARD.encode(challenge),
+    })
+}
+
+/// Ask `agent` for an OIDC ID token from `idp` bound to `nonce`. Waits at
+/// most `timeout`; an elapsed wait is [AuthFailureReason::InteractionTimeout].
+/// A gone agent is [AuthFailureReason::NoAgent]. Dropping the returned
+/// future drops the reply receiver, which the agent bridge observes and uses
+/// to cancel the in-flight RPC.
+pub async fn request_id_token(
+    agent: &AuthAgentHandle,
+    idp: auth::OidcIdpInfo,
+    nonce: String,
+    interactive: bool,
+    timeout: std::time::Duration,
+) -> Result<String, AuthFailureReason> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
     let request = OidcCredentialRequest {
         idp,
-        nonce: auth::oidc_nonce_for_challenge(challenge),
+        nonce,
         interactive,
         reply: reply_tx,
     };
@@ -196,22 +235,14 @@ pub async fn request_oidc_blob(
         // The agent went away (ph-cli disconnected).
         return Err(AuthFailureReason::NoAgent);
     }
-    let id_token = match tokio::time::timeout(timeout, reply_rx).await {
-        Ok(Ok(result)) => result?,
+    match tokio::time::timeout(timeout, reply_rx).await {
+        Ok(Ok(result)) => result,
         // The bridge dropped the reply without answering.
-        Ok(Err(_)) => {
-            return Err(AuthFailureReason::AgentError(
-                "AuthAgent dropped the request".to_string(),
-            ));
-        }
-        Err(_elapsed) => return Err(AuthFailureReason::InteractionTimeout),
-    };
-    Ok(auth::ZdpOidcBlob {
-        blob_type: auth::BLOB_TYPE_OIDC.to_string(),
-        issuer,
-        id_token,
-        challenge: BASE64_STANDARD.encode(challenge),
-    })
+        Ok(Err(_)) => Err(AuthFailureReason::AgentError(
+            "AuthAgent dropped the request".to_string(),
+        )),
+        Err(_elapsed) => Err(AuthFailureReason::InteractionTimeout),
+    }
 }
 
 /// Produce the adapter's actor authentication evidence for an
@@ -312,6 +343,8 @@ mod tests {
             AuthFailureReason::DeviceBlobRejected,
             AuthFailureReason::LocalAuthError("x".into()),
             AuthFailureReason::ActivationFailed("x".into()),
+            AuthFailureReason::SessionReplaced,
+            AuthFailureReason::LoginExpired,
         ];
         for reason in transient.iter().chain(terminal.iter()) {
             assert!(

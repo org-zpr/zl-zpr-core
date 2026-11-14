@@ -356,7 +356,8 @@ const SEND_DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
 /// A send that fails because the network changed under it (see
 /// [is_network_change_send_error]) drops its packet, even a PRIORITY one,
 /// which would only fail the same way again. A batch-level error of that
-/// kind drops the whole batch. Any other send error is fatal.
+/// kind drops the first packet, the one that failed, and sends the rest.
+/// Any other send error is fatal.
 ///
 /// This is a free function rather than a [FastpathIo] method so a test can
 /// drive it with a real socket and no TUN.
@@ -372,40 +373,38 @@ fn send_substrate_egress_queue(
     const SENDS_CARRY_SOURCE: bool = true;
 
     // (Try to) send packets.
-    io_results.clear();
-
-    let batch = wouldblock_as_empty_batch(batch_io.try_send_to_from_batch(
-        substrate_socket,
-        worker.substrate_egress_q.iter().map(|pkt| {
-            (
-                pkt.pkt.body(),
-                pkt.dst,
-                Some(pkt.src),
-                get_confirm_flag(&pkt.pkt),
-            )
-        }),
-        io_results,
-    ));
-    let n = match batch {
-        Ok(n) => n,
-        Err(err) if is_network_change_send_error(&err, SENDS_CARRY_SOURCE) => {
-            // The engines report a failed first packet as the batch error
-            // (the sendmmsg(2) emulation), with nothing sent. Drop the whole
-            // batch: its packets share the vanished source address.
-            if let Some(first) = worker.substrate_egress_q.first() {
-                warn_send_dropped(send_drop_warned_at, first, &err);
+    let n = loop {
+        io_results.clear();
+        let batch = wouldblock_as_empty_batch(batch_io.try_send_to_from_batch(
+            substrate_socket,
+            worker.substrate_egress_q.iter().map(|pkt| {
+                (
+                    pkt.pkt.body(),
+                    pkt.dst,
+                    Some(pkt.src),
+                    get_confirm_flag(&pkt.pkt),
+                )
+            }),
+            io_results,
+        ));
+        match batch {
+            Ok(n) => break n,
+            Err(err) if is_network_change_send_error(&err, SENDS_CARRY_SOURCE) => {
+                // The engines that emulate sendmmsg(2) report a failed first
+                // packet as the batch error, with nothing sent. Drop only that
+                // packet and send the rest: they may leave from other, live
+                // addresses (a multi-homed Zode). Each pass drops one packet,
+                // so the loop ends.
+                let first = worker.substrate_egress_q.remove(0);
+                warn_send_dropped(send_drop_warned_at, &first, &err);
+                worker.batch_counters[FastpathCounterType::OutPacksDrop].increase_by(1);
+                worker.buffers.push(first.pkt.destroy());
+                if worker.substrate_egress_q.is_empty() {
+                    return;
+                }
             }
-            let dropped = worker.substrate_egress_q.len();
-            worker.batch_counters[FastpathCounterType::OutPacksDrop].increase_by(dropped as u64);
-            worker.buffers.extend(
-                worker
-                    .substrate_egress_q
-                    .drain(..)
-                    .map(|pkt| pkt.pkt.destroy()),
-            );
-            return;
+            Err(err) => panic!("unrecoverable I/O error: {err}"),
         }
-        Err(err) => panic!("unrecoverable I/O error: {err}"),
     };
 
     // Tally results.
@@ -775,32 +774,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "local")]
     async fn substrate_send_from_vanished_source_drops_and_counts() {
-        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
         use crate::counters::FastpathCounterType;
-        use crate::fastpath::{FastpathWorker, FastpathWorkerConfig, QueuedEgressPacket};
+        use crate::fastpath::QueuedEgressPacket;
         use crate::packet::{Packet, flags};
         use bytes::BufMut as _;
-        use std::sync::Arc;
 
         for name in batch_io::engine_names() {
             for priority in [false, true] {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
                 let engine = batch_io::select_engine_by_name(name).unwrap();
-                let mut worker = FastpathWorker::new(
-                    FastpathWorkerConfig {
-                        batch_io_engine: engine,
-                        buffer_count: 4,
-                        batch_size: 4,
-                        #[cfg(feature = "enable-security-testing")]
-                        mangle_forwarded_pings: false,
-                        #[cfg(feature = "enable-security-testing")]
-                        unkeyed_a2a_micv: false,
-                        #[cfg(feature = "enable-security-testing")]
-                        recompute_micvs: false,
-                    },
-                    0,
-                    asm,
-                );
+                let mut worker = test_worker(engine);
                 let (sender, receiver, gone) = vanished_source_setup(false);
                 let buffers_before = worker.buffers.len();
                 let mut pkt = Packet::new(worker.buffers.pop().unwrap(), 64);
@@ -846,6 +828,113 @@ mod tests {
                     "{what}: the buffer is freed"
                 );
                 assert!(warned_at.is_some(), "{what}: the drop is logged");
+            }
+        }
+    }
+
+    /// A fastpath worker with four buffers and a batch of four, on engine
+    /// `engine`, for the substrate egress tests.
+    #[cfg(unix)]
+    fn test_worker(engine: &'static batch_io::BatchIoEngine) -> crate::fastpath::FastpathWorker {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
+        use std::sync::Arc;
+
+        FastpathWorker::new(
+            FastpathWorkerConfig {
+                batch_io_engine: engine,
+                buffer_count: 4,
+                batch_size: 4,
+                #[cfg(feature = "enable-security-testing")]
+                mangle_forwarded_pings: false,
+                #[cfg(feature = "enable-security-testing")]
+                unkeyed_a2a_micv: false,
+                #[cfg(feature = "enable-security-testing")]
+                recompute_micvs: false,
+            },
+            0,
+            Arc::new(create_assembly(TestAssemblyBuilder::new())),
+        )
+    }
+
+    /// A send from a vanished address drops only its own packet: the next
+    /// packet in the queue, from an address that is still there (another
+    /// interface of a multi-homed Zode), is still sent, PRIORITY or not.
+    /// The engines that emulate sendmmsg(2) report a failed first packet as
+    /// the batch error.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "local")]
+    async fn substrate_send_from_vanished_source_spares_the_rest_of_the_queue() {
+        use crate::counters::FastpathCounterType;
+        use crate::fastpath::QueuedEgressPacket;
+        use crate::packet::{Packet, flags};
+        use bytes::BufMut as _;
+        use std::net::Ipv4Addr;
+
+        for name in batch_io::engine_names() {
+            for priority in [false, true] {
+                let engine = batch_io::select_engine_by_name(name).unwrap();
+                let mut worker = test_worker(engine);
+                let (sender, receiver, gone) = vanished_source_setup(false);
+                receiver
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .unwrap();
+                let buffers_before = worker.buffers.len();
+                for (body, src) in [
+                    (&b"from the old address"[..], gone),
+                    (
+                        &b"from a live address"[..],
+                        std::net::IpAddr::from(Ipv4Addr::LOCALHOST).into(),
+                    ),
+                ] {
+                    let mut pkt = Packet::new(worker.buffers.pop().unwrap(), 64);
+                    pkt.put(body);
+                    if priority {
+                        pkt.metadata_mut().flags |= flags::PRIORITY;
+                    }
+                    worker.substrate_egress_q.push(QueuedEgressPacket {
+                        pkt,
+                        dst: receiver.local_addr().unwrap(),
+                        src,
+                    });
+                }
+
+                let mut bio = engine.instantiate(4).unwrap();
+                let mut results = Vec::new();
+                let mut warned_at = None;
+                send_substrate_egress_queue(
+                    &mut bio,
+                    &sender,
+                    &mut results,
+                    &mut worker,
+                    &mut warned_at,
+                );
+
+                let what = format!("engine {name}, priority {priority}");
+                let mut buf = [0u8; 64];
+                let (len, _) = receiver
+                    .recv_from(&mut buf)
+                    .unwrap_or_else(|e| panic!("{what}: the live packet arrives: {e}"));
+                assert_eq!(&buf[..len], b"from a live address", "{what}");
+                assert_eq!(
+                    worker.batch_counters[FastpathCounterType::OutPacksDrop].get_count(),
+                    1,
+                    "{what}: only the packet from the old address is dropped"
+                );
+                assert_eq!(
+                    worker.batch_counters[FastpathCounterType::OutPacksSent].get_count(),
+                    1,
+                    "{what}: the packet from the live address is sent"
+                );
+                assert!(
+                    worker.substrate_egress_q.is_empty(),
+                    "{what}: nothing is retained"
+                );
+                assert_eq!(
+                    worker.buffers.len(),
+                    buffers_before,
+                    "{what}: both buffers are freed"
+                );
             }
         }
     }

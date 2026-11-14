@@ -405,11 +405,50 @@ async fn attempt_login(asm: &Arc<Assembly>, agent: AuthAgentHandle) -> Result<()
             spawn_renewal(asm, generation);
             Ok(())
         }
-        Err(reason) => {
+        Err(LoginFailure::Failed(reason)) => {
             warn!(target: RPC, "Zode login failed: {reason:?}");
             asm.zode_login.logged_out(Some(reason.clone()));
             Err(LoginError::Failed(reason))
         }
+        Err(LoginFailure::Unanswered {
+            reason,
+            idp,
+            nonce,
+            submitted,
+        }) => {
+            // The visa service may have committed the login. Keep it as an
+            // already-expired login: the timer then logs out at once and
+            // retries until the visa service confirms, `ph-cli logout`
+            // still works, and a new login waits until it is gone.
+            warn!(target: RPC, "Zode login: no answer to the login ({reason:?}); logging out to be sure");
+            let generation = asm
+                .zode_login
+                .logged_in(idp, nonce, submitted, SystemTime::now());
+            spawn_renewal(asm, generation);
+            Err(LoginError::Failed(reason))
+        }
+    }
+}
+
+/// Why [obtain_login] did not log in.
+enum LoginFailure {
+    /// The login failed; nothing is left on the visa service.
+    Failed(AuthFailureReason),
+    /// The `reauthorize` got no answer (a transport failure or a timeout),
+    /// so the visa service may have committed the login: what it would be,
+    /// for the cleanup.
+    Unanswered {
+        reason: AuthFailureReason,
+        idp: OidcIdpInfo,
+        nonce: String,
+        submitted: SystemTime,
+    },
+}
+
+impl From<AuthFailureReason> for LoginFailure {
+    /// A plain failure.
+    fn from(reason: AuthFailureReason) -> Self {
+        Self::Failed(reason)
     }
 }
 
@@ -422,7 +461,7 @@ async fn attempt_login(asm: &Arc<Assembly>, agent: AuthAgentHandle) -> Result<()
 async fn obtain_login(
     asm: &Arc<Assembly>,
     agent: &AuthAgentHandle,
-) -> Result<(OidcIdpInfo, String, SystemTime, Connection), AuthFailureReason> {
+) -> Result<(OidcIdpInfo, String, SystemTime, Connection), LoginFailure> {
     // ponytail: the first advertised IdP; a choice of IdP waits for a
     // policy with more than one.
     let idp = oidc_idps(asm, "Zode login")
@@ -461,17 +500,17 @@ async fn obtain_login(
                 retried = true;
             }
             // No answer (a transport failure or a timeout): the visa
-            // service may have committed the login. Drop the user again
-            // before reporting the failure, so no login is left behind
-            // that ph does not know about.
+            // service may have committed the login, so the caller cleans
+            // up rather than forgetting it.
             Err(e) if !matches!(e, VSApiError::CodedError(_)) => {
-                warn!(target: RPC, "Zode login: no answer to the login ({e}); logging out to be sure");
-                if let Err(reason) = send_logout(asm).await {
-                    warn!(target: RPC, "Zode login: the cleanup logout failed too: {reason:?}");
-                }
-                return Err(vs_failure(e));
+                return Err(LoginFailure::Unanswered {
+                    reason: vs_failure(e),
+                    idp,
+                    nonce: login_nonce.nonce,
+                    submitted,
+                });
             }
-            Err(e) => return Err(vs_failure(e)),
+            Err(e) => return Err(vs_failure(e).into()),
         }
     }
 }
@@ -1714,6 +1753,14 @@ pub(crate) mod tests {
                 .await;
                 let err = login(&asm, ok_agent().0).await.unwrap_err();
                 assert!(matches!(err, LoginError::Failed(_)), "{err:?}");
+                // Until the cleanup is confirmed the login is not forgotten:
+                // `ph-cli logout` works and a new login waits.
+                fake.borrow_mut().reauth_delay = None;
+                assert!(
+                    eventually(Duration::from_secs(5), || !asm.zode_login.is_logged_in()).await,
+                    "{:?}",
+                    asm.zode_login.state()
+                );
                 assert_eq!(
                     reauth_shapes(&fake),
                     vec![with_user("vs-nonce-1"), device_only()]

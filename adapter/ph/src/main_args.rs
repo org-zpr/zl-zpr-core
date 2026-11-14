@@ -97,7 +97,9 @@ pub struct CommonArgs {
     #[arg(long, short = 'i', value_name = "DEVICE")]
     pub tun_if: Option<String>,
 
-    /// ZPR address (no port) of the adapter (must match your TUN address if it has one)
+    /// ZPR address (no port) of the adapter (must match your TUN address if it has one).
+    /// Repeatable. On a node the first is the node's own address; a relay adds
+    /// fd5a:5052::1 (vs.zpr) after it, and no other node lists it.
     #[arg(long, short = 'z')]
     pub zpr_addr: Option<Vec<IpAddr>>,
 
@@ -214,7 +216,9 @@ pub enum Command {
 
         /// Whether this Zode is a relay: it never dials, and accepts a link
         /// from any peer in its topology. Off by default. Overrides the
-        /// `relay` key in the `[node]` section of the config file.
+        /// `relay` key in the `[node]` section of the config file. A relay
+        /// hosts the visa service: list fd5a:5052::1 in --zpr-addr after
+        /// the relay's own address.
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         relay: Option<bool>,
 

@@ -746,6 +746,7 @@ mod tests {
             aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
                 .expect("test RSA key"),
             "127.0.0.1:5000".parse().unwrap(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
         );
         let lifecycle_rx = vsconn.subscribe_lifecycle_events();
         let vs_handle = vsconn.handle();
@@ -1161,6 +1162,7 @@ mod tests {
                     aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
                         .expect("test RSA key"),
                     "127.0.0.1:5000".parse().unwrap(),
+                    std::net::Ipv4Addr::LOCALHOST.into(),
                 );
                 let vs_handle = vsconn.handle();
                 vs_handle.restart().await.unwrap();

@@ -320,6 +320,12 @@ impl VisaTable {
     /// one (the relay, which hosts the visa service) grants itself the
     /// VS-API pair ([VisaTable::new_with_vs_visas]): its first
     /// authentication runs over it.
+    ///
+    /// On a relay that hosts the visa service on its own TUN (zl-zipline#229),
+    /// the VS-API session runs over `lo` and never reaches `ph`, so this pair,
+    /// and the J5a and J9 visas that supersede it, match no packet. They are
+    /// kept on purpose (gate g117 q5): harmless, and the J10 relay path stays
+    /// as it is. Removing them waits for #234, which retires adapters.
     pub fn initial_for_node(node_addr: &IpAddr, has_initial_link: bool) -> Self {
         if has_initial_link {
             Self::new()

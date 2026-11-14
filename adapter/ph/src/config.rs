@@ -3,6 +3,7 @@
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{self, Path, PathBuf};
+use zpr::addrs::VISA_SERVICE_ADDR;
 use zpr::packet_info::{KM_ID_NOISE, KM_ID_NULL, KmId};
 
 use admin_api::{SocketOwner, control_socket_path};
@@ -208,7 +209,11 @@ pub struct Config {
     /// Required for adapter - the node dock address on substrate.
     pub node_addr: Option<SocketAddr>,
 
-    /// Required for node, optional for adapter - the ZPR address (no port) of the adapter.
+    /// Required for node, optional for adapter - the ZPR addresses (no port).
+    /// On a node, `zpr_addr[0]` is the node's own address. A relay lists
+    /// `vs.zpr` (fd5a:5052::1) after it, because it hosts the visa service;
+    /// no other node lists `vs.zpr`, and no address appears twice
+    /// (zl-zipline#229, see [Config::check_valid]).
     pub zpr_addr: Vec<IpAddr>,
 
     /// Ignored for node, optional for adapter - Only set if the adapter is configured for bootstrap authentication.
@@ -268,7 +273,9 @@ pub struct Config {
     /// Node only — whether this Zode is a relay (ZODE_LINKS.md rule 4). A
     /// relay never dials: it accepts a link from any peer whose CN is in its
     /// topology. Off by default. Configured via `relay` in the `[node]`
-    /// section or `ph node --relay`. A relay has no initial link.
+    /// section or `ph node --relay`. A relay has no initial link. A relay
+    /// hosts the visa service on its own TUN, so it lists `vs.zpr` in
+    /// `zpr_addr` after its own address (zl-zipline#229).
     pub relay: bool,
 
     /// Security testing for A2A Pubkeys
@@ -457,6 +464,46 @@ impl Config {
         Ok(())
     }
 
+    /// Node mode: check `zpr_addr` against the relay rules (zl-zipline#229,
+    /// gate g117 q2). A relay hosts the visa service on its own TUN, so it
+    /// lists `vs.zpr` ([VISA_SERVICE_ADDR]) after its own address:
+    /// `zpr_addr[0]` is the node's own address everywhere (the VS-API
+    /// session and its source, the VSS listener, link ownership), so
+    /// `vs.zpr` may never be first. No address may be listed twice, and a
+    /// node that is not a relay never lists `vs.zpr`. Each refusal names
+    /// the fix. There is no implicit `vs.zpr`: the TUN's addresses are all
+    /// in the configuration.
+    fn check_node_zpr_addrs(&self) -> Result<(), ArgsError> {
+        for (i, addr) in self.zpr_addr.iter().enumerate() {
+            if self.zpr_addr[..i].contains(addr) {
+                return Err(ArgsError::ParseError(format!(
+                    "zpr_addr lists {addr} more than once; list each address once"
+                )));
+            }
+        }
+        let vs_listed = self.zpr_addr.contains(&VISA_SERVICE_ADDR);
+        if self.relay {
+            if self.zpr_addr[0] == VISA_SERVICE_ADDR {
+                return Err(ArgsError::ParseError(format!(
+                    "a relay hosts the visa service: list {VISA_SERVICE_ADDR} in zpr_addr \
+                     after the relay's own address, not first"
+                )));
+            }
+            if !vs_listed {
+                return Err(ArgsError::ParseError(format!(
+                    "a relay hosts the visa service: add {VISA_SERVICE_ADDR} to zpr_addr \
+                     after the relay's own address"
+                )));
+            }
+        } else if vs_listed {
+            return Err(ArgsError::ParseError(format!(
+                "only a relay hosts the visa service: remove {VISA_SERVICE_ADDR} from \
+                 zpr_addr, or set relay"
+            )));
+        }
+        Ok(())
+    }
+
     // Check that the required bits are present based on mode.
     // Also checks that the various files exist.
     pub fn check_valid(&self, mode: PhMode) -> Result<(), ArgsError> {
@@ -511,6 +558,7 @@ impl Config {
                 if self.zpr_addr.is_empty() {
                     return Err("zpr_addr".arg_missing());
                 }
+                self.check_node_zpr_addrs()?;
                 if self.certificate_file.is_none() {
                     return Err("certificate_file".arg_missing());
                 }
@@ -870,6 +918,8 @@ pub struct NodeConfigSection {
     pub initial_link: Option<InitialLinkSection>,
 
     /// Whether this Zode is a relay (ZODE_LINKS.md rule 4). Default false.
+    /// A relay lists `vs.zpr` in `zpr_addr` after its own address
+    /// (zl-zipline#229).
     pub relay: Option<bool>,
 }
 
@@ -1363,7 +1413,7 @@ mod test {
     #[test]
     fn test_check_valid_initial_link_family() {
         let node = |self_addr: &str, link: &str| Config {
-            zpr_addr: vec!["fd5a:5052::1".parse().unwrap()],
+            zpr_addr: vec!["fd5a:5052::2".parse().unwrap()],
             certificate_file: Some(std::env::temp_dir()),
             private_key_data: Some("key".to_owned()),
             control_path: std::env::temp_dir().join("ctl.sock"),
@@ -1386,7 +1436,7 @@ mod test {
     fn test_check_valid_initial_link_and_relay() {
         let link = InitialLink::parse_cli("relay.zpr@10.0.0.9:5000").unwrap();
         let node = || Config {
-            zpr_addr: vec!["fd5a:5052::1".parse().unwrap()],
+            zpr_addr: vec!["fd5a:5052::2".parse().unwrap()],
             certificate_file: Some(std::env::temp_dir()),
             private_key_data: Some("key".to_owned()),
             control_path: std::env::temp_dir().join("ctl.sock"),
@@ -1397,11 +1447,15 @@ mod test {
         config.initial_link = Some(link.clone());
         assert!(config.check_valid(PhMode::Node).is_ok());
 
+        // A relay lists vs.zpr after its own address (zl-zipline#229), so
+        // only the initial link makes this one invalid.
         config.relay = true;
+        config.zpr_addr.push(VISA_SERVICE_ADDR);
         assert!(config.check_valid(PhMode::Node).is_err());
 
         let mut config = node();
         config.relay = true;
+        config.zpr_addr.push(VISA_SERVICE_ADDR);
         assert!(config.check_valid(PhMode::Node).is_ok());
 
         let adapter = || Config {
@@ -1417,6 +1471,54 @@ mod test {
         let mut config = adapter();
         config.relay = true;
         assert!(config.check_valid(PhMode::Adapter).is_err());
+    }
+
+    /// zl-zipline#229 (gate g117 q2): a relay hosts the visa service, so it
+    /// lists `vs.zpr` in `zpr_addr` after its own address. A relay without
+    /// it, with it first, or with a duplicate address is refused, and so is
+    /// a node that is not a relay but lists it.
+    #[test]
+    fn test_check_valid_relay_hosts_visa_service() {
+        let own: IpAddr = "fd5a:5052::2".parse().unwrap();
+        let check = |relay: bool, zpr_addr: Vec<IpAddr>| {
+            Config {
+                zpr_addr,
+                relay,
+                certificate_file: Some(std::env::temp_dir()),
+                private_key_data: Some("key".to_owned()),
+                control_path: std::env::temp_dir().join("ctl.sock"),
+                ..Config::default()
+            }
+            .check_valid(PhMode::Node)
+        };
+        let refusal = |relay: bool, zpr_addr: Vec<IpAddr>| match check(relay, zpr_addr) {
+            Err(ArgsError::ParseError(msg)) => msg,
+            other => panic!("expected a ParseError, got {other:?}"),
+        };
+
+        // The relay: its own address first, then vs.zpr.
+        assert!(check(true, vec![own, VISA_SERVICE_ADDR]).is_ok());
+        let msg = refusal(true, vec![own]);
+        assert!(msg.contains("add fd5a:5052::1 to zpr_addr"), "{msg}");
+        let msg = refusal(true, vec![VISA_SERVICE_ADDR, own]);
+        assert!(msg.contains("after the relay's own address"), "{msg}");
+        let msg = refusal(true, vec![VISA_SERVICE_ADDR]);
+        assert!(msg.contains("after the relay's own address"), "{msg}");
+
+        // Duplicates, on a relay and on any other node.
+        let msg = refusal(true, vec![own, VISA_SERVICE_ADDR, own]);
+        assert!(msg.contains("more than once"), "{msg}");
+        let msg = refusal(true, vec![own, VISA_SERVICE_ADDR, VISA_SERVICE_ADDR]);
+        assert!(msg.contains("more than once"), "{msg}");
+        let msg = refusal(false, vec![own, own]);
+        assert!(msg.contains("more than once"), "{msg}");
+
+        // A node that is not a relay never lists vs.zpr.
+        assert!(check(false, vec![own]).is_ok());
+        let msg = refusal(false, vec![own, VISA_SERVICE_ADDR]);
+        assert!(msg.contains("only a relay"), "{msg}");
+        let msg = refusal(false, vec![VISA_SERVICE_ADDR]);
+        assert!(msg.contains("only a relay"), "{msg}");
     }
 
     #[test]

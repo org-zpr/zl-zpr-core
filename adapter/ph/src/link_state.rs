@@ -719,6 +719,8 @@ impl LinkStateWrapper {
             }
         }
 
+        // Set when a relay refuses the visa service's adapter (below).
+        let mut refuse_vs_adapter = false;
         if let Some(ref peer_cert) = sa.peer_cert {
             let cert = peer_cert.get_cert();
             let is_verified = peer_cert.is_verified();
@@ -755,6 +757,15 @@ impl LinkStateWrapper {
                         "{} presented unverified certificate claiming special peer name {name:?}; ignoring", asm.formatted_link_id(link_id)
                     );
                 }
+            } else if asm.config.get().relay
+                && special_peers::special_peer_names_from_subject_der(&subject_der)
+                    .contains(SpecialPeerName::VisaServiceAdapter)
+            {
+                // A relay hosts the visa service on its own TUN, as the
+                // local actor vs.zpr (zl-zipline#229, gate g117 q4): there
+                // is no adapter-docked visa service to accept.
+                warn!(target: LINK_STATE, "{} relay hosts the visa service itself; refusing a dock from the visa service's adapter; closing", asm.formatted_link_id(link_id));
+                refuse_vs_adapter = true;
             } else {
                 // assign special-peer name if this peer is special
                 for name in special_peers::special_peer_names_from_subject_der(&subject_der) {
@@ -772,6 +783,11 @@ impl LinkStateWrapper {
 
         drop(sa);
         drop(peer_state);
+
+        if refuse_vs_adapter {
+            drop(locked_fsm);
+            return self.initiate_close(asm, TerminateReason::Reset);
+        }
 
         debug!(target: LINK_STATE, "{} finished keying.  Starting hello", asm.formatted_link_id(link_id));
 
@@ -1800,6 +1816,63 @@ mod tests {
             .await
     }
 
+    /// A keyable node-side assembly, a relay if `relay`, with an adapter
+    /// link in Keying whose verified certificate carries the visa service's
+    /// DN. Returns the assembly and the link (zl-zipline#229).
+    fn vs_adapter_keyed(relay: bool) -> (Arc<Assembly>, LinkId) {
+        let asm = keyable_assembly(true);
+        let mut cfg = (*asm.config.get()).clone();
+        cfg.relay = relay;
+        asm.config.write(cfg);
+        let link_id = add_node_peer(&asm);
+        crate::peer_table::test::set_verified_peer_cn(&asm, link_id, zpr::dn::VISA_SERVICE_CN);
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_set_keying();
+        (asm, link_id)
+    }
+
+    /// zl-zipline#229 (gate g117 q4): a relay hosts the visa service on its
+    /// own TUN, so it refuses a dock from the visa service's adapter: the
+    /// link closes at KeyingDone and claims no special-peer name.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_refuses_visa_service_adapter_dock() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link_id) = vs_adapter_keyed(true);
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
+                assert_eq!(
+                    asm.peer_table
+                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
+                    None
+                );
+            })
+            .await
+    }
+
+    /// zl-zipline#229: a node that is not a relay still takes the visa
+    /// service's adapter dock (the `one-node-*` layouts, until #234).
+    #[tokio::test(start_paused = true)]
+    async fn test_non_relay_assigns_visa_service_adapter() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, link_id) = vs_adapter_keyed(false);
+                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
+                assert_eq!(
+                    asm.peer_table
+                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
+                    std::num::NonZero::new(link_id)
+                );
+            })
+            .await
+    }
+
     /// The substrate egress queue a Zode test assembly sends through.
     type EgressRx = crate::packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>;
 
@@ -2764,6 +2837,7 @@ mod tests {
             "test-node".to_string(),
             key,
             "127.0.0.1:5000".parse().unwrap(),
+            std::net::Ipv4Addr::LOCALHOST.into(),
         );
         // Observable egress: the close path puts a Terminate on the mgmt
         // substrate queue, which must have a live receiver.

@@ -325,6 +325,61 @@ FORWARD accepts and the MASQUERADE rule — it finds them by scanning the live
 tables, so it needs no environment and plain `sudo` (no `-E`) is correct
 here. Then `rm -rf "$WORK"`.
 
+## 6. Log in on the node (zl-zipline#233)
+
+A person logs in on the Zode with `ph-cli`, and the Zode's own actor gains
+the user's OIDC attributes until `ph-cli logout`. This section checks that
+on Windows: the admin RPC `login` over the named pipe, the visa-service nonce,
+and the agent callback to `ph-cli`.
+
+Setup, beyond sections 1 and 2:
+
+* **An OIDC provider in the policy.** Add a `[trusted_services.fake-idp]`
+  block to the policy's `.zplc` as in `pregen/oidc-test.zplc`, with
+  `issuer = "https://<Linux host IP>:9443"`, the matching `jwks_uri`,
+  `seed_jwks = "oidc-test-seed-jwks.json"` and
+  `allow_offline_access = true`, and recompile.
+* **The fake IdP on the Linux host's address**, with a server certificate
+  for that IP signed by the test CA:
+
+  ```sh
+  openssl req -new -newkey rsa:2048 -nodes -keyout idp.key -subj "/CN=$HOST_IP" -out idp.csr
+  openssl x509 -req -in idp.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+    -out idp.crt -extfile <(printf "subjectAltName=IP:$HOST_IP")
+  python3 integration-test/lib/fake-idp.py --host "$HOST_IP" --port 9443 \
+    --state-dir idp-state --tls-cert idp.crt --tls-key idp.key \
+    --signing-key integration-test/pregen/fake-idp-rsa.key \
+    --client-id zpr-test-client --sub user-zb --email user-zb@example.com --hd example.com
+  ```
+
+* **Windows must trust the test CA** for `ph-cli` to reach the IdP: `ph-cli`
+  uses the system trust store (`Cert:\LocalMachine\Root`). This is a change to the test
+  host. Without it, the login stops at the IdP with `IdpUnreachable` (exit
+  4), after the nonce and the agent callback have run.
+* **The VSS firewall rule** (`zpr-node-vss`, section 2) is needed: the
+  identity-provider list reaches the node over its VSS connection. Without
+  it, `connect` fails with `AuthUnavailable` (exit 1) before asking for a
+  nonce.
+* Under the `zipline` service ph runs as LocalSystem: your account must be
+  in the configured `control_group` to reach the pipe (zipline#154).
+
+On the node, **as yourself, not elevated or under sudo** (so `ph-cli` can
+open the browser):
+
+```sh
+.\ph-cli.exe login-status            # State: logged out
+.\ph-cli.exe auth-agent --no-browser # prints a URL: open it in the node's browser; stays resident
+.\ph-cli.exe login-status            # State: logged in, Issuer, Expires in, Auth agent: registered
+.\ph-cli.exe logout                  # Logged out; the node stays connected
+.\ph-cli.exe logout                  # logout failed: not logged in (exit 1)
+```
+
+Pass criteria: `auth-agent` prints `Logged in`; `login-status` shows the
+issuer and the time left; a flow the policy allows only with a `user.*`
+attribute is admitted while logged in and denied after `logout`; the node's
+log shows `Zode login: logged in with <issuer>` and `Zode login: logged
+out`, and never a token or a nonce.
+
 ## Recording the result
 
 Paste the transcript (node startup lines, `ph-cli` output from both sides,
@@ -359,3 +414,22 @@ Minor observation, not filed: on Ctrl-C, `adapter1` received
 `Terminate ... reason Reset`, while `adapter2` dropped the node's terminate
 as `unexpected ZPI value 0 (expected ZPIPair { encr: 133, hmac: 6 })` and
 noticed the node had gone only through missed keep-alives.
+
+### 2026-11-13 — Zode login (zl-zipline#233), partial
+
+* Build: `zl-zpr-core` `feature/zodes-233-zode-login` @ `1fa417b`, on the VM
+  (Windows 11). Linux side: a relay Zode in the host netns advertising
+  `192.168.122.1:5000`, the visa service (`v0.22.0-zodes.6`) docked on it
+  from a netns, the zodes fixture policy plus a fake-IdP trusted service, and
+  `fake-idp.py --host 192.168.122.1`. The VM ran `ph.exe node` as Zode `zb`
+  (`--self-addr 192.168.122.39:5000 --initial-link relay@192.168.122.1:5000`).
+* No change to the VM: no firewall rule, no CA in the trust store.
+* Result: the Zode joined, got its VS-API session and registered its VSS,
+  but the visa service could not reach the VSS (no `zpr-node-vss` rule), so
+  no identity provider was listed. Over the named pipe: `login-status`
+  printed `State: logged out` (exit 0); `logout` printed `logout failed: not
+  logged in` (exit 1); `connect --no-browser` printed `login failed:
+  AuthUnavailable` (exit 1, node log `Zode login requested` / `Zode login
+  failed: AuthUnavailable`); `login-status` then showed `Last failure:
+  AuthUnavailable`. The nonce, the agent callback and a completed login were
+  not reached: they need the VSS rule and the CA trusted.

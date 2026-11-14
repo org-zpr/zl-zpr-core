@@ -19,6 +19,12 @@ interface CmdLineInter {
     changeLogging        @15 (logs: List(Log)) -> (result: LogsApplied);
     getNodeInfo          @16 () -> (result: SuccessOrError);
     getTunInfo           @17 () -> (result: SuccessOrError, info: TunInfo); # zipline#202: `ph-cli tun`
+    # zl-zipline#233: a Zode's own login. `login` registers authAgent for
+    # this connection and returns when the login finishes; its error text is
+    # the AuthFailureReason Debug spelling. All three refuse on an adapter.
+    login                @18 (authAgent: AuthAgent) -> (result: SuccessOrError);
+    logout               @19 () -> (result: SuccessOrError);
+    showLogin            @20 () -> (result: Text);
 }
 
 # The TUN interface ph opened (zipline#202). `zprAddrs` lists only the

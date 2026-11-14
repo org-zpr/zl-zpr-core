@@ -256,6 +256,55 @@ Linux: identical to `windows-node-test.md` section 5 —
 `sudo integration-test/remote-node-host-env.sh nat-down` on the host (plain
 `sudo`, no `-E`), then `rm -rf "$WORK"`.
 
+## 6. Log in on the node (zl-zipline#233)
+
+A person logs in on the Zode with `ph-cli`, and the Zode's own actor gains
+the user's OIDC attributes until `ph-cli logout`. This section checks that
+on macOS: the admin RPC `login` over the unix socket, the visa-service nonce,
+and the agent callback to `ph-cli`.
+
+Setup, beyond sections 1 and 2:
+
+* **An OIDC provider in the policy.** Add a `[trusted_services.fake-idp]`
+  block to the policy's `.zplc` as in `pregen/oidc-test.zplc`, with
+  `issuer = "https://<Linux host IP>:9443"`, the matching `jwks_uri`,
+  `seed_jwks = "oidc-test-seed-jwks.json"` and
+  `allow_offline_access = true`, and recompile.
+* **The fake IdP on the Linux host's address**, with a server certificate
+  for that IP signed by the test CA:
+
+  ```sh
+  openssl req -new -newkey rsa:2048 -nodes -keyout idp.key -subj "/CN=$HOST_IP" -out idp.csr
+  openssl x509 -req -in idp.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+    -out idp.crt -extfile <(printf "subjectAltName=IP:$HOST_IP")
+  python3 integration-test/lib/fake-idp.py --host "$HOST_IP" --port 9443 \
+    --state-dir idp-state --tls-cert idp.crt --tls-key idp.key \
+    --signing-key integration-test/pregen/fake-idp-rsa.key \
+    --client-id zpr-test-client --sub user-zb --email user-zb@example.com --hd example.com
+  ```
+
+* **macOS must trust the test CA** for `ph-cli` to reach the IdP: `ph-cli`
+  uses the system trust store (the System keychain). This is a change to the test
+  host. Without it, the login stops at the IdP with `IdpUnreachable` (exit
+  4), after the nonce and the agent callback have run.
+
+On the node, **as yourself, not elevated or under sudo** (so `ph-cli` can
+open the browser):
+
+```sh
+./ph-cli login-status            # State: logged out
+./ph-cli auth-agent --no-browser # prints a URL: open it in the node's browser; stays resident
+./ph-cli login-status            # State: logged in, Issuer, Expires in, Auth agent: registered
+./ph-cli logout                  # Logged out; the node stays connected
+./ph-cli logout                  # logout failed: not logged in (exit 1)
+```
+
+Pass criteria: `auth-agent` prints `Logged in`; `login-status` shows the
+issuer and the time left; a flow the policy allows only with a `user.*`
+attribute is admitted while logged in and denied after `logout`; the node's
+log shows `Zode login: logged in with <issuer>` and `Zode login: logged
+out`, and never a token or a nonce.
+
 ## Recording the result
 
 Paste the transcript (node startup lines, `ph-cli` output from both sides,
@@ -307,3 +356,22 @@ Other observations from this run:
   exit; harmless (the next start re-binds it).
 * `WARN startup: Unable to enable ingress packet steering: packet steering
   not supported on this OS` at every start — expected on macOS.
+
+### 2026-11-13 — Zode login (zl-zipline#233), partial
+
+* Build: `zl-zpr-core` `feature/zodes-233-zode-login` @ `1fa417b`, on the Mac
+  (macOS 26.5.2, arm64). Linux side as in the Windows guide's run of the same
+  day, advertising `192.168.0.212:5000`, with `fake-idp.py --host
+  192.168.0.212`. The Mac ran `sudo ph node` as Zode `zb` (`--self-addr
+  0.0.0.0:5000 --advertised-substrate-addr 192.168.0.150:5000
+  --initial-link relay@192.168.0.212:5000`); `ph-cli` ran as the user.
+* No change to the Mac: the test CA is not trusted.
+* Result: the Zode joined and the visa service connected to its VSS. Over
+  the unix socket: `login-status` printed `State: logged out` (exit 0);
+  `logout` printed `logout failed: not logged in` (exit 1); `connect
+  --no-browser` got a visa-service nonce, ph called the agent back over the
+  socket, and the agent's discovery request reached the fake IdP, which
+  logged `TLSV1_ALERT_UNKNOWN_CA`; `ph-cli` printed `login failed:
+  IdpUnreachable("HTTP error talking to the IdP: …")` and exited 4.
+  `login-status` then showed that `Last failure`. A completed login was not
+  reached: it needs the CA trusted.

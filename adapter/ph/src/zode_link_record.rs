@@ -139,8 +139,10 @@ pub struct LinkRecord {
     pub kind: Kind,
     /// Who dials it (see [crate::zode_links::link_owner]).
     pub owner: Owner,
-    /// The peer's substrate address, which the owner dials.
-    pub dial_addr: SocketAddr,
+    /// The peer's substrate address, which the owner dials. `None` only
+    /// when the peer owns the link: the visa service may not know the
+    /// address of a Zode that dials in (ZODE_LINKS.md rule 13b).
+    pub dial_addr: Option<SocketAddr>,
     /// The connection currently serving the link: an attempt or the up
     /// link. `None` when there is none.
     pub link_id: Option<LinkId>,
@@ -160,7 +162,12 @@ pub struct LinkRecord {
 impl LinkRecord {
     /// A new, idle record. `jitter` returns a uniform number in [0, 1) and
     /// spreads initial-link redials; see [jittered].
-    pub fn new(kind: Kind, owner: Owner, dial_addr: SocketAddr, jitter: fn() -> f64) -> Self {
+    pub fn new(
+        kind: Kind,
+        owner: Owner,
+        dial_addr: Option<SocketAddr>,
+        jitter: fn() -> f64,
+    ) -> Self {
         LinkRecord {
             kind,
             owner,
@@ -389,7 +396,12 @@ mod tests {
     }
 
     fn record(kind: Kind, owner: Owner) -> LinkRecord {
-        LinkRecord::new(kind, owner, "10.0.0.9:5000".parse().unwrap(), mid_jitter)
+        LinkRecord::new(
+            kind,
+            owner,
+            Some("10.0.0.9:5000".parse().unwrap()),
+            mid_jitter,
+        )
     }
 
     /// The clock carried by the first `Arm` of `timer` in `actions`.

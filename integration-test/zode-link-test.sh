@@ -4,19 +4,24 @@
 # docs/ZODE_LINKS.md.
 #
 # A relay Zode (relay = true) docks the visa service. Zode zb has an initial
-# link to the relay; zb is in the relay's topology. Zode zc has a
+# link to the relay; zb is in the relay's topology. zb has no substrate
+# address in policy (zl-zipline#255, W10), so the visa service knows it only
+# once zb connects and reports it. Zode zc has a
 # certificate from the same CA and an initial link to the relay, but is in
 # no policy.
 #
 # Scenarios, each checking the exact link count on both ends (no leaked or
 # duplicate links):
-#   1. zb joins (J1-J5, J11): one Active link at each end. The relay requests
+#   1. Before zb connects, the relay's topology already names zb, with its
+#      peer address unset (ZODE_LINKS.md rule 13b). zb joins (J1-J5, J11):
+#      one Active link at each end. The relay requests
 #      zb's bootstrap visas and hands them off; zb starts with an empty visa
 #      table, so it holds exactly those two (IDs from the visa service, not
 #      the self-granted 1 and 2). zb authenticates, reports its link up,
 #      registers its VSS and receives its topology. Its own VS-API visas
 #      (J5a) supersede the bootstrap pair and its live session moves onto
-#      them with no failed rebind.
+#      them with no failed rebind. Once zb has connected, the visa service
+#      re-proposes the relay's topology with zb's reported address.
 #   2. zb restarts on the same address: the relay ends with one link to zb
 #      (rule 5) and reports it up again; the restarted zb joins again with
 #      fresh bootstrap visas (J6).
@@ -83,6 +88,10 @@ INSTALLED='installed bootstrap visas \[[0-9]+, [0-9]+\] bound to the link'
 GRANTED='node access granted to visa service'
 REGISTERED='registered VSS'
 TOPOLOGY='received topology update with [1-9][0-9]* links'
+# One topology link (vss_worker.rs process_topology): the relay's link to zb
+# with no peer address, and with the address zb reported.
+TOPOLOGY_ZB_UNSET="\\]-> peer unset, zpr addr $(ere_escape "$ZB_ZPR_ADDR"), peer cn \"zb\""
+TOPOLOGY_ZB_REPORTED="\\]-> peer $(ere_escape "$ZB_SUBSTRATE_ADDR:$ZODE_PORT"), zpr addr $(ere_escape "$ZB_ZPR_ADDR"), peer cn \"zb\""
 REPORT_RELAY_UP='reported Zode link states to the visa service: \[.*relay=Up'
 REJOIN='rejoining \(J10\)'
 # J11: a failed rebind (mgmt/node.rs rebind_failed).
@@ -96,6 +105,8 @@ if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
 
   echo "== 1. zb joins"
+  wait_log_after 20 relay.log "$TOPOLOGY_ZB_UNSET" 0 "before zb connects, the relay's topology names zb with no peer address (rule 13b)" || PASS=1
+  assert_no_log relay.log "$TOPOLOGY_ZB_REPORTED" "the relay has no address for zb yet" || PASS=1
   launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
   assert_active_links 20 relay "$ZB_SUBSTRATE_ADDR" 1 "the relay has one Active link to zb" || PASS=1
   assert_active_links 5 zb "$RELAY_SUBSTRATE_ADDR" 1 "zb has one Active link to the relay" || PASS=1
@@ -108,6 +119,7 @@ if [[ "$PASS" == 0 ]]; then
   wait_log_after 10 zb.log "$INSTALLED" 0 "zb installs the hand-off (J4)" || PASS=1
   assert_joiner_table zb.log "$HANDOFF" || PASS=1
   wait_log_after 30 zb.log "$GRANTED" 0 "zb authenticates over its bootstrap visas (J5)" || PASS=1
+  wait_log_after 20 relay.log "$TOPOLOGY_ZB_REPORTED" 0 "the relay's next topology carries zb's reported address" || PASS=1
   wait_log_after 10 zb.log "$REPORT_RELAY_UP" 0 "zb reports its initial link up itself" || PASS=1
   wait_log_after 20 zb.log "$REGISTERED" 0 "zb registers its VSS" || PASS=1
   wait_log_after 20 zb.log "$TOPOLOGY" 0 "zb receives its topology" || PASS=1

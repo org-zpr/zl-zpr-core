@@ -11,6 +11,7 @@ info:
 	@echo make all     - recompiles out of date policy files
 	@echo make rebuild - run a clean followed by an all.
 	@echo
+	@echo Requires zplc 0.21.x, the only version the visa service loads.
 	@echo Requires that \'zplc\' the ZPL compiler is in your path.
 	@echo Or you can set path to zplc by setting ZPLC variable.
 	@echo
@@ -62,8 +63,8 @@ oidc-file-interplay.bin2: oidc-file-interplay.zpl oidc-file-interplay.zplc oidc-
 # configs: the base policy plus two variants whose only difference is a
 # removed [bootstrap] key (adapter2's for leg 3, the node's for leg 4) —
 # the same one-source trick oidc-renewal.bin2 plays on oidc-test.zpl. Same
-# omitted-`service` warning as oidc-test; expected. Needs zplc >= 0.20.0
-# (the policy version the visa service accepts, zipline#114).
+# omitted-`service` warning as oidc-test; expected. Needs zplc 0.21.x
+# (the policy version the visa service accepts, zl-zipline#256).
 policy-reauth.bin2: policy-reauth.zplc policy-reauth.zpl oidc-test-seed-jwks.json
 	$(ZPLC) -c policy-reauth.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
 

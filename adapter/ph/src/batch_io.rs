@@ -1613,9 +1613,9 @@ mod windows_udp {
     /// Send datagrams to explicit destinations, each from its caller-chosen
     /// source address when one is given. The engine's plain `send_to` leg
     /// comes here too, with no source.
-    pub fn send_to_from_batch<'a>(
+    pub fn send_to_from_batch(
         socket: &UdpSocket,
-        bufs: &mut dyn Iterator<Item = (&'a [u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
+        bufs: &mut dyn Iterator<Item = (&[u8], SocketAddr, Option<ScopedIpAddr>, SendFlags)>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize> {
         do_batch_op(
@@ -1700,9 +1700,9 @@ mod windows_udp {
 
     /// Receive datagrams with their source addresses and, with `with_dest`,
     /// their destination addresses (see [`recv_msg`]).
-    pub fn recv_from_batch<'a>(
+    pub fn recv_from_batch(
         socket: &UdpSocket,
-        bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+        bufs: &mut dyn Iterator<Item = &mut dyn BufMut>,
         results: &mut Vec<Result<ReceivedPacket>>,
         with_dest: bool,
     ) -> Result<usize> {
@@ -3384,23 +3384,21 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(50));
 
-        // Drain. Every outcome except ConnectionReset/panic is a pass:
-        // WouldBlock (reset already mapped or ioctl-suppressed) ends the
-        // drain; a datagram cannot arrive (nothing sends to us).
+        // One batch receive. Every outcome except ConnectionReset/panic is
+        // a pass: WouldBlock (reset already mapped or ioctl-suppressed) or an
+        // empty batch; a datagram cannot arrive (nothing sends to us).
         let mut bufs = vec![Vec::with_capacity(64); 4];
         let mut results: Vec<Result<ReceivedPacket>> = Vec::new();
-        for _ in 0..8 {
-            match windows_udp::recv_from_batch(
-                &socket,
-                &mut bufs.iter_mut().map(|b| b as &mut dyn BufMut),
-                &mut results,
-                true,
-            ) {
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(err) => panic!("reset must not surface as a batch error: {err}"),
-                Ok(0) => break,
-                Ok(_) => panic!("received a datagram nobody sent"),
-            }
+        match windows_udp::recv_from_batch(
+            &socket,
+            &mut bufs.iter_mut().map(|b| b as &mut dyn BufMut),
+            &mut results,
+            true,
+        ) {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => panic!("reset must not surface as a batch error: {err}"),
+            Ok(0) => {}
+            Ok(_) => panic!("received a datagram nobody sent"),
         }
     }
 

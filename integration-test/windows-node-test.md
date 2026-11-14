@@ -193,10 +193,10 @@ result. On later runs add the dock rule up front and the VSS rule after
 startup, if an earlier run has not already left it in place.
 
 Start the node from an **elevated** PowerShell (Wintun device creation
-requires it). The concrete `--self-addr` is decision N1 of the win-node plan:
-the Windows engine rejects a wildcard bind by design, and with a concrete
-address no separate `advertised_substrate_addr` is needed (it defaults to
-`self_addr` when that is specific).
+requires it). The concrete `--self-addr` keeps this procedure short: with a
+concrete address no separate `advertised_substrate_addr` is needed (it
+defaults to `self_addr` when that is specific). A wildcard bind works too
+since zipline#150, with `advertised_substrate_addr` set.
 
 ```powershell
 cd C:\zpr-node

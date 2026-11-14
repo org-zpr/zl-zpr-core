@@ -12,17 +12,14 @@ use tracing::warn;
 /// Create, configure and bind one substrate UDP socket on `addr`.
 ///
 /// The socket is nonblocking (the batch I/O engines poll it). The Windows
-/// datapath (zipline#131, plan D5) is single-socket/single-homed, so
-/// there is no pktinfo or `SO_REUSEPORT` here; the Windows-specific setup
-/// is instead:
+/// datapath (zipline#131) drives a single socket, so there is no
+/// `SO_REUSEPORT` here. After the bind:
 ///
-/// - [`batch_io::windows_substrate_bind_check`] after the bind: a socket
-///   still wildcard-bound — a node with a wildcard `self_addr`, which the
-///   adapter-only probe in `main.rs` never rebinds — would record
-///   `0.0.0.0`/`::` as every packet's interface address and trip the
-///   fastpath's unspecified-address assertion on the first response.
-///   Rejected here with the fix in the error message; the caller logs it
-///   and exits cleanly, not a panic (zipline#160).
+/// - [`batch_io::set_recv_packet_info`] (zipline#150): each received
+///   datagram carries its destination address (`IP_PKTINFO` /
+///   `IPV6_PKTINFO`, read by `WSARecvMsg`), so a wildcard `self_addr`
+///   works as on unix. Windows needs the socket bound first to know its
+///   family, hence after the bind, not before it as on unix.
 /// - [`disable_udp_connreset`] (zipline#160, plan N4): without it, a peer
 ///   that departs — its host answering our sends with ICMP
 ///   port-unreachable — makes a later `recvfrom` on this unconnected UDP
@@ -43,11 +40,7 @@ pub fn open(addr: SocketAddr) -> io::Result<socket2::Socket> {
     )?;
     socket.set_nonblocking(true)?;
     socket.bind(&socket2::SockAddr::from(addr))?;
-    let bound = socket
-        .local_addr()?
-        .as_socket()
-        .expect("substrate socket bound to a non-IP address");
-    batch_io::windows_substrate_bind_check(bound)?;
+    batch_io::set_recv_packet_info(&socket, true)?;
     if let Err(err) = disable_udp_connreset(&socket) {
         warn!(
             target: STARTUP,
@@ -68,7 +61,7 @@ pub fn open(addr: SocketAddr) -> io::Result<socket2::Socket> {
 /// wanted: a node's substrate socket talks to many adapters and any of them
 /// may leave at any time. This ioctl turns the behavior off so the reset is
 /// never reported; the `ConnectionReset` mapping in
-/// `batch_io`'s `std_udp::connreset_as_wouldblock` remains as the
+/// `batch_io`'s `windows_udp::connreset_as_wouldblock` remains as the
 /// belt-and-braces fallback should the ioctl ever be absent.
 ///
 /// Moved here from `batch_io.rs` (zipline#176): it is socket setup, not

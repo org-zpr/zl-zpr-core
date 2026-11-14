@@ -33,6 +33,14 @@
 #   6. The relay cannot reach the visa service: it cannot get zb's bootstrap
 #      visas, so it closes zb's link instead of handing off (J7).
 #   7. The relay never dials (rule 4).
+#   8. zb changes networks (zl-zipline#230): its substrate address moves to
+#      another subnet. zb binds the wildcard self_addr, a laptop Zode's
+#      default, and has no advertised_substrate_addr. Sends from the old
+#      address fail and are dropped, not fatal; the keep-alive closes the
+#      initial link, zb redials from the new address and rejoins (rule 11a,
+#      J6), and reports the new address to the visa service. Its session
+#      comes back. The visa service accepts the new address only because
+#      policy gives zb none (zl-zipline#255).
 #
 # Every Stream ID Request in the run crosses the relay-zb Zode link, in both
 # directions: the join, the J11 rebinds, the VSS flow, the restart and the
@@ -91,12 +99,24 @@ REBIND_FAILED='its rebind onto visa [0-9]+ failed'
 # (mgmt/node.rs prepare_next_hop_bind), and the counter of every refusal.
 PREV_HOP_REFUSED="refusing Stream ID Request from .*: not the visa's previous hop"
 REJECTED='Stream ID Request Rejected'
+# Gap 1 (zl-zipline#230): a send error that stops ph, and a send from a
+# vanished address that is dropped instead (fastpath_io.rs).
+UNRECOVERABLE='unrecoverable I/O error'
+SEND_DROPPED='dropping substrate send from'
+
+# zb binds the wildcard self_addr with no advertised address (zl-zipline#230):
+# it reports its initial link's local address, which follows scenario 8's
+# network change.
+ZB_BIND=0.0.0.0
+# Scenario 8's new network: a second subnet on the relay's bridge.
+RELAY_NEW_NET_ADDR=10.3.0.1
+ZB_NEW_SUBSTRATE_ADDR=10.3.0.2
 
 if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
 
   echo "== 1. zb joins"
-  launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
+  launch_zode zb "$ZB_BIND" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
   assert_active_links 20 relay "$ZB_SUBSTRATE_ADDR" 1 "the relay has one Active link to zb" || PASS=1
   assert_active_links 5 zb "$RELAY_SUBSTRATE_ADDR" 1 "zb has one Active link to the relay" || PASS=1
   wait_log_after 10 relay.log "$REPORT_ZB_UP" 0 "the relay reports zb up to the visa service" || PASS=1
@@ -124,7 +144,7 @@ if [[ "$PASS" == 0 ]]; then
   HANDOFFS=$(log_count relay.log "$HANDED_ZB")
   REGISTRATIONS=$(log_count zb.log "$REGISTERED")
   kill_zode zb || PASS=1
-  launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
+  launch_zode zb "$ZB_BIND" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
   wait_log_after 20 relay.log "$ZB_ACCEPTED" "$ACCEPTED" "the relay accepts the restarted zb" || PASS=1
   assert_active_links 10 relay "$ZB_SUBSTRATE_ADDR" 1 "the relay still has exactly one link to zb" || PASS=1
   assert_active_links 5 zb "$RELAY_SUBSTRATE_ADDR" 1 "the restarted zb has one link to the relay" || PASS=1
@@ -185,9 +205,10 @@ if [[ "$PASS" == 0 ]]; then
   echo "== 6. the relay cannot reach the visa service"
   REFUSALS=$(log_count relay.log "$REFUSED_ZB_J7")
   HANDOFFS=$(log_count relay.log "$HANDED_ZB")
+  REGISTRATIONS=$(log_count zb.log "$REGISTERED")
   kill_zode zb || PASS=1
   block_substrate vs
-  launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
+  launch_zode zb "$ZB_BIND" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
   wait_log_after 30 relay.log "$REFUSED_ZB_J7" "$REFUSALS" "the relay closes zb's link instead of handing off (J7)" || PASS=1
   if log_count_above relay.log "$HANDED_ZB" "$HANDOFFS"; then
     echo "ASSERTION FAILED: the relay handed zb bootstrap visas without the visa service"
@@ -204,6 +225,40 @@ if [[ "$PASS" == 0 ]]; then
   # Gap 7, over the whole run (zb.log spans every zb process).
   assert_no_log relay.log "$PREV_HOP_REFUSED" "the relay refused no request from a previous hop" || PASS=1
   assert_no_log zb.log "$PREV_HOP_REFUSED" "zb refused no request from a previous hop" || PASS=1
+
+  echo "== 8. zb changes networks"
+  # Scenario 6 started zb while the visa service was cut off: wait for that
+  # zb's session before the change, so the rejoin below is the change's.
+  wait_log_after 90 zb.log "$REGISTERED" "$REGISTRATIONS" "zb has a session before the change" || PASS=1
+  HANDOFFS=$(log_count relay.log "$HANDED_ZB")
+  REJOINS=$(log_count zb.log "$REJOIN")
+  REGISTRATIONS=$(log_count zb.log "$REGISTERED")
+  DROPS=$(log_count zb.log "$SEND_DROPPED")
+  ZB_PID=$(ph_pid_for_socket zb.sock)
+  # The new network: zb's address moves to another subnet on the same
+  # segment, and the relay is reached through its address there.
+  in_ns zpr-relay ip addr add "$RELAY_NEW_NET_ADDR/24" dev br0
+  in_ns zpr-zb ip addr add "$ZB_NEW_SUBSTRATE_ADDR/24" dev veth0
+  in_ns zpr-zb ip addr del "$ZB_SUBSTRATE_ADDR/24" dev veth0
+  in_ns zpr-zb ip route add "${RELAY_SUBSTRATE_ADDR%.*}.0/24" via "$RELAY_NEW_NET_ADDR"
+  # The keep-alive notices in about 12 s, then zb redials and rejoins.
+  wait_log_after 30 zb.log "$SEND_DROPPED $ZB_SUBSTRATE_ADDR" "$DROPS" "zb drops its sends from the old address" || PASS=1
+  wait_log_after 30 zb.log "$REJOIN" "$REJOINS" "zb's session broke: it rejoins (J10)" || PASS=1
+  assert_active_links 60 relay "$ZB_NEW_SUBSTRATE_ADDR" 1 "the relay has one link to zb at its new address" || PASS=1
+  assert_active_links 5 relay "$ZB_SUBSTRATE_ADDR" 0 "the relay has no link to zb's old address" || PASS=1
+  assert_active_links 5 zb "$RELAY_SUBSTRATE_ADDR" 1 "zb has one link to the relay" || PASS=1
+  wait_log_after 10 relay.log "$HANDED_ZB" "$HANDOFFS" "the rejoin gets a new hand-off (J6)" || PASS=1
+  wait_log_after 30 vs.log "node zb substrate address .*-> $ZB_NEW_SUBSTRATE_ADDR:$ZODE_PORT" 0 \
+    "the visa service has zb's new substrate address" || PASS=1
+  wait_log_after 30 zb.log "$REGISTERED" "$REGISTRATIONS" "zb's session is back: it registers its VSS again" || PASS=1
+  assert_superseded 20 zb "$(last_handoff_ids relay.log zb)" || PASS=1
+  if [[ -n "$ZB_PID" ]] && ! process_exited "$ZB_PID"; then
+    echo "assertion OK: zb kept running through the change"
+  else
+    echo "ASSERTION FAILED: zb did not keep running through the change"
+    PASS=1
+  fi
+  assert_no_log zb.log "$UNRECOVERABLE" "no send error stopped zb" || PASS=1
 fi
 
 zode_report "$PASS"

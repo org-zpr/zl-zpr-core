@@ -42,6 +42,11 @@ use crate::prelude::*;
 /// failed. The wait never runs past the expiry, which logs the user out.
 const RENEWAL_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
+/// The least time between two silent renewals: refresh-grant tokens minted
+/// in the same second can carry the same `iat`, and the visa service
+/// requires it to increase.
+const MIN_RENEWAL_SPACING: Duration = Duration::from_secs(1);
+
 /// Where a Zode's own login stands.
 #[derive(Clone, Debug)]
 pub enum LoginState {
@@ -109,6 +114,10 @@ pub struct ZodeLogin {
     /// Serializes every `reauthorize` of the node's own actor, so a renewal
     /// cannot put a user back after a logout went out.
     reauth_lock: tokio::sync::Mutex<()>,
+    /// Held for a whole silent renewal, so overlapping renewals (the timer
+    /// and policy requests) share one. Holds when the last successful
+    /// renewal was submitted.
+    renew_lock: tokio::sync::Mutex<Option<SystemTime>>,
 }
 
 impl Default for ZodeLogin {
@@ -121,6 +130,7 @@ impl Default for ZodeLogin {
                 generation: 0,
             }),
             reauth_lock: tokio::sync::Mutex::new(()),
+            renew_lock: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -339,8 +349,26 @@ fn auth_expiry(conn: &Connection) -> SystemTime {
 /// another login is pending or someone is logged in. On success the
 /// renewal timer is armed; on failure the reason is recorded for
 /// `login-status`.
+///
+/// The attempt runs as its own task, so it always finishes and settles the
+/// state even if the caller goes away (a cancelled admin RPC). It is
+/// bounded anyway: an agent whose connection closed fails at once, and the
+/// wait for the user is bounded.
 pub async fn login(asm: &Arc<Assembly>, agent: AuthAgentHandle) -> Result<(), LoginError> {
     asm.zode_login.begin_login(&agent)?;
+    let task_asm = asm.clone();
+    tokio::task::spawn_local(async move { attempt_login(&task_asm, agent).await })
+        .await
+        .unwrap_or_else(|e| {
+            Err(LoginError::Failed(AuthFailureReason::AgentError(format!(
+                "the login task failed: {e}"
+            ))))
+        })
+}
+
+/// One login attempt after [ZodeLogin::begin_login]: obtain the login,
+/// then record it and arm the renewal timer, or record the failure.
+async fn attempt_login(asm: &Arc<Assembly>, agent: AuthAgentHandle) -> Result<(), LoginError> {
     match obtain_login(asm, &agent).await {
         Ok((idp, nonce, conn)) => {
             let expires = auth_expiry(&conn);
@@ -439,7 +467,21 @@ async fn send_logout(asm: &Arc<Assembly>) -> Result<(), AuthFailureReason> {
 /// One silent renewal of the login of `generation`: a non-interactive agent
 /// request with the login's nonce, then `[SS, OIDC]`. Success moves the
 /// expiry forward. `Ok` without sending anything if that login has ended.
+///
+/// Overlapping renewals share one: a renewal that waited for another
+/// returns `Ok` if that one was submitted after it was asked for, and two
+/// renewals are spaced at least [MIN_RENEWAL_SPACING] apart.
 async fn renew(asm: &Arc<Assembly>, generation: u64) -> Result<(), AuthFailureReason> {
+    let asked = SystemTime::now();
+    let mut last_renewal = asm.zode_login.renew_lock.lock().await;
+    if last_renewal.is_some_and(|submitted| submitted >= asked) {
+        return Ok(());
+    }
+    if let Some(since) = last_renewal.and_then(|t| SystemTime::now().duration_since(t).ok()) {
+        if since < MIN_RENEWAL_SPACING {
+            tokio::time::sleep(MIN_RENEWAL_SPACING - since).await;
+        }
+    }
     let Some((idp, nonce, _, expires)) = asm.zode_login.current(generation) else {
         return Ok(());
     };
@@ -458,10 +500,12 @@ async fn renew(asm: &Arc<Assembly>, generation: u64) -> Result<(), AuthFailureRe
         id_token,
         nonce,
     };
+    let submitted = SystemTime::now();
     let conn = vsconn
         .reauthorize_own_actor(actor_addr(asm), Some(blob))
         .await
         .map_err(vs_failure)?;
+    *last_renewal = Some(submitted);
     asm.zode_login
         .renewed(generation, SystemTime::now(), auth_expiry(&conn));
     Ok(())
@@ -488,8 +532,13 @@ async fn renewal_loop(asm: &Arc<Assembly>, generation: u64) {
         };
         let now = SystemTime::now();
         if now >= expires {
-            expire(asm, generation).await;
-            return;
+            if expire(asm, generation).await {
+                return;
+            }
+            // The logout was refused: the user may still be on the actor,
+            // so stay logged in and retry.
+            tokio::time::sleep(RENEWAL_RETRY_INTERVAL).await;
+            continue;
         }
         let due = next_attempt.unwrap_or_else(|| renewal_deadline(granted_at, expires, lead));
         if now < due {
@@ -508,21 +557,25 @@ async fn renewal_loop(asm: &Arc<Assembly>, generation: u64) {
 }
 
 /// The login of `generation` expired without a renewal: log out on the
-/// visa service and record [AuthFailureReason::LoginExpired]. Recorded
-/// locally even if the logout cannot be sent: the authentication has
-/// expired either way.
-async fn expire(asm: &Arc<Assembly>, generation: u64) {
+/// visa service and record [AuthFailureReason::LoginExpired]. False if the
+/// visa service refused the logout: the state stays logged in, because
+/// the user may still be on the actor (and a new login would look like a
+/// renewal), and the caller retries. True once done, or if the login
+/// ended meanwhile.
+async fn expire(asm: &Arc<Assembly>, generation: u64) -> bool {
     if asm.zode_login.current(generation).is_none() {
-        return;
+        return true;
     }
     warn!(target: RPC, "Zode login: expired without a renewal; logging out");
     if let Err(reason) = send_logout(asm).await {
-        warn!(target: RPC, "Zode login: the logout at expiry failed: {reason:?}");
+        warn!(target: RPC, "Zode login: the logout at expiry failed: {reason:?}; retrying");
+        return false;
     }
     if asm.zode_login.current(generation).is_some() {
         asm.zode_login
             .logged_out(Some(AuthFailureReason::LoginExpired));
     }
+    true
 }
 
 /// The node's VS-API session was replaced: call after every successful node
@@ -1148,6 +1201,134 @@ pub(crate) mod tests {
                 assert_eq!(seen.borrow()[1], ("vs-nonce-1".to_string(), false));
                 assert_eq!(seen.borrow()[2], ("vs-nonce-2".to_string(), true));
                 assert!(eventually(Duration::from_secs(5), || asm.zode_login.is_logged_in()).await);
+            })
+            .await;
+    }
+
+    /// A login whose caller goes away (the admin RPC was cancelled, and
+    /// ph-cli with it) does not leave the Zode stuck in `LoggingIn`: the
+    /// attempt still settles, and a new login works.
+    #[tokio::test]
+    async fn cancelled_login_does_not_wedge_the_state() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _fake) = zode(FakeVsState::default(), true).await;
+                // An agent the test can make go away, like ph-cli exiting.
+                let (gone_agent, mut agent_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<OidcCredentialRequest>();
+                let first_asm = asm.clone();
+                let first =
+                    tokio::task::spawn_local(async move { login(&first_asm, gone_agent).await });
+                let request = tokio::time::timeout(Duration::from_secs(5), agent_rx.recv())
+                    .await
+                    .expect("the agent is asked")
+                    .expect("a request");
+
+                first.abort();
+                let _ = first.await;
+                drop(request);
+                drop(agent_rx);
+                assert!(
+                    eventually(Duration::from_secs(5), || matches!(
+                        asm.zode_login.state(),
+                        LoginState::LoggedOut { .. }
+                    ))
+                    .await,
+                    "{:?}",
+                    asm.zode_login.state()
+                );
+                login(&asm, ok_agent().0).await.expect("a new login works");
+            })
+            .await;
+    }
+
+    /// An agent that answers every request with [ID_TOKEN] after `delay`.
+    fn slow_agent(delay: Duration) -> (AuthAgentHandle, Seen) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<OidcCredentialRequest>();
+        let seen: Seen = Rc::default();
+        let task_seen = seen.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(req) = rx.recv().await {
+                task_seen
+                    .borrow_mut()
+                    .push((req.nonce.clone(), req.interactive));
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = req.reply.send(Ok(ID_TOKEN.to_string()));
+                });
+            }
+        });
+        (tx, seen)
+    }
+
+    /// Overlapping renewals (two policy requests) share one: the agent is
+    /// asked once and one `reauthorize` goes out. Two refresh-grant tokens
+    /// in the same second can carry the same `iat`, which the visa service
+    /// refuses.
+    #[tokio::test]
+    async fn overlapping_renewals_are_coalesced() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(FakeVsState::default(), true).await;
+                let (agent, seen) = slow_agent(Duration::from_millis(300));
+                login(&asm, agent).await.expect("login");
+                let own: IpAddr = NODE_ADDR.parse().unwrap();
+
+                crate::vss_worker::process_request_authentication(&asm, &[own]);
+                crate::vss_worker::process_request_authentication(&asm, &[own]);
+
+                assert!(
+                    eventually(Duration::from_secs(5), || fake.borrow().reauths.len() >= 2).await
+                );
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                assert_eq!(fake.borrow().reauths.len(), 2, "one renewal, not two");
+                assert_eq!(seen.borrow().len(), 2, "the agent was asked once to renew");
+                assert_eq!(fake.borrow().connects.len(), 1, "no K2");
+                assert!(asm.zode_login.is_logged_in());
+            })
+            .await;
+    }
+
+    /// A logout at expiry that the visa service refuses is retried: the
+    /// user must not stay on the actor, and until the logout goes through
+    /// the Zode does not claim to be logged out.
+    #[tokio::test]
+    async fn failed_logout_at_expiry_is_retried() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(
+                    FakeVsState {
+                        auth_lifetime: Some(Duration::from_secs(2)),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await;
+                login(&asm, interactive_only_agent().0)
+                    .await
+                    .expect("login");
+                fake.borrow_mut()
+                    .reauth_errors
+                    .push_back(ErrorCode::TemporarilyUnavailable);
+
+                assert!(
+                    eventually(Duration::from_secs(5), || fake.borrow().reauths.len() == 2).await,
+                    "the logout at expiry"
+                );
+                assert!(
+                    asm.zode_login.is_logged_in(),
+                    "the refused logout is pending"
+                );
+
+                assert!(
+                    eventually(Duration::from_secs(15), || !asm.zode_login.is_logged_in()).await,
+                    "the logout is retried"
+                );
+                assert_eq!(last_failure(&asm), Some(AuthFailureReason::LoginExpired));
+                assert_eq!(
+                    reauth_shapes(&fake),
+                    vec![with_user("vs-nonce-1"), device_only(), device_only()]
+                );
             })
             .await;
     }

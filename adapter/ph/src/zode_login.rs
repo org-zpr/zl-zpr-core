@@ -121,9 +121,10 @@ pub struct ZodeLogin {
     /// Held for a whole silent renewal, so overlapping renewals (the timer
     /// and policy requests) share one.
     renew_lock: tokio::sync::Mutex<()>,
-    /// Bumped whenever a login ends, so a renewal waiting on that login's
-    /// agent gives up instead of holding up the next login's renewals.
-    ended: tokio::sync::watch::Sender<u64>,
+    /// Bumped whenever a login ends or its expiry changes: a renewal
+    /// waiting on an ended login's agent gives up instead of holding up the
+    /// next login's renewals, and the renewal timer recomputes its deadline.
+    changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for ZodeLogin {
@@ -138,7 +139,7 @@ impl Default for ZodeLogin {
             }),
             reauth_lock: tokio::sync::Mutex::new(()),
             renew_lock: tokio::sync::Mutex::new(()),
-            ended: tokio::sync::watch::Sender::new(0),
+            changes: tokio::sync::watch::Sender::new(0),
         }
     }
 }
@@ -227,7 +228,7 @@ impl ZodeLogin {
     /// Move to logged out, recording `last`.
     fn logged_out(&self, last: Option<AuthFailureReason>) {
         self.data.lock().unwrap().state = LoginState::LoggedOut { last };
-        self.ended.send_modify(|n| *n += 1);
+        self.changes.send_modify(|n| *n += 1);
     }
 
     /// The identity provider, nonce, grant time and expiry of the login of
@@ -272,6 +273,8 @@ impl ZodeLogin {
             *g = granted_at;
             *e = expires;
         }
+        drop(data);
+        self.changes.send_modify(|n| *n += 1);
     }
 
     /// If logged in, move to logged out with `reason` and return the
@@ -284,7 +287,7 @@ impl ZodeLogin {
         data.state = LoginState::LoggedOut { last: Some(reason) };
         let agent = data.agent.clone();
         drop(data);
-        self.ended.send_modify(|n| *n += 1);
+        self.changes.send_modify(|n| *n += 1);
         Some(agent)
     }
 
@@ -536,10 +539,14 @@ async fn renew(asm: &Arc<Assembly>, generation: u64) -> Result<(), AuthFailureRe
     };
     let agent = asm.zode_login.agent().ok_or(AuthFailureReason::NoAgent)?;
     let vsconn = vsconn(asm)?;
-    let timeout = renewal_attempt_timeout(SystemTime::now(), expires);
+    // Never past the expiry: the timer logs out then, and must not wait on
+    // a silent agent to do so.
+    let now = SystemTime::now();
+    let timeout = renewal_attempt_timeout(now, expires)
+        .min(expires.duration_since(now).unwrap_or(Duration::ZERO));
     // Give up if the login ends while its agent is asked: a stuck agent of
     // an ended login must not hold up the next login's renewals.
-    let mut ended = asm.zode_login.ended.subscribe();
+    let mut ended = asm.zode_login.changes.subscribe();
     let id_token = tokio::select! {
         reply = request_id_token(&agent, idp.clone(), nonce.clone(), false, timeout) => reply?,
         _ = ended.wait_for(|_| asm.zode_login.current(generation).is_none()) => return Ok(()),
@@ -579,6 +586,8 @@ fn spawn_renewal(asm: &Arc<Assembly>, generation: u64) {
 /// visa service. Exits once the login of `generation` has ended.
 async fn renewal_loop(asm: &Arc<Assembly>, generation: u64) {
     let lead = asm.config.get().auth_renewal_lead;
+    // A policy renewal can move the expiry while this sleeps.
+    let mut changes = asm.zode_login.changes.subscribe();
     let mut next_attempt: Option<SystemTime> = None;
     loop {
         let Some((_, _, granted_at, expires)) = asm.zode_login.current(generation) else {
@@ -600,7 +609,10 @@ async fn renewal_loop(asm: &Arc<Assembly>, generation: u64) {
         let due = next_attempt.unwrap_or_else(|| renewal_deadline(granted_at, expires, lead));
         if now < due {
             let wake = due.min(expires);
-            tokio::time::sleep(wake.duration_since(now).unwrap_or_default()).await;
+            tokio::select! {
+                () = tokio::time::sleep(wake.duration_since(now).unwrap_or_default()) => {}
+                _ = changes.changed() => {}
+            }
             continue;
         }
         match renew(asm, generation).await {
@@ -1596,6 +1608,73 @@ pub(crate) mod tests {
                         > before)
                     .await,
                     "the new login's renewal is blocked"
+                );
+            })
+            .await;
+    }
+
+    /// A policy renewal that shortens the login wakes the timer, which then
+    /// logs out at the new expiry instead of sleeping on the old one.
+    #[tokio::test]
+    async fn a_shortened_renewal_rearms_the_timer() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(FakeVsState::default(), true).await;
+                // One silent renewal works; later ones are refused.
+                let calls = std::cell::Cell::new(0u32);
+                let (agent, _) = agent(move |interactive| {
+                    if interactive {
+                        return Some(Ok(ID_TOKEN.to_string()));
+                    }
+                    calls.set(calls.get() + 1);
+                    Some(if calls.get() == 1 {
+                        Ok(ID_TOKEN.to_string())
+                    } else {
+                        Err(AuthFailureReason::AgentError(
+                            "no refresh token".to_string(),
+                        ))
+                    })
+                });
+                login(&asm, agent).await.expect("login");
+                tokio::time::sleep(MIN_RENEWAL_SPACING + Duration::from_millis(100)).await;
+                fake.borrow_mut().auth_lifetime = Some(Duration::from_secs(3));
+                let own: IpAddr = NODE_ADDR.parse().unwrap();
+                crate::vss_worker::process_request_authentication(&asm, &[own]);
+
+                assert!(
+                    eventually(Duration::from_secs(10), || !asm.zode_login.is_logged_in()).await,
+                    "the timer must follow the shortened expiry"
+                );
+                assert_eq!(last_failure(&asm), Some(AuthFailureReason::LoginExpired));
+            })
+            .await;
+    }
+
+    /// A renewal waiting on an agent that never answers does not hold the
+    /// logout past the expiry.
+    #[tokio::test]
+    async fn a_silent_agent_does_not_delay_the_expiry_logout() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _fake) = zode(
+                    FakeVsState {
+                        auth_lifetime: Some(Duration::from_secs(3)),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await;
+                let (silent, _) =
+                    agent(|interactive| interactive.then(|| Ok(ID_TOKEN.to_string())));
+                login(&asm, silent).await.expect("login");
+
+                assert!(
+                    eventually(Duration::from_millis(4500), || !asm
+                        .zode_login
+                        .is_logged_in())
+                    .await,
+                    "logged out late: {:?}",
+                    asm.zode_login.state()
                 );
             })
             .await;

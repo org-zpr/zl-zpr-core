@@ -120,6 +120,7 @@ ZB_BIND=0.0.0.0
 # Scenario 8's new network: a second subnet on the relay's bridge.
 RELAY_NEW_NET_ADDR=10.3.0.1
 ZB_NEW_SUBSTRATE_ADDR=10.3.0.2
+TOPOLOGY_ZB_NEW_REPORTED="\\]-> peer $(ere_escape "$ZB_NEW_SUBSTRATE_ADDR:$ZODE_PORT"), zpr addr $(ere_escape "$ZB_ZPR_ADDR"), peer cn \"zb\""
 
 if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
@@ -260,8 +261,11 @@ if [[ "$PASS" == 0 ]]; then
   assert_active_links 5 relay "$ZB_SUBSTRATE_ADDR" 0 "the relay has no link to zb's old address" || PASS=1
   assert_active_links 5 zb "$RELAY_SUBSTRATE_ADDR" 1 "zb has one link to the relay" || PASS=1
   wait_log_after 10 relay.log "$HANDED_ZB" "$HANDOFFS" "the rejoin gets a new hand-off (J6)" || PASS=1
-  wait_log_after 30 vs.log "node zb substrate address .*-> $ZB_NEW_SUBSTRATE_ADDR:$ZODE_PORT" 0 \
-    "the visa service has zb's new substrate address" || PASS=1
+  # The rejoin's fresh connect reports the new address. The visa service
+  # logs a change only on `open`, so the proof is the relay's next
+  # topology, which carries the address the visa service now holds for zb.
+  wait_log_after 30 relay.log "$TOPOLOGY_ZB_NEW_REPORTED" 0 \
+    "the visa service has zb's new substrate address: the relay's topology carries it" || PASS=1
   wait_log_after 30 zb.log "$REGISTERED" "$REGISTRATIONS" "zb's session is back: it registers its VSS again" || PASS=1
   assert_superseded 20 zb "$(last_handoff_ids relay.log zb)" || PASS=1
   if [[ -n "$ZB_PID" ]] && ! process_exited "$ZB_PID"; then

@@ -460,6 +460,17 @@ async fn obtain_login(
                 info!(target: RPC, "Zode login: the visa service is temporarily unavailable; retrying once with a new nonce");
                 retried = true;
             }
+            // No answer (a transport failure or a timeout): the visa
+            // service may have committed the login. Drop the user again
+            // before reporting the failure, so no login is left behind
+            // that ph does not know about.
+            Err(e) if !matches!(e, VSApiError::CodedError(_)) => {
+                warn!(target: RPC, "Zode login: no answer to the login ({e}); logging out to be sure");
+                if let Err(reason) = send_logout(asm).await {
+                    warn!(target: RPC, "Zode login: the cleanup logout failed too: {reason:?}");
+                }
+                return Err(vs_failure(e));
+            }
             Err(e) => return Err(vs_failure(e)),
         }
     }
@@ -611,7 +622,9 @@ async fn renewal_loop(asm: &Arc<Assembly>, generation: u64) {
             let wake = due.min(expires);
             tokio::select! {
                 () = tokio::time::sleep(wake.duration_since(now).unwrap_or_default()) => {}
-                _ = changes.changed() => {}
+                // A renewal elsewhere moved the expiry: forget a pending
+                // retry and recompute the deadline from the new grant.
+                _ = changes.changed() => next_attempt = None,
             }
             continue;
         }
@@ -653,8 +666,12 @@ async fn expire(asm: &Arc<Assembly>, generation: u64) -> Expiry {
         warn!(target: RPC, "Zode login: the logout at expiry failed: {reason:?}; retrying");
         return Expiry::Refused;
     }
-    asm.zode_login
-        .logged_out(Some(AuthFailureReason::LoginExpired));
+    // A login that replaced this one meanwhile (after a session change) is
+    // left alone.
+    if asm.zode_login.current(generation).is_some() {
+        asm.zode_login
+            .logged_out(Some(AuthFailureReason::LoginExpired));
+    }
     Expiry::Ended
 }
 
@@ -1675,6 +1692,125 @@ pub(crate) mod tests {
                     .await,
                     "logged out late: {:?}",
                     asm.zode_login.state()
+                );
+            })
+            .await;
+    }
+
+    /// A login whose `reauthorize` answer never comes (the RPC timed out
+    /// after the visa service may have committed it) is cleaned up with a
+    /// device-only `reauthorize` before it is reported as failed.
+    #[tokio::test]
+    async fn an_indeterminate_login_is_cleaned_up() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(
+                    FakeVsState {
+                        reauth_delay: Some(Duration::from_secs(11)),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await;
+                let err = login(&asm, ok_agent().0).await.unwrap_err();
+                assert!(matches!(err, LoginError::Failed(_)), "{err:?}");
+                assert_eq!(
+                    reauth_shapes(&fake),
+                    vec![with_user("vs-nonce-1"), device_only()]
+                );
+            })
+            .await;
+    }
+
+    /// A policy renewal after a failed timer renewal drops the pending
+    /// retry: the timer renews ahead of the new expiry instead of letting
+    /// it lapse.
+    #[tokio::test]
+    async fn a_policy_renewal_clears_the_timer_retry() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(
+                    FakeVsState {
+                        auth_lifetime: Some(Duration::from_secs(3)),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await;
+                // The timer's first renewal is refused; every later one works.
+                let calls = std::cell::Cell::new(0u32);
+                let (agent, _) = agent(move |interactive| {
+                    if interactive {
+                        return Some(Ok(ID_TOKEN.to_string()));
+                    }
+                    calls.set(calls.get() + 1);
+                    Some(if calls.get() == 1 {
+                        Err(AuthFailureReason::AgentError("not yet".to_string()))
+                    } else {
+                        Ok(ID_TOKEN.to_string())
+                    })
+                });
+                login(&asm, agent).await.expect("login");
+                // Past the timer's first (refused) renewal, before expiry.
+                let expires = asm.zode_login.expires().unwrap();
+                let at = expires - Duration::from_millis(300);
+                tokio::time::sleep(at.duration_since(SystemTime::now()).unwrap_or_default()).await;
+                fake.borrow_mut().auth_lifetime = Some(Duration::from_secs(4));
+                let own: IpAddr = NODE_ADDR.parse().unwrap();
+                crate::vss_worker::process_request_authentication(&asm, &[own]);
+
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                assert!(
+                    asm.zode_login.is_logged_in(),
+                    "{:?}",
+                    asm.zode_login.state()
+                );
+                assert!(!reauth_shapes(&fake).contains(&device_only()));
+            })
+            .await;
+    }
+
+    /// The expiry logout does not overwrite a login that replaced the
+    /// expired one while the logout was in flight.
+    #[tokio::test]
+    async fn the_expiry_logout_leaves_a_replacement_login_alone() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(
+                    FakeVsState {
+                        auth_lifetime: Some(Duration::from_secs(2)),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .await;
+                login(&asm, interactive_only_agent().0)
+                    .await
+                    .expect("login");
+                fake.borrow_mut().reauth_delay = Some(Duration::from_millis(800));
+                assert!(
+                    eventually(Duration::from_secs(5), || reauth_shapes(&fake).len() == 2).await,
+                    "the expiry logout goes out"
+                );
+                // The session is replaced while the logout is in flight; the
+                // resident agent starts a new login.
+                session_replaced(&asm);
+                let mut overwritten = false;
+                let started = tokio::time::Instant::now();
+                while started.elapsed() < Duration::from_secs(3) {
+                    if matches!(
+                        asm.zode_login.state(),
+                        LoginState::LoggedOut {
+                            last: Some(AuthFailureReason::LoginExpired)
+                        }
+                    ) {
+                        overwritten = true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(
+                    !overwritten,
+                    "the expiry logout overwrote the new login's state"
                 );
             })
             .await;

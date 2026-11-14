@@ -255,6 +255,50 @@ Linux: identical to `windows-node-test.md` section 5 —
 `sudo integration-test/remote-node-host-env.sh nat-down` on the host (plain
 `sudo`, no `-E`), then `rm -rf "$WORK"`.
 
+## 6. Zode with a wildcard address
+
+A separate, shorter run (zl-zipline#230): the Mac is a **Zode** (CN `zb`)
+that joins through a relay Zode on the Linux host, on the default config:
+no `--self-addr` (it binds the wildcard `0.0.0.0:5000`) and no
+`--advertised-substrate-addr`. On every VS-API `connect` and `open` it
+reports its initial link's current local address with `self_addr`'s port,
+so the address follows the network. Network-change runs (moving the Mac's
+address) are tracked in
+[zl-zipline#263](https://github.com/org-zpr/zl-zipline/issues/263).
+
+**Linux side:** as `windows-node-test.md` section 6, with `RELAY_IP` and the
+relay's `i0` in the policy set to the host's address on the Mac's LAN
+(`192.168.0.212`).
+
+**Mac side:** copy `ca.crt`, `zb.crt` and `zb.key` from `$WORK/run` and
+`pregen/zb-rsa-key.pem` to a working directory, then:
+
+```sh
+sudo ./ph node -l all=INFO --initial-link relay@192.168.0.212:5000 \
+  --tun-if utun9 --zpr-addr fd5a:5052::3 \
+  --ca-file ca.crt --certificate-file zb.crt -k zb.key \
+  --auth-private-key zb-rsa-key.pem
+```
+
+No firewall change is needed (the application firewall is off on the test
+Mac; see Findings, item 4 of the first run).
+
+**Expected:**
+
+* zb: `dock listening on 0.0.0.0:5000`; `reporting substrate address the
+  initial link's local address at each connect/open, port 5000 (wildcard
+  self_addr) to the visa service`; `Started Zode link with
+  192.168.0.212:5000 as the dialer`; `installed bootstrap visas [...] bound
+  to the link`; `node access granted to visa service`; `registered VSS`;
+  `received topology update`. No startup error.
+* `netstat -an -p udp` shows `*.5000`; `./ph-cli link show` (not under
+  sudo) shows one link, `192.168.0.212:5000 (Active)`.
+* relay.log: `Started Zode link with <Mac IP>:5000 as the answerer`, then
+  `handed bootstrap visas [...] to "zb"`. The relay's topology goes from
+  `peer unset, ... peer cn "zb"` to `peer <Mac IP>:5000, ... peer cn "zb"`:
+  the visa service holds zb's real LAN address.
+* `ping6 -c 5 fd5a:5052::1` (the visa service, through the relay): 5/5.
+
 ## Recording the result
 
 Paste the transcript (node startup lines, `ph-cli` output from both sides,
@@ -268,6 +312,18 @@ Packet captures, if needed: `tcpdump -ni utun9` works on the Mac;
 ## Findings
 
 *(filled in by the first run; keep one dated subsection per run)*
+
+### 2026-11-14 — Zode with a wildcard address (section 6, zl-zipline#230)
+
+* Build (`zl-zpr-core`): `feature/zodes-230-2-network-change` at `81c474e`,
+  the same build on the Mac and the Linux host · vs `v0.22.0-zodes.8` ·
+  policy: `pregen/zodes.zplc`, relay `i0` rewritten, zplc 0.21.0
+* macOS 26.5.2 (25F84), Apple Silicon, on Wi-Fi at 192.168.0.150; relay at
+  192.168.0.212
+
+| Check | Result | Evidence |
+|---|---|---|
+| start with the wildcard and no advertised address, then join | PASS | `dock listening on 0.0.0.0:5000` (`udp4 *.5000`); no startup error; `Using packet I/O engine posix_unbatched`; bootstrap visas installed, `node access granted`, `registered VSS`, topology received. zb `link show`: one link, `192.168.0.212:5000 (Active)`. Relay `link show`: the visa service's link plus one link, `192.168.0.150:5000 (Active)`. The relay handed zb bootstrap visas, and its topology went from `peer unset` to `peer 192.168.0.150:5000` for zb. `ping6` to the visa service: 5/5, 11-47 ms. No lab change. |
 
 ### 2026-10-02 — first end-to-end run
 

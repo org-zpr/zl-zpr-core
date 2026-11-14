@@ -193,9 +193,11 @@ pub enum Command {
         auth_private_key: Option<PathBuf>,
 
         /// Substrate address to advertise to the visa service, as a literal
-        /// IP:port (IPv6 in square brackets, e.g. [2001:db8::1]:5000). Required
-        /// when self_addr has an unspecified IP (e.g. 0.0.0.0), since a wildcard
-        /// address cannot be dialed by peers.
+        /// IP:port (IPv6 in square brackets, e.g. [2001:db8::1]:5000). Without
+        /// it, a node reports a concrete self_addr, or, with a wildcard
+        /// self_addr (e.g. 0.0.0.0), its initial link's local address at each
+        /// connect, which follows a network change. A relay with a wildcard
+        /// self_addr has no initial link and needs it.
         #[arg(long, value_name = "ADDR:PORT")]
         advertised_substrate_addr: Option<String>,
 

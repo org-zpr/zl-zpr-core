@@ -933,18 +933,25 @@ mod io_uring {
         let in6_pktinfo;
         let pktinfo_ptr;
         let pktinfo_len;
+        // The level and type must match the family: an IPv6 socket ignores
+        // an `IP_PKTINFO` cmsg, so an IPv6 source sent that way was silently
+        // replaced by the kernel's choice (found by zl-zipline#230's
+        // `send_from_vanished_source_is_a_network_change_error`).
+        let (cmsg_level, cmsg_type);
 
         match &addr {
             ScopedIpAddr::V4(addr) => {
                 in_pktinfo = super::pktinfo_from_ipv4addr(addr);
                 pktinfo_ptr = &in_pktinfo as *const _ as *const u8;
                 pktinfo_len = std::mem::size_of_val(&in_pktinfo);
+                (cmsg_level, cmsg_type) = (libc::IPPROTO_IP, libc::IP_PKTINFO);
             }
 
             ScopedIpAddr::V6(addr) => {
                 in6_pktinfo = super::pktinfo_from_scoped_ipv6addr(addr);
                 pktinfo_ptr = &in6_pktinfo as *const _ as *const u8;
                 pktinfo_len = std::mem::size_of_val(&in6_pktinfo);
+                (cmsg_level, cmsg_type) = (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO);
             }
         }
 
@@ -952,8 +959,8 @@ mod io_uring {
         unsafe {
             cmsg.write(libc::cmsghdr {
                 cmsg_len: libc::CMSG_LEN(pktinfo_len as u32) as usize,
-                cmsg_level: libc::IPPROTO_IP,
-                cmsg_type: libc::IP_PKTINFO,
+                cmsg_level,
+                cmsg_type,
             });
             libc::CMSG_DATA(cmsg.as_ptr()).copy_from(pktinfo_ptr, pktinfo_len); // note unaligned (*u8) copy!
             return libc::CMSG_SPACE(pktinfo_len as u32) as usize;

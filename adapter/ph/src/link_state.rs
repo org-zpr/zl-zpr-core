@@ -871,6 +871,14 @@ impl LinkStateWrapper {
                     self.locked_data.lock().unwrap().echo_timeout += 1;
                     locked_fsm.keep_alive_misses += 1;
                     if locked_fsm.keep_alive_misses >= config::KEEP_ALIVE_MAX_MISSES {
+                        // This is also how a Zode notices that its own
+                        // substrate address went away (a network change,
+                        // zl-zipline#230): the keep-alive declares the
+                        // initial link down, and the Zode redials it from
+                        // its new address. We could switch to OS-specific
+                        // operations (address or route change notifications)
+                        // to detect the link down sooner if we want to in
+                        // the future.
                         error!(target: LINK_STATE, "{} failed to respond to keep-alive messages", asm.formatted_link_id(self.id));
                         locked_fsm.set_state(LinkState::Error);
                         drop(locked_fsm);
@@ -2763,7 +2771,7 @@ mod tests {
             vs_addr,
             "test-node".to_string(),
             key,
-            "127.0.0.1:5000".parse().unwrap(),
+            libnode::vsconn::fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()),
         );
         // Observable egress: the close path puts a Terminate on the mgmt
         // substrate queue, which must have a live receiver.

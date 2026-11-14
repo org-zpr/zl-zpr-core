@@ -459,6 +459,8 @@ fn main() -> ExitCode {
     //
 
     let mut vsconn;
+    // Filled in once the assembly exists; see the substrate address source below.
+    let report_asm: Arc<std::sync::OnceLock<std::sync::Weak<Assembly>>> = Arc::default();
 
     if ph_mode == PhMode::Node {
         // config parsing ensures that IF node THEN certificate_file is set.
@@ -478,42 +480,39 @@ fn main() -> ExitCode {
         let auth_private_key = zpr_utils::rsa_sign::load_rsa_key(auth_key_pem.as_bytes())
             .unwrap_or_else(|e| panic!("failed to parse auth_private_key {auth_key_path:?}: {e}"));
 
-        // Advertised substrate address resolution, in order:
-        //   1. advertised_substrate_addr config, if set.
-        //   2. self_addr, if its IP is specified (common LAN/single-host case).
-        // A wildcard self_addr with no configured advertised address is a startup
-        // error: a wildcard binds every local IP (including ones added later), of
-        // which the machine may have several, but we can advertise only one —
-        // there is no sound way to pick it automatically, so the operator must
-        // choose via advertised_substrate_addr.
-        let advertised_substrate = config
-            .advertised_substrate_addr
-            .or_else(|| {
-                if config.self_addr.ip().is_unspecified() {
-                    None
-                } else {
-                    Some(config.self_addr)
-                }
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "cannot determine an advertised substrate address: self_addr {} \
-                     has an unspecified IP; set advertised_substrate_addr in the \
-                     [node] config section",
-                    config.self_addr
-                )
-            });
+        // The substrate address reported on each connect and open
+        // (zl-zipline#230): see ReportedSubstrateAddr for the rules. A
+        // wildcard self_addr with no initial link has none, and that is a
+        // configuration error, not a panic.
+        let reported_substrate = match config::ReportedSubstrateAddr::for_config(&config) {
+            Ok(rule) => rule,
+            Err(err) => {
+                error!(target: STARTUP, "{err}");
+                return ExitCode::FAILURE;
+            }
+        };
         info!(
             target: STARTUP,
-            "advertising substrate address {advertised_substrate} to the visa service"
+            "reporting substrate address {reported_substrate} to the visa service"
         );
+        // The initial-link rule reads the assembly, which is built after the
+        // VSConn (it holds the VSConn's handle): the source gets the
+        // assembly through this cell once it exists.
+        let report_asm = report_asm.clone();
+        let substrate_addr_source: libnode::vsconn::SubstrateAddrSource = Box::new(move || {
+            let asm = report_asm
+                .get()
+                .and_then(std::sync::Weak::upgrade)
+                .ok_or_else(|| std::io::Error::other("the node is not set up yet"))?;
+            reported_substrate.resolve(&asm)
+        });
 
         vsconn = Some(libnode::vsconn::VSConn::new(
             topology_config.vs_queue_size,
             SocketAddr::new(VISA_SERVICE_ADDR, VISA_SERVICE_PORT),
             node_name,
             auth_private_key,
-            advertised_substrate,
+            substrate_addr_source,
         ));
     } else {
         vsconn = None;
@@ -567,6 +566,10 @@ fn main() -> ExitCode {
         logging: Mutex::new(logging_map),
         reload_handle,
     });
+    // The reported substrate address source reads the assembly from here on.
+    report_asm
+        .set(Arc::downgrade(&asm))
+        .expect("the assembly is set up once");
 
     //
     // create a Tokio "local set" to schedule all our management workers on

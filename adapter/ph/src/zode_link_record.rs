@@ -30,8 +30,11 @@ use std::time::{Duration, Instant};
 use zpr::packet_info::LinkId;
 
 /// How long the owner of a topology link gives it to come up before it
-/// reports `failed` and stops (rule 6). The design's default.
-pub const LINK_UP_WINDOW: Duration = Duration::from_secs(5);
+/// reports `failed` and stops (rule 6). 10 s, not the design's first 5 s
+/// (gate g123): the non-owner can learn the link about 4 s after the owner
+/// (the visa service's VSS start delay plus a NoRoute retry), and the
+/// owner's redials must keep going past that.
+pub const LINK_UP_WINDOW: Duration = Duration::from_secs(10);
 
 /// How soon the owner redials a topology link after an attempt fails inside
 /// the link-up window (rule 6: "about once a second"). This covers the
@@ -506,9 +509,31 @@ mod tests {
         r.handle(Event::Start, now);
         r.handle(Event::Dialed(7), now);
         assert!(
-            r.handle(Event::Closed(7), now + Duration::from_millis(4500))
-                .is_empty()
+            r.handle(
+                Event::Closed(7),
+                now + LINK_UP_WINDOW - OWNER_REDIAL_INTERVAL / 2
+            )
+            .is_empty()
         );
+    }
+
+    /// Gate g123: the non-owner can learn the link well after the owner.
+    /// When the owner already has a VSS session as the non-owner
+    /// authenticates, the visa service sends the owner the link at once
+    /// but reaches the non-owner only after its VSS start delay (3 s) and
+    /// a NoRoute retry (1 s); zode-reroute-test.sh saw 4.2 s. An attempt
+    /// refused (rule 3) that late must still be followed by a redial
+    /// inside the window, or the link ends failed although both ends are
+    /// healthy.
+    #[test]
+    fn owner_redials_after_the_non_owners_topology_lag() {
+        const NON_OWNER_TOPOLOGY_LAG: Duration = Duration::from_millis(4500);
+        let now = Instant::now();
+        let mut r = record(Kind::Topology, Owner::ThisZode);
+        r.handle(Event::Start, now);
+        r.handle(Event::Dialed(7), now);
+        let actions = r.handle(Event::Closed(7), now + NON_OWNER_TOPOLOGY_LAG);
+        assert_eq!(armed(&actions, Timer::Redial).0, OWNER_REDIAL_INTERVAL);
     }
 
     /// Owner: the window ends -> Failed; the attempt in flight is aborted

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 #
-# Shared set-up for the Zode netns tests (zl-zipline#250; #254 adds more).
-# Source it after lib/common_funcs.sh. The layout matches
-# pregen/zodes.zplc:
+# Shared set-up for the Zode netns tests (zl-zipline#250, #254).
+# Source it after lib/common_funcs.sh. The layout matches pregen/zodes.zplc
+# and pregen/zodes-pair.zplc:
 #
 #   zpr-vs ---- zpr-relay ---- br0 ---- zpr-zb
 #   (visa        (relay Zode,       \--- zpr-zc
@@ -17,7 +17,7 @@
 # visa-service session.
 #
 # Each Zode is a `ph node` with its own certificate (CN = its policy node
-# name), signed by the test CA.
+# name), signed by the test CA unless a test says otherwise.
 #
 
 export RUST_BACKTRACE=1
@@ -47,7 +47,15 @@ RELAY_SUBSTRATE_ADDR=10.2.0.1
 ZB_SUBSTRATE_ADDR=10.2.0.2
 ZC_SUBSTRATE_ADDR=10.2.0.3
 
+# The policy the visa service starts with. A script may set it after
+# sourcing this file.
 ZODE_POLICY_BIN=zodes.bin2
+
+# What ph logs when it refuses a Stream ID Request that does not come from
+# the visa's previous hop (gap 7, zl-zipline#253; mgmt/node.rs
+# prepare_next_hop_bind), and the counter of every refused request.
+PREV_HOP_REFUSED="refusing Stream ID Request from .*: not the visa's previous hop"
+REJECTED='Stream ID Request Rejected'
 
 # Check that every binary and fixture the Zode tests use is present.
 function zode_preflight() {
@@ -79,17 +87,44 @@ function zode_begin() {
   create_ca_key_and_cert ca
 }
 
-# The EXIT trap: print the Zode logs when ZPR_TEST_VERBOSE is set, then
-# common_funcs' cleanup (which stops everything and removes the directory).
+# The EXIT trap: print every log under the working directory when
+# ZPR_TEST_VERBOSE is set, including those of a test's legs in
+# subdirectories, then common_funcs' cleanup (which stops everything and
+# removes the directory). cleanup prints the top-level valkey.log, vs.log
+# and adapter-vs.log itself, so they are left to it.
 function zode_cleanup() {
   if [ "${ZPR_TEST_VERBOSE:-no}" != "no" ]; then
     local LOG
-    for LOG in relay.log zb.log zc.log
+    while read -r LOG
     do
-      emitlog "$LOG"
-    done
+      case "$LOG" in
+        valkey.log | vs.log | adapter-vs.log) ;;
+        *) emitlog "$LOG" ;;
+      esac
+    done < <(cd "$TMPDIR" && find . -name '*.log' -printf '%P\n' | sort)
   fi
   cleanup
+}
+
+# Stop every process the test started and remove its namespaces, so a test
+# can run its next leg from a clean start. The same first steps as
+# common_funcs' cleanup, which the EXIT trap still runs at the end.
+function zode_stop_all() {
+  local PID
+  for PID in $(get_descendants) $(jobs -p)
+  do
+    kill -9 "$PID" 2> /dev/null || true
+  done
+  wait -f
+  destroy_network
+}
+
+# Make a second CA, unrelated to the test CA, as $1.key and $1.crt in the
+# working directory. A certificate it signs fails verification against the
+# test CA (create_ca_key_and_cert copies the test CA from pregen instead).
+function create_other_ca() {
+  "$ZPR_PKI_BIN" gencakey > "$1.key"
+  "$ZPR_PKI_BIN" gencacert /CN="$1" 1 < "$1.key" > "$1.crt"
 }
 
 # Build the namespaces in the diagram above. Arguments are NAME:ADDR pairs,
@@ -194,8 +229,11 @@ function install_zode_policy() {
     --api-key-file vs-admin.key --format compact install "$PREGEN/$1"
 }
 
-# Start the relay Zode (`relay = true`, ZODE_LINKS.md rule 4).
+# Start the relay Zode (`relay = true`, ZODE_LINKS.md rule 4). $1 is its
+# `forwarding` setting, `true` (the default) or `false`: a relay that does
+# not forward refuses forward-only visas (visa_mgmt.rs insert_visa).
 function launch_relay() {
+  local FORWARDING=${1:-true}
   create_actor_key_and_cert ca relay
 
   in_ns zpr-relay "$PH_BIN" \
@@ -209,7 +247,7 @@ function launch_relay() {
     --auth-private-key "$PREGEN/node-rsa-key.pem" \
     --km-impl "$KM_IMPL" \
     --relay true \
-    --forwarding true \
+    --forwarding "$FORWARDING" \
     --tun-if tun0 \
     --zpr-addr "$RELAY_ZPR_ADDR" 2>&1 | tee relay.log | prefix_log relay &
 }
@@ -240,12 +278,15 @@ function launch_vs_adapter() {
 
 # Start Zode NAME in namespace zpr-NAME with an initial link to the relay.
 # $1 = name (its certificate CN), $2 = substrate address, $3 = ZPR address,
-# $4 = its RSA authentication key. Its key and certificate are made on the
+# $4 = its RSA authentication key, $5 = the CA that signs its certificate
+# (default `ca`, the test CA). Its own --ca-file is always the test CA, so
+# with another signing CA the Zode still accepts the relay, and it is the
+# relay that must refuse the Zode. Its key and certificate are made on the
 # first launch and reused on a restart. The log is appended to, so a
 # restart keeps the earlier lines.
 function launch_zode() {
-  local NAME=$1 SUBSTRATE=$2 ZPR_ADDR=$3 AUTH_KEY=$4
-  [ -e "$NAME.crt" ] || create_actor_key_and_cert ca "$NAME"
+  local NAME=$1 SUBSTRATE=$2 ZPR_ADDR=$3 AUTH_KEY=$4 SIGNING_CA=${5:-ca}
+  [ -e "$NAME.crt" ] || create_actor_key_and_cert "$SIGNING_CA" "$NAME"
 
   in_ns "zpr-$NAME" "$PH_BIN" \
     node \
@@ -367,19 +408,19 @@ function assert_issued_ids() {
 }
 
 # Succeed when the hand-off $1 holds two visa-service IDs ([assert_issued_ids])
-# that share none with the earlier hand-off $2: every join gets new visas
-# (J6). $3 names the hand-off in the message.
+# that share none with the other hand-off $2: every join gets new visas
+# (J6), and no joiner gets another's. $3 names the hand-off in the message.
 function assert_new_ids() {
   assert_issued_ids "$1" "$3 holds two visa-service IDs" || return 1
   local ID
   for ID in $1
   do
     if [[ " $2 " == *" $ID "* ]]; then
-      echo "ASSERTION FAILED: $3 reuses visa $ID of the earlier hand-off ($2)"
+      echo "ASSERTION FAILED: $3 reuses visa $ID of the other hand-off ($2)"
       return 1
     fi
   done
-  echo "assertion OK: $3 has new IDs ($1, earlier $2)"
+  echo "assertion OK: $3 shares no ID with the other hand-off ($1; other $2)"
 }
 
 # Check the joiner's visa table as it starts (J1, J4), from its log $1:
@@ -426,6 +467,67 @@ function assert_counter_zero() {
     echo "ASSERTION FAILED: $1's '$2' counter is '$VALUE', not 0"
     return 1
   fi
+}
+
+# Assert that no Zode named in the arguments refused a Stream ID Request
+# as not from the visa's previous hop (gap 7), in its log, and that its
+# `Stream ID Request Rejected` counter, which counts every refusal for any
+# reason, is zero. Checks every Zode before failing.
+function assert_no_refusals() {
+  local ZODE RESULT=0
+  for ZODE in "$@"
+  do
+    assert_no_log "$ZODE.log" "$PREV_HOP_REFUSED" "$ZODE refused no request from a previous hop" || RESULT=1
+    assert_counter_zero "$ZODE" "$REJECTED" || RESULT=1
+  done
+  return "$RESULT"
+}
+
+# Ping $2 from Zode $1's namespace, from its own ZPR address, and assert
+# that it answers ($3 is the assertion message). The first echo makes the
+# Zode request a visa, so up to $4 (default 3) one-second warm-up echoes
+# may go unanswered before the five that must all be answered.
+function zode_ping() {
+  wait_for "${4:-3}" in_ns "zpr-$1" ping -q -n -c 1 -W 1 "$2" > /dev/null 2>&1 || true
+  if in_ns "zpr-$1" ping -q -n -c 5 -w 10 "$2" > /dev/null; then
+    echo "assertion OK: $3"
+  else
+    echo "ASSERTION FAILED: $3 ($1 did not get all five echo replies from $2)"
+    return 1
+  fi
+}
+
+# Ping $2 from Zode $1's namespace and assert that none of five echoes is
+# answered ($3 is the assertion message). ping's exit status cannot tell
+# "no reply" from "some replies", so this reads the received count from its
+# summary; no summary (ping itself failed) fails the assertion too.
+function zode_no_ping() {
+  local OUT RECEIVED
+  OUT=$(in_ns "zpr-$1" ping -q -n -c 5 -W 1 "$2" 2>&1 || true)
+  RECEIVED=$(sed -nE 's/.*, ([0-9]+) received.*/\1/p' <<< "$OUT")
+  if [[ "$RECEIVED" == 0 ]]; then
+    echo "assertion OK: $3"
+  else
+    echo "ASSERTION FAILED: $3 ($1 pinging $2: $(tail -n 2 <<< "$OUT" | head -n 1))"
+    return 1
+  fi
+}
+
+# Drop the substrate traffic between Zodes $1 and $2 only (names with a
+# <NAME>_SUBSTRATE_ADDR above, e.g. zb), in both directions: each one's
+# veth0 drops what it sends to the other's substrate address. Both still
+# reach the relay over the same bridge.
+function block_pair() {
+  local FROM TO TO_ADDR
+  for FROM in "$1" "$2"
+  do
+    TO=$1
+    [[ "$FROM" == "$1" ]] && TO=$2
+    TO_ADDR=${TO^^}_SUBSTRATE_ADDR
+    in_ns "zpr-$FROM" tc qdisc add dev veth0 root handle 1: prio
+    in_ns "zpr-$FROM" tc filter add dev veth0 parent 1: protocol ip u32 \
+      match ip dst "${!TO_ADDR}/32" action drop
+  done
 }
 
 # Drop all substrate traffic of Zode NAME ($1), both ways, or restore it.

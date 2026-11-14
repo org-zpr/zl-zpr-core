@@ -68,8 +68,9 @@ pub const NODE_KEYING_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 /// the link (zl-zipline#250). A real handshake takes one round trip.
 ///
 /// Every per-attempt bound on a Zode link fits inside the owner's link-up
-/// window (ZODE_LINKS.md rule 6, 5 s): this plus [ZODE_HELLO_TIMEOUT] is 4 s,
-/// so an attempt has ended on its own by the time the window does.
+/// window (ZODE_LINKS.md rule 6, `zode_link_record::LINK_UP_WINDOW`): this
+/// plus [ZODE_HELLO_TIMEOUT] is shorter, so an attempt has ended on its own
+/// by the time the window does (checked at compile time there).
 pub const ZODE_KEYING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long either end of a Zode link may stay in `Helloing` before it

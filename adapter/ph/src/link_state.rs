@@ -711,6 +711,14 @@ impl LinkStateWrapper {
                 drop(sa);
                 drop(peer_state);
                 drop(locked_fsm);
+                // The refused link gives up the peer's address now, not
+                // when it finishes closing: that waits up to
+                // DEFAULT_TERMINATE_TIMEOUT for a Terminate ack the peer
+                // often cannot send (it has already dropped its SA), and
+                // the owner's redial from the same address (rule 6) must
+                // start a new link meanwhile rather than reach this one
+                // (gate g120).
+                asm.peer_table.unmap_substrate_addr(link_id);
                 return self.initiate_close(asm, TerminateReason::Reset);
             }
             info!(target: LINK_STATE, "{} accepted Zode link with peer CN {peer_cn:?}", asm.formatted_link_id(link_id));

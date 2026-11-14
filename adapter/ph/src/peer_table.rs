@@ -732,10 +732,10 @@ pub mod test {
     pub fn topology_link_at(peer_cn: &str, zpr_addr: std::net::IpAddr) -> zpr::vsapi_types::Link {
         zpr::vsapi_types::Link {
             link_id: format!("link-{peer_cn}"),
-            peer: zpr::vsapi_types::SockAddr {
+            peer: Some(zpr::vsapi_types::SockAddr {
                 addr: std::net::IpAddr::from([127, 0, 0, 9]),
                 port: 5000,
-            },
+            }),
             role: zpr::vsapi_types::LinkRole::Active,
             zpr_addr,
             peer_cn: peer_cn.to_owned(),

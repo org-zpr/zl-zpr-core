@@ -351,7 +351,13 @@ fn process_configuration(asm: &Arc<Assembly>, params: Vec<Param>) -> ConfigureRe
 fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyResponse {
     info!(target: VSS_RPC, "received topology update with {} links", links.len());
     for (i, link) in links.iter().enumerate() {
-        info!(target: VSS_RPC, "[link {i}]-> peer {:?}, zpr addr {}, peer cn {:?}", link.peer, link.zpr_addr, link.peer_cn);
+        // `peer` is unset when the visa service does not know the peer's
+        // substrate address (ZODE_LINKS.md rule 13b).
+        let peer = match &link.peer {
+            Some(peer) => std::net::SocketAddr::new(peer.addr, peer.port).to_string(),
+            None => "unset".to_owned(),
+        };
+        info!(target: VSS_RPC, "[link {i}]-> peer {peer}, zpr addr {}, peer cn {:?}", link.zpr_addr, link.peer_cn);
     }
     *asm.topology.write().unwrap() = links;
     crate::zode_links::apply_topology(asm);

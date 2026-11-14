@@ -325,6 +325,109 @@ FORWARD accepts and the MASQUERADE rule — it finds them by scanning the live
 tables, so it needs no environment and plain `sudo` (no `-E`) is correct
 here. Then `rm -rf "$WORK"`.
 
+## 6. Zode with a wildcard address
+
+A separate, shorter run (zl-zipline#230): the Windows VM is a **Zode** (CN
+`zb`) that joins through a relay Zode on the Linux host, on the default
+config. It has no `--self-addr`, so it binds the wildcard `0.0.0.0:5000`,
+and no `--advertised-substrate-addr`. On every VS-API `connect` and `open`
+it reports its initial link's current local address, with `self_addr`'s
+port. The address follows the network that way, so a laptop Zode needs no
+address in its config. Network-change runs on Windows and macOS (switching
+the VM's network, moving the Mac's address) are tracked in
+[zl-zipline#263](https://github.com/org-zpr/zl-zipline/issues/263).
+
+**Linux side.** The relay runs in the host's network namespace, so the VM
+reaches it at the host's address on the VM network (`192.168.122.1` for
+libvirt NAT). The visa service is docked on it from a namespace, built from
+`lib/zode_funcs.sh`, with the zode-link-test fixtures. The fixture policy
+`pregen/zodes.zplc` gives the relay the substrate address `10.2.0.1:5000`
+and gives zb none. Copy `pregen` to a scratch directory, set the relay's
+`i0` to the host's address, and compile it with zplc 0.21.0 or later:
+
+```sh
+cp -r integration-test/pregen "$WORK/pregen" && cd "$WORK/pregen"
+sed -i 's/i0 = "10.2.0.1:5000"/i0 = "192.168.122.1:5000"/' zodes.zplc
+zplc -c zodes.zplc -k zpr-rsa-key.pem -f v2 -o zodes-remote.bin2 zodes.zpl
+```
+
+Then, in the integration-test container (section 1's `docker run`, with
+`$WORK` mounted), from `integration-test/`:
+
+```sh
+source lib/common_funcs.sh; source lib/zode_funcs.sh
+PREGEN=$WORK/pregen ZODE_POLICY_BIN=zodes-remote.bin2
+RELAY_IP=192.168.122.1      # the host as the remote Zode sees it
+VS_BIN=... VS_ADMIN_BIN=... VALKEY_SERVER_BIN=$(command -v valkey-server)
+mkdir -p "$WORK/run" && cd "$WORK/run"
+create_ca_key_and_cert ca
+# The visa service's namespace, on a veth pair to the host.
+new_netns zpr-vs
+ip link add veth-zvs type veth peer name veth0
+ip link set veth0 netns "${NETNS_PID[zpr-vs]}"
+ip addr add "$RELAY_SUBSTRATE_ADDR_VS/24" dev veth-zvs && ip link set veth-zvs up
+in_ns zpr-vs ip addr add "$VS_SUBSTRATE_ADDR/24" dev veth0
+in_ns zpr-vs ip link set veth0 up; in_ns zpr-vs ip link set lo up
+in_ns zpr-vs ip tuntap add name tun0 mode tun multi_queue
+in_ns zpr-vs ip link set tun0 up
+in_ns zpr-vs ip addr add "$VS_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
+ip tuntap add name zrelay mode tun multi_queue && ip link set zrelay up
+launch_zode_vs
+create_actor_key_and_cert ca relay
+"$PH_BIN" node -l all=INFO --control-path relay.sock \
+  --advertised-substrate-addr "$RELAY_IP:5000" \
+  --ca-file ca.crt --certificate-file relay.crt --private-key-file relay.key \
+  --auth-private-key "$PREGEN/node-rsa-key.pem" --km-impl noise \
+  --relay true --forwarding true --tun-if zrelay \
+  --zpr-addr "$RELAY_ZPR_ADDR" > relay.log 2>&1 &
+launch_vs_adapter
+create_actor_key_and_cert ca zb      # the remote Zode's identity
+```
+
+Teardown: stop the container, then delete `veth-zvs` and `zrelay` (host
+root, or another container with `NET_ADMIN`). They are in the host's
+namespace and outlive the container.
+
+**Windows side.** Copy `ph.exe`, `ph-cli.exe` and `wintun.dll` to a
+directory such as `C:\zpr-zode`, with `ca.crt`, `zb.crt` and `zb.key` from
+`$WORK/run` and `pregen/zb-rsa-key.pem`. From an elevated PowerShell:
+
+```powershell
+.\ph.exe node -l all=INFO --initial-link relay@192.168.122.1:5000 `
+  --tun-if zpr-node --zpr-addr fd5a:5052::3 `
+  --ca-file ca.crt --certificate-file zb.crt -k zb.key `
+  --auth-private-key zb-rsa-key.pem
+```
+
+No dock rule is needed: zb dials out, and the replies are allowed. The
+visa service reaches zb's VSS (TCP 8183) over the Wintun interface. Once
+the adapter exists, add section 2's temporary VSS rule, and remove it after
+the run:
+
+```powershell
+New-NetFirewallRule -DisplayName zpr-zode-vss -Direction Inbound `
+  -Protocol TCP -LocalPort 8183 -InterfaceAlias zpr-node -Action Allow
+# ... the checks ...
+Remove-NetFirewallRule -DisplayName zpr-zode-vss
+```
+
+**Expected:**
+
+* zb: `dock listening on 0.0.0.0:5000`; `reporting substrate address the
+  initial link's local address at each connect/open, port 5000 (wildcard
+  self_addr) to the visa service`; `Started Zode link with
+  192.168.122.1:5000 as the dialer`; `installed bootstrap visas [...] bound
+  to the link`; `node access granted to visa service`; `registered VSS`;
+  `received topology update`. No startup error.
+* `netstat -ano -p UDP` shows `0.0.0.0:5000`. `.\ph-cli.exe link show`
+  shows one link, `192.168.122.1:5000 (Active)`.
+* relay.log: `Started Zode link with <VM IP>:5000 as the answerer`, then
+  `handed bootstrap visas [...] to "zb"`. The relay's topology goes from
+  `peer unset, ... peer cn "zb"` to `peer <VM IP>:5000, ... peer cn "zb"`.
+  That is the address the visa service holds for zb: zb's real address on
+  the VM network.
+* `ping -6 -n 5 fd5a:5052::1` (the visa service, through the relay): 5/5.
+
 ## Recording the result
 
 Paste the transcript (node startup lines, `ph-cli` output from both sides,
@@ -338,6 +441,17 @@ capture on the Linux side instead (e.g.
 ## Findings
 
 *(filled in by the first run; keep one dated subsection per run)*
+
+### 2026-11-14 — Zode with a wildcard address (section 6, zl-zipline#230)
+
+* Build (`zl-zpr-core`): `feature/zodes-230-2-network-change` at `81c474e`,
+  the same build on the VM and the Linux host · vs `v0.22.0-zodes.8` ·
+  policy: `pregen/zodes.zplc`, relay `i0` rewritten, zplc 0.21.0
+* Windows 11 Home, version 10.0.26200; VM at 192.168.122.39 on libvirt NAT
+
+| Check | Result | Evidence |
+|---|---|---|
+| start with the wildcard and no advertised address, then join | PASS | `dock listening on 0.0.0.0:5000` (`UDP 0.0.0.0:5000`); no startup error; `Using packet I/O engine windows_unbatched`; bootstrap visas installed, `node access granted`, `registered VSS`, topology received. zb `link show`: one link, `192.168.122.1:5000 (Active)`. The relay accepted one link from `192.168.122.39:5000` and handed it bootstrap visas. The relay's topology went from `peer unset` to `peer 192.168.122.39:5000` for zb. `ping -6` to the visa service: 5/5, 1-15 ms. Only the temporary VSS rule was added, and it was removed. |
 
 ### 2026-10-01 — first end-to-end run
 

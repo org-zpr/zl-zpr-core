@@ -61,6 +61,9 @@ pub struct FakeVsState {
     /// The authentication lifetime a successful `reauthorize` grants
     /// (`authExpires = now + lifetime`); [DEFAULT_AUTH_LIFETIME] when unset.
     pub auth_lifetime: Option<Duration>,
+    /// How long `reauthorize` takes to answer, after recording the
+    /// request; immediate when unset.
+    pub reauth_delay: Option<Duration>,
 }
 
 struct FakeVs {
@@ -212,9 +215,16 @@ impl vsapi2::v_s_handle::Server for FakeVsHandle {
         let req = ReauthRequest::try_from(params.get()?.get_req()?)
             .map_err(|e| capnp::Error::failed(format!("{e:?}")))?;
         let zpr_addr = req.zpr_addr;
-        let (refusal, lifetime) = {
+        let delay = {
             let mut st = self.state.borrow_mut();
             st.reauths.push(req);
+            st.reauth_delay
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let (refusal, lifetime) = {
+            let mut st = self.state.borrow_mut();
             (
                 st.reauth_errors.pop_front(),
                 st.auth_lifetime.unwrap_or(DEFAULT_AUTH_LIFETIME),

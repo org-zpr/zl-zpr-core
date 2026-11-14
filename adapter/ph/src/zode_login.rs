@@ -121,6 +121,9 @@ pub struct ZodeLogin {
     /// Held for a whole silent renewal, so overlapping renewals (the timer
     /// and policy requests) share one.
     renew_lock: tokio::sync::Mutex<()>,
+    /// Bumped whenever a login ends, so a renewal waiting on that login's
+    /// agent gives up instead of holding up the next login's renewals.
+    ended: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for ZodeLogin {
@@ -135,6 +138,7 @@ impl Default for ZodeLogin {
             }),
             reauth_lock: tokio::sync::Mutex::new(()),
             renew_lock: tokio::sync::Mutex::new(()),
+            ended: tokio::sync::watch::Sender::new(0),
         }
     }
 }
@@ -223,6 +227,7 @@ impl ZodeLogin {
     /// Move to logged out, recording `last`.
     fn logged_out(&self, last: Option<AuthFailureReason>) {
         self.data.lock().unwrap().state = LoginState::LoggedOut { last };
+        self.ended.send_modify(|n| *n += 1);
     }
 
     /// The identity provider, nonce, grant time and expiry of the login of
@@ -277,7 +282,10 @@ impl ZodeLogin {
             return None;
         }
         data.state = LoginState::LoggedOut { last: Some(reason) };
-        Some(data.agent.clone())
+        let agent = data.agent.clone();
+        drop(data);
+        self.ended.send_modify(|n| *n += 1);
+        Some(agent)
     }
 
     /// When the last `reauthorize` carrying the user's token was submitted.
@@ -529,7 +537,13 @@ async fn renew(asm: &Arc<Assembly>, generation: u64) -> Result<(), AuthFailureRe
     let agent = asm.zode_login.agent().ok_or(AuthFailureReason::NoAgent)?;
     let vsconn = vsconn(asm)?;
     let timeout = renewal_attempt_timeout(SystemTime::now(), expires);
-    let id_token = request_id_token(&agent, idp.clone(), nonce.clone(), false, timeout).await?;
+    // Give up if the login ends while its agent is asked: a stuck agent of
+    // an ended login must not hold up the next login's renewals.
+    let mut ended = asm.zode_login.ended.subscribe();
+    let id_token = tokio::select! {
+        reply = request_id_token(&agent, idp.clone(), nonce.clone(), false, timeout) => reply?,
+        _ = ended.wait_for(|_| asm.zode_login.current(generation).is_none()) => return Ok(()),
+    };
     let _serial = asm.zode_login.reauth_lock.lock().await;
     // A logout or a replaced session while the agent answered ends this
     // renewal: it must not put the user back.
@@ -1551,6 +1565,37 @@ pub(crate) mod tests {
                     asm.zode_login.is_logged_in(),
                     "{:?}",
                     asm.zode_login.state()
+                );
+            })
+            .await;
+    }
+
+    /// A renewal stuck on an ended login's agent does not hold up the next
+    /// login's renewals.
+    #[tokio::test]
+    async fn stale_stuck_renewal_does_not_block_a_new_login() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(FakeVsState::default(), true).await;
+                // Logs in, then never answers a silent renewal.
+                let (stuck, _) = agent(|interactive| interactive.then(|| Ok(ID_TOKEN.to_string())));
+                login(&asm, stuck).await.expect("first login");
+                tokio::time::sleep(MIN_RENEWAL_SPACING + Duration::from_millis(100)).await;
+                let own: IpAddr = NODE_ADDR.parse().unwrap();
+                crate::vss_worker::process_request_authentication(&asm, &[own]);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                logout(&asm).await.expect("logout");
+                login(&asm, ok_agent().0).await.expect("second login");
+                tokio::time::sleep(MIN_RENEWAL_SPACING + Duration::from_millis(100)).await;
+                let before = fake.borrow().reauths.len();
+                crate::vss_worker::process_request_authentication(&asm, &[own]);
+
+                assert!(
+                    eventually(Duration::from_secs(3), || fake.borrow().reauths.len()
+                        > before)
+                    .await,
+                    "the new login's renewal is blocked"
                 );
             })
             .await;

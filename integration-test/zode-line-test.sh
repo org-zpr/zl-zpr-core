@@ -7,9 +7,8 @@
 # other (pregen/zodes-pair.zplc), so their traffic crosses the relay. The
 # relay is neither end of that flow: the visa service gives it forward-only
 # visas for it. The relay's `forwarding` setting decides whether it accepts
-# them. It is a `ph` setting, so changing it means a restart, and a
-# restarted Zode refuses its first Stream ID Requests (zl-zipline#262);
-# instead each leg runs from a clean start, in its own subdirectory:
+# them. It is a `ph` setting, so changing it means a restart: each leg
+# runs from a clean start, in its own subdirectory:
 #   1. forwarding on: zb pings zc and zc pings zb. The policy allows only
 #      Zb -> PingableZc and Zc -> PingableZb, so a reply shows the traffic
 #      carried the sender's own identity (W4). The relay inserted

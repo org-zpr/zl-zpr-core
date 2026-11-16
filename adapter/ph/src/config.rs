@@ -472,14 +472,27 @@ impl Config {
     /// `zpr_addr[0]` is the node's own address everywhere (the VS-API
     /// session and its source, the VSS listener, link ownership), so
     /// `vs.zpr` may never be first. No address may be listed twice, and a
-    /// node that is not a relay never lists `vs.zpr`. Each refusal names
-    /// the fix. There is no implicit `vs.zpr`: the TUN's addresses are all
+    /// node that is not a relay never lists `vs.zpr`. `zpr_addr[0]` is
+    /// IPv6, since the VS-API session to `vs.zpr` leaves from it. Each
+    /// refusal names the fix. There is no implicit `vs.zpr`: the TUN's addresses are all
     /// in the configuration.
     fn check_node_zpr_addrs(&self) -> Result<(), ArgsError> {
         for (i, addr) in self.zpr_addr.iter().enumerate() {
             if self.zpr_addr[..i].contains(addr) {
                 return Err(ArgsError::ParseError(format!(
                     "zpr_addr lists {addr} more than once; list each address once"
+                )));
+            }
+        }
+        // The node's own address is the source of its VS-API session to
+        // vs.zpr (VSConn binds it, zl-zipline#229). vs.zpr is IPv6, so an
+        // IPv4 own address could never connect: refuse it here rather than
+        // have the session retry forever.
+        if let Some(own) = self.zpr_addr.first() {
+            if !own.is_ipv6() {
+                return Err(ArgsError::ParseError(format!(
+                    "zpr_addr[0] ({own}) is the node's own address and must be an IPv6 \
+                     address: the VS-API session to {VISA_SERVICE_ADDR} leaves from it"
                 )));
             }
         }
@@ -1647,6 +1660,17 @@ mod test {
         assert!(msg.contains("only a relay"), "{msg}");
         let msg = refusal(false, vec![VISA_SERVICE_ADDR]);
         assert!(msg.contains("only a relay"), "{msg}");
+
+        // The node's own address is IPv6: its VS-API session to vs.zpr
+        // leaves from it (VSConn binds it), and vs.zpr is IPv6, so an IPv4
+        // own address could never connect. A later IPv4 entry is not the
+        // session's source and stays allowed.
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        let msg = refusal(false, vec![v4]);
+        assert!(msg.contains("must be an IPv6 address"), "{msg}");
+        let msg = refusal(true, vec![v4, VISA_SERVICE_ADDR]);
+        assert!(msg.contains("must be an IPv6 address"), "{msg}");
+        assert!(check(false, vec![own, v4]).is_ok());
     }
 
     #[test]

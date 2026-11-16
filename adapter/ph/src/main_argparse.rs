@@ -727,7 +727,7 @@ mod test {
         certificate_file = '$CERTFILE'
         private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
-        zpr_addr = [ "10.0.0.1" ]
+        zpr_addr = [ "fd5a:5052::2" ]
         "#;
 
         let ca_file = TempFile::touch();
@@ -787,7 +787,7 @@ mod test {
             "--control-path",
             &control_sock,
             "--zpr-addr",
-            "10.0.0.1",
+            "fd5a:5052::2",
         ];
 
         let (pmode, config) = argparse(Some(args)).unwrap();
@@ -836,7 +836,7 @@ mod test {
             "--control-path",
             &control_sock,
             "--zpr-addr",
-            "10.0.0.1",
+            "fd5a:5052::2",
             "--self-addr",
             "0.0.0.0:12345",
             "--advertised-substrate-addr",
@@ -871,7 +871,7 @@ mod test {
         private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         self_addr = "0.0.0.0:12345"
-        zpr_addr = [ "10.0.0.1" ]
+        zpr_addr = [ "fd5a:5052::2" ]
 
         [node]
         advertised_substrate_addr = "203.0.113.7:6000"
@@ -934,7 +934,7 @@ mod test {
             "--control-path",
             &control_sock,
             "--zpr-addr",
-            "10.0.0.1",
+            "fd5a:5052::2",
             "--advertised-substrate-addr",
             "0.0.0.0:12345",
         ];
@@ -966,7 +966,7 @@ mod test {
         private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
         self_addr = "10.0.0.1:12345"
-        zpr_addr = [ "10.0.0.1" ]
+        zpr_addr = [ "fd5a:5052::2" ]
 
         [node]
         forwarding = true
@@ -1025,7 +1025,7 @@ mod test {
 
     /// [node_config_file] with substrate address `self_addr`.
     fn node_config_file_at(self_addr: &str, node_section: &str) -> (TempFile, [TempFile; 3]) {
-        node_config_file_full(self_addr, r#"[ "10.0.0.1" ]"#, node_section)
+        node_config_file_full(self_addr, r#"[ "fd5a:5052::2" ]"#, node_section)
     }
 
     /// [node_config_file] whose `zpr_addr` is the TOML array `zpr_addr`.
@@ -1134,7 +1134,7 @@ mod test {
     #[parallel(env)]
     fn test_main_args_argparse_node_relay_cli() {
         // A relay lists vs.zpr after its own address (zl-zipline#229).
-        let relay_addrs = r#"[ "10.0.0.1", "fd5a:5052::1" ]"#;
+        let relay_addrs = r#"[ "fd5a:5052::2", "fd5a:5052::1" ]"#;
         let (cfg, _keys) = node_config_file_addrs(relay_addrs, "relay = true");
         let path = cfg.get_path().to_str().unwrap();
         let (_, config) = argparse(Some(vec!["ph", "node", "-c", path])).unwrap();
@@ -1189,15 +1189,15 @@ mod test {
         };
 
         // `relay = true` in the [node] section, addresses in the file.
-        let (_, config) = parse_file(r#"["10.0.0.1", "fd5a:5052::1"]"#, "relay = true", &[])
+        let (_, config) = parse_file(r#"["fd5a:5052::2", "fd5a:5052::1"]"#, "relay = true", &[])
             .expect("a relay with vs.zpr after its own address");
-        let expected: Vec<IpAddr> = vec!["10.0.0.1".parse().unwrap(), vs.parse().unwrap()];
+        let expected: Vec<IpAddr> = vec!["fd5a:5052::2".parse().unwrap(), vs.parse().unwrap()];
         assert_eq!(config.zpr_addr, expected);
         for refused in [
-            r#"["10.0.0.1"]"#,
-            r#"["fd5a:5052::1", "10.0.0.1"]"#,
-            r#"["10.0.0.1", "fd5a:5052::1", "fd5a:5052::1"]"#,
-            r#"["10.0.0.1", "fd5a:5052::1", "10.0.0.1"]"#,
+            r#"["fd5a:5052::2"]"#,
+            r#"["fd5a:5052::1", "fd5a:5052::2"]"#,
+            r#"["fd5a:5052::2", "fd5a:5052::1", "fd5a:5052::1"]"#,
+            r#"["fd5a:5052::2", "fd5a:5052::1", "fd5a:5052::2"]"#,
         ] {
             assert!(
                 parse_file(refused, "relay = true", &[]).is_err(),
@@ -1208,17 +1208,31 @@ mod test {
         // `--relay true` and `--zpr-addr` on the command line; the file
         // lists no addresses.
         let none = "[]";
-        assert!(parse_file(none, "", &["--relay", "true", "-z", "10.0.0.1"]).is_err());
-        assert!(parse_file(none, "", &["--relay", "true", "-z", "10.0.0.1", "-z", vs]).is_ok());
-        assert!(parse_file(none, "", &["--relay", "true", "-z", vs, "-z", "10.0.0.1"]).is_err());
+        assert!(parse_file(none, "", &["--relay", "true", "-z", "fd5a:5052::2"]).is_err());
+        assert!(
+            parse_file(
+                none,
+                "",
+                &["--relay", "true", "-z", "fd5a:5052::2", "-z", vs]
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_file(
+                none,
+                "",
+                &["--relay", "true", "-z", vs, "-z", "fd5a:5052::2"]
+            )
+            .is_err()
+        );
         // The command line's addresses come before the file's.
-        assert!(parse_file(r#"["10.0.0.1"]"#, "relay = true", &["-z", vs]).is_err());
+        assert!(parse_file(r#"["fd5a:5052::2"]"#, "relay = true", &["-z", vs]).is_err());
 
         // A node that is not a relay never lists vs.zpr, nor any duplicate.
-        assert!(parse_file(r#"["10.0.0.1"]"#, "", &[]).is_ok());
-        assert!(parse_file(r#"["10.0.0.1", "fd5a:5052::1"]"#, "", &[]).is_err());
-        assert!(parse_file(none, "", &["-z", "10.0.0.1", "-z", vs]).is_err());
-        assert!(parse_file(r#"["10.0.0.1"]"#, "", &["-z", "10.0.0.1"]).is_err());
+        assert!(parse_file(r#"["fd5a:5052::2"]"#, "", &[]).is_ok());
+        assert!(parse_file(r#"["fd5a:5052::2", "fd5a:5052::1"]"#, "", &[]).is_err());
+        assert!(parse_file(none, "", &["-z", "fd5a:5052::2", "-z", vs]).is_err());
+        assert!(parse_file(r#"["fd5a:5052::2"]"#, "", &["-z", "fd5a:5052::2"]).is_err());
     }
 
     #[test]

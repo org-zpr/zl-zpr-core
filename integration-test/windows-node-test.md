@@ -339,8 +339,10 @@ the VM's network, moving the Mac's address) are tracked in
 
 **Linux side.** The relay runs in the host's network namespace, so the VM
 reaches it at the host's address on the VM network (`192.168.122.1` for
-libvirt NAT). The visa service is docked on it from a namespace, built from
-`lib/zode_funcs.sh`, with the zode-link-test fixtures. The fixture policy
+libvirt NAT). The relay hosts the visa service (zl-zipline#229): the relay's
+TUN carries its own address and `vs.zpr`, and valkey and `vs` run in the same
+namespace, started after the relay. It uses `lib/zode_funcs.sh` and the
+zode-link-test fixtures. The fixture policy
 `pregen/zodes.zplc` gives the relay the substrate address `10.2.0.1:5000`
 and gives zb none. Copy `pregen` to a scratch directory, set the relay's
 `i0` to the host's address, and compile it with zplc 0.21.0 or later:
@@ -361,32 +363,30 @@ RELAY_IP=192.168.122.1      # the host as the remote Zode sees it
 VS_BIN=... VS_ADMIN_BIN=... VALKEY_SERVER_BIN=$(command -v valkey-server)
 mkdir -p "$WORK/run" && cd "$WORK/run"
 create_ca_key_and_cert ca
-# The visa service's namespace, on a veth pair to the host.
-new_netns zpr-vs
-ip link add veth-zvs type veth peer name veth0
-ip link set veth0 netns "${NETNS_PID[zpr-vs]}"
-ip addr add "$RELAY_SUBSTRATE_ADDR_VS/24" dev veth-zvs && ip link set veth-zvs up
-in_ns zpr-vs ip addr add "$VS_SUBSTRATE_ADDR/24" dev veth0
-in_ns zpr-vs ip link set veth0 up; in_ns zpr-vs ip link set lo up
-in_ns zpr-vs ip tuntap add name tun0 mode tun multi_queue
-in_ns zpr-vs ip link set tun0 up
-in_ns zpr-vs ip addr add "$VS_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
 ip tuntap add name zrelay mode tun multi_queue && ip link set zrelay up
-launch_zode_vs
 create_actor_key_and_cert ca relay
+# The relay lists vs.zpr after its own address and applies both to zrelay.
 "$PH_BIN" node -l all=INFO --control-path relay.sock \
   --advertised-substrate-addr "$RELAY_IP:5000" \
   --ca-file ca.crt --certificate-file relay.crt --private-key-file relay.key \
   --auth-private-key "$PREGEN/node-rsa-key.pem" --km-impl noise \
   --relay true --forwarding true --tun-if zrelay \
-  --zpr-addr "$RELAY_ZPR_ADDR" > relay.log 2>&1 &
-launch_vs_adapter
+  --zpr-addr "$RELAY_ZPR_ADDR" --zpr-addr "$VS_ZPR_ADDR" > relay.log 2>&1 &
+until ip -6 addr show dev zrelay | grep -q "inet6 $VS_ZPR_ADDR/"; do sleep 1; done
+# The visa service binds vs.zpr, so it starts only now, in the same namespace.
+# valkey takes 127.0.0.1:6379 there: stop any other valkey on the host first.
+create_actor_key_and_cert ca vs.zpr
+emit_vs_config ca vs.zpr > vs-config.toml && write_vs_admin_key
+"$VALKEY_SERVER_BIN" --save "" --appendonly no > valkey.log 2>&1 &
+env XDG_DATA_HOME=/tmp "$VS_BIN" -c vs-config.toml --clear-state \
+  "$PREGEN/$ZODE_POLICY_BIN" > vs.log 2>&1 &
+wait_for 30 check_registered relay.log   # the relay registered with the VS
 create_actor_key_and_cert ca zb      # the remote Zode's identity
 ```
 
-Teardown: stop the container, then delete `veth-zvs` and `zrelay` (host
-root, or another container with `NET_ADMIN`). They are in the host's
-namespace and outlive the container.
+Teardown: stop the container, then delete `zrelay` (host root, or another
+container with `NET_ADMIN`). It is in the host's namespace and outlives the
+container.
 
 **Windows side.** Copy `ph.exe`, `ph-cli.exe` and `wintun.dll` to a
 directory such as `C:\zpr-zode`, with `ca.crt`, `zb.crt` and `zb.key` from

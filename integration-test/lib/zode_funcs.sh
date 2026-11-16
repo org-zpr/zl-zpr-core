@@ -58,6 +58,15 @@ ZODE_POLICY_BIN=zodes.bin2
 PREV_HOP_REFUSED="refusing Stream ID Request from .*: not the visa's previous hop"
 REJECTED='Stream ID Request Rejected'
 
+# The bulk transfer of the demo test (zl-zipline#231): BULK_COUNT echo
+# requests of BULK_SIZE payload bytes, BULK_INTERVAL seconds apart (about
+# 2 MB each way in about 10 s). BULK_PAYLOAD is what one direction carries,
+# the yardstick for the relay's received-byte counter.
+BULK_COUNT=2000
+BULK_SIZE=1000
+BULK_INTERVAL=0.005
+BULK_PAYLOAD=$((BULK_COUNT * BULK_SIZE))
+
 # Check that every binary and fixture the Zode tests use is present.
 function zode_preflight() {
   local F
@@ -612,6 +621,81 @@ function block_pair() {
     in_ns "zpr-$FROM" tc filter add dev veth0 parent 1: protocol ip u32 \
       match ip dst "${!TO_ADDR}/32" action drop
   done
+}
+
+# Undo block_pair $1 $2: remove the filter from both Zodes' veth0.
+function unblock_pair() {
+  in_ns "zpr-$1" tc qdisc del dev veth0 root
+  in_ns "zpr-$2" tc qdisc del dev veth0 root
+}
+
+# Print the bytes the relay has received on its substrate: the RX byte
+# counter of br0 in the relay's namespace (zl-zipline#231; the netns
+# counterpart of the dashboard's relay container rx). br0 counts only the
+# frames the bridge passes up to the relay's own stack (addressed to the
+# relay, or broadcast and multicast), not those it bridges from one Zode's
+# port to another's. So zb-zc traffic over their direct link, which crosses
+# the bridge, is not counted, while the same traffic through the relay is.
+# The veth-NAME port counters would count both. Never make br0 promiscuous
+# (tcpdump on it, say): the bridge then passes every frame up and counts it.
+# Read over netlink (`ip -s link`), which honours the namespace.
+function relay_rx_bytes() {
+  local BYTES
+  BYTES=$(in_ns zpr-relay ip -s link show dev br0 | awk 'f { print $1; exit } /RX:/ { f = 1 }')
+  if [[ ! "$BYTES" =~ ^[0-9]+$ ]]; then
+    echo "cannot read br0's RX bytes in zpr-relay (got '$BYTES')" >&2
+    return 1
+  fi
+  echo "$BYTES"
+}
+
+# Send the bulk transfer from Zode $1 to ZPR address $2: BULK_COUNT echo
+# requests of BULK_SIZE bytes, BULK_INTERVAL seconds apart, with a 60 s
+# deadline. ping checks each reply's payload. Fails unless at least 95% are
+# answered ($3 is the assertion message). Ping first with zode_ping, so the
+# flow's visa is in place and the transfer does not wait on it.
+function bulk_ping() {
+  local OUT RECEIVED
+  OUT=$(in_ns "zpr-$1" ping -q -n -c "$BULK_COUNT" -s "$BULK_SIZE" -i "$BULK_INTERVAL" -w 60 "$2" 2>&1 || true)
+  RECEIVED=$(sed -nE 's/.*, ([0-9]+) received.*/\1/p' <<< "$OUT")
+  if [[ -n "$RECEIVED" ]] && (( RECEIVED * 100 >= BULK_COUNT * 95 )); then
+    echo "assertion OK: $3 ($RECEIVED of $BULK_COUNT answered)"
+  else
+    echo "ASSERTION FAILED: $3 ($1 pinging $2: $(tail -n 2 <<< "$OUT" | head -n 1))"
+    return 1
+  fi
+}
+
+# Assert that the relay received less than a tenth of BULK_PAYLOAD since
+# its br0 RX byte count was $1 (from relay_rx_bytes before a bulk_ping):
+# the transfer did not cross the relay ($2 is the assertion message). Keep-
+# alives, VS-API traffic and neighbour discovery stay far below the bound.
+function assert_relay_rx_flat() {
+  local NOW DELTA
+  NOW=$(relay_rx_bytes) || return 1
+  DELTA=$((NOW - $1))
+  if (( DELTA < BULK_PAYLOAD / 10 )); then
+    echo "assertion OK: $2 (relay received $DELTA bytes, bound $((BULK_PAYLOAD / 10)))"
+  else
+    echo "ASSERTION FAILED: $2 (relay received $DELTA bytes, bound $((BULK_PAYLOAD / 10)))"
+    return 1
+  fi
+}
+
+# Assert that the relay received at least BULK_PAYLOAD since its br0 RX
+# byte count was $1: the transfer crossed the relay, whose substrate
+# receives every echo request from one end and every reply from the other
+# ($2 is the assertion message).
+function assert_relay_rx_rose() {
+  local NOW DELTA
+  NOW=$(relay_rx_bytes) || return 1
+  DELTA=$((NOW - $1))
+  if (( DELTA >= BULK_PAYLOAD )); then
+    echo "assertion OK: $2 (relay received $DELTA bytes, at least $BULK_PAYLOAD)"
+  else
+    echo "ASSERTION FAILED: $2 (relay received $DELTA bytes, fewer than $BULK_PAYLOAD)"
+    return 1
+  fi
 }
 
 # Drop all substrate traffic of Zode NAME ($1), both ways, or restore it.

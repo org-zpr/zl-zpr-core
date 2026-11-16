@@ -26,9 +26,8 @@ i0 = "10.2.0.1:5000"
 [nodes.zb]
 provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
 zpr_address = "zb.zpr"
-
-[nodes.zb.substrate_addrs]
-i0 = "10.2.0.2:5000"
+# No substrate_addrs for zb (zl-zipline#255, W10): the visa service learns
+# zb's address only from what zb reports when it connects.
 
 [trusted_services.default]
 cert_path = "ca-cert.pem"

@@ -30,8 +30,11 @@ use std::time::{Duration, Instant};
 use zpr::packet_info::LinkId;
 
 /// How long the owner of a topology link gives it to come up before it
-/// reports `failed` and stops (rule 6). The design's default.
-pub const LINK_UP_WINDOW: Duration = Duration::from_secs(5);
+/// reports `failed` and stops (rule 6). 10 s, not the design's first 5 s
+/// (gate g123): the non-owner can learn the link about 4 s after the owner
+/// (the visa service's VSS start delay plus a NoRoute retry), and the
+/// owner's redials must keep going past that.
+pub const LINK_UP_WINDOW: Duration = Duration::from_secs(10);
 
 /// How soon the owner redials a topology link after an attempt fails inside
 /// the link-up window (rule 6: "about once a second"). This covers the
@@ -139,8 +142,10 @@ pub struct LinkRecord {
     pub kind: Kind,
     /// Who dials it (see [crate::zode_links::link_owner]).
     pub owner: Owner,
-    /// The peer's substrate address, which the owner dials.
-    pub dial_addr: SocketAddr,
+    /// The peer's substrate address, which the owner dials. `None` only
+    /// when the peer owns the link: the visa service may not know the
+    /// address of a Zode that dials in (ZODE_LINKS.md rule 13b).
+    pub dial_addr: Option<SocketAddr>,
     /// The connection currently serving the link: an attempt or the up
     /// link. `None` when there is none.
     pub link_id: Option<LinkId>,
@@ -160,7 +165,12 @@ pub struct LinkRecord {
 impl LinkRecord {
     /// A new, idle record. `jitter` returns a uniform number in [0, 1) and
     /// spreads initial-link redials; see [jittered].
-    pub fn new(kind: Kind, owner: Owner, dial_addr: SocketAddr, jitter: fn() -> f64) -> Self {
+    pub fn new(
+        kind: Kind,
+        owner: Owner,
+        dial_addr: Option<SocketAddr>,
+        jitter: fn() -> f64,
+    ) -> Self {
         LinkRecord {
             kind,
             owner,
@@ -389,7 +399,12 @@ mod tests {
     }
 
     fn record(kind: Kind, owner: Owner) -> LinkRecord {
-        LinkRecord::new(kind, owner, "10.0.0.9:5000".parse().unwrap(), mid_jitter)
+        LinkRecord::new(
+            kind,
+            owner,
+            Some("10.0.0.9:5000".parse().unwrap()),
+            mid_jitter,
+        )
     }
 
     /// The clock carried by the first `Arm` of `timer` in `actions`.
@@ -494,9 +509,31 @@ mod tests {
         r.handle(Event::Start, now);
         r.handle(Event::Dialed(7), now);
         assert!(
-            r.handle(Event::Closed(7), now + Duration::from_millis(4500))
-                .is_empty()
+            r.handle(
+                Event::Closed(7),
+                now + LINK_UP_WINDOW - OWNER_REDIAL_INTERVAL / 2
+            )
+            .is_empty()
         );
+    }
+
+    /// Gate g123: the non-owner can learn the link well after the owner.
+    /// When the owner already has a VSS session as the non-owner
+    /// authenticates, the visa service sends the owner the link at once
+    /// but reaches the non-owner only after its VSS start delay (3 s) and
+    /// a NoRoute retry (1 s); zode-reroute-test.sh saw 4.2 s. An attempt
+    /// refused (rule 3) that late must still be followed by a redial
+    /// inside the window, or the link ends failed although both ends are
+    /// healthy.
+    #[test]
+    fn owner_redials_after_the_non_owners_topology_lag() {
+        const NON_OWNER_TOPOLOGY_LAG: Duration = Duration::from_millis(4500);
+        let now = Instant::now();
+        let mut r = record(Kind::Topology, Owner::ThisZode);
+        r.handle(Event::Start, now);
+        r.handle(Event::Dialed(7), now);
+        let actions = r.handle(Event::Closed(7), now + NON_OWNER_TOPOLOGY_LAG);
+        assert_eq!(armed(&actions, Timer::Redial).0, OWNER_REDIAL_INTERVAL);
     }
 
     /// Owner: the window ends -> Failed; the attempt in flight is aborted

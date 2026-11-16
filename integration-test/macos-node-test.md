@@ -116,9 +116,8 @@ Copy from the Linux host to a working directory on the Mac (e.g.
 * the staged node material: `$WORK/node/ca.crt`, `$WORK/node/node.crt`,
   `$WORK/node/node.key`, `$WORK/node/node-rsa-key.pem`.
 
-Start the node from a terminal. Unlike the Windows doc's concrete
-`--self-addr` (a Windows-engine rule), the macOS engine is the same POSIX
-engine the Linux integration tests use: a **wildcard bind with pktinfo** is
+Start the node from a terminal. The macOS engine is the same POSIX engine
+the Linux integration tests use: a **wildcard bind with pktinfo** is
 supported and is what this test exercises (checklist item 3). A wildcard
 `self_addr` cannot be advertised, so `--advertised-substrate-addr` names the
 address the adapters dial:

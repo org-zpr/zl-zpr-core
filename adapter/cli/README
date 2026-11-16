@@ -65,6 +65,35 @@ with one that is about to exit -- silently, with nothing logged. Use
 `ph-cli link show <id>` to check on a link instead; it reports the
 authentication expiry and the last authentication failure.
 
+Logging in on a Zode (zl-zipline#233)
+
+On a Zode there is no link to start: `connect` and `auth-agent` without a
+link id log in YOU, the person at this machine. The Zode's own actor (the
+machine) then carries your identity-provider attributes as well as its own,
+until you log out. One person is logged in per Zode at a time.
+
+  ph-cli auth-agent [--no-browser]   log in, stay resident, renew silently;
+                                     if the visa service drops the login (a
+                                     reconnect or restart) it asks you to log
+                                     in again
+  ph-cli connect [--no-browser]      log in and exit, with the exit codes
+                                     above; nothing renews the login, so it
+                                     ends at expiration_seconds
+  ph-cli login-status                state, identity provider, time left,
+                                     whether an agent is registered, and the
+                                     last failure
+  ph-cli logout                      drop your attributes; the machine stays
+                                     connected
+
+A second login while logged in is refused: log out first. When nothing
+renews the login, ph logs you out itself when it expires. Anyone who can
+reach the control socket (or, on Windows, the named pipe) can log in or out
+for the whole machine.
+
+Run ph-cli without sudo so it can open your browser. On Windows, under the
+`zipline` service ph runs as LocalSystem: your account needs to be in the
+configured `control_group` to reach the pipe.
+
 Which socket does ph-cli talk to?
 
 ph-cli needs no sudo except in the residual case above (no recorded owner

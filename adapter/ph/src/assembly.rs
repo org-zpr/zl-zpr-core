@@ -104,6 +104,10 @@ pub struct Assembly {
     /// (zl-zipline#250, [crate::zode_links]).
     pub zode_links: crate::zode_links::ZodeLinkTable,
 
+    /// This Zode's own login: the user logged in on the machine with
+    /// `ph-cli connect` / `auth-agent` (zl-zipline#233, [crate::zode_login]).
+    pub zode_login: crate::zode_login::ZodeLogin,
+
     // Used to intercept packets that are unencrypted but still have ZDP headers
     pub capture_queue: Capture,
     pub capture_worker: CaptureWorker,
@@ -1780,6 +1784,7 @@ pub mod test {
             visa_table,
             topology: Default::default(),
             zode_links: Default::default(),
+            zode_login: Default::default(),
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
             deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),

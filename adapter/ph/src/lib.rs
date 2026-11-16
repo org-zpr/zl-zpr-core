@@ -63,10 +63,14 @@ pub mod zdpr;
 pub mod zdpr_worker;
 pub mod zode_link_record;
 pub mod zode_links;
+pub mod zode_login;
 pub mod zprtun;
 
 #[cfg(test)]
 mod km_testdata;
+
+#[cfg(test)]
+mod fake_vs;
 
 /// Re-export test modules for fuzzing when feature is enabled
 #[cfg(feature = "fuzzing")]

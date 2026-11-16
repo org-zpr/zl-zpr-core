@@ -157,6 +157,10 @@ pub struct RequestAuthOutcome {
 
 /// Classify each address of a VSS `requestAuthentication` (zipline#121, K1).
 ///
+/// - The node's own address while a user is logged in on this Zode
+///   (zl-zipline#233, g116 q3): answered with a silent renewal of the
+///   login, which [crate::zode_login::answer_policy_reauth] spawns, falling
+///   back to K2 itself only when no renewal can be had — counted.
 /// - The node's own address: start an in-place self re-auth against the VS —
 ///   counted, and coalesced onto a running attempt if one is in flight
 ///   ([Assembly::self_reauth_in_flight] stays set until that attempt
@@ -183,6 +187,13 @@ pub fn process_request_authentication(
 
     for addr in addrs {
         if local_addrs.contains(addr) {
+            // Our own address with a user logged in (zl-zipline#233, q3):
+            // a silent renewal answers it and keeps the user; K2 would
+            // drop the login. Counted: re-authorization is underway.
+            if crate::zode_login::answer_policy_reauth(asm) {
+                processed += 1;
+                continue;
+            }
             // Our own address: re-authenticate ourselves to the VS (K2).
             // swap(true) is the claim: false -> we start one; true -> one is
             // already in flight and this request coalesces onto it.
@@ -272,6 +283,9 @@ pub fn spawn_self_reauth(asm: &Arc<Assembly>) {
         match vsconn.reauthenticate(req).await {
             Ok(()) => {
                 info!(target: VSS_RPC, "self re-authentication with the visa service succeeded");
+                // The visa service built a new, device-only actor: a
+                // Zode's own login is gone (zl-zipline#233).
+                crate::zode_login::session_replaced(&asm);
             }
             Err(e) => {
                 // Keep the old handle (the run loop already did); the VS

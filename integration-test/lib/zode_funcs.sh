@@ -185,15 +185,80 @@ function launch_zode_vs() {
   # check_vs_valkey_port, in the relay's namespace.
   wait_for 15 in_ns zpr-relay bash -c 'exec 3<>/dev/tcp/127.0.0.1/6379'
 
-  in_ns zpr-relay env XDG_DATA_HOME=/tmp "$VS_BIN" \
-    -c vs-config.toml \
-    --clear-state \
-    "$PREGEN/$ZODE_POLICY_BIN" 2>&1 | tee vs.log | prefix_log vs &
+  start_vs --clear-state
 
   wait_for 30 check_registered relay.log || {
     echo "the relay did not register with the visa service"
     return 1
   }
+}
+
+# Start the visa service with the Zode policy in the relay's namespace,
+# appending to vs.log; extra arguments go to vs (launch_zode_vs passes
+# --clear-state, a restart keeps the state in valkey). SSL_CERT_FILE lets it
+# fetch an OIDC trusted service's JWKS from a fake IdP whose certificate the
+# test CA signed.
+function start_vs() {
+  in_ns zpr-relay env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/ca.crt" "$VS_BIN" \
+    -c vs-config.toml \
+    "$@" \
+    "$PREGEN/$ZODE_POLICY_BIN" 2>&1 | tee -a vs.log | prefix_log vs &
+  sleep 2
+}
+
+# The PID of this run's visa service. Anchored on $VS_BIN, as
+# ph_pid_for_socket is on $PH_BIN: env execs it.
+function vs_pid() {
+  pgrep_own -f "^$(ere_escape "$VS_BIN") -c vs-config.toml" | head -n 1
+}
+
+# Restart the visa service, keeping its state: kill it at once, wait for it
+# to be gone, and start it again. Every node's VS-API session breaks and
+# reconnects with a new authentication.
+function restart_zode_vs() {
+  local PID
+  PID=$(vs_pid)
+  if [ -z "$PID" ]; then
+    echo "no running visa service"
+    return 1
+  fi
+  kill -9 "$PID"
+  wait_for 10 process_exited "$PID"
+  start_vs
+}
+
+# The fake IdP the OIDC Zode tests use (lib/fake-idp.py). Every consumer
+# dials the policy's issuer on its own loopback, so one instance runs in
+# each namespace that needs it; they share the signing keys, the TLS
+# certificate and one state directory, as in one-node-oidc-test.sh.
+IDP_PORT=9000
+IDP_ISSUER="https://127.0.0.1:$IDP_PORT"
+FAKE_IDP=$(realpath "$(dirname "$0")/lib/fake-idp.py")
+
+# Make the fake IdP's TLS certificate for 127.0.0.1, signed by the test CA,
+# and its state directory. Run after create_ca_key_and_cert.
+function create_idp_cert() {
+  mkdir -p idp-state
+  openssl req -new -newkey rsa:2048 -nodes -keyout idp.key \
+    -subj "/CN=127.0.0.1" -out idp.csr 2> /dev/null
+  openssl x509 -req -in idp.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+    -days 1 -out idp.crt \
+    -extfile <(printf "subjectAltName=IP:127.0.0.1") 2> /dev/null
+}
+
+# Start a fake IdP in namespace zpr-$1 that mints tokens for subject $2,
+# and wait until it answers discovery. Returns non-zero if it does not.
+function launch_zode_idp() {
+  in_ns "zpr-$1" python3 "$FAKE_IDP" \
+    --port "$IDP_PORT" \
+    --state-dir idp-state \
+    --tls-cert idp.crt --tls-key idp.key \
+    --signing-key "$PREGEN/fake-idp-rsa.key" \
+    --client-id zpr-test-client \
+    --sub "$2" --email "$2@example.com" --hd example.com \
+    2>&1 | tee "idp-$1.log" | prefix_log "idp-$1" &
+  wait_for 15 in_ns "zpr-$1" curl --silent --cacert ca.crt \
+    --output /dev/null "$IDP_ISSUER/.well-known/openid-configuration"
 }
 
 # Mint an admin API key the way vsapikey does (vs/src/apikey.rs), as
@@ -557,12 +622,6 @@ function block_substrate() {
 function unblock_substrate() {
   in_ns "zpr-$1" tc qdisc del dev veth0 root
   in_ns zpr-relay tc qdisc del dev "veth-$1" root
-}
-
-# The PID of this run's visa service, which runs in the relay's namespace.
-# Anchored on $VS_BIN, as ph_pid_for_socket is on $PH_BIN: env execs it.
-function vs_pid() {
-  pgrep_own -f "^$(ere_escape "$VS_BIN") -c vs-config.toml" | head -n 1
 }
 
 # Cut the relay off from its visa service: stop the visa service's process

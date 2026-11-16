@@ -945,7 +945,7 @@ mod tests {
                     "test-node".to_string(),
                     aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
                         .expect("test RSA key"),
-                    "127.0.0.1:5000".parse().unwrap(),
+                    libnode::vsconn::fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()),
                 );
                 let vs_handle = vsconn.handle();
                 vs_handle.restart().await.unwrap();

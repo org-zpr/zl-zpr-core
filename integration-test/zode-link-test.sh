@@ -52,10 +52,14 @@
 # rejoin. Each is bound only if it comes from the visa's previous hop (gap
 # 7, zl-zipline#253), so the run also shows that the check refuses none of
 # them: no previous-hop refusal is logged on either Zode, and no Stream ID
-# Request is refused at all until scenario 2 starts breaking links. After
+# Request is refused at all until scenario 4 starts breaking links. After
 # that some refusals are by design: a request pending over a lost link
-# (rule 9), or the relay asking the restarted zb for a stream for a visa
-# of the zb that crashed, which the visa service no longer has.
+# (rule 9).
+#
+# In scenarios 1 and 2 zb pings the visa service as soon as it registers
+# its VSS, while its VSS connection is still VSS_START_DELAY away. The relay
+# requests the reply's visa, so zb's copy can come only from the by-ID
+# fetch, which must return zb's still-pending copy (zl-zipline#262).
 #
 # Joins wait 20-30 s: the joiner's TCP dial to the visa service starts
 # before the hand-off and relies on SYN retransmits, so it connects a few
@@ -140,6 +144,7 @@ if [[ "$PASS" == 0 ]]; then
   wait_log_after 20 relay.log "$TOPOLOGY_ZB_REPORTED" 0 "the relay's next topology carries zb's reported address" || PASS=1
   wait_log_after 10 zb.log "$REPORT_RELAY_UP" 0 "zb reports its initial link up itself" || PASS=1
   wait_log_after 20 zb.log "$REGISTERED" 0 "zb registers its VSS" || PASS=1
+  zode_ping zb "$VS_ZPR_ADDR" "zb reaches the visa service during its join" || PASS=1
   wait_log_after 20 zb.log "$TOPOLOGY" 0 "zb receives its topology" || PASS=1
   assert_superseded 20 zb "$HANDOFF" || PASS=1
   assert_no_log zb.log "$REJOIN" "zb has not rejoined" || PASS=1
@@ -162,7 +167,10 @@ if [[ "$PASS" == 0 ]]; then
   assert_new_ids "$(last_handoff_ids relay.log zb)" "$HANDOFF" "the new hand-off" || PASS=1
   HANDOFF=$(last_handoff_ids relay.log zb)
   wait_log_after 30 zb.log "$REGISTERED" "$REGISTRATIONS" "the restarted zb registers its VSS" || PASS=1
+  zode_ping zb "$VS_ZPR_ADDR" "the restarted zb reaches the visa service during its join" || PASS=1
   assert_superseded 20 zb "$HANDOFF" || PASS=1
+  # No Stream ID Request was refused on either Zode across the restart.
+  assert_no_refusals relay zb || PASS=1
 
   echo "== 3. zc, not in the relay's topology, dials the relay"
   launch_zode zc "$ZC_SUBSTRATE_ADDR" "$ZC_ZPR_ADDR" "$PREGEN/node-rsa-key.pem"

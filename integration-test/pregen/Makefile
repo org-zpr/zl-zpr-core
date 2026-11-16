@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2 zodes.bin2 zodes-unlinked.bin2 zodes-pair.bin2 zodes-direct.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2 zodes.bin2 zodes-unlinked.bin2 zodes-pair.bin2 zodes-direct.bin2 zodes-login.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -124,3 +124,9 @@ zodes-pair.bin2: zodes-pair.zplc zodes-pair.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.
 
 zodes-direct.bin2: zodes-direct.zplc zodes-pair.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.pem
 	$(ZPLC) -c zodes-direct.zplc -k $(KEY) -f v2 -o $@ zodes-pair.zpl
+
+# Zode login fixture (zl-zipline#233): zodes.zplc's relay and zb plus the
+# fake IdP as an OIDC trusted service, as in oidc-renewal.zplc. Same
+# omitted-`service` warning as oidc-test; expected.
+zodes-login.bin2: zodes-login.zplc zodes-login.zpl zb-rsa-pubkey.pem oidc-test-seed-jwks.json
+	$(ZPLC) -c zodes-login.zplc -k $(KEY) -f v2 -o $@ zodes-login.zpl

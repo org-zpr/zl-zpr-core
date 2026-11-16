@@ -617,8 +617,10 @@ async fn renew(asm: &Arc<Assembly>, generation: u64) -> Result<(), AuthFailureRe
         .reauthorize_own_actor(actor_addr(asm), Some(blob))
         .await
         .map_err(vs_failure)?;
-    asm.zode_login
-        .renewed(generation, submitted, auth_expiry(&conn));
+    let expires = auth_expiry(&conn);
+    asm.zode_login.renewed(generation, submitted, expires);
+    info!(target: RPC, "Zode login: renewed; expires in {}s",
+        expires.duration_since(SystemTime::now()).unwrap_or_default().as_secs());
     Ok(())
 }
 

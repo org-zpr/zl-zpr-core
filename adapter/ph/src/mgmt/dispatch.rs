@@ -515,13 +515,11 @@ mod test {
         );
     }
 
-    /// A Zode at fd5a:5052::10 with CA-signed link keys and a topology in
-    /// which `b.zpr` (fd5a:5052::9) owns its link to this Zode, plus an
-    /// established Active link from b.zpr. Returns the assembly, the
-    /// established link id and the egress queue the links send through.
-    fn zode_with_established_link() -> (
+    /// A Zode `a.zpr` at fd5a:5052::10 with CA-signed link keys and an
+    /// empty topology. Returns the assembly and the egress queue its links
+    /// send through.
+    fn zode_a() -> (
         Arc<Assembly>,
-        LinkId,
         crate::packet_queue::Receiver<{ PACKET_BUFFER_SIZE }>,
     ) {
         let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(64);
@@ -537,6 +535,19 @@ mod test {
             mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
             ..TestAssemblyBuilder::new()
         }));
+        (asm, egress_rx)
+    }
+
+    /// [zode_a] with a topology in which `b.zpr` (fd5a:5052::9) owns its
+    /// link to this Zode, plus an established Active link from b.zpr.
+    /// Returns the assembly, the established link id and the egress queue
+    /// the links send through.
+    fn zode_with_established_link() -> (
+        Arc<Assembly>,
+        LinkId,
+        crate::packet_queue::Receiver<{ PACKET_BUFFER_SIZE }>,
+    ) {
+        let (asm, egress_rx) = zode_a();
         *asm.topology.write().unwrap() = vec![crate::peer_table::test::topology_link("b.zpr")];
         let old = crate::peer_table::test::insert_zode_peer_with_verified_cn(
             &asm,
@@ -726,6 +737,64 @@ mod test {
                     asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
                     Some(old)
                 );
+            })
+            .await
+    }
+
+    /// Deliver `km_msg` as a key-management packet from substrate address
+    /// `sa` on `iface`, routed as the fastpath routes it: to the link the
+    /// address maps to, or as a packet from an unknown peer.
+    fn deliver_km_from(
+        asm: &Arc<Assembly>,
+        sa: SubstrateAddr,
+        iface: net_defs::ScopedIpAddr,
+        km_msg: &[u8],
+    ) {
+        match asm.peer_table.lookup_peer(&sa, &iface) {
+            Some(link_id) => deliver_km_on_link(asm, link_id.get(), km_msg),
+            None => dispatch_mgmt_packet_with_addr(asm, sa, iface, &mut km_packet(km_msg)),
+        }
+    }
+
+    /// Gate g120 (ZODE_LINKS.md rules 3 and 6): the owner b.zpr dials
+    /// before this Zode's topology names the link, so the link is refused
+    /// at KeyingDone. The refused link stays Closing until its Terminate
+    /// ack wait ends, and its cleanup clears its SA before its peer entry
+    /// goes. The owner's redial from the same address, in that window,
+    /// must start a link of its own rather than reach the dying link.
+    #[tokio::test(start_paused = true)]
+    async fn test_redial_after_refusal_starts_a_new_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_a();
+                let sa = SubstrateAddr::from(([127, 0, 0, 1], 4001));
+                let iface = net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+                let state_of = |id: LinkId| {
+                    asm.peer_table
+                        .get(id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state()
+                };
+
+                let (dial0, _) = first_messages();
+                deliver_km_from(&asm, sa, iface, &dial0);
+                let refused = asm.peer_table.lookup_peer(&sa, &iface).unwrap().get();
+                crate::peer_table::test::set_verified_peer_cn(&asm, refused, "b.zpr");
+                asm.process_link_state_event(refused, crate::link_state::LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(state_of(refused), crate::link_state::LinkState::Closing);
+                asm.peer_table.clear_security_association(refused).unwrap();
+
+                // The topology now names the link, and b.zpr redials.
+                *asm.topology.write().unwrap() =
+                    vec![crate::peer_table::test::topology_link("b.zpr")];
+                let (redial0, _) = first_messages();
+                deliver_km_from(&asm, sa, iface, &redial0);
+                let redial = asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get());
+                assert_ne!(redial, Some(refused), "the redial reaches the refused link");
+                let redial = redial.expect("the redial starts a link");
+                assert_eq!(state_of(redial), crate::link_state::LinkState::Keying);
             })
             .await
     }

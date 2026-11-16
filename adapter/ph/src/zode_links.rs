@@ -336,7 +336,8 @@ impl ZodeLinkTable {
         link_id: Option<LinkId>,
     ) {
         let dial_addr = SocketAddr::from(([127, 0, 0, 9], 5000));
-        let mut record = LinkRecord::new(Kind::Topology, Owner::Peer, dial_addr, system_jitter);
+        let mut record =
+            LinkRecord::new(Kind::Topology, Owner::Peer, Some(dial_addr), system_jitter);
         record.state = state;
         record.link_id = link_id;
         self.insert(peer_cn, record);
@@ -370,7 +371,7 @@ impl ZodeLinkTable {
         peer_cn: &str,
         serial: Option<u64>,
         event: Event,
-    ) -> Option<(Vec<Action>, u64, SocketAddr)> {
+    ) -> Option<(Vec<Action>, u64, Option<SocketAddr>)> {
         let mut inner = self.inner.lock().unwrap();
         let (record_serial, record) = inner.records.get_mut(peer_cn)?;
         if serial.is_some_and(|s| s != *record_serial) {
@@ -415,10 +416,22 @@ fn drive(asm: &Arc<Assembly>, peer_cn: &str, serial: Option<u64>, event: Event) 
         serial = Some(record_serial);
         for action in actions {
             match action {
-                Action::Dial => pending.push_back(match dial(asm, peer_cn, dial_addr) {
-                    Some(link_id) => Event::Dialed(link_id),
-                    None => Event::DialFailed,
-                }),
+                Action::Dial => {
+                    // Only the owner dials, and apply_topology never gives
+                    // the owner a record without an address; should one
+                    // slip through, the dial fails rather than guess.
+                    let dialed = match dial_addr {
+                        Some(dial_addr) => dial(asm, peer_cn, dial_addr),
+                        None => {
+                            warn!(target: LINK_STATE, "cannot dial Zode {peer_cn:?}: no substrate address");
+                            None
+                        }
+                    };
+                    pending.push_back(match dialed {
+                        Some(link_id) => Event::Dialed(link_id),
+                        None => Event::DialFailed,
+                    });
+                }
                 Action::Close(link_id) => close_link(asm, link_id, "the link-up window ended"),
                 Action::Arm {
                     timer,
@@ -494,7 +507,12 @@ pub fn start_initial_link(asm: &Arc<Assembly>) {
     info!(target: LINK_STATE, "dialing initial link {:?} at {}", link.cn, link.addr);
     asm.zode_links.insert(
         &link.cn,
-        LinkRecord::new(Kind::Initial, Owner::ThisZode, link.addr, system_jitter),
+        LinkRecord::new(
+            Kind::Initial,
+            Owner::ThisZode,
+            Some(link.addr),
+            system_jitter,
+        ),
     );
     drive(asm, &link.cn, None, Event::Start);
 }
@@ -505,7 +523,8 @@ pub fn start_initial_link(asm: &Arc<Assembly>) {
 /// - every link in it is started: the owner dials a new, failed or down
 ///   link once more (rule 6), an up link is left alone, and the non-owner
 ///   waits;
-/// - a link whose owner cannot be decided (equal addresses) is logged and
+/// - a link whose owner cannot be decided (equal addresses), or one this
+///   Zode owns that has no `peer` to dial (rule 13b), is logged and
 ///   skipped, and the rest is applied;
 /// - the initial link's record is never touched: when the relay is also in
 ///   the topology, the initial-link rule wins.
@@ -515,14 +534,24 @@ pub fn start_initial_link(asm: &Arc<Assembly>) {
 pub fn apply_topology(asm: &Arc<Assembly>) {
     let config = asm.config.get();
     let initial_cn = config.initial_link.as_ref().map(|link| link.cn.clone());
-    let mut wanted: HashMap<String, (Owner, SocketAddr)> = HashMap::new();
+    let mut wanted: HashMap<String, (Owner, Option<SocketAddr>)> = HashMap::new();
     for link in asm.topology.read().unwrap().iter() {
         if Some(&link.peer_cn) == initial_cn.as_ref() {
             continue;
         }
         match link_owner(&config, &link.peer_cn, link.zpr_addr) {
             Ok(owner) => {
-                let dial_addr = SocketAddr::new(link.peer.addr, link.peer.port);
+                let dial_addr = link
+                    .peer
+                    .as_ref()
+                    .map(|peer| SocketAddr::new(peer.addr, peer.port));
+                // Rule 13b: the visa service leaves `peer` unset when it does
+                // not know the peer's address. The non-owner never dials, so
+                // that is fine there; a link this Zode owns cannot be dialed.
+                if owner == Owner::ThisZode && dial_addr.is_none() {
+                    warn!(target: LINK_STATE, "skipping topology link {} to {:?}: this Zode owns it, but it has no peer address to dial", link.link_id, link.peer_cn);
+                    continue;
+                }
                 wanted.insert(link.peer_cn.clone(), (owner, dial_addr));
             }
             Err(e) => {
@@ -980,6 +1009,15 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tokio::task::LocalSet;
 
+    /// Long enough for an owner's link-up window (rule 6) to have ended.
+    const PAST_THE_WINDOW: Duration =
+        Duration::from_secs(crate::zode_link_record::LINK_UP_WINDOW.as_secs() + 1);
+
+    /// Long enough for the window to have ended and the attempt it aborted
+    /// to have finished closing, so the peer's address is free to redial.
+    const PAST_THE_WINDOW_AND_CLOSE: Duration =
+        Duration::from_secs(crate::zode_link_record::LINK_UP_WINDOW.as_secs() + 5);
+
     /// The substrate egress queue a driver test keeps open.
     pub(crate) type EgressRx = crate::packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
 
@@ -991,12 +1029,26 @@ pub(crate) mod tests {
         self_cn: &str,
         initial_link: Option<&str>,
     ) -> (Arc<Assembly>, EgressRx) {
+        let mut config = zode_config(self_addr);
+        config.initial_link = initial_link.map(|spec| InitialLink::parse_cli(spec).unwrap());
+        driven_zode_with(config, self_cn)
+    }
+
+    /// The relay Zode `self_cn` at ZPR address `self_addr`, otherwise as
+    /// [driven_zode].
+    fn driven_relay(self_addr: &str, self_cn: &str) -> (Arc<Assembly>, EgressRx) {
+        let mut config = zode_config(self_addr);
+        config.relay = true;
+        driven_zode_with(config, self_cn)
+    }
+
+    /// The Zode `self_cn` with `config`, bound to 127.0.0.1, with CA-signed
+    /// link keys.
+    fn driven_zode_with(mut config: Config, self_cn: &str) -> (Arc<Assembly>, EgressRx) {
         let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(256);
         let ca = crate::pki::TestCa::new("zode-ca");
         let (keypair, certx) = crate::assembly::test::zode_link_keys(&ca, self_cn);
-        let mut config = zode_config(self_addr);
         config.self_addr = "127.0.0.1:0".parse().unwrap();
-        config.initial_link = initial_link.map(|spec| InitialLink::parse_cli(spec).unwrap());
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
             ph_mode: Some(crate::assembly::PhMode::Node),
             self_noise_keypair: Some(keypair),
@@ -1012,10 +1064,18 @@ pub(crate) mod tests {
     /// 127.0.0.1:`port`.
     fn peer(cn: &str, addr: &str, port: u16) -> zpr::vsapi_types::Link {
         let mut link = topology_link_at(cn, ip(addr));
-        link.peer = zpr::vsapi_types::SockAddr {
+        link.peer = Some(zpr::vsapi_types::SockAddr {
             addr: ip("127.0.0.1"),
             port,
-        };
+        });
+        link
+    }
+
+    /// A topology link to `cn` at ZPR address `addr` with no `peer`: the
+    /// visa service does not know `cn`'s substrate address (rule 13b).
+    fn unaddressed(cn: &str, addr: &str) -> zpr::vsapi_types::Link {
+        let mut link = topology_link_at(cn, ip(addr));
+        link.peer = None;
         link
     }
 
@@ -1038,6 +1098,22 @@ pub(crate) mod tests {
 
     /// Bring the Zode connection `link_id` up as if keying verified `cn`
     /// and Hello completed.
+    /// Sleep for `duration` while the peer of `link_id` answers each
+    /// keep-alive, as a live peer would, so an up link outlasts a wait
+    /// longer than the keep-alive miss tolerance.
+    async fn sleep_answering_keep_alives(asm: &Arc<Assembly>, link_id: LinkId, duration: Duration) {
+        let step = Duration::from_millis(500);
+        let mut slept = Duration::ZERO;
+        while slept < duration {
+            tokio::time::sleep(step).await;
+            slept += step;
+            if let Some(peer) = asm.peer_table.get(link_id) {
+                // Err when no keep-alive is outstanding: nothing to answer.
+                let _ = peer.link_state_machine.process_keep_alive_response(asm);
+            }
+        }
+    }
+
     pub(crate) fn bring_up(asm: &Arc<Assembly>, link_id: LinkId, cn: &str) {
         crate::peer_table::test::set_verified_peer_cn(asm, link_id, cn);
         asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
@@ -1180,7 +1256,7 @@ pub(crate) mod tests {
                     redialed.is_some_and(|id| id != first),
                     "redialed inside the window"
                 );
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                tokio::time::sleep(PAST_THE_WINDOW - Duration::from_millis(4200)).await;
                 let record = record_of(&asm, "b");
                 assert_eq!(record.state, RecordState::Failed);
                 assert_eq!(record.outcome, Some(Outcome::Failed));
@@ -1264,7 +1340,7 @@ pub(crate) mod tests {
 
                 // Failed and down records are forgotten too.
                 set_topology(&asm, vec![peer("f", "fd5a::23", 7108)]);
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(PAST_THE_WINDOW_AND_CLOSE).await;
                 assert_eq!(record_of(&asm, "f").state, RecordState::Failed);
                 set_topology(&asm, vec![]);
                 assert!(asm.zode_links.record("f").is_none());
@@ -1295,7 +1371,7 @@ pub(crate) mod tests {
                 bring_up(&asm, up, "up");
                 asm.process_link_state_event(down, LinkEvent::Close(TerminateReason::Reset))
                     .unwrap();
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                sleep_answering_keep_alives(&asm, up, PAST_THE_WINDOW_AND_CLOSE).await;
                 assert_eq!(record_of(&asm, "failed").state, RecordState::Failed);
                 assert_eq!(record_of(&asm, "down").state, RecordState::Down);
 
@@ -1399,6 +1475,80 @@ pub(crate) mod tests {
             .await
     }
 
+    /// Rule 13b: a link this Zode owns with no `peer` cannot be dialed, so
+    /// it is skipped (and logged) and the rest of the topology is applied.
+    /// No dial address is invented.
+    #[tokio::test(start_paused = true)]
+    async fn test_owned_link_without_peer_is_skipped() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(
+                    &asm,
+                    vec![unaddressed("c", "fd5a::30"), peer("b", "fd5a::20", 7121)],
+                );
+                assert!(asm.zode_links.record("c").is_none());
+                let dialed = record_of(&asm, "b").link_id.expect("b is dialed");
+                assert_eq!(zode_connections(&asm), vec![dialed]);
+            })
+            .await
+    }
+
+    /// Rule 13b: the relay never dials, so its link to a joiner whose
+    /// address the visa service does not know yet (no `peer`) still gets a
+    /// record, which waits for the joiner to dial in.
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_link_without_peer_waits_for_the_joiner() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_relay("fd5a::1", "relay");
+                set_topology(&asm, vec![unaddressed("zb", "fd5a::20")]);
+                let record = record_of(&asm, "zb");
+                assert_eq!(record.owner, Owner::Peer);
+                assert_eq!(record.state, RecordState::Idle);
+                assert_eq!(record.dial_addr, None);
+                assert!(zode_connections(&asm).is_empty());
+
+                let link_id = answered_up(&asm, "zb", 7222);
+                assert_eq!(record_of(&asm, "zb").link_id, Some(link_id));
+                assert_eq!(record_of(&asm, "zb").state, RecordState::Up);
+            })
+            .await
+    }
+
+    /// Rule 13b: a link the peer owns needs no `peer`; it is kept and
+    /// waits.
+    #[tokio::test(start_paused = true)]
+    async fn test_non_owner_link_without_peer_is_kept() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::10", "a", None);
+                set_topology(&asm, vec![unaddressed("b", "fd5a::9")]);
+                let record = record_of(&asm, "b");
+                assert_eq!(record.owner, Owner::Peer);
+                assert_eq!(record.state, RecordState::Idle);
+                assert!(zode_connections(&asm).is_empty());
+            })
+            .await
+    }
+
+    /// The initial link's topology entry without a `peer` leaves the
+    /// initial record alone: it keeps dialing the configured address.
+    #[tokio::test(start_paused = true)]
+    async fn test_initial_link_entry_without_peer_is_untouched() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = driven_zode("fd5a::20", "b", Some("relay@127.0.0.1:7122"));
+                start_initial_link(&asm);
+                set_topology(&asm, vec![unaddressed("relay", "fd5a::1")]);
+                let record = record_of(&asm, "relay");
+                assert_eq!(record.kind, Kind::Initial);
+                assert_eq!(record.dial_addr, Some("127.0.0.1:7122".parse().unwrap()));
+                assert_eq!(zode_connections(&asm).len(), 1);
+            })
+            .await
+    }
+
     /// Rule 11: the initial link is dialed at startup and redialed with
     /// backoff after each failed attempt; it is never failed.
     #[tokio::test(start_paused = true)]
@@ -1462,7 +1612,7 @@ pub(crate) mod tests {
                 set_topology(&asm, vec![peer("relay", "fd5a::1", 7999)]);
                 let record = record_of(&asm, "relay");
                 assert_eq!(record.kind, Kind::Initial);
-                assert_eq!(record.dial_addr, "127.0.0.1:7120".parse().unwrap());
+                assert_eq!(record.dial_addr, Some("127.0.0.1:7120".parse().unwrap()));
                 assert_eq!(zode_connections(&asm).len(), 1);
             })
             .await
@@ -1530,7 +1680,7 @@ pub(crate) mod tests {
                     asm.process_link_state_event(id, LinkEvent::Close(TerminateReason::Reset))
                         .unwrap();
                 }
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                tokio::time::sleep(PAST_THE_WINDOW).await;
 
                 assert_eq!(
                     listed(&asm),
@@ -1557,7 +1707,7 @@ pub(crate) mod tests {
                 let (asm, _egress) = driven_zode("fd5a::10", "a", None);
                 let links = vec![peer("b", "fd5a::20", 7138)];
                 set_topology(&asm, links.clone());
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                tokio::time::sleep(PAST_THE_WINDOW).await;
                 assert_eq!(listed(&asm), vec![("b".to_owned(), Reported::Failed)]);
                 asm.zode_links
                     .report_pending
@@ -1573,7 +1723,7 @@ pub(crate) mod tests {
                     .report_pending
                     .store(false, std::sync::atomic::Ordering::Release);
 
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                tokio::time::sleep(PAST_THE_WINDOW).await;
                 assert_eq!(listed(&asm), vec![("b".to_owned(), Reported::Failed)]);
                 assert!(
                     asm.zode_links.report_pending(),

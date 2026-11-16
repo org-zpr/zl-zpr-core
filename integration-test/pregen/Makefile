@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2 zodes.bin2 zodes-unlinked.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2 zodes.bin2 zodes-unlinked.bin2 zodes-pair.bin2 zodes-direct.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -11,6 +11,7 @@ info:
 	@echo make all     - recompiles out of date policy files
 	@echo make rebuild - run a clean followed by an all.
 	@echo
+	@echo Requires zplc 0.21.x, the only version the visa service loads.
 	@echo Requires that \'zplc\' the ZPL compiler is in your path.
 	@echo Or you can set path to zplc by setting ZPLC variable.
 	@echo
@@ -62,8 +63,8 @@ oidc-file-interplay.bin2: oidc-file-interplay.zpl oidc-file-interplay.zplc oidc-
 # configs: the base policy plus two variants whose only difference is a
 # removed [bootstrap] key (adapter2's for leg 3, the node's for leg 4) —
 # the same one-source trick oidc-renewal.bin2 plays on oidc-test.zpl. Same
-# omitted-`service` warning as oidc-test; expected. Needs zplc >= 0.20.0
-# (the policy version the visa service accepts, zipline#114).
+# omitted-`service` warning as oidc-test; expected. Needs zplc 0.21.x
+# (the policy version the visa service accepts, zl-zipline#256).
 policy-reauth.bin2: policy-reauth.zplc policy-reauth.zpl oidc-test-seed-jwks.json
 	$(ZPLC) -c policy-reauth.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
 
@@ -113,3 +114,13 @@ zodes.bin2: zodes.zplc zodes.zpl zb-rsa-pubkey.pem
 
 zodes-unlinked.bin2: zodes-unlinked.zplc zodes.zpl zb-rsa-pubkey.pem
 	$(ZPLC) -c zodes-unlinked.zplc -k $(KEY) -f v2 -o $@ zodes.zpl
+
+# Two-joiner Zode fixtures (zl-zipline#254): the relay linked to zb and zc,
+# and the same plus a direct zb-zc link. One ZPL, two configs, the same
+# trick v6-1node-2actor-ping.bin2 plays. zc's RSA authentication key is
+# checked in, like zb's.
+zodes-pair.bin2: zodes-pair.zplc zodes-pair.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.pem
+	$(ZPLC) -c zodes-pair.zplc -k $(KEY) -f v2 -o $@ zodes-pair.zpl
+
+zodes-direct.bin2: zodes-direct.zplc zodes-pair.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.pem
+	$(ZPLC) -c zodes-direct.zplc -k $(KEY) -f v2 -o $@ zodes-pair.zpl

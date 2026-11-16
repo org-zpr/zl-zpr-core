@@ -651,13 +651,20 @@ function relay_rx_bytes() {
 
 # Send the bulk transfer from Zode $1 to ZPR address $2: BULK_COUNT echo
 # requests of BULK_SIZE bytes, BULK_INTERVAL seconds apart, with a 60 s
-# deadline. ping checks each reply's payload. Fails unless at least 95% are
-# answered ($3 is the assertion message). Ping first with zode_ping, so the
-# flow's visa is in place and the transfer does not wait on it.
+# deadline. Fails unless at least 95% are answered, or if any reply's
+# payload differs from what was sent ($3 is the assertion message). ping
+# compares the payload only without -q, and reports a difference as "wrong
+# data byte", so it runs without -q and only its summary is printed. Ping
+# first with zode_ping, so the flow's visa is in place and the transfer
+# does not wait on it.
 function bulk_ping() {
   local OUT RECEIVED
-  OUT=$(in_ns "zpr-$1" ping -q -n -c "$BULK_COUNT" -s "$BULK_SIZE" -i "$BULK_INTERVAL" -w 60 "$2" 2>&1 || true)
+  OUT=$(in_ns "zpr-$1" ping -n -c "$BULK_COUNT" -s "$BULK_SIZE" -i "$BULK_INTERVAL" -w 60 "$2" 2>&1 || true)
   RECEIVED=$(sed -nE 's/.*, ([0-9]+) received.*/\1/p' <<< "$OUT")
+  if grep -q 'wrong data byte' <<< "$OUT"; then
+    echo "ASSERTION FAILED: $3 ($1 pinging $2: a reply's payload differs from the request's)"
+    return 1
+  fi
   if [[ -n "$RECEIVED" ]] && (( RECEIVED * 100 >= BULK_COUNT * 95 )); then
     echo "assertion OK: $3 ($RECEIVED of $BULK_COUNT answered)"
   else

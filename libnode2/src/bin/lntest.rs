@@ -40,7 +40,7 @@ async fn main() {
         vs_sa,
         args.node_cn,
         private_key,
-        substrate_addr,
+        libnode2::vsconn::fixed_substrate_addr(substrate_addr),
         // The VS-API connection leaves from the node's own address (zl-zipline#229).
         node_zpr_addr,
     );

@@ -3,8 +3,8 @@
 # Zode links (zl-zipline#250) and the relay join (zl-zipline#252),
 # docs/ZODE_LINKS.md.
 #
-# A relay Zode (relay = true) docks the visa service. Zode zb has an initial
-# link to the relay; zb is in the relay's topology. zb has no substrate
+# A relay Zode (relay = true) hosts the visa service in its own namespace,
+# on its own TUN (zl-zipline#229). Zode zb has an initial link to the relay; zb is in the relay's topology. zb has no substrate
 # address in policy (zl-zipline#255, W10), so the visa service knows it only
 # once zb connects and reports it. Zode zc has a
 # certificate from the same CA and an initial link to the relay, but is in
@@ -22,6 +22,9 @@
 #      (J5a) supersede the bootstrap pair and its live session moves onto
 #      them with no failed rebind. Once zb has connected, the visa service
 #      re-proposes the relay's topology with zb's reported address.
+#      Section 7 check 1 (zl-zipline#229): the relay routes vs.zpr over lo,
+#      its VS-API session leaves from its own address, and the visa
+#      service's VSS session to zb leaves from vs.zpr.
 #   2. zb restarts on the same address: the relay ends with one link to zb
 #      (rule 5) and reports it up again; the restarted zb joins again with
 #      fresh bootstrap visas (J6).
@@ -35,8 +38,9 @@
 #   5. A policy without the relay-zb link: the relay closes the link and
 #      stops reporting it (rule 12), and zb's redials are refused (rule 3).
 #      The policy with the link back lets zb's next redial in.
-#   6. The relay cannot reach the visa service: it cannot get zb's bootstrap
-#      visas, so it closes zb's link instead of handing off (J7).
+#   6. The relay cannot reach the visa service (stopped with SIGSTOP): it
+#      cannot get zb's bootstrap visas, so it closes zb's link instead of
+#      handing off (J7).
 #   7. The relay never dials (rule 4).
 #
 # Every Stream ID Request in the run crosses the relay-zb Zode link, in both
@@ -63,11 +67,9 @@ enter_test_namespace "$@"
 zode_begin
 
 create_zode_network "zb:$ZB_SUBSTRATE_ADDR" "zc:$ZC_SUBSTRATE_ADDR"
-launch_zode_vs
-launch_relay
-
 PASS=0
-launch_vs_adapter || PASS=1
+launch_relay || PASS=1
+launch_zode_vs || PASS=1
 
 # What the logs say (link_state.rs, zode_links.rs, bootstrap_handoff.rs,
 # vs_worker.rs, vss_worker.rs, visa_table.rs).
@@ -125,6 +127,13 @@ if [[ "$PASS" == 0 ]]; then
   # Gap 7: the join, both directions and J11 ran under the previous-hop
   # check, and no Stream ID Request was refused on either Zode.
   assert_no_refusals relay zb || PASS=1
+  # Section 7 check 1: the relay's sessions with the visa service stay in
+  # the host, and each client bound its own source address.
+  assert_vs_route_local || PASS=1
+  assert_relay_conn "$RELAY_ZPR_ADDR" "$VS_ZPR_ADDR" 5002 \
+    "the relay's VS-API session leaves from its own address" || PASS=1
+  assert_relay_conn "$VS_ZPR_ADDR" "$ZB_ZPR_ADDR" 8183 \
+    "the visa service's VSS session to zb leaves from vs.zpr" || PASS=1
 
   echo "== 2. zb restarts on the same address"
   UP_REPORTS=$(log_count relay.log "$REPORT_ZB_UP")
@@ -194,7 +203,7 @@ if [[ "$PASS" == 0 ]]; then
   REFUSALS=$(log_count relay.log "$REFUSED_ZB_J7")
   HANDOFFS=$(log_count relay.log "$HANDED_ZB")
   kill_zode zb || PASS=1
-  block_substrate vs
+  stop_vs
   launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
   wait_log_after 30 relay.log "$REFUSED_ZB_J7" "$REFUSALS" "the relay closes zb's link instead of handing off (J7)" || PASS=1
   if log_count_above relay.log "$HANDED_ZB" "$HANDOFFS"; then
@@ -203,7 +212,7 @@ if [[ "$PASS" == 0 ]]; then
   else
     echo "assertion OK: no hand-off without the visa service"
   fi
-  unblock_substrate vs
+  cont_vs
 
   echo "== 7. the relay never dials"
   assert_no_log relay.log "$DIAL" "the relay started no link as the dialer" || PASS=1

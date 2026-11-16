@@ -436,7 +436,9 @@ or issue the run verifies, and fill in **Findings** below in the same PR.
 
 Packet captures: `pktmon` on the VM does **not** capture Wintun traffic —
 capture on the Linux side instead (e.g.
-`ip netns exec zpr-vs tcpdump -ni tun0`).
+`ip netns exec zpr-vs tcpdump -ni tun0` for sections 1-5, and
+`tcpdump -ni zrelay` for section 6, where the visa service runs beside the
+relay).
 
 ## Findings
 

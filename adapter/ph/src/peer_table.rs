@@ -321,11 +321,9 @@ impl PeerTable {
         let Some(peer_state) = peer_slab.get((link_id as usize).wrapping_sub(1)) else {
             return;
         };
-        // Only unmap the address if it still leads to this link: a Zode link
-        // that replaced this one at the same address now owns it (rule 5).
-        self.sa_to_link.remove_if(
+        self.unmap_key(
             &(peer_state.substrate_addr, peer_state.interface_addr),
-            |_, mapped| mapped.get() == link_id,
+            link_id,
         );
 
         self.special_peers
@@ -386,6 +384,25 @@ impl PeerTable {
         if let Some(id) = NonZero::new(link_id) {
             self.sa_to_link.insert(key, id);
         }
+    }
+
+    /// Stop routing packets from `link_id`'s substrate address to
+    /// `link_id`, leaving the peer entry in place. A Zode link refused at
+    /// `KeyingDone` does this while it finishes closing, so its owner's
+    /// redial from the same address starts a new link (ZODE_LINKS.md rules
+    /// 3 and 6, gate g120).
+    pub fn unmap_substrate_addr(&self, link_id: LinkId) {
+        if let Some(key) = self.inspect(link_id, |p| (p.substrate_addr, p.interface_addr)) {
+            self.unmap_key(&key, link_id);
+        }
+    }
+
+    /// Remove the address mapping `key`, but only if it still leads to
+    /// `link_id`: a Zode link that replaced this one at the same address
+    /// may own it now (rule 5).
+    fn unmap_key(&self, key: &(SubstrateAddr, ScopedIpAddr), link_id: LinkId) {
+        self.sa_to_link
+            .remove_if(key, |_, mapped| mapped.get() == link_id);
     }
 
     pub fn lookup_special_peer(&self, name: SpecialPeerName) -> Option<NonZero<LinkId>> {

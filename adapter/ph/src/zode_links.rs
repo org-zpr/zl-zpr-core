@@ -1009,6 +1009,15 @@ pub(crate) mod tests {
     use std::time::Duration;
     use tokio::task::LocalSet;
 
+    /// Long enough for an owner's link-up window (rule 6) to have ended.
+    const PAST_THE_WINDOW: Duration =
+        Duration::from_secs(crate::zode_link_record::LINK_UP_WINDOW.as_secs() + 1);
+
+    /// Long enough for the window to have ended and the attempt it aborted
+    /// to have finished closing, so the peer's address is free to redial.
+    const PAST_THE_WINDOW_AND_CLOSE: Duration =
+        Duration::from_secs(crate::zode_link_record::LINK_UP_WINDOW.as_secs() + 5);
+
     /// The substrate egress queue a driver test keeps open.
     pub(crate) type EgressRx = crate::packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
 
@@ -1089,6 +1098,22 @@ pub(crate) mod tests {
 
     /// Bring the Zode connection `link_id` up as if keying verified `cn`
     /// and Hello completed.
+    /// Sleep for `duration` while the peer of `link_id` answers each
+    /// keep-alive, as a live peer would, so an up link outlasts a wait
+    /// longer than the keep-alive miss tolerance.
+    async fn sleep_answering_keep_alives(asm: &Arc<Assembly>, link_id: LinkId, duration: Duration) {
+        let step = Duration::from_millis(500);
+        let mut slept = Duration::ZERO;
+        while slept < duration {
+            tokio::time::sleep(step).await;
+            slept += step;
+            if let Some(peer) = asm.peer_table.get(link_id) {
+                // Err when no keep-alive is outstanding: nothing to answer.
+                let _ = peer.link_state_machine.process_keep_alive_response(asm);
+            }
+        }
+    }
+
     pub(crate) fn bring_up(asm: &Arc<Assembly>, link_id: LinkId, cn: &str) {
         crate::peer_table::test::set_verified_peer_cn(asm, link_id, cn);
         asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
@@ -1231,7 +1256,7 @@ pub(crate) mod tests {
                     redialed.is_some_and(|id| id != first),
                     "redialed inside the window"
                 );
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                tokio::time::sleep(PAST_THE_WINDOW - Duration::from_millis(4200)).await;
                 let record = record_of(&asm, "b");
                 assert_eq!(record.state, RecordState::Failed);
                 assert_eq!(record.outcome, Some(Outcome::Failed));
@@ -1315,7 +1340,7 @@ pub(crate) mod tests {
 
                 // Failed and down records are forgotten too.
                 set_topology(&asm, vec![peer("f", "fd5a::23", 7108)]);
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(PAST_THE_WINDOW_AND_CLOSE).await;
                 assert_eq!(record_of(&asm, "f").state, RecordState::Failed);
                 set_topology(&asm, vec![]);
                 assert!(asm.zode_links.record("f").is_none());
@@ -1346,7 +1371,7 @@ pub(crate) mod tests {
                 bring_up(&asm, up, "up");
                 asm.process_link_state_event(down, LinkEvent::Close(TerminateReason::Reset))
                     .unwrap();
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                sleep_answering_keep_alives(&asm, up, PAST_THE_WINDOW_AND_CLOSE).await;
                 assert_eq!(record_of(&asm, "failed").state, RecordState::Failed);
                 assert_eq!(record_of(&asm, "down").state, RecordState::Down);
 
@@ -1655,7 +1680,7 @@ pub(crate) mod tests {
                     asm.process_link_state_event(id, LinkEvent::Close(TerminateReason::Reset))
                         .unwrap();
                 }
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                tokio::time::sleep(PAST_THE_WINDOW).await;
 
                 assert_eq!(
                     listed(&asm),
@@ -1682,7 +1707,7 @@ pub(crate) mod tests {
                 let (asm, _egress) = driven_zode("fd5a::10", "a", None);
                 let links = vec![peer("b", "fd5a::20", 7138)];
                 set_topology(&asm, links.clone());
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                tokio::time::sleep(PAST_THE_WINDOW).await;
                 assert_eq!(listed(&asm), vec![("b".to_owned(), Reported::Failed)]);
                 asm.zode_links
                     .report_pending
@@ -1698,7 +1723,7 @@ pub(crate) mod tests {
                     .report_pending
                     .store(false, std::sync::atomic::Ordering::Release);
 
-                tokio::time::sleep(Duration::from_secs(6)).await;
+                tokio::time::sleep(PAST_THE_WINDOW).await;
                 assert_eq!(listed(&asm), vec![("b".to_owned(), Reported::Failed)]);
                 assert!(
                     asm.zode_links.report_pending(),

@@ -110,6 +110,10 @@ struct LoginData {
     /// a renewal) was submitted. Renewals coalesce and space themselves by
     /// it ([renew]).
     last_user_reauth: Option<SystemTime>,
+    /// Bumped whenever the VS-API session is replaced ([session_replaced]),
+    /// so a login that was in flight meanwhile knows its result may be
+    /// gone.
+    session_epoch: u64,
 }
 
 /// A Zode's own login state, held on the [Assembly].
@@ -136,6 +140,7 @@ impl Default for ZodeLogin {
                 agent: None,
                 generation: 0,
                 last_user_reauth: None,
+                session_epoch: 0,
             }),
             reauth_lock: tokio::sync::Mutex::new(()),
             renew_lock: tokio::sync::Mutex::new(()),
@@ -203,8 +208,36 @@ impl ZodeLogin {
         Ok(())
     }
 
-    /// Record a successful login, whose `reauthorize` was submitted at
-    /// `submitted`, and return its generation.
+    /// The current VS-API session epoch (see `LoginData::session_epoch`).
+    fn session_epoch(&self) -> u64 {
+        self.data.lock().unwrap().session_epoch
+    }
+
+    /// Record a successful login of session epoch `epoch`, whose
+    /// `reauthorize` was submitted at `submitted`, and return its
+    /// generation. `None`, recording nothing, when the session was replaced
+    /// since `epoch`: the visa service may have dropped the login. The
+    /// check and the record share the lock with [ZodeLogin::drop_login], so
+    /// a replacement is seen by one of them.
+    fn logged_in_if_current(
+        &self,
+        epoch: u64,
+        idp: OidcIdpInfo,
+        nonce: String,
+        submitted: SystemTime,
+        expires: SystemTime,
+    ) -> Option<u64> {
+        let mut data = self.data.lock().unwrap();
+        if data.session_epoch != epoch {
+            return None;
+        }
+        Some(Self::record_login(
+            &mut data, idp, nonce, submitted, expires,
+        ))
+    }
+
+    /// Record a login, whose `reauthorize` was submitted at `submitted`,
+    /// whatever the session, and return its generation.
     fn logged_in(
         &self,
         idp: OidcIdpInfo,
@@ -212,7 +245,23 @@ impl ZodeLogin {
         submitted: SystemTime,
         expires: SystemTime,
     ) -> u64 {
-        let mut data = self.data.lock().unwrap();
+        Self::record_login(
+            &mut self.data.lock().unwrap(),
+            idp,
+            nonce,
+            submitted,
+            expires,
+        )
+    }
+
+    /// Move `data` to logged in and return the new generation.
+    fn record_login(
+        data: &mut LoginData,
+        idp: OidcIdpInfo,
+        nonce: String,
+        submitted: SystemTime,
+        expires: SystemTime,
+    ) -> u64 {
         data.generation += 1;
         data.last_user_reauth = Some(submitted);
         let granted_at = SystemTime::now();
@@ -277,10 +326,13 @@ impl ZodeLogin {
         self.changes.send_modify(|n| *n += 1);
     }
 
-    /// If logged in, move to logged out with `reason` and return the
-    /// registered agent (if any). `None` when nobody was logged in.
+    /// The VS-API session was replaced: bump the session epoch, so a login
+    /// in flight does not record itself. Then, if logged in, move to logged
+    /// out with `reason` and return the registered agent (if any). `None`
+    /// when nobody was logged in.
     fn drop_login(&self, reason: AuthFailureReason) -> Option<Option<AuthAgentHandle>> {
         let mut data = self.data.lock().unwrap();
+        data.session_epoch += 1;
         if !matches!(data.state, LoginState::LoggedIn { .. }) {
             return None;
         }
@@ -395,13 +447,32 @@ pub async fn login(asm: &Arc<Assembly>, agent: AuthAgentHandle) -> Result<(), Lo
 /// One login attempt after [ZodeLogin::begin_login]: obtain the login,
 /// then record it and arm the renewal timer, or record the failure.
 async fn attempt_login(asm: &Arc<Assembly>, agent: AuthAgentHandle) -> Result<(), LoginError> {
+    let epoch = asm.zode_login.session_epoch();
     match obtain_login(asm, &agent).await {
         Ok((idp, nonce, submitted, conn)) => {
             let expires = auth_expiry(&conn);
+            let Some(generation) = asm.zode_login.logged_in_if_current(
+                epoch,
+                idp.clone(),
+                nonce.clone(),
+                submitted,
+                expires,
+            ) else {
+                // The session was replaced while the login ran, before or
+                // after its `reauthorize`: the user may be on the actor or
+                // not, so log out to be sure.
+                warn!(target: RPC, "Zode login: the VS-API session was replaced during the login; logging out to be sure");
+                return Err(clean_up_uncertain_login(
+                    asm,
+                    AuthFailureReason::SessionReplaced,
+                    idp,
+                    nonce,
+                    submitted,
+                ));
+            };
             info!(target: RPC, "Zode login: logged in with {}; expires in {}s",
                 idp.issuer,
                 expires.duration_since(SystemTime::now()).unwrap_or_default().as_secs());
-            let generation = asm.zode_login.logged_in(idp, nonce, submitted, expires);
             spawn_renewal(asm, generation);
             Ok(())
         }
@@ -416,18 +487,28 @@ async fn attempt_login(asm: &Arc<Assembly>, agent: AuthAgentHandle) -> Result<()
             nonce,
             submitted,
         }) => {
-            // The visa service may have committed the login. Keep it as an
-            // already-expired login: the timer then logs out at once and
-            // retries until the visa service confirms, `ph-cli logout`
-            // still works, and a new login waits until it is gone.
             warn!(target: RPC, "Zode login: no answer to the login ({reason:?}); logging out to be sure");
-            let generation = asm
-                .zode_login
-                .logged_in(idp, nonce, submitted, SystemTime::now());
-            spawn_renewal(asm, generation);
-            Err(LoginError::Failed(reason))
+            Err(clean_up_uncertain_login(asm, reason, idp, nonce, submitted))
         }
     }
+}
+
+/// A login failed with `reason`, but the visa service may still hold it.
+/// Keep it as an already-expired login: the timer then logs out at once and
+/// retries until the visa service confirms, `ph-cli logout` still works,
+/// and a new login waits until it is gone. Returns the login's error.
+fn clean_up_uncertain_login(
+    asm: &Arc<Assembly>,
+    reason: AuthFailureReason,
+    idp: OidcIdpInfo,
+    nonce: String,
+    submitted: SystemTime,
+) -> LoginError {
+    let generation = asm
+        .zode_login
+        .logged_in(idp, nonce, submitted, SystemTime::now());
+    spawn_renewal(asm, generation);
+    LoginError::Failed(reason)
 }
 
 /// Why [obtain_login] did not log in.
@@ -1758,6 +1839,47 @@ pub(crate) mod tests {
                 // Until the cleanup is confirmed the login is not forgotten:
                 // `ph-cli logout` works and a new login waits.
                 fake.borrow_mut().reauth_delay = None;
+                assert!(
+                    eventually(Duration::from_secs(5), || !asm.zode_login.is_logged_in()).await,
+                    "{:?}",
+                    asm.zode_login.state()
+                );
+                assert_eq!(
+                    reauth_shapes(&fake),
+                    vec![with_user("vs-nonce-1"), device_only()]
+                );
+            })
+            .await;
+    }
+
+    /// A session replaced while a login waits for the user drops that
+    /// login too (Codex P1 on core#120): the visa service built a new,
+    /// device-only actor, so the login must not be recorded as logged in.
+    /// It fails with `SessionReplaced`, and since the replacement may have
+    /// come before or after its `reauthorize`, a device-only cleanup goes
+    /// out as for an unanswered login.
+    #[tokio::test]
+    async fn a_session_replaced_during_a_login_fails_it() {
+        LocalSet::new()
+            .run_until(async {
+                let (asm, fake) = zode(FakeVsState::default(), true).await;
+                // An agent that answers only once the test says so.
+                let (agent, mut requests) =
+                    tokio::sync::mpsc::unbounded_channel::<OidcCredentialRequest>();
+                let login_asm = asm.clone();
+                let pending =
+                    tokio::task::spawn_local(async move { login(&login_asm, agent).await });
+                let request = requests.recv().await.expect("the login asks the agent");
+                assert!(matches!(asm.zode_login.state(), LoginState::LoggingIn));
+
+                session_replaced(&asm);
+                let _ = request.reply.send(Ok(ID_TOKEN.to_string()));
+
+                let err = pending.await.unwrap().unwrap_err();
+                assert!(
+                    matches!(err, LoginError::Failed(AuthFailureReason::SessionReplaced)),
+                    "{err:?}"
+                );
                 assert!(
                     eventually(Duration::from_secs(5), || !asm.zode_login.is_logged_in()).await,
                     "{:?}",

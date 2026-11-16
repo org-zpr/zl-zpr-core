@@ -467,6 +467,20 @@ function log_count() {
   grep -cE -- "$2" "$1" || true
 }
 
+# Assert that log $1 matches the extended regex $2 exactly $3 times (pass
+# the count from before the step plus what the step must add); $4 is the
+# message.
+function assert_log_count() {
+  local N
+  N=$(log_count "$1" "$2")
+  if (( N == $3 )); then
+    echo "assertion OK: $4"
+  else
+    echo "ASSERTION FAILED: $4 (expected $3 matches for '$2' in $1, got $N)"
+    return 1
+  fi
+}
+
 # Assert that log $1 does not match the extended regex $2 ($3 = message).
 function assert_no_log() {
   if grep -qE -- "$2" "$1"; then

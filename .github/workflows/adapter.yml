@@ -41,11 +41,12 @@ env:
   # (v0.21.2 sends no Link.peerCn, so it cannot drive Zode links). Re-cut
   # rule (docs/BUILD.md, zl-zipline#254): when the visa service changes in a
   # way core CI needs, cut the next v0.22.0-zodes.N pre-release from its
-  # feature/zodes and move this pin to it. v0.22.0-zodes.8 is cut from the
-  # visa service's feature/zodes at 3a9596e, after the zl-zipline#255/#256
-  # merge set and the #262 by-ID fetch fix (visaservice#68, #69). It loads
-  # only zplc 0.21.x policies.
-  VISA_SERVICE_RELEASE: v0.22.0-zodes.8
+  # feature/zodes and move this pin to it. v0.22.0-zodes.9 is cut from the
+  # visa service's feature/zodes at 65fe475, the zl-zipline#268 merge
+  # (visaservice#71: a direct link reported down is proposed again after
+  # LINK_REPROPOSE_DELAY, bounded by rule 13a), which zode-reroute-test.sh
+  # asserts. It loads only zplc 0.21.x policies.
+  VISA_SERVICE_RELEASE: v0.22.0-zodes.9
 
 jobs:
   # Build and upload ph

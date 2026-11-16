@@ -701,7 +701,6 @@ mod tests {
     /// A wildcard-bound socket, a receiver it can reach, and a source
     /// address that is not local (a documentation prefix): IPv6 if `v6`,
     /// else IPv4.
-    #[cfg(unix)]
     fn vanished_source_setup(
         v6: bool,
     ) -> (UdpSocket, UdpSocket, zpr_utils::net_defs::ScopedIpAddr) {
@@ -727,7 +726,6 @@ mod tests {
 
     /// A send's error from engine `name`: the batch error, or the first
     /// packet's own result (io_uring reports per packet).
-    #[cfg(unix)]
     fn first_send_error(
         name: &str,
         sender: &UdpSocket,
@@ -756,8 +754,7 @@ mod tests {
     /// zl-zipline#230 gap 1: a send whose source address is no longer
     /// local, as after a Wi-Fi switch, fails with an error the classifier
     /// accepts, for both families and every engine. This pins the real
-    /// errno of each platform (Linux, macOS).
-    #[cfg(unix)]
+    /// errno of each platform (Linux, macOS, Windows).
     #[test]
     fn send_from_vanished_source_is_a_network_change_error() {
         for name in batch_io::engine_names() {
@@ -779,7 +776,6 @@ mod tests {
     /// in the substrate egress queue, the fastpath drops and counts it in
     /// `OutPacksDrop` instead of panicking, and frees its buffer. A
     /// PRIORITY packet is dropped too: it would only fail again.
-    #[cfg(unix)]
     #[tokio::test(flavor = "local")]
     async fn substrate_send_from_vanished_source_drops_and_counts() {
         use crate::counters::FastpathCounterType;
@@ -842,7 +838,6 @@ mod tests {
 
     /// A fastpath worker with four buffers and a batch of four, on engine
     /// `engine`, for the substrate egress tests.
-    #[cfg(unix)]
     fn test_worker(engine: &'static batch_io::BatchIoEngine) -> crate::fastpath::FastpathWorker {
         use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
         use crate::fastpath::{FastpathWorker, FastpathWorkerConfig};
@@ -870,7 +865,6 @@ mod tests {
     /// interface of a multi-homed Zode), is still sent, PRIORITY or not.
     /// The engines that emulate sendmmsg(2) report a failed first packet as
     /// the batch error.
-    #[cfg(unix)]
     #[tokio::test(flavor = "local")]
     async fn substrate_send_from_vanished_source_spares_the_rest_of_the_queue() {
         use crate::counters::FastpathCounterType;

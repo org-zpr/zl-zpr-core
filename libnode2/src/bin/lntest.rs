@@ -41,6 +41,8 @@ async fn main() {
         args.node_cn,
         private_key,
         libnode2::vsconn::fixed_substrate_addr(substrate_addr),
+        // The VS-API connection leaves from the node's own address (zl-zipline#229).
+        node_zpr_addr,
     );
     let life_rx = vsc.subscribe_lifecycle_events();
     let handle = vsc.handle();

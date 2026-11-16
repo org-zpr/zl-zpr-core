@@ -3,8 +3,8 @@
 # Two Zodes join through the relay at once (zl-zipline#254; Zodes plan W3,
 # and W4 against the visa service), docs/ZODE_LINKS.md J1-J5 and J11.
 #
-# A relay Zode (relay = true) docks the visa service. Zodes zb and zc are
-# both in the relay's topology (pregen/zodes-pair.zplc) and start together,
+# A relay Zode (relay = true) hosts the visa service (zl-zipline#229).
+# Zodes zb and zc are both in the relay's topology (pregen/zodes-pair.zplc) and start together,
 # each with an initial link to the relay. For each of them:
 #   - the relay requests its bootstrap visas and hands them off (J2-J4):
 #     two visa-service IDs, none of them the other joiner's;
@@ -34,11 +34,9 @@ ZODE_POLICY_BIN=zodes-pair.bin2
 zode_begin
 
 create_zode_network "zb:$ZB_SUBSTRATE_ADDR" "zc:$ZC_SUBSTRATE_ADDR"
-launch_zode_vs
-launch_relay
-
 PASS=0
-launch_vs_adapter || PASS=1
+launch_relay || PASS=1
+launch_zode_vs || PASS=1
 
 # What the logs say (bootstrap_handoff.rs, zode_links.rs, vs_worker.rs,
 # vss_worker.rs).

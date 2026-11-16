@@ -35,8 +35,9 @@
     # zpr_addr
     #
     # [requried] - The ZPR address of the node's internal adapter.
+    #             An IPv6 address: the VS-API session to vs.zpr leaves from it.
     # ------------------------------------------------------------------------
-zpr_addr = "10.0.0.1"
+zpr_addr = "fd5a:5052::2"
 
     # ------------------------------------------------------------------------
     # ca_file

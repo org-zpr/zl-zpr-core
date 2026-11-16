@@ -35,11 +35,9 @@ zode_begin
 
 create_zode_network "zb:$ZB_SUBSTRATE_ADDR" "zc:$ZC_SUBSTRATE_ADDR"
 create_other_ca otherca
-launch_zode_vs
-launch_relay
-
 PASS=0
-launch_vs_adapter || PASS=1
+launch_relay || PASS=1
+launch_zode_vs || PASS=1
 
 # What the logs say (km_noise.rs, peer_mgmt.rs, bootstrap_handoff.rs,
 # vs_worker.rs).

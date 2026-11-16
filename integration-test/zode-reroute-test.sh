@@ -42,11 +42,9 @@ ZODE_POLICY_BIN=zodes-direct.bin2
 zode_begin
 
 create_zode_network "zb:$ZB_SUBSTRATE_ADDR" "zc:$ZC_SUBSTRATE_ADDR"
-launch_zode_vs
-launch_relay
-
 PASS=0
-launch_vs_adapter || PASS=1
+launch_relay || PASS=1
+launch_zode_vs || PASS=1
 
 # What the logs say (vss_rpc.rs, link_state.rs, zode_links.rs,
 # visa_table.rs; the visa service's topology_mgr.rs).

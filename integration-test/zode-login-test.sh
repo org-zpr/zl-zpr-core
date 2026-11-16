@@ -6,8 +6,8 @@
 # through its initial link. The policy (pregen/zodes-login.zpl) lets zb's
 # actor ping the visa service as a machine (the device flow) and ping the
 # relay only with the logged-in user's OIDC subject (the user flow). A fake
-# IdP runs in zpr-zb, for ph-cli's login, and in zpr-vs, for the visa
-# service's JWKS. ph-cli runs with --no-browser, and curl in zpr-zb drives
+# IdP runs in zpr-zb, for ph-cli's login, and in zpr-relay, for the visa
+# service's JWKS (the relay hosts the visa service, zl-zipline#229). ph-cli runs with --no-browser, and curl in zpr-zb drives
 # the authorization URL it prints, as in one-node-oidc-test.sh.
 #
 # Scenarios:
@@ -44,11 +44,10 @@ zode_begin
 create_zode_network "zb:$ZB_SUBSTRATE_ADDR"
 create_idp_cert
 PASS=0
-launch_zode_idp vs user-vs-unused || PASS=1
+launch_zode_idp relay user-vs-unused || PASS=1
 launch_zode_idp zb user-zb || PASS=1
-launch_zode_vs
-launch_relay
-launch_vs_adapter || PASS=1
+launch_relay || PASS=1
+launch_zode_vs || PASS=1
 
 # What the logs say (zode_login.rs, vss_worker.rs, visa_table.rs) and what
 # ph-cli prints (adapter/cli/src/main.rs, zode_login.rs format_status).

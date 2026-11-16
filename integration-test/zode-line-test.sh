@@ -51,9 +51,8 @@ function run_leg() {
   pushd "$LEG" > /dev/null
 
   create_zode_network "zb:$ZB_SUBSTRATE_ADDR" "zc:$ZC_SUBSTRATE_ADDR"
-  launch_zode_vs
-  launch_relay "$FORWARDING"
-  launch_vs_adapter || RESULT=1
+  launch_relay "$FORWARDING" || RESULT=1
+  launch_zode_vs || RESULT=1
 
   if [[ "$RESULT" == 0 ]]; then
     launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"

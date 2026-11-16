@@ -5,12 +5,17 @@
 # Source it after lib/common_funcs.sh. The layout matches pregen/zodes.zplc
 # and pregen/zodes-pair.zplc:
 #
-#   zpr-vs ---- zpr-relay ---- br0 ---- zpr-zb
-#   (visa        (relay Zode,       \--- zpr-zc
-#    service)     docks the VS)
+#   zpr-relay ---- br0 ---- zpr-zb
+#   (relay Zode       \--- zpr-zc
+#    + visa service)
 #
-# The visa service runs as an adapter docked on the relay, as in
-# one-node-test.sh. The other Zodes sit on one substrate segment (a bridge
+# The relay hosts the visa service in its own namespace, on its own TUN
+# (zl-zipline#229): the relay's `ph node` puts both its own ZPR address and
+# vs.zpr on tun0, so vs.zpr is a local actor of the relay, and the visa
+# service runs next to it. There is no `ph adapter` for the visa service.
+# The relay's VS-API session to vs.zpr, and the visa service's VSS session
+# to the relay, stay in the host (over lo). The other Zodes sit on one
+# substrate segment (a bridge
 # in the relay's namespace) and dial the relay through their configured
 # initial link. A Zode in the relay's topology joins through it
 # (zl-zipline#252): the relay hands it bootstrap visas for its own
@@ -37,12 +42,8 @@ VS_ZPR_ADDR=fd5a:5052::1
 RELAY_ZPR_ADDR=fd5a:5052::2
 ZB_ZPR_ADDR=fd5a:5052::3
 ZC_ZPR_ADDR=fd5a:5052::4
-# The whole ZPRnet, routed through the visa service's TUN.
-ZPR_SUBNET=fd5a:5052::/32
 ADMIN_URL="https://[$VS_ZPR_ADDR]:8182"
 
-RELAY_SUBSTRATE_ADDR_VS=10.0.0.1
-VS_SUBSTRATE_ADDR=10.0.0.2
 RELAY_SUBSTRATE_ADDR=10.2.0.1
 ZB_SUBSTRATE_ADDR=10.2.0.2
 ZC_SUBSTRATE_ADDR=10.2.0.3
@@ -90,15 +91,15 @@ function zode_begin() {
 # The EXIT trap: print every log under the working directory when
 # ZPR_TEST_VERBOSE is set, including those of a test's legs in
 # subdirectories, then common_funcs' cleanup (which stops everything and
-# removes the directory). cleanup prints the top-level valkey.log, vs.log
-# and adapter-vs.log itself, so they are left to it.
+# removes the directory). cleanup prints the top-level valkey.log and
+# vs.log itself, so they are left to it.
 function zode_cleanup() {
   if [ "${ZPR_TEST_VERBOSE:-no}" != "no" ]; then
     local LOG
     while read -r LOG
     do
       case "$LOG" in
-        valkey.log | vs.log | adapter-vs.log) ;;
+        valkey.log | vs.log) ;;
         *) emitlog "$LOG" ;;
       esac
     done < <(cd "$TMPDIR" && find . -name '*.log' -printf '%P\n' | sort)
@@ -131,20 +132,13 @@ function create_other_ca() {
 # one per Zode on the bridge (e.g. zb:10.2.0.2); each gets namespace
 # zpr-NAME with ADDR/24 on its veth0.
 #
-# A Zode's TUN gets no address here: `ph node` applies its own ZPR address.
-# The visa service's adapter TUN is addressed here, as in create_network.
+# No TUN gets an address here: each `ph node` applies its own ZPR
+# addresses, the relay's vs.zpr included (Assembly::
+# ensure_local_zpr_addrs_on_tun), which this layout tests.
 function create_zode_network() {
   local PAIR NAME ADDR NS
 
-  new_netns zpr-vs
   new_netns zpr-relay
-
-  # The visa service docks on the relay over its own veth pair.
-  connect_ns zpr-vs veth0 zpr-relay veth-vs
-  in_ns zpr-vs ip addr add "$VS_SUBSTRATE_ADDR/24" dev veth0
-  in_ns zpr-relay ip addr add "$RELAY_SUBSTRATE_ADDR_VS/24" dev veth-vs
-  in_ns zpr-vs ip link set veth0 up
-  in_ns zpr-relay ip link set veth-vs up
 
   # The Zodes' shared segment.
   in_ns zpr-relay ip link add br0 type bridge
@@ -170,34 +164,42 @@ function create_zode_network() {
     in_ns "$NS" ip tuntap add name tun0 mode tun multi_queue
     in_ns "$NS" ip link set tun0 up
   done
-
-  # After the link is up: see the kernel note in create_network.
-  in_ns zpr-vs ip addr add "$VS_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
 }
 
-# Write the visa service's config, certificate and admin API key, then start
-# valkey and the visa service with the Zode policy. Run from the test's
-# working directory, after create_ca_key_and_cert.
+# Write the visa service's config, certificate and admin API key, start
+# valkey and the visa service with the Zode policy in the relay's
+# namespace, and wait until the relay has registered with the visa service.
+# Run from the test's working directory, after launch_relay: the visa
+# service binds its listeners to vs.zpr, which must already be on the
+# relay's TUN. Returns non-zero if the relay does not register.
 function launch_zode_vs() {
+  # The visa service still serves TLS on VS-API and admin with this
+  # certificate.
   create_actor_key_and_cert ca vs.zpr
-  cp "$PREGEN/actorvs-rsa.key" actorvs-rsa.key
   emit_vs_config ca vs.zpr > vs-config.toml
   write_vs_admin_key
 
-  in_ns zpr-vs "$VALKEY_SERVER_BIN" \
+  in_ns zpr-relay "$VALKEY_SERVER_BIN" \
     --save "" \
     --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
-  wait_for 15 check_vs_valkey_port
+  # check_vs_valkey_port, in the relay's namespace.
+  wait_for 15 in_ns zpr-relay bash -c 'exec 3<>/dev/tcp/127.0.0.1/6379'
 
   start_vs --clear-state
+
+  wait_for 30 check_registered relay.log || {
+    echo "the relay did not register with the visa service"
+    return 1
+  }
 }
 
-# Start the visa service with the Zode policy, appending to vs.log; extra
-# arguments go to vs (launch_zode_vs passes --clear-state, a restart keeps
-# the state in valkey). SSL_CERT_FILE lets it fetch an OIDC trusted
-# service's JWKS from a fake IdP whose certificate the test CA signed.
+# Start the visa service with the Zode policy in the relay's namespace,
+# appending to vs.log; extra arguments go to vs (launch_zode_vs passes
+# --clear-state, a restart keeps the state in valkey). SSL_CERT_FILE lets it
+# fetch an OIDC trusted service's JWKS from a fake IdP whose certificate the
+# test CA signed.
 function start_vs() {
-  in_ns zpr-vs env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/ca.crt" "$VS_BIN" \
+  in_ns zpr-relay env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/ca.crt" "$VS_BIN" \
     -c vs-config.toml \
     "$@" \
     "$PREGEN/$ZODE_POLICY_BIN" 2>&1 | tee -a vs.log | prefix_log vs &
@@ -284,17 +286,20 @@ PYEOF
 }
 
 # Hot-install the compiled policy $1 (a file name in pregen) with vs-admin,
-# from inside the zpr-vs netns. Fails if the visa service rejects it.
+# from inside the relay's netns. Fails if the visa service rejects it.
 function install_zode_policy() {
   echo "Installing policy: $1"
-  in_ns zpr-vs \
+  in_ns zpr-relay \
     "$VS_ADMIN_BIN" --svc-url "$ADMIN_URL" --ca-cert ca.crt \
     --api-key-file vs-admin.key --format compact install "$PREGEN/$1"
 }
 
-# Start the relay Zode (`relay = true`, ZODE_LINKS.md rule 4). $1 is its
-# `forwarding` setting, `true` (the default) or `false`: a relay that does
-# not forward refuses forward-only visas (visa_mgmt.rs insert_visa).
+# Start the relay Zode (`relay = true`, ZODE_LINKS.md rule 4) with its own
+# ZPR address first and vs.zpr after it (zl-zipline#229), and wait until
+# vs.zpr is on its TUN. $1 is its `forwarding` setting, `true` (the
+# default) or `false`: a relay that does not forward refuses forward-only
+# visas (visa_mgmt.rs insert_visa). Returns non-zero if vs.zpr never
+# appears.
 function launch_relay() {
   local FORWARDING=${1:-true}
   create_actor_key_and_cert ca relay
@@ -312,31 +317,47 @@ function launch_relay() {
     --relay true \
     --forwarding "$FORWARDING" \
     --tun-if tun0 \
-    --zpr-addr "$RELAY_ZPR_ADDR" 2>&1 | tee relay.log | prefix_log relay &
-}
+    --zpr-addr "$RELAY_ZPR_ADDR" \
+    --zpr-addr "$VS_ZPR_ADDR" 2>&1 | tee relay.log | prefix_log relay &
 
-# Dock the visa service's adapter on the relay and wait until the relay has
-# registered with it. Returns non-zero if it does not.
-function launch_vs_adapter() {
-  in_ns zpr-vs "$PH_BIN" \
-    adapter \
-    --logging "$DEBUG_TARGETS" \
-    --control-path vs.sock \
-    --self-addr "$VS_SUBSTRATE_ADDR" \
-    --ca-file ca.crt \
-    --certificate-file vs.zpr.crt \
-    --private-key-file vs.zpr.key \
-    --bootstrap-key actorvs-rsa.key \
-    --km-impl "$KM_IMPL" \
-    --tun-if tun0 \
-    --io-engine auto \
-    --node-addr "$RELAY_SUBSTRATE_ADDR_VS" \
-    --zpr-addr "$VS_ZPR_ADDR" 2>&1 | tee adapter-vs.log | prefix_log zpr-vs &
-
-  wait_for 30 check_registered relay.log || {
-    echo "the relay did not register with the visa service"
+  wait_for 15 relay_has_vs_addr || {
+    echo "the relay did not put $VS_ZPR_ADDR on its TUN"
     return 1
   }
+}
+
+# True once vs.zpr is on the relay's tun0.
+function relay_has_vs_addr() {
+  in_ns zpr-relay ip -6 addr show dev tun0 | grep -q "inet6 $VS_ZPR_ADDR/"
+}
+
+# Section 7 check 1 (zl-zipline#229): the relay's traffic to vs.zpr stays
+# in the host. vs.zpr is a local address of the relay, so the kernel routes
+# it over lo, never through the TUN and `ph`.
+function assert_vs_route_local() {
+  local ROUTE
+  ROUTE=$(in_ns zpr-relay ip -6 route get "$VS_ZPR_ADDR")
+  if [[ "$ROUTE" == *" dev lo "* ]]; then
+    echo "assertion OK: the relay routes $VS_ZPR_ADDR over lo"
+  else
+    echo "ASSERTION FAILED: the relay routes $VS_ZPR_ADDR as '$ROUTE', not over lo"
+    return 1
+  fi
+}
+
+# Assert that the relay's namespace has an established TCP connection from
+# address $1 to [$2]:$3 ($4 is the assertion message). This checks the
+# source address the client bound, which `ss` shows as the local address.
+function assert_relay_conn() {
+  local CONNS
+  CONNS=$(in_ns zpr-relay ss -Htn state established)
+  if grep -qE "\[$(ere_escape "$1")\]:[0-9]+ +\[$(ere_escape "$2")\]:$3( |\$)" <<< "$CONNS"; then
+    echo "assertion OK: $4"
+  else
+    echo "ASSERTION FAILED: $4 (no connection from [$1] to [$2]:$3)"
+    echo "$CONNS"
+    return 1
+  fi
 }
 
 # Start Zode NAME in namespace zpr-NAME with an initial link to the relay.
@@ -594,7 +615,6 @@ function block_pair() {
 }
 
 # Drop all substrate traffic of Zode NAME ($1), both ways, or restore it.
-# NAME "vs" cuts the visa service off from the relay.
 function block_substrate() {
   in_ns "zpr-$1" tc qdisc add dev veth0 root netem loss 100%
   in_ns zpr-relay tc qdisc add dev "veth-$1" root netem loss 100%
@@ -602,6 +622,18 @@ function block_substrate() {
 function unblock_substrate() {
   in_ns "zpr-$1" tc qdisc del dev veth0 root
   in_ns zpr-relay tc qdisc del dev "veth-$1" root
+}
+
+# Cut the relay off from its visa service: stop the visa service's process
+# (SIGSTOP), so its sockets stay open but nothing answers. With the visa
+# service in the relay's namespace there is no substrate link to block.
+function stop_vs() {
+  kill -STOP "$(vs_pid)"
+}
+
+# Let the visa service that stop_vs stopped run again (SIGCONT).
+function cont_vs() {
+  kill -CONT "$(vs_pid)"
 }
 
 # Print the verdict for $1 (0 = pass) and exit with it.

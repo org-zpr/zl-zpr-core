@@ -143,7 +143,7 @@ class IdpState:
     """Server-wide state: the two keys, issued codes, and the rotation file."""
 
     def __init__(self, args):
-        self.issuer = f"https://127.0.0.1:{args.port}"
+        self.issuer = f"https://{args.host}:{args.port}"
         self.keys = [SigningKey(Path(args.signing_key))]
         if args.signing_key_2:
             self.keys.append(SigningKey(Path(args.signing_key_2)))
@@ -426,6 +426,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--port", type=int, default=9000, help="listen port (default 9000)")
     parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="IPv4 address to listen on and name in the issuer (default 127.0.0.1); "
+        "a LAN address serves a remote node (windows-node-test.md, macos-node-test.md)",
+    )
+    parser.add_argument(
         "--state-dir",
         required=True,
         help="directory for the rotation state file (shared with --rotate)",
@@ -510,7 +516,7 @@ def main() -> int:
             finally:
                 tls_request.close()
 
-    server = TlsIdpServer(("127.0.0.1", args.port), IdpHandler)
+    server = TlsIdpServer((args.host, args.port), IdpHandler)
     server.idp = idp
     sys.stderr.write(f"fake-idp: serving {idp.issuer} (kid {idp.active_key().kid})\n")
     try:

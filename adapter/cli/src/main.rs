@@ -282,12 +282,25 @@ async fn process_command(command: Commands, socket: &PathBuf) -> Result<bool, Cl
                 Commands::Logging { logs } => change_logging_task(service, logs).await?,
                 Commands::Addr => get_node_addr_task(service).await?,
                 Commands::Tun => get_tun_info_task(service).await?,
-                Commands::Connect { id, no_browser } => {
-                    connect_task(service, id, no_browser).await?
-                }
-                Commands::AuthAgent { id, no_browser } => {
-                    auth_agent_task(service, id, no_browser).await?
-                }
+                Commands::Connect {
+                    id: Some(id),
+                    no_browser,
+                } => connect_task(service, id, no_browser).await?,
+                Commands::AuthAgent {
+                    id: Some(id),
+                    no_browser,
+                } => auth_agent_task(service, id, no_browser).await?,
+                // zl-zipline#233: no link id logs in on a Zode.
+                Commands::Connect {
+                    id: None,
+                    no_browser,
+                } => login_task(service, no_browser, false).await?,
+                Commands::AuthAgent {
+                    id: None,
+                    no_browser,
+                } => login_task(service, no_browser, true).await?,
+                Commands::Logout => logout_task(service).await?,
+                Commands::LoginStatus => login_status_task(service).await?,
                 Commands::OidcLogin { .. } => unreachable!("handled before connecting"),
                 Commands::Quit => return Ok(true), // Will never reach here
             }
@@ -477,6 +490,68 @@ async fn auth_agent_task(service: svc::Client, id: u32, no_browser: bool) -> Res
     println!("Serving authentication requests until interrupted (Ctrl-C)…");
     tokio::signal::ctrl_c().await?;
     println!("auth-agent: interrupted, exiting");
+    Ok(())
+}
+
+/// The exit code of a failed Zode `login` (zl-zipline#233). ph answers
+/// with the AuthFailureReason spelling, so the codes are those of a link
+/// `connect`; ph's own refusals ("already logged in", "not a Zode") are 1.
+fn login_exit_code(error_text: &str) -> i32 {
+    oidc::exit_code_for_auth_failure(error_text)
+}
+
+/// `connect` / `auth-agent` without a link id on a Zode (zl-zipline#233):
+/// log the Zode's own actor in with an interactive agent, served over this
+/// connection while `login` is pending. `connect` then exits;
+/// `auth-agent` (`resident`) stays until Ctrl-C so ph can ask it for
+/// silent renewals and, after the visa service drops the login, for a new
+/// login. A failure exits with [login_exit_code].
+async fn login_task(
+    service: svc::Client,
+    no_browser: bool,
+    resident: bool,
+) -> Result<(), CliError> {
+    println!("Logging in on this Zode…");
+    let mut request = service.login_request();
+    request
+        .get()
+        .set_auth_agent(capnp_rpc::new_client(interactive_auth_agent(no_browser)));
+    let response = request.send().promise.await?;
+    if let cli::success_or_error::Which::Error(e) = response.get()?.get_result()?.which()? {
+        let msg = e?.get_txt()?.to_string()?;
+        eprintln!("login failed: {msg}");
+        std::process::exit(login_exit_code(&msg));
+    }
+    println!("Logged in");
+    if !resident {
+        return Ok(());
+    }
+    println!("Serving silent renewals and new logins until interrupted (Ctrl-C)…");
+    tokio::signal::ctrl_c().await?;
+    println!("auth-agent: interrupted, exiting (the login stays until it expires)");
+    Ok(())
+}
+
+/// `logout` (zl-zipline#233): log out the user logged in on this Zode.
+/// Exits 1 with ph's error text on failure.
+async fn logout_task(service: svc::Client) -> Result<(), CliError> {
+    let response = service.logout_request().send().promise.await?;
+    if let cli::success_or_error::Which::Error(e) = response.get()?.get_result()?.which()? {
+        eprintln!("logout failed: {}", e?.get_txt()?.to_string()?);
+        std::process::exit(1);
+    }
+    println!("Logged out");
+    Ok(())
+}
+
+/// `login-status` (zl-zipline#233): print ph's login status text as is.
+async fn login_status_task(service: svc::Client) -> Result<(), CliError> {
+    let response = service.show_login_request().send().promise.await?;
+    let text = response.get()?.get_result()?.to_string()?;
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
     Ok(())
 }
 
@@ -1003,5 +1078,26 @@ mod tests {
             "utun7\nfd5a:5052::1234\nfd5a:5052::99\n"
         );
         assert_eq!(format_tun_info("tun0", &[]), "tun0\n");
+    }
+
+    /// zl-zipline#233: a failed Zode `login` answers with the
+    /// AuthFailureReason spelling, so it exits with the same codes as a
+    /// link `connect`; ph's own refusals exit 1.
+    #[test]
+    fn login_error_exit_codes_follow_the_connect_contract() {
+        for (text, code) in [
+            ("UserDeclined", 2),
+            ("InteractionTimeout", 3),
+            ("IdpUnreachable(\"HTTP 503\")", 4),
+            ("VisaServiceRejected(\"AuthError: bad token\")", 5),
+            ("PolicyDenied", 6),
+            ("AuthUnavailable", 1),
+            ("NoAgent", 1),
+            ("already logged in; run `ph-cli logout` first", 1),
+            ("a login is already in progress", 1),
+            ("not a Zode", 1),
+        ] {
+            assert_eq!(login_exit_code(text), code, "{text}");
+        }
     }
 }

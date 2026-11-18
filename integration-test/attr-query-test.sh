@@ -407,6 +407,13 @@ if [[ "$PASS" == 0 ]]; then
   plumbing_test "connect path" || PASS=1
 fi
 
+# The visa service's re-check after an attribute change (its visa sweep)
+# revoking a visa, and zb dropping it (as in zode-login-test.sh). The
+# actor loses the tag first; the sweep that revokes the visa follows.
+VS_SWEEP='visa sweep reason=AttributeChange '
+VS_SWEEP_REVOKED="$VS_SWEEP.* revoked=[1-9]"
+REVOKED='Revoked visa [0-9]+'
+
 #
 # Leg 2: untargeted notify with UNCHANGED data — reconcile must converge
 # with no spurious revocation. Runs before the data edit on purpose (see
@@ -418,10 +425,22 @@ if [[ "$PASS" == 0 ]]; then
     echo "SKIP_NOTIFY=1: skipping the untargeted-notify leg"
   else
     echo "== 2. untargeted notify (empty body: everything changed, data unchanged)"
+    # zode_ping's warm-up would hide a revoked visa that zb simply asks
+    # for again, so wait for the notify's sweep and count revocations on
+    # both sides too: none may happen.
+    LEG2_ALL_SWEEPS=$(log_count vs.log "$VS_SWEEP")
+    LEG2_SWEEPS=$(log_count vs.log "$VS_SWEEP_REVOKED")
+    LEG2_REVOCATIONS=$(log_count zb.log "$REVOKED")
     attr_notify || PASS=1
     if [[ "$PASS" == 0 ]]; then
-      sleep 5
+      wait_log_after 30 vs.log "$VS_SWEEP" "$LEG2_ALL_SWEEPS" \
+        "the untargeted notify starts a visa sweep" || PASS=1
+      sleep 2
       assert_user_actor "after untargeted notify" || PASS=1
+      assert_log_count vs.log "$VS_SWEEP_REVOKED" "$LEG2_SWEEPS" \
+        "the untargeted notify's sweep revoked no visa" || PASS=1
+      assert_log_count zb.log "$REVOKED" "$LEG2_REVOCATIONS" \
+        "zb dropped no visa after the untargeted notify" || PASS=1
       zode_ping zb "$ZC_ZPR_ADDR" "zb still reaches Web after the untargeted notify" || PASS=1
     fi
   fi
@@ -441,11 +460,6 @@ if [[ "$PASS" == 0 ]]; then
   wait_for 15 check_attr_server || PASS=1
 fi
 
-# The visa service's re-check after an attribute change (its visa sweep)
-# revoking a visa, and zb dropping it (as in zode-login-test.sh). The
-# actor loses the tag first; the sweep that revokes the visa follows.
-VS_SWEEP_REVOKED='visa sweep reason=AttributeChange .* revoked=[1-9]'
-REVOKED='Revoked visa [0-9]+'
 # The visa service's policy refusing a visa request (vreq): what a fresh
 # connect attempt meets once the contractor visa is gone. The only flow
 # the test starts in that window is zb's ping to Web.

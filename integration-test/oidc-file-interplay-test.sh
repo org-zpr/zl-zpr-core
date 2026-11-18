@@ -115,6 +115,16 @@ function assert_user_actor() {
   assert_zb_actor "$1: user.email from google" user.email '["user-a@example.com"]' || RESULT=1
   assert_zb_actor "$1: the lazy tag from happyfile" user.zpr.tag.lazy || RESULT=1
   assert_zb_actor "$1: the user's authority is google" user.zpr.authority '["google"]' || RESULT=1
+  # The tag is live, not just present: after the TTL leg only the refresh
+  # can have moved its expiry past now.
+  if zb_actor_query 'any(.attrs[]; .key == "user.zpr.tag.lazy" and .expires_at > $now)' \
+    --argjson now "$(date +%s)"; then
+    echo "assertion OK: $1: the lazy tag has not expired"
+  else
+    echo "ASSERTION FAILED: $1: the lazy tag has expired, or the actor could not be read"
+    zb_actor || true
+    RESULT=1
+  fi
   return "$RESULT"
 }
 
@@ -183,11 +193,11 @@ fi
 # TTL leg: wait out happyfile's expiration_seconds so the next reconcile
 # takes the TTL-expired path rather than the revision-moved one, then
 # assert again and check that zb still reaches Web. The lazy visa is
-# bounded by happyfile's TTL, so it has expired by now; while a stream
+# bounded by happyfile's TTL, so it has expired by now. While a stream
 # bound before the expiry still outlives it (zl-zipline#274), this ping
-# rides that stream, and the actor assertions are the evidence. Once ph
-# drops an expired visa's streams, the ping needs a new lazy visa, which
-# only the refreshed attributes can get.
+# rides that stream, and the actor assertions (the lazy tag's expiry
+# included) are the evidence. Once ph drops an expired visa's streams, the
+# ping needs a new lazy visa, which only the refreshed attributes can get.
 if [[ "$PASS" == 0 ]]; then
   echo "== 5. waiting out happyfile's TTL (${HAPPYFILE_TTL}s + slack), then refresh"
   sleep $((HAPPYFILE_TTL + 5))

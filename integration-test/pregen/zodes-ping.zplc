@@ -1,0 +1,93 @@
+# -*- mode: toml -*-
+#
+# Ping-mesh Zode netns fixture (zl-zipline#234), used by zode-ping-test.sh
+# through lib/zode_funcs.sh. Compiles zodes-ping.zpl.
+#
+# zodes-pair.zplc plus a third endpoint, zd: the relay Zode (the only
+# transit node) docks the visa service and is linked to Zodes zb, zc and
+# zd, which are not linked to each other, so traffic between any two of
+# them crosses the relay on forward-only visas.
+#
+# All Zodes share one substrate segment (a bridge in the relay's
+# namespace); the addresses below match lib/zode_funcs.sh and
+# zode-ping-test.sh (zd).
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+"zc.zpr" = "fd5a:5052::4"
+"zd.zpr" = "fd5a:5052::5"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[nodes.zb.substrate_addrs]
+i0 = "10.2.0.2:5000"
+
+[nodes.zc]
+provider = [ [ "device.zpr.adapter.cn", "zc" ] ]
+zpr_address = "zc.zpr"
+
+[nodes.zc.substrate_addrs]
+i0 = "10.2.0.3:5000"
+
+[nodes.zd]
+provider = [ [ "device.zpr.adapter.cn", "zd" ] ]
+zpr_address = "zd.zpr"
+
+[nodes.zd.substrate_addrs]
+i0 = "10.2.0.4:5000"
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
+
+[links.relay-zc]
+peers = [ { node = "relay" }, { node = "zc" } ]
+
+[links.relay-zd]
+peers = [ { node = "relay" }, { node = "zd" } ]
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[visa_service]
+dock_node = "relay"
+
+[bootstrap]
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
+"zc" = "zc-rsa-pubkey.pem"
+"zd" = "zd-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableRelay]
+protocol = "ping"
+
+[services.PingableZb]
+protocol = "ping"
+
+[services.PingableZc]
+protocol = "ping"
+
+[services.PingableZd]
+protocol = "ping"

@@ -551,6 +551,93 @@ mod tests {
         link_id.get()
     }
 
+    /// A Zode assembly whose own address `own` is held by its `Internal`
+    /// local-actor peer, as `main.rs` sets it up, plus one Active Zode link
+    /// that owns no address. Returns the Zode link's id.
+    fn zode_with_internal_pair(own: IpAddr) -> (Arc<Assembly>, LinkId) {
+        use crate::peer_table::test::insert_zode_peer_with_verified_cn;
+        use zpr::packet_info::LOCAL_ACTOR_LINK_ID;
+        let asm = Arc::new(create_assembly(node_builder(own)));
+        let (local_actor, _dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+        assert_eq!(local_actor.get(), LOCAL_ACTOR_LINK_ID);
+        asm.peer_table
+            .get(LOCAL_ACTOR_LINK_ID)
+            .unwrap()
+            .actor_auth
+            .add_internal_address(IpAddress::new_from_std(&own));
+        let zode = insert_zode_peer_with_verified_cn(&asm, "b.zpr", LinkState::Active);
+        (asm, zode)
+    }
+
+    /// The link state of `link_id`.
+    fn link_state_of(asm: &Assembly, link_id: LinkId) -> LinkState {
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .get_state()
+    }
+
+    /// K1 (zipline#45 C5, #121): a `revokeAuthentication` or
+    /// `requestAuthentication` for an address that no link owns changes
+    /// nothing. A revocation counts it as processed (a no-op ack); a
+    /// request does not count it.
+    #[tokio::test]
+    async fn test_revoke_and_request_for_unowned_address_are_noops() {
+        LocalSet::new()
+            .run_until(async {
+                let own: IpAddr = "fd5a:5052:1::1".parse().unwrap();
+                let unknown: IpAddr = "fd5a:5052:1::99".parse().unwrap();
+                let (asm, zode) = zode_with_internal_pair(own);
+
+                assert_eq!(process_revoke_auth(&asm, &[unknown]), 1);
+                let outcome = process_request_authentication(&asm, &[unknown]);
+                assert_eq!(outcome.processed, 0, "an unknown address is not counted");
+                assert!(!outcome.start_self_reauth);
+                assert!(
+                    !asm.self_reauth_in_flight
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                );
+                assert_eq!(link_state_of(&asm, zode), LinkState::Active);
+            })
+            .await
+    }
+
+    /// The Zode's own address is held by its `Internal` local-actor peer.
+    /// A `requestAuthentication` for it goes down the self re-auth path
+    /// (K2) and is counted; a `revokeAuthentication` for it is acked. Neither
+    /// terminates the `Internal` link nor touches the Zode link.
+    #[tokio::test]
+    async fn test_revoke_and_request_for_own_address_keep_internal_link() {
+        use zpr::packet_info::LOCAL_ACTOR_LINK_ID;
+        LocalSet::new()
+            .run_until(async {
+                let own: IpAddr = "fd5a:5052:1::1".parse().unwrap();
+                let (asm, zode) = zode_with_internal_pair(own);
+                let internal_before = link_state_of(&asm, LOCAL_ACTOR_LINK_ID);
+
+                let outcome = process_request_authentication(&asm, &[own]);
+                assert_eq!(outcome.processed, 1);
+                assert!(outcome.start_self_reauth, "own address starts K2");
+
+                assert_eq!(process_revoke_auth(&asm, &[own]), 1);
+
+                assert_eq!(link_state_of(&asm, LOCAL_ACTOR_LINK_ID), internal_before);
+                assert!(
+                    asm.peer_table
+                        .get(LOCAL_ACTOR_LINK_ID)
+                        .unwrap()
+                        .actor_auth
+                        .owns_address(&IpAddress::new_from_std(&own)),
+                    "the Internal peer keeps the Zode's own address"
+                );
+                assert_eq!(link_state_of(&asm, zode), LinkState::Active);
+            })
+            .await
+    }
+
     /// C5 (zipline#45): revoke_auth for an actor docked here terminates the
     /// actor's link via the existing close path; an unknown address is a
     /// no-op — both count as processed in the ack.

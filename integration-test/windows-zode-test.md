@@ -139,9 +139,6 @@ create_actor_key_and_cert ca relay
   --auth-private-key "$PREGEN/node-rsa-key.pem" --km-impl noise \
   --relay true --forwarding true --tun-if zrelay \
   --zpr-addr "$RELAY_ZPR_ADDR" --zpr-addr "$VS_ZPR_ADDR" > relay.log 2>&1 &
-# Bounded: if ph exits early (say, UDP 5000 is taken), stop here and read relay.log.
-wait_for 30 bash -c "ip -6 addr show dev zrelay | grep -q 'inet6 $VS_ZPR_ADDR/'" ||
-  { echo "relay did not apply $VS_ZPR_ADDR: see relay.log"; tail -n 20 relay.log; }
 # The visa service binds vs.zpr, so it starts only now, in the same namespace.
 # The test Valkey gets a port of its own and keeps no state (`--save ""`,
 # no AOF), so it starts empty and the visa service needs no `--clear-state`,
@@ -150,7 +147,10 @@ create_actor_key_and_cert ca vs.zpr
 VK_PORT=6390
 emit_vs_config ca vs.zpr | sed "s|127.0.0.1:6379|127.0.0.1:$VK_PORT|" > vs-config.toml
 write_vs_admin_key
-if (exec 3<>/dev/tcp/127.0.0.1/$VK_PORT) 2> /dev/null; then
+# Bounded: if ph exits early (say, UDP 5000 is taken), nothing more starts.
+if ! wait_for 30 bash -c "ip -6 addr show dev zrelay | grep -q 'inet6 $VS_ZPR_ADDR/'"; then
+  echo "relay did not apply $VS_ZPR_ADDR: see relay.log"; tail -n 20 relay.log
+elif (exec 3<>/dev/tcp/127.0.0.1/$VK_PORT) 2> /dev/null; then
   echo "127.0.0.1:$VK_PORT is in use: set another VK_PORT and run these lines again"
 else
   "$VALKEY_SERVER_BIN" --port "$VK_PORT" --save "" --appendonly no > valkey.log 2>&1 &

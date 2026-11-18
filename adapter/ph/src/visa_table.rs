@@ -784,23 +784,6 @@ impl VisaTable {
         }
     }
 
-    /// Whether this Zode holds the visa `visa_id` and it has not expired:
-    /// whether a Stream ID Request for it may be bound from the visa held
-    /// here. An expired visa is ejected, as in
-    /// [VisaTable::match_traffic], so the caller handles it as one it does
-    /// not hold, and withdraws the returned streams that were bound under
-    /// it.
-    pub fn holds_unexpired(
-        &mut self,
-        peer_table: &peer_table::PeerTable,
-        visa_id: VisaId,
-    ) -> (bool, Vec<ForwardingEntry>) {
-        match self.eject_if_expired(peer_table, visa_id) {
-            Some(withdrawn) => (false, withdrawn),
-            None => (self.table.contains_key(&visa_id), Vec::new()),
-        }
-    }
-
     /// If this Zode holds the visa `visa_id` and it has expired, eject it,
     /// with its bindings and their PFT entries, through the one removal
     /// path ([VisaTable::revoke]). Returns the ingress entries of its
@@ -2176,7 +2159,6 @@ pub mod tests {
                 .0,
             Some(fresh)
         );
-        assert!(visa_table.holds_unexpired(&asm.peer_table, fresh).0);
     }
 
     // ---- J11: a newer same-five-tuple visa supersedes (zl-zipline#252) ----

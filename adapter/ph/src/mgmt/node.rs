@@ -15,7 +15,7 @@ use crate::forwarding_tables;
 use crate::peer_table::PeerType;
 use crate::prelude::*;
 use crate::visa_mgmt;
-use crate::visa_table::{StreamBinding, VisaTable, VisaTableError};
+use crate::visa_table::{StreamBinding, Visa, VisaTable, VisaTableError};
 
 use dashmap::DashMap;
 use std::num::NonZero;
@@ -378,20 +378,31 @@ pub fn request_stream(
         return;
     };
 
-    // Check if we already have the indicated visa, unexpired: an expired one
-    // is ejected and fetched again, as if it were not held (zl-zipline#271).
-    // The visa-table lock is released before the bind goes on:
-    // `requested_visa_granted` looks up the egress link and sends, neither
-    // of which may run under it.
-    let (have_visa, withdrawn) = asm
+    // Check if we already have the indicated visa. The visa-table lock is
+    // released before the bind goes on: `requested_visa_granted` looks up
+    // the egress link and sends, neither of which may run under it.
+    let held_visa_expired = asm
         .visa_table
-        .write()
+        .read()
         .unwrap()
-        .holds_unexpired(&asm.peer_table, visa_id);
-    asm.withdraw_streams(withdrawn, None);
-    if have_visa {
+        .get(visa_id)
+        .map(Visa::has_expired);
+    match held_visa_expired {
         // Visa found.
-        return requested_visa_granted(asm, ingress_link_id, txn_id, visa_id);
+        Some(false) => return requested_visa_granted(asm, ingress_link_id, txn_id, visa_id),
+        // zl-zipline#271: an expired visa is refused, never bound, and not
+        // fetched again (the visa service has forgotten it). It is not
+        // ejected either, unlike at a match (VisaTable::match_traffic): its
+        // live transit streams come from an upstream Zode that no
+        // withdrawal reaches (F5), and freeing their stream IDs here could
+        // hand them to an unrelated stream while that Zode still sends on
+        // them. It goes when it is revoked (a sweep is zl-zipline#274).
+        Some(true) => {
+            info!(target: FLOW_MGMT, "refusing Stream ID Request {txn_id} from {}: visa {visa_id} has expired",
+                asm.formatted_link_id(ingress_link_id.get()));
+            return requested_visa_denied(asm, ingress_link_id, txn_id);
+        }
+        None => (),
     }
 
     // We do not have an existing visa.  Request one.
@@ -3094,22 +3105,24 @@ mod tests {
             .await
     }
 
-    /// zl-zipline#271, the same rule further down the path: a Stream ID
-    /// Request for a visa this Zode holds but which has expired is handled
-    /// as if the visa were not held. The visa is ejected and fetched again
-    /// by ID (which the visa service then refuses), rather than granted.
+    /// zl-zipline#271, further down the path: a Stream ID Request for a
+    /// visa this Zode holds but which has expired is refused, and nothing
+    /// else changes. The visa is not fetched again (the visa service has
+    /// forgotten it), and it is not ejected: its live transit streams came
+    /// from an upstream Zode, which no withdrawal reaches (F5), and freeing
+    /// their stream IDs here could hand them to an unrelated stream while
+    /// that Zode still sends on them.
     #[tokio::test]
-    async fn test_a_stream_request_for_an_expired_visa_fetches_it_again() {
+    async fn test_a_stream_request_for_an_expired_visa_is_refused() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (asm, _egress_rx) = node_with_visa_and_no_vs_session();
+                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
                 let link_a =
                     NonZero::new(insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop())).unwrap();
-                let _link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
+                let link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
                 let expired: VisaId = VISA_ID + 201;
-                asm.visa_table
-                    .write()
-                    .unwrap()
+                let mut visa_table = asm.visa_table.write().unwrap();
+                visa_table
                     .insert_visa(new_vsapi_visa_forward_only_from(
                         expired,
                         crate::visa_table::tests::ALREADY_EXPIRED,
@@ -3117,12 +3130,43 @@ mod tests {
                         next_hop(),
                     ))
                     .unwrap();
+                // A transit stream A bound under the visa before it expired.
+                let live_stream = asm
+                    .peer_table
+                    .get(link_a.get())
+                    .unwrap()
+                    .pft
+                    .insert(forwarding_tables::PftPep::new(
+                        ForwardingEntry(link_b, 42),
+                        expired,
+                    ))
+                    .unwrap();
+                visa_table
+                    .bind(
+                        expired,
+                        StreamBinding {
+                            ingress: ForwardingEntry(link_a.get(), live_stream),
+                            egress: ForwardingEntry(link_b, 42),
+                        },
+                    )
+                    .unwrap();
+                drop(visa_table);
                 let asked = &asm.counters.management[ManagementCounterType::VisaByIdRequested];
 
                 request_stream(&asm, link_a, 7, expired);
 
-                assert_eq!(asked.get_count(), 1, "the visa is fetched again");
-                assert!(!asm.visa_table.read().unwrap().contains(expired));
+                assert_only_stream_id_error_response(&mut egress_rx, link_a.get());
+                assert_eq!(asked.get_count(), 0, "an expired visa is not fetched again");
+                assert!(asm.visa_table.read().unwrap().contains(expired));
+                assert!(
+                    asm.peer_table
+                        .get(link_a.get())
+                        .unwrap()
+                        .pft
+                        .inspect(live_stream, |pep| pep.next_hop())
+                        == Some(ForwardingEntry(link_b, 42)),
+                    "the live transit stream keeps its stream ID"
+                );
             })
             .await
     }

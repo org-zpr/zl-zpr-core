@@ -1,0 +1,100 @@
+# -*- mode: toml -*-
+#
+# Policy-install re-authentication fixture for Zodes (zipline#124, ported
+# to Zodes by zl-zipline#234), used by zode-policy-reauth-test.sh. Compiles
+# zodes-policy-reauth.zpl.
+#
+# The relay Zode docks the visa service and is linked to zb and zc, as in
+# zodes-pair.zplc; the fake IdP is an OIDC trusted service, as in
+# zodes-login.zplc. The OIDC lifetime is LONG (an hour): ph renews a login
+# at `expires - min(auth_renewal_lead, lifetime / 2)`, about 55 minutes
+# after it, far past the end of the run. So every re-authentication the
+# test observes is driven by a policy install (zipline#123), never by the
+# renewal clock. allow_offline_access lets the resident auth agent answer
+# an install with a silent refresh.
+#
+# The re-authentication deadline is a VISA SERVICE setting
+# (`reauth_deadline`, vs-config.toml), not a policy knob.
+#
+# Two variants compile the same ZPL with bootstrap keys removed:
+# zodes-policy-reauth-no-zb.zplc (leg 3) and zodes-policy-reauth-no-zc.zplc
+# (leg 4).
+#
+# `service` (the JWKS CONNECT proxy) is omitted, as in oidc-test.zplc, so
+# zplc warns; expected.
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+"zc.zpr" = "fd5a:5052::4"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+# No substrate_addrs for zb and zc (zl-zipline#255, W10): the visa service
+# learns their addresses from what they report when they connect.
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[nodes.zc]
+provider = [ [ "device.zpr.adapter.cn", "zc" ] ]
+zpr_address = "zc.zpr"
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
+
+[links.relay-zc]
+peers = [ { node = "relay" }, { node = "zc" } ]
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[trusted_services.fake-idp]
+api             = "oidc"
+issuer          = "https://127.0.0.1:9000"
+jwks_uri        = "https://127.0.0.1:9000/jwks"
+client_id       = "zpr-test-client"
+scopes          = ["openid", "email", "profile"]
+allowed_domains = ["example.com"]
+seed_jwks       = "oidc-test-seed-jwks.json"
+
+# Long lifetime (see the header): no clock-driven renewal during the run.
+expiration_seconds   = 3600
+max_auth_age_seconds = 43200
+allow_offline_access = true
+
+returns_attributes = [
+  "sub   -> user.oidc-subject",
+  "email -> user.email",
+  "hd    -> user.domain",
+]
+identity_attributes = ["sub"]
+
+[visa_service]
+dock_node = "relay"
+
+[bootstrap]
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
+"zc" = "zc-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableZb]
+protocol = "ping"

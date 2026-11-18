@@ -1,8 +1,9 @@
 # oidc + zpr-attr/1 trusted-service interplay fixture (zipline#81, epic #72
-# E1). oidc-file-interplay.zpl with the `file` decorator replaced by the
-# networked `zpr-attr/1` attribute service:
-#   - adapter1 is USER-ONLY: no bootstrap key; it authenticates through the
-#     fake IdP (`google`, api = "oidc") as sub `user-a`.
+# E1; ported to Zodes by zl-zipline#234). oidc-file-interplay.zpl with the
+# `file` decorator replaced by the networked `zpr-attr/1` attribute service:
+#   - zb is a Zode whose user logs in through the fake IdP (`google`,
+#     api = "oidc") as sub `user-a` (zl-zipline#233): zb's own actor then
+#     carries the user's attributes.
 #   - `zipline` (api = "zpr-attr/1") decorates that identity over HTTPS: the
 #     reference zpr-attr-server vends dept plus the `contractor` tag, keyed
 #     on user.sub.
@@ -11,35 +12,26 @@
 #     zipline's tag — so `google` survives compilation by the
 #     identity-vendor retention rule (zipline#23), not by any attribute
 #     reference.
-#   - adapter2 stays device-only (bootstrap key) and provides Web.
+#   - zc is a device-only Zode (nobody logs in on it) and provides Web.
 
-define adapter as a device with zpr.adapter.cn.
+define zode as a device with zpr.adapter.cn.
 
-define Node as adapter with zpr.adapter.cn:node.
-define Vs as adapter with zpr.adapter.cn:'vs.zpr'.
+define Relay as zode with zpr.adapter.cn:relay.
+define Zb as zode with zpr.adapter.cn:zb.
+define Zc as zode with zpr.adapter.cn:zc.
+define Vs as zode with zpr.adapter.cn:'vs.zpr'.
 
-# Web is provided by adapter2's device CN; protocol/port in the .zplc match
-# the existing ping connectivity check.
-define Web as a service with device.zpr.adapter.cn:adapter2.
+# Web is provided by zc's device CN; its protocol in the .zplc is ping.
+define Web as a service with device.zpr.adapter.cn:zc.
 define PingableVs as a service with device.zpr.adapter.cn:'vs.zpr'.
-define PingableNode as a service with device.zpr.adapter.cn:node.
 
 # The interplay under test: `contractor` resolves through the zipline
 # attribute service (contractor -> #user.contractor), keyed on the identity
 # attribute user.sub that `google` mints.
 allow contractor users to access Web.
 
-# adapter1 needs no join policy: it runs WITHOUT --zpr-addr and lives on the
-# dynamic fd5a:5052:adda:1::/64 address the fabric assigns (zipline#88 —
-# adapters now install a return route covering the whole ZPR internal net on
-# activation, so a dynamically-addressed actor is reachable). The former
-# UserASvc join-policy workaround (a service minted only so the visa service
-# would honor adapter1's static fd5a:5052:8888::1:1 claim) is gone with it.
-
-# Fabric plumbing, unchanged from oidc-test.zpl.
-allow Node to access PingableVs.
-allow Vs to access PingableNode.
-
-# Admin access to VS
-define VsAdmin as a device with zpr.adapter.cn:'client.zpr.org'.
-allow VsAdmin to access VisaService.
+# Fabric plumbing: every Zode reaches the visa service as a machine, so
+# the revocation leg can show that only the contractor visa went.
+allow Relay to access PingableVs.
+allow Zb to access PingableVs.
+allow Zc to access PingableVs.

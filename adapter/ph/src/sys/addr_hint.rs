@@ -33,11 +33,22 @@ fn hint_for(platform: Platform, addr: &IpAddr, prefix_len: u8, ifname: &str) -> 
     match platform {
         Platform::Linux => format!("ip -6 addr add {addr}/{prefix_len} dev {ifname}"),
         Platform::MacOs => format!("ifconfig {ifname} inet6 {addr}/{prefix_len} alias"),
-        // Exactly the arguments the Windows `add_address` runs.
-        Platform::Windows => format!(
-            "netsh interface ipv6 {}",
-            netsh_add_address_args(ifname, addr, prefix_len, false).join(" ")
-        ),
+        // Exactly the arguments the Windows `add_address` runs. An argument
+        // with a space (a Wintun adapter name may have one) is quoted, so the
+        // copied command line passes it as one argument, as `ph` does.
+        Platform::Windows => {
+            let args: Vec<String> = netsh_add_address_args(ifname, addr, prefix_len, false)
+                .into_iter()
+                .map(|arg| {
+                    if arg.contains(' ') {
+                        format!("\"{arg}\"")
+                    } else {
+                        arg
+                    }
+                })
+                .collect();
+            format!("netsh interface ipv6 {}", args.join(" "))
+        }
     }
 }
 
@@ -133,6 +144,16 @@ mod tests {
         assert_eq!(
             hint_for(Platform::Windows, &addr(), 32, "zpr0"),
             "netsh interface ipv6 add address zpr0 fd5a:5052::a:b:c/32"
+        );
+    }
+
+    #[test]
+    fn windows_hint_quotes_an_interface_name_with_spaces() {
+        // `ph` passes the name as one argument; a copied command line must
+        // too (Wintun adapter names may contain spaces).
+        assert_eq!(
+            hint_for(Platform::Windows, &addr(), 32, "ZPR tun"),
+            "netsh interface ipv6 add address \"ZPR tun\" fd5a:5052::a:b:c/32"
         );
     }
 

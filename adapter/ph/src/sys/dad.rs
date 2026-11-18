@@ -11,7 +11,7 @@
 //!
 //! This module is the platform-neutral half: the DAD-state model and the
 //! polling loop. It is compiled on every OS so it stays unit-testable from
-//! Linux builds (same pattern as `macos_route`); only Windows calls it at
+//! Linux builds (same pattern as `macos_ifconfig`); only Windows calls it at
 //! runtime, supplying a probe that reads the state through IP Helper.
 
 use std::io::{Error, ErrorKind, Result};

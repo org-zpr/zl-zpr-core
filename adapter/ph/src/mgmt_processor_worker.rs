@@ -161,9 +161,7 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
             base_hdr.packet_type,
             ZdpPacketType::StartAuthentication
                 | ZdpPacketType::AbandonAuthenticationAttempt
-                | ZdpPacketType::InitAuthenticationRequest
                 | ZdpPacketType::AcquireZprAddress
-                | ZdpPacketType::GrantZprAddress
         ) {
             let hdr = ZdpTransactionHeader::read_from_buf(&mut pkt)
                 .map_err(|_| HandleMgmtError::BadStructure)?;
@@ -175,14 +173,8 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
                 ZdpPacketType::AbandonAuthenticationAttempt => {
                     handlers::handle_abandon_authentication(asm, txn, pkt).await
                 }
-                ZdpPacketType::InitAuthenticationRequest => {
-                    handlers::handle_init_authentication_request(asm, txn, pkt).await
-                }
                 ZdpPacketType::AcquireZprAddress => {
                     handlers::handle_acquire_zpr_address_request(asm, txn, pkt).await
-                }
-                ZdpPacketType::GrantZprAddress => {
-                    handlers::handle_grant_zpr_address_request(asm, txn, pkt).await
                 }
                 _ => unreachable!(),
             };
@@ -210,10 +202,6 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
 
             // Zipline renewal messages (zipline#66) are not transactions:
             // each response echoes its request's challenge for correlation.
-            ZdpPacketType::RenewAuthenticationRequest => {
-                handlers::handle_renew_authentication_request(asm, pkt).await
-            }
-
             ZdpPacketType::RenewAuthenticationResponse => {
                 handlers::handle_renew_authentication_response(asm, pkt).await
             }

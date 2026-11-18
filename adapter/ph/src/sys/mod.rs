@@ -19,28 +19,16 @@ pub use self::windows::TunPiImpl;
 #[cfg(windows)]
 pub use self::windows::ZprTun;
 
-// Pure decision logic for the macOS route path. Compiled on every OS so it
-// stays unit-testable from Linux builds; only macOS code calls it at runtime.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) mod macos_route;
-
-// Pure parsing/decision logic for the ZPR internal-network route-owner
-// check (zipline#101): the Linux `ip -6 route show` parser and the
-// platform-neutral conflict decision. Compiled on every OS, same pattern
-// and reason as `macos_route` above; the Linux parser half is dead code on
-// macOS.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) mod linux_route;
-
 // Pure parsing of macOS `ifconfig <if>` output for `has_address` (PR #66
 // review P1: unscoped ULA addresses were not recognized). Compiled on every
-// OS, same pattern and reason as `macos_route` above.
+// OS so it stays unit-testable from Linux builds; only macOS code calls it
+// at runtime.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) mod macos_ifconfig;
 
 // The manual add-address hint printed when a node ZPR address cannot be
 // applied to, or is missing from, the TUN device (zipline#161). Compiled on
-// every OS, same pattern and reason as `macos_route`: the per-platform
+// every OS, same pattern and reason as `macos_ifconfig`: the per-platform
 // command strings stay unit-testable from Linux builds. `main.rs` calls the
 // hints, and the Windows `add_address` calls `netsh_add_address_args`
 // (zl-zipline#272), so most of the library's copy is dead code by design.
@@ -49,7 +37,7 @@ pub(crate) mod addr_hint;
 
 // Bounded wait for a freshly added address to leave the DAD tentative
 // state (zipline#162). Compiled on every OS, same pattern and reason as
-// `macos_route` above; only the Windows `add_address` calls it at runtime.
+// `macos_ifconfig` above; only the Windows `add_address` calls it at runtime.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod dad;
 
@@ -59,7 +47,7 @@ pub mod substrate;
 
 // Platform-neutral control-channel access helpers (zipline#154): the
 // shared missing-group warning and the Windows pipe SDDL builder. Compiled
-// on every OS, same pattern and reason as `macos_route` above; each arm
+// on every OS, same pattern and reason as `macos_ifconfig` above; each arm
 // uses only its half at runtime.
 #[allow(dead_code)]
 pub(crate) mod control_access;

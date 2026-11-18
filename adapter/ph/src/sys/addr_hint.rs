@@ -5,7 +5,7 @@
 //! prints, so the two cannot drift apart (zl-zipline#272).
 //!
 //! Compiled on every OS so the per-platform strings stay unit-testable from
-//! Linux builds, same pattern and reason as `macos_route`: the decision of
+//! Linux builds, same pattern and reason as `macos_ifconfig`: the decision of
 //! *which* command to print is pure, only the caller is platform-specific.
 
 use std::net::IpAddr;

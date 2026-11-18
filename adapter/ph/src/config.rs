@@ -10,7 +10,6 @@ use admin_api::{SocketOwner, control_socket_path};
 use base64::prelude::*;
 use serde::Deserialize;
 
-use crate::auth::RsaBootstrapAuth;
 use crate::batch_io;
 use crate::pki::{NOISE_KEY_LEN, common_name, load_cert, load_noise_private_key};
 
@@ -48,7 +47,6 @@ pub const DEFAULT_ZDPR_RETRY_TIMER: std::time::Duration = std::time::Duration::f
 /// (Not a global default!)
 pub const DEFAULT_ZDPR_RETRY_LIMIT: u8 = 3;
 
-pub const LINK_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 pub const DEFAULT_TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Node side only: how long a node-to-adapter link may stay in `Keying`
@@ -96,11 +94,6 @@ pub const VSCONN_RETRY_WAIT: std::time::Duration = std::time::Duration::from_sec
 /// (#1410); ZDP-R and keep-alives bound it.
 pub const OIDC_USER_INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Actor authorization retry backoff after a retryable failure: starts at
-/// the initial delay, doubles per attempt, capped at the max (#1410).
-pub const ACTOR_AUTH_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
-pub const ACTOR_AUTH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
-
 const DEFAULT_BUFFER_COUNT: usize = 512; // should be at least 5x batch size; see fastpath_worker.rs for explanation
 const DEFAULT_BATCH_SIZE: usize = 64;
 const DEFAULT_DATAPATH_QUEUE_SIZE: usize = 256;
@@ -131,8 +124,6 @@ pub const KEEP_ALIVE_MAX_MISSES: u32 = 3;
 /// half the granted authentication lifetime so short `expiration_seconds`
 /// values stay workable (see [crate::link_state::renewal_lead]).
 pub const DEFAULT_AUTH_RENEWAL_LEAD: std::time::Duration = std::time::Duration::from_secs(300);
-
-pub const DEFAULT_LINK_RESTART_HOLDDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Maximum length of payload to include in a Bind Request.
 ///
@@ -211,22 +202,11 @@ pub struct Config {
     /// (zl-zipline#229, see [Config::check_valid]).
     pub zpr_addr: Vec<IpAddr>,
 
-    /// Adapter side of a dock only; never set now that there is no adapter,
-    /// but still read by the `AdapterToNode` code.
-    // #234: deleted by core-adapter
-    pub bootstrap: Option<RsaBootstrapAuth>,
-
     /// The batch I/O engine to use.
     pub batch_io_engine: String,
 
     /// Type of key manager implementation
     pub km_impl: KmId,
-
-    /// Adapter side of a dock only: whether the tether link connects (and
-    /// reconnects) on its own (zipline#28). Always `true` now that there is
-    /// no adapter, but still read by the `AdapterToNode` code.
-    // #234: deleted by core-adapter
-    pub auto_connect: bool,
 
     /// The user the control socket should belong to, resolved from
     /// `SUDO_UID`/`SUDO_GID`/`PKEXEC_UID` by [Config::apply_socket_owner].
@@ -759,10 +739,8 @@ impl Default for Config {
             tun_if: None,
             logging: Vec::new(),
             zpr_addr: Vec::new(),
-            bootstrap: None,
             batch_io_engine: batch_io::AUTO_ENGINE_NAME.to_owned(),
             km_impl: KM_ID_NOISE,
-            auto_connect: true,
             socket_owner: None,
             control_path_derived: true,
             auth_renewal_lead: DEFAULT_AUTH_RENEWAL_LEAD,

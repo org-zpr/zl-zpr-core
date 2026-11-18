@@ -1,5 +1,4 @@
 use crate::auth;
-use crate::auth_agent::AuthFailureReason;
 use crate::counters::ManagementCounterType;
 use crate::km::ZPIPair;
 use crate::km_multiplexor;
@@ -26,9 +25,8 @@ use zpr_utils::net_defs::IpAddress;
 /// Zipline additions to upstream #1410's link layer (search "zipline#"):
 /// OIDC IdP advertisement in Hello (zipline#12), keep-alive miss tolerance
 /// and VSConn recycling (zipline#113), the node keying timeout
-/// (zipline#173), idle mode with auto-connect off (zipline#28), no restart
-/// after a fatal local activation failure (zipline#157), the renewal tick
-/// (zipline#45), and a fresh ZDP-R session per Start.
+/// (zipline#173), the renewal tick (zipline#45), and a fresh ZDP-R session
+/// per Start.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum LinkState {
     Inactive,
@@ -91,7 +89,6 @@ pub enum LinkStateError {
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum LinkType {
     Internal,
-    AdapterToNode,
     /// A link between two Zodes (zl-zipline#220, #250). Both ends verify the
     /// other's CA-signed certificate, the dialer says Hello, and neither end
     /// hands out an AAA address. Which end this Zode is lives in [ZodeEnd].
@@ -125,9 +122,6 @@ pub struct LinkData {
     // For now, keep-alives are attempted every 3 seconds
     // Assuming no loss, 100 samples will store 5 minutes of latency data
     latency_data: SampleRing<Duration, 100>,
-    /// Zipline (zipline#12): OIDC identity providers advertised by our peer
-    /// in HelloResponse, if any.
-    oidc_idps: Option<Vec<auth::OidcIdpInfo>>,
     installed_aaa: bool,
 }
 
@@ -137,7 +131,6 @@ impl LinkData {
             echo_success: 0,
             echo_timeout: 0,
             latency_data: SampleRing::new(Duration::ZERO),
-            oidc_idps: None,
             installed_aaa: false,
         }
     }
@@ -329,22 +322,6 @@ impl LinkStateWrapper {
         *self.aaa_address.get()
     }
 
-    /// Zipline (zipline#12): the OIDC IdPs our peer advertised in Hello.
-    pub fn oidc_idps(&self) -> Vec<auth::OidcIdpInfo> {
-        self.locked_data
-            .lock()
-            .unwrap()
-            .oidc_idps
-            .clone()
-            .unwrap_or_default()
-    }
-
-    /// Test-only: pretend a HelloResponse advertised these IdPs.
-    #[cfg(test)]
-    pub fn test_set_oidc_idps(&self, idps: Vec<auth::OidcIdpInfo>) {
-        self.locked_data.lock().unwrap().oidc_idps = Some(idps);
-    }
-
     /// Test-only: force the FSM into a state without walking the transitions.
     #[cfg(test)]
     pub fn test_set_state(&self, state: LinkState) {
@@ -440,57 +417,47 @@ impl LinkStateWrapper {
             return self.initiate_close(asm, TerminateReason::Other);
         }
         let locked_fsm = self.locked_fsm.lock().unwrap();
-        if !(self.link_type == LinkType::AdapterToNode || self.is_zode_dialer())
-            || locked_fsm.state != LinkState::Helloing
-        {
+        // Only the Zode that dialed a Zode link sends a HelloRequest, so
+        // only it expects a HelloResponse.
+        if !self.is_zode_dialer() || locked_fsm.state != LinkState::Helloing {
             return Err(LinkStateError::UnexpectedTransition(
                 locked_fsm.state,
                 "ReceivedHelloResponse",
             ));
         }
-        if self.link_type == LinkType::NodeToNode {
-            // zl-zipline#250 (gaps 5 and 6): a Zode answers Hello with
-            // nothing an adapter dock would get. A peer that offers an AAA
-            // address, identity providers or the visa-service bootstrap flag
-            // is not behaving as a Zode, so the link is refused.
-            if response.aaa_address.is_some()
-                || response.oidc_idps.is_some()
-                || response.vs_bootstrap
-            {
-                warn!(target: LINK_STATE, "{}: refusing a Zode HelloResponse that carries an AAA address, identity providers or the bootstrap flag; closing",
-                    asm.formatted_link_id(self.id));
-                drop(locked_fsm);
-                return self.initiate_close(asm, TerminateReason::Other);
-            }
-            return self.run_active_zode(asm, locked_fsm);
+        // zl-zipline#250 (gaps 5 and 6): a Zode answers Hello with nothing
+        // an adapter dock would get. A peer that offers an AAA address,
+        // identity providers or the visa-service bootstrap flag is not
+        // behaving as a Zode, so the link is refused.
+        if response.aaa_address.is_some() || response.oidc_idps.is_some() || response.vs_bootstrap {
+            warn!(target: LINK_STATE, "{}: refusing a Zode HelloResponse that carries an AAA address, identity providers or the bootstrap flag; closing",
+                asm.formatted_link_id(self.id));
+            drop(locked_fsm);
+            return self.initiate_close(asm, TerminateReason::Other);
         }
-        if response.aaa_address.is_none() && !response.vs_bootstrap {
-            return Err(LinkStateError::InvalidOperation(
-                "ordinary link established without AAA".into(),
-            ));
-        }
-        {
-            let mut data = self.locked_data.lock().unwrap();
-            self.aaa_address.write(response.aaa_address);
-            data.oidc_idps = response.oidc_idps;
-        }
-        if let Some(aaa) = response.aaa_address {
-            let exists = asm
-                .tun_ctl
-                .has_address(aaa.into())
-                .map_err(|e| LinkStateError::InvalidOperation(format!("inspect AAA: {e}")))?;
-            asm.tun_ctl
-                .add_authentication_address(aaa.into(), ZPRNET_PREFIX_LEN)
-                .map_err(|e| LinkStateError::InvalidOperation(format!("configure AAA: {e}")))?;
-            self.locked_data.lock().unwrap().installed_aaa = !exists;
-        }
+        self.run_active_zode(asm, locked_fsm)
+    }
+
+    /// Install `aaa` on the TUN interface as this link's authentication
+    /// address and remember it, so link cleanup clears it again. An address
+    /// the interface already carried is not ours to clear, so
+    /// `installed_aaa` is set only when this call added it.
+    // AAA kept unused in v1 (zodes plan §5.4)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn install_aaa(
+        &self,
+        asm: &Arc<Assembly>,
+        aaa: IpAddress,
+    ) -> Result<(), LinkStateError> {
+        self.process_assigned_aaa(asm, aaa)?;
+        let exists = asm
+            .tun_ctl
+            .has_address(aaa.into())
+            .map_err(|e| LinkStateError::InvalidOperation(format!("inspect AAA: {e}")))?;
         asm.tun_ctl
-            .set_carrier(true)
-            .map_err(|e| LinkStateError::InvalidOperation(format!("enable AAA carrier: {e}")))?;
-        self.run_active(asm, locked_fsm)?;
-        if let Some(peer) = asm.peer_table.get(self.id) {
-            peer.actor_auth.link_ready(asm);
-        }
+            .add_authentication_address(aaa.into(), ZPRNET_PREFIX_LEN)
+            .map_err(|e| LinkStateError::InvalidOperation(format!("configure AAA: {e}")))?;
+        self.locked_data.lock().unwrap().installed_aaa = !exists;
         Ok(())
     }
 
@@ -567,7 +534,8 @@ impl LinkStateWrapper {
 
     /// Start an inactive link/tether
     /// Transitions from Inactive -> Keying
-    /// Will trigger key management messages to be sent if this is an adapter
+    /// Will trigger key management messages to be sent if this Zode dialed
+    /// the link
     fn process_start(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         assert!(self.id != LINK_ID_UNKNOWN);
         let link_id = self.id;
@@ -582,13 +550,10 @@ impl LinkStateWrapper {
         locked_fsm.status = LinkStatus::Up;
         locked_fsm.set_state(LinkState::Keying);
 
-        // A Start also begins a fresh ZDP-R session.  An adapter keeps one
-        // peer table entry per link for the life of the process, but the
-        // node it docks with allocates a new link -- and so a new ZDP-R
-        // session, restarting at sequence number 0 -- for every attempt.
-        // Carrying the previous attempt's sequence numbers and receive
-        // window into this one would have each side silently discard the
-        // other's traffic.
+        // A Start also begins a fresh ZDP-R session: the peer restarts its
+        // sequence numbers at 0 for every attempt, and carrying a previous
+        // attempt's sequence numbers and receive window into this one would
+        // have each side silently discard the other's traffic.
         if let Some(peer) = asm.peer_table.get(link_id) {
             peer.reset_zdpr_session();
         }
@@ -596,17 +561,6 @@ impl LinkStateWrapper {
         info!(target: LINK_STATE, "{} started.  Keying in progress", asm.formatted_link_id(link_id));
 
         match self.link_type {
-            LinkType::AdapterToNode => {
-                km_multiplexor::add_adapter_link(
-                    asm,
-                    link_id,
-                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 5, 6),
-                    asm.self_noise_keypair.clone().unwrap(),
-                    asm.certx.clone().unwrap(),
-                )
-                .unwrap();
-                Ok(())
-            }
             LinkType::NodeToNode => {
                 // zl-zipline#250: the dialer initiates keying, and both ends
                 // demand a CA-signed certificate (#220). A Zode without link
@@ -668,7 +622,7 @@ impl LinkStateWrapper {
 
     /// The Key Manager sends in the [LinkEvent::KeyingDone] event when it is done with initial keying.
     /// Transitions from Keying -> Helloing
-    /// Will trigger a Hello to be sent if this is an adapter
+    /// Will trigger a Hello to be sent if this Zode dialed the link
     fn process_keying_done(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let link_id = self.id;
         let mut locked_fsm = self.locked_fsm.lock().unwrap();
@@ -801,12 +755,12 @@ impl LinkStateWrapper {
 
         locked_fsm.set_state(LinkState::Helloing);
 
-        // An adapter, or the Zode that dialed a Zode link, issues the hello
-        if self.link_type == LinkType::AdapterToNode || self.is_zode_dialer() {
+        // The Zode that dialed a Zode link issues the hello
+        if self.is_zode_dialer() {
             // Grab public key from keypair to send in hello request
             let pubkey = x25519_dalek::PublicKey::from(&asm.a2a_dh_keypair);
             mgmt::requests::send_hello_request(asm, self.id, pubkey).enqueue();
-            self.set_timeout(asm, &mut locked_fsm, hello_timeout(self.link_type));
+            self.set_timeout(asm, &mut locked_fsm, config::ZODE_HELLO_TIMEOUT);
             debug!(
                 target: LINK_STATE,
                 "{} sent HelloRequest.  Waiting for other side to respond.", asm.formatted_link_id(link_id)
@@ -821,7 +775,7 @@ impl LinkStateWrapper {
         if let Some(peer_cn) = replaces_links_to {
             crate::zode_links::replace_established_links(asm, link_id, &peer_cn);
         }
-        // Otherwise we are a node so wait for an adapter to reach out
+        // Otherwise we wait for the peer to say Hello
         Ok(())
     }
 
@@ -864,8 +818,7 @@ impl LinkStateWrapper {
 
         // handle the timeout...
         match (self.link_type, locked_fsm.state) {
-            (LinkType::AdapterToNode, LinkState::Helloing)
-            | (LinkType::NodeToNode, LinkState::Keying | LinkState::Helloing) => {
+            (LinkType::NodeToNode, LinkState::Keying | LinkState::Helloing) => {
                 // Timeout here means we give up on the link.
                 error!(target: LINK_STATE, "{}: timed out in state {:?}", asm.formatted_link_id(self.id), locked_fsm.state);
                 locked_fsm.set_state(LinkState::Error);
@@ -1056,28 +1009,6 @@ impl LinkStateWrapper {
         let link_id = self.id;
         info!(target: LINK_STATE,"Initiating shutdown on {}", asm.formatted_link_id(link_id));
 
-        // With auto-connect off (zipline#28) a completed close is terminal:
-        // the tether stays Inactive until the next startLink RPC. Every
-        // failure path parks the FSM in Error before initiating the close,
-        // while an operator stop arrives from a running state — so an Error
-        // entry with no recorded failure (e.g. a Helloing timeout) must
-        // record one here, or ph-cli's `connect` poll reads the permanently
-        // Inactive link as "restart forthcoming" and hangs until its
-        // deadline.
-        if self.link_type == LinkType::AdapterToNode
-            && !asm.config.get().auto_connect
-            && self.get_state() == LinkState::Error
-        {
-            if let Some(peer) = asm.peer_table.get(link_id) {
-                if peer.actor_auth.last_failure().is_none() {
-                    peer.actor_auth
-                        .record_failure(AuthFailureReason::LinkFailed(format!(
-                            "link failed before authentication completed ({reason:?})"
-                        )));
-                }
-            }
-        }
-
         self.maybe_disconnect_visa_service_client(asm, true, reason)
     }
 
@@ -1153,7 +1084,7 @@ impl LinkStateWrapper {
                 let aaa = self.aaa_address();
                 self.aaa_address.write(None);
                 if let Some(aaa_addr) = aaa {
-                    if self.link_type == LinkType::AdapterToNode && link_data.installed_aaa {
+                    if link_data.installed_aaa {
                         if let Err(err) = asm
                             .tun_ctl
                             .clear_address(aaa_addr.into(), ZPRNET_PREFIX_LEN)
@@ -1172,21 +1103,10 @@ impl LinkStateWrapper {
                         };
                     }
                 }
-                link_data.oidc_idps = None;
                 link_data.installed_aaa = false;
                 drop(link_data);
 
                 asm.peer_table.clear_peer_state(link_id);
-
-                match self.link_type {
-                    LinkType::AdapterToNode => {
-                        if let Err(err) = asm.tun_ctl.set_carrier(false) {
-                            error!(target: LINK_STATE, "cannot disable TUN carrier: {err}");
-                        }
-                    }
-                    LinkType::NodeToAdapter => {}
-                    _ => {}
-                }
 
                 let task_asm = asm.clone();
                 join_set.spawn_local(async move {
@@ -1230,26 +1150,10 @@ impl LinkStateWrapper {
                 locked_fsm.silent = false;
                 locked_fsm.set_state(LinkState::Inactive);
                 info!(target: LINK_STATE, "{} has fully shut down", asm.formatted_link_id(link_id));
-                if !locked_fsm.shutting_down {
-                    drop(locked_fsm);
-                    if self.link_type == LinkType::AdapterToNode && !asm.config.get().auto_connect {
-                        // With auto-connect off (zipline#28) the tether does
-                        // not restart itself: it stays Inactive until the
-                        // next startLink RPC (ph-cli connect / link start).
-                        info!(target: LINK_STATE, "{} idle (auto-connect off); waiting for startLink", asm.formatted_link_id(link_id));
-                    } else if self.link_type == LinkType::AdapterToNode
-                        && fatal_activation_failure(asm, link_id)
-                    {
-                        // zipline#157: a local activation failure is
-                        // non-transient (an EPERM will not clear on
-                        // reconnect). Stay Inactive with the recorded reason;
-                        // the operator re-runs `ph-cli connect` after fixing
-                        // the host.
-                        warn!(target: LINK_STATE, "{} not reconnecting after a fatal local activation failure; fix the host and re-run `ph-cli connect`", asm.formatted_link_id(link_id));
-                    } else {
-                        self.setup_restart(asm);
-                    }
-                } else {
+                // No link type restarts itself any more: a Zode link is
+                // redialed only by its owner. The peer stays Inactive unless
+                // ph is shutting down.
+                if locked_fsm.shutting_down {
                     drop(locked_fsm);
                     asm.drop_peer(link_id); // buh bye!
                 }
@@ -1263,27 +1167,6 @@ impl LinkStateWrapper {
                 );
             }
         }
-    }
-
-    /// Set a timer to attempt a link restart after a holddown period
-    fn setup_restart(&self, asm: &Arc<Assembly>) {
-        // TODO: use timeout mechanism
-        let link_id = self.id;
-        let task_asm = asm.clone();
-        tokio::task::spawn_local(async move {
-            tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN).await;
-            // zipline#157: this timer may have been scheduled by an earlier,
-            // non-fatal close while a newer attempt (an operator startLink
-            // during the holddown) reached a fatal local activation failure.
-            // A stale Start would resume the reconnect loop the hard stop
-            // was meant to end.
-            if fatal_activation_failure(&task_asm, link_id) {
-                info!(target: LINK_STATE, "{} skipping stale holddown restart after a fatal local activation failure", task_asm.formatted_link_id(link_id));
-                return;
-            }
-            info!(target: LINK_STATE, "Attempting to restart {}", task_asm.formatted_link_id(link_id));
-            let _ = task_asm.process_link_state_event(link_id, LinkEvent::Start);
-        });
     }
 
     /// Reset the link, shutting it down and wiping its configuration
@@ -1435,28 +1318,6 @@ impl LinkStateWrapper {
     }
 }
 
-/// The Hello timeout for the end that sends the HelloRequest: Zode links are
-/// bounded by [config::ZODE_HELLO_TIMEOUT] (zl-zipline#250), adapter links by
-/// [config::LINK_HELLO_TIMEOUT].
-fn hello_timeout(link_type: LinkType) -> Duration {
-    if link_type == LinkType::NodeToNode {
-        config::ZODE_HELLO_TIMEOUT
-    } else {
-        config::LINK_HELLO_TIMEOUT
-    }
-}
-
-/// zipline#157: whether the link's actor recorded a fatal local activation
-/// failure, which suppresses automatic reconnects.
-fn fatal_activation_failure(asm: &Assembly, link_id: LinkId) -> bool {
-    asm.peer_table.get(link_id).is_some_and(|peer| {
-        matches!(
-            peer.actor_auth.last_failure(),
-            Some(AuthFailureReason::ActivationFailed(_))
-        )
-    })
-}
-
 impl Display for LinkStateWrapper {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // FIXME: This doesn't print link ID because the caller is printing link ID
@@ -1526,7 +1387,7 @@ mod tests {
 
     #[test]
     fn readiness_tracks_all_link_states() {
-        let link = LinkStateWrapper::new(3, LinkType::AdapterToNode);
+        let link = LinkStateWrapper::new(3, LinkType::NodeToNode);
         assert!(!link.is_ready());
         assert!(LinkStateWrapper::new(1, LinkType::Internal).is_ready());
 
@@ -1555,6 +1416,65 @@ mod tests {
             fsm.set_state(LinkState::Active);
         }
         assert!(!link.is_ready());
+    }
+
+    /// A `TunCtl` whose addresses live in a shared list, so a test can see
+    /// what `install_aaa` and link cleanup did to the TUN.
+    struct AaaTunCtl(Arc<Mutex<Vec<std::net::IpAddr>>>);
+
+    impl crate::tun_ctl::TunCtl for AaaTunCtl {
+        fn name(&self) -> String {
+            "tun-aaa".to_string()
+        }
+        fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn add_address(&self, addr: std::net::IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(addr);
+            Ok(())
+        }
+        fn add_authentication_address(
+            &self,
+            addr: std::net::IpAddr,
+            prefix_len: u8,
+        ) -> std::io::Result<()> {
+            self.add_address(addr, prefix_len)
+        }
+        fn clear_address(&self, addr: std::net::IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+            self.0.lock().unwrap().retain(|a| *a != addr);
+            Ok(())
+        }
+        fn has_address(&self, addr: std::net::IpAddr) -> std::io::Result<bool> {
+            Ok(self.0.lock().unwrap().contains(&addr))
+        }
+    }
+
+    /// `install_aaa` puts the AAA on the TUN and records it, and link
+    /// cleanup clears it again; an AAA the TUN already carried is not ours,
+    /// so cleanup leaves it in place.
+    #[tokio::test(flavor = "local")]
+    async fn install_aaa_is_cleared_by_cleanup_only_when_it_added_it() {
+        let aaa_ip: std::net::IpAddr = "fd5a:5052:0:aaa::1".parse().unwrap();
+        for already_on_tun in [false, true] {
+            let tun = Arc::new(Mutex::new(if already_on_tun {
+                vec![aaa_ip]
+            } else {
+                Vec::new()
+            }));
+            let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+                tun_ctl: Some(Box::new(AaaTunCtl(tun.clone()))),
+                ..TestAssemblyBuilder::new()
+            }));
+            let link = LinkStateWrapper::new(3, LinkType::NodeToNode);
+            link.install_aaa(&asm, aaa_ip.into()).unwrap();
+            assert_eq!(link.aaa_address(), Some(aaa_ip.into()));
+            assert!(tun.lock().unwrap().contains(&aaa_ip));
+
+            link.test_set_state(LinkState::Closing);
+            let _ = link.clean_up_link_state(&asm);
+            assert_eq!(link.aaa_address(), None);
+            assert_eq!(tun.lock().unwrap().contains(&aaa_ip), already_on_tun);
+        }
     }
 
     #[tokio::test]
@@ -1587,53 +1507,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_activates_link_and_keepalives_before_actor_authorization() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link = hello_link(LinkType::AdapterToNode);
-                let aaa = "fd5a:5052:0:aaa::1"
-                    .parse::<std::net::IpAddr>()
-                    .unwrap()
-                    .into();
-                link.process_hello_response(
-                    &asm,
-                    HelloResponse {
-                        status: ResponseCode::Success,
-                        aaa_address: Some(aaa),
-                        oidc_idps: None,
-                        vs_bootstrap: false,
-                    },
-                )
-                .unwrap();
-                assert!(link.is_ready());
-                assert_eq!(link.aaa_address(), Some(aaa));
-                assert!(link.locked_fsm.lock().unwrap().timeout_handle.is_some());
-                assert!(asm.get_local_zpr_addrs_std().is_empty());
-            })
-            .await;
-    }
-
-    #[tokio::test]
     async fn ordinary_hello_cannot_succeed_without_aaa() {
         LocalSet::new()
             .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let adapter = hello_link(LinkType::AdapterToNode);
-                assert!(
-                    adapter
-                        .process_hello_response(
-                            &asm,
-                            HelloResponse {
-                                status: ResponseCode::Success,
-                                aaa_address: None,
-                                oidc_idps: None,
-                                vs_bootstrap: false,
-                            },
-                        )
-                        .is_err()
-                );
-                assert!(!adapter.is_ready());
                 let node = hello_link(LinkType::NodeToAdapter);
                 node.process_hello_request(&asm).unwrap();
                 assert!(!node.is_ready());
@@ -1654,28 +1531,8 @@ mod tests {
                 node.process_hello_request(&asm).unwrap();
                 assert!(node.is_ready());
                 assert!(node.aaa_address().is_none());
-                let adapter = hello_link(LinkType::AdapterToNode);
-                adapter
-                    .process_hello_response(
-                        &asm,
-                        HelloResponse {
-                            status: ResponseCode::Success,
-                            aaa_address: None,
-                            oidc_idps: None,
-                            vs_bootstrap: true,
-                        },
-                    )
-                    .unwrap();
-                assert!(adapter.is_ready());
             })
             .await;
-    }
-
-    /// Insert an adapter-side (AdapterToNode) peer into the table and return
-    /// its link id. Each call gets a distinct substrate port: the peer table
-    /// rejects duplicate substrate addresses.
-    fn add_adapter_peer(asm: &Arc<Assembly>) -> LinkId {
-        add_peer(asm, LinkType::AdapterToNode, 9000)
     }
 
     /// Insert a node-side (NodeToAdapter) peer and return its link id.
@@ -1703,14 +1560,11 @@ mod tests {
 
     /// A test assembly whose links can be started: `process_start` hands
     /// the link to the key manager, which needs a noise keypair and a
-    /// certificate exchange. `auto_connect` sets the zipline#28 option.
-    fn keyable_assembly(auto_connect: bool) -> Arc<Assembly> {
-        let mut cfg = <config::Config as std::default::Default>::default();
-        cfg.auto_connect = auto_connect;
+    /// certificate exchange.
+    fn keyable_assembly() -> Arc<Assembly> {
         Arc::new(create_assembly(TestAssemblyBuilder {
             self_noise_keypair: Some(crate::km_noise::NoiseKeypair::generate()),
             certx: Some(crate::km_cert_exchange::KmCertExchange::new(None, None)),
-            config: Some(rcu::RcuBox::new(cfg)),
             ..TestAssemblyBuilder::new()
         }))
     }
@@ -1719,7 +1573,7 @@ mod tests {
     /// (zl-zipline#220), each of which owns its link to this Zode.
     fn zode_assembly(peer_cns: &[&str]) -> Arc<Assembly> {
         use crate::peer_table::test::topology_link;
-        let asm = keyable_assembly(true);
+        let asm = keyable_assembly();
         let mut cfg = (*asm.config.get()).clone();
         cfg.zpr_addr = vec!["fd5a:5052::10".parse().unwrap()];
         asm.config.write(cfg);
@@ -1782,7 +1636,7 @@ mod tests {
     /// link in Keying whose verified certificate carries the visa service's
     /// DN. Returns the assembly and the link (zl-zipline#229).
     fn vs_adapter_keyed(relay: bool) -> (Arc<Assembly>, LinkId) {
-        let asm = keyable_assembly(true);
+        let asm = keyable_assembly();
         let mut cfg = (*asm.config.get()).clone();
         cfg.relay = relay;
         asm.config.write(cfg);
@@ -1963,7 +1817,7 @@ mod tests {
     async fn test_zode_link_start_without_ca_fails_closed() {
         LocalSet::new()
             .run_until(async {
-                let asm = keyable_assembly(true);
+                let asm = keyable_assembly();
                 let before = asm.peer_table.len();
                 let iface =
                     zpr_utils::net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2));
@@ -2167,10 +2021,23 @@ mod tests {
                     complete_close_of(&asm, link_id);
                     assert!(asm.peer_table.get(link_id).is_none());
                 }
-                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN * 2).await;
+                // Long after any holddown a restart would have waited.
+                tokio::time::sleep(Duration::from_secs(10)).await;
                 assert!(asm.peer_table.get(dialed).is_none());
             })
             .await
+    }
+
+    /// Complete a close of `link_id` (Closing -> CloseDone), as the
+    /// terminate handshake does.
+    fn complete_close_of(asm: &Arc<Assembly>, link_id: LinkId) {
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_set_state(LinkState::Closing);
+        asm.process_link_state_event(link_id, LinkEvent::CloseDone)
+            .unwrap();
     }
 
     /// The NodeToNode links whose verified peer CN is `cn`.
@@ -2326,181 +2193,27 @@ mod tests {
             .unwrap();
     }
 
-    /// Complete a close of `link_id` (Closing -> CloseDone), as the
-    /// terminate handshake does.
-    fn complete_close_of(asm: &Arc<Assembly>, link_id: LinkId) {
-        asm.peer_table
-            .get(link_id)
-            .unwrap()
-            .link_state_machine
-            .test_set_state(LinkState::Closing);
-        asm.process_link_state_event(link_id, LinkEvent::CloseDone)
-            .unwrap();
-    }
-
-    /// With `auto_connect = false` (zipline#28), a dropped AdapterToNode
-    /// tether must NOT auto-restart: `complete_close` leaves it Inactive
-    /// and no holddown timer re-fires `Start`. The next `startLink` RPC is
-    /// the only way back up.
-    #[tokio::test(start_paused = true)]
-    async fn test_no_restart_after_close_when_auto_connect_disabled() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = keyable_assembly(false);
-                let link_id = add_adapter_peer(&asm);
-
-                complete_close_of(&asm, link_id);
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Inactive);
-
-                // Advance well past the restart holddown: still Inactive.
-                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
-                    .await;
-                assert_eq!(
-                    link_state_of(&asm, link_id),
-                    LinkState::Inactive,
-                    "auto_connect=false link must wait for startLink, not self-restart"
-                );
-            })
-            .await
-    }
-
-    /// Companion: with the default config (`auto_connect = true`) the
-    /// holddown restart still happens.
-    #[tokio::test(start_paused = true)]
-    async fn test_restart_after_close_with_default_auto_connect() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = keyable_assembly(true);
-                let link_id = add_adapter_peer(&asm);
-
-                complete_close_of(&asm, link_id);
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Inactive);
-
-                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
-                    .await;
-                assert_eq!(
-                    link_state_of(&asm, link_id),
-                    LinkState::Keying,
-                    "default config must keep the automatic holddown restart"
-                );
-            })
-            .await
-    }
-
-    /// With `auto_connect = false`, a manually started link that fails
-    /// BEFORE authentication (here: the Helloing timeout in
-    /// `process_timeout`, which records no `AuthFailureReason`) ends up
-    /// permanently Inactive — terminal, since no restart is coming. The
-    /// close path must record `LinkFailed` on the actor: ph-cli's `connect`
-    /// poll classifies a teardown state *without* a `Last auth failure:`
-    /// line as Pending (restart forthcoming) and would otherwise wait
-    /// forever on a link that will never recover (zipline#28).
-    #[tokio::test(start_paused = true)]
-    async fn test_manual_mode_pre_auth_failure_is_terminal_not_pending() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = keyable_assembly(false);
-                let link_id = add_adapter_peer(&asm);
-
-                // A manually started attempt is stuck in Helloing; its
-                // timeout fires (process_timeout gives up on the link).
-                asm.peer_table
-                    .get(link_id)
-                    .unwrap()
-                    .link_state_machine
-                    .test_set_state(LinkState::Helloing);
-                fire_current_timeout(&asm, link_id);
-                assert_eq!(
-                    link_state_of(&asm, link_id),
-                    LinkState::Closing,
-                    "test precondition: the Helloing timeout initiates the close"
-                );
-
-                // The terminate handshake completes and the close finishes.
-                asm.process_link_state_event(link_id, LinkEvent::CloseDone)
-                    .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(peer.link_state_machine.get_state(), LinkState::Inactive);
-                assert!(
-                    matches!(
-                        peer.actor_auth.last_failure(),
-                        Some(AuthFailureReason::LinkFailed(_))
-                    ),
-                    "terminal idle after a pre-auth failure must carry a recorded \
-                     failure reason, or ph-cli connect classifies the permanently \
-                     Inactive link as Pending and hangs until its deadline; got {:?}",
-                    peer.actor_auth.last_failure()
-                );
-            })
-            .await
-    }
-
-    /// The `LinkFailed` record above only fills a gap: a close after a
-    /// recorded failure keeps that (more specific) reason, and with
-    /// auto-connect ON nothing is recorded, since a restart is coming.
-    #[tokio::test(start_paused = true)]
-    async fn test_link_failed_is_recorded_only_when_terminal_and_unexplained() {
-        LocalSet::new()
-            .run_until(async {
-                // Auto-connect off, failure already recorded: kept.
-                let asm = keyable_assembly(false);
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.actor_auth
-                        .record_failure(AuthFailureReason::UserDeclined);
-                    peer.link_state_machine.test_set_state(LinkState::Helloing);
-                }
-                fire_current_timeout(&asm, link_id);
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .actor_auth
-                        .last_failure(),
-                    Some(AuthFailureReason::UserDeclined)
-                );
-
-                // Auto-connect on: nothing recorded.
-                let asm = keyable_assembly(true);
-                let link_id = add_adapter_peer(&asm);
-                asm.peer_table
-                    .get(link_id)
-                    .unwrap()
-                    .link_state_machine
-                    .test_set_state(LinkState::Helloing);
-                fire_current_timeout(&asm, link_id);
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .actor_auth
-                        .last_failure(),
-                    None
-                );
-            })
-            .await
-    }
-
     /// A `Start` begins a fresh ZDP-R session, so it must reset the link's
-    /// sender and receiver.
-    ///
-    /// An adapter keeps one peer table entry (and so one ZDP-R session) per
-    /// link for the life of the process, but the node it re-docks with
-    /// allocates a brand new link -- and so a brand new sender -- for every
-    /// dock attempt, restarting its sequence numbers at 0.  An adapter that
-    /// carried the previous attempt's receive window into the restart would
-    /// classify every packet of the new session as an already-seen
-    /// duplicate: dropped without processing but still acknowledged, so the
-    /// node never retransmits and the link never gets past Helloing.
+    /// sender and receiver: a peer whose sequence numbers restart at 0
+    /// would otherwise have every packet of the new session classified as
+    /// an already-seen duplicate, dropped without processing but still
+    /// acknowledged, so the link never gets past Helloing.
     #[tokio::test(start_paused = true)]
     async fn test_start_resets_zdpr_session() {
         LocalSet::new()
             .run_until(async {
-                let asm = keyable_assembly(true);
-                let link_id = add_adapter_peer(&asm);
+                let (asm, _egress) = zode_keys_assembly("a.zpr");
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "b.zpr",
+                    LinkState::Inactive,
+                );
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .set_zode_end(dialer("b.zpr"))
+                    .unwrap();
 
                 // A previous dock attempt received the peer's first two
                 // management packets, then the link was torn down.
@@ -2547,7 +2260,7 @@ mod tests {
     async fn test_node_link_stuck_in_keying_is_torn_down() {
         LocalSet::new()
             .run_until(async {
-                let asm = keyable_assembly(true);
+                let asm = keyable_assembly();
                 let link_id = add_node_peer(&asm);
 
                 asm.process_link_state_event(link_id, LinkEvent::Start)
@@ -2585,7 +2298,7 @@ mod tests {
     async fn test_node_link_keying_done_cancels_keying_timeout() {
         LocalSet::new()
             .run_until(async {
-                let asm = keyable_assembly(true);
+                let asm = keyable_assembly();
                 let link_id = add_node_peer(&asm);
 
                 asm.process_link_state_event(link_id, LinkEvent::Start)
@@ -2607,117 +2320,6 @@ mod tests {
             .await
     }
 
-    /// zipline#157: once the actor has recorded a fatal local activation
-    /// failure (`ActivationFailed`, e.g. EPERM setting the granted address),
-    /// the close that follows must NOT schedule the holddown restart: a
-    /// reconnect re-keys, re-prompts OIDC interactively, and the EPERM will
-    /// not have cleared. The link stays Inactive with the reason recorded.
-    /// (The activation failure itself is pinned in actor_auth/
-    /// actor_activation tests; this is the link-level half.)
-    #[tokio::test(start_paused = true)]
-    async fn test_fatal_activation_failure_suppresses_reconnect() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = keyable_assembly(true);
-                let link_id = add_adapter_peer(&asm);
-                asm.peer_table
-                    .get(link_id)
-                    .unwrap()
-                    .actor_auth
-                    .record_failure(AuthFailureReason::ActivationFailed(
-                        "failed to set ZPR address: EPERM".to_owned(),
-                    ));
-
-                complete_close_of(&asm, link_id);
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Inactive);
-                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
-                    .await;
-                assert_eq!(
-                    link_state_of(&asm, link_id),
-                    LinkState::Inactive,
-                    "a fatal local activation failure must hard-stop the \
-                     reconnect loop (zipline#157 Q1); the holddown restart \
-                     re-fired Start"
-                );
-            })
-            .await
-    }
-
-    /// zipline#157 review round 1 (Codex P1): a restart timer scheduled by
-    /// an EARLIER, non-fatal close must not override a later fatal stop.
-    ///
-    /// Sequence: an auto-connect close completes and schedules the holddown
-    /// restart; during the holddown the operator manually starts a new
-    /// attempt (startLink), which reaches a fatal `ActivationFailed` and
-    /// closes. The hard-stop branch in `complete_close` correctly declines
-    /// to schedule a NEW timer — but the OLD timer is still pending, and an
-    /// unconditional `setup_restart` task would fire it, send `Start`, and
-    /// resume the reconnect loop the fatal stop was meant to end. The
-    /// pending task must re-check the recorded fatal failure before
-    /// starting.
-    #[tokio::test(start_paused = true)]
-    async fn test_stale_restart_timer_does_not_override_fatal_stop() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = keyable_assembly(true);
-                let link_id = add_adapter_peer(&asm);
-
-                // 1. A non-fatal close completes: `complete_close` leaves
-                //    the link Inactive and schedules the holddown restart.
-                complete_close_of(&asm, link_id);
-                assert_eq!(
-                    link_state_of(&asm, link_id),
-                    LinkState::Inactive,
-                    "test precondition: the first close parks the link Inactive"
-                );
-
-                // 2. During the holddown, the operator manually starts a
-                //    new attempt (ph-cli connect -> startLink -> Start).
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                asm.process_link_state_event(link_id, LinkEvent::Start)
-                    .unwrap();
-                assert_eq!(
-                    link_state_of(&asm, link_id),
-                    LinkState::Keying,
-                    "test precondition: the manual Start begins a new attempt"
-                );
-
-                // 3. The new attempt hits a fatal local activation failure
-                //    and its close completes BEFORE the old timer expires.
-                asm.peer_table
-                    .get(link_id)
-                    .unwrap()
-                    .actor_auth
-                    .record_failure(AuthFailureReason::ActivationFailed(
-                        "failed to set ZPR address: EPERM".to_owned(),
-                    ));
-                complete_close_of(&asm, link_id);
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Inactive);
-
-                // 4. The FIRST close's restart timer expires. It must not
-                //    send Start: the link stays Inactive and the recorded
-                //    fatal failure survives for showLink / ph-cli connect.
-                tokio::time::sleep(config::DEFAULT_LINK_RESTART_HOLDDOWN + Duration::from_secs(1))
-                    .await;
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_state(),
-                    LinkState::Inactive,
-                    "a restart timer scheduled before a fatal activation \
-                     failure must not resume the reconnect loop \
-                     (zipline#157 review round 1)"
-                );
-                assert!(
-                    matches!(
-                        peer.actor_auth.last_failure(),
-                        Some(AuthFailureReason::ActivationFailed(_))
-                    ),
-                    "the stale restart wiped the recorded fatal failure"
-                );
-            })
-            .await
-    }
-
     /// zipline#113: one missed keep-alive echo must NOT kill an Active link.
     /// The link tolerates consecutive misses and only goes to `Error` (and
     /// closes) on the KEEP_ALIVE_MAX_MISSES'th consecutive miss; a keep-alive
@@ -2728,12 +2330,11 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_node_peer(&asm);
-                asm.peer_table
-                    .get(link_id)
-                    .unwrap()
-                    .link_state_machine
-                    .test_set_state(LinkState::Active);
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "b.zpr",
+                    LinkState::Active,
+                );
 
                 // First timeout: no echo outstanding -> sends a fresh echo.
                 fire_current_timeout(&asm, link_id);
@@ -2993,127 +2594,6 @@ mod tests {
                     "restart must recycle the run loop, not stop run_with_reconnect"
                 );
                 vsconn_task.abort();
-            })
-            .await
-    }
-
-    /// zipline#170: tearing down an adapter's dock link must flush the
-    /// adapter's flow tables. Every ELT stream id and DLT entry was issued
-    /// by the node on the old docking session; a restarted node knows none
-    /// of them, so a surviving ELT entry sends on a stream id the node drops
-    /// (`Unknown Stream ID`) and never triggers a fresh bind. A Pending entry
-    /// orphaned by the closed link would block re-binding its flow forever.
-    /// Since #1410 the flush lives in `ActorAuthorization::link_down`, which
-    /// the link's cleanup calls; this drives the cleanup end to end.
-    #[tokio::test]
-    async fn test_adapter_dock_link_cleanup_flushes_elt_and_dlt() {
-        use crate::adapter_tables::{DltPep, EltPep};
-        use crate::defs::FiveTuple;
-        use crate::mgmt::core::new_heap_packet;
-        use crate::mgmt::txn_mgr::TxnMgr;
-        use zpr::packet_info::CompressionMode;
-
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let txn_mgr = Arc::new(TxnMgr::new());
-
-                // One Active ELT entry, as left behind by a completed bind.
-                let active_ft = FiveTuple {
-                    src_port: 1000,
-                    ..FiveTuple::default()
-                };
-                let txn = txn_mgr.try_open().unwrap();
-                asm.elt
-                    .insert_pending(active_ft, new_heap_packet(), &txn)
-                    .unwrap();
-                asm.elt
-                    .set_active(&active_ft, EltPep::new(CompressionMode::default(), 7, None))
-                    .unwrap();
-
-                // One Pending ELT entry, as left by a bind in flight at close.
-                let pending_ft = FiveTuple {
-                    src_port: 2000,
-                    ..FiveTuple::default()
-                };
-                let pending_txn = txn_mgr.try_open().unwrap();
-                asm.elt
-                    .insert_pending(pending_ft, new_heap_packet(), &pending_txn)
-                    .unwrap();
-
-                // One DLT entry, as installed by a node's bind_egress_stream.
-                let dlt_id = asm
-                    .dlt
-                    .insert(DltPep::new(crate::tc::Ip5TupleTc::new(active_ft), None))
-                    .unwrap();
-
-                let peer = asm.peer_table.get(link_id).unwrap();
-                peer.link_state_machine.test_set_state(LinkState::Closing);
-                let _ = peer.link_state_machine.clean_up_link_state(&asm);
-                drop(peer);
-
-                assert!(
-                    asm.elt.get(&active_ft).is_none(),
-                    "Active ELT entry must be flushed"
-                );
-                assert!(
-                    asm.elt.get(&pending_ft).is_none(),
-                    "Pending ELT entry must be flushed"
-                );
-                assert!(
-                    asm.elt.lookup_pending(&pending_txn).is_err(),
-                    "the flushed Pending entry's transaction must be forgotten too"
-                );
-                assert!(asm.dlt.get(dlt_id).is_none(), "DLT entry must be flushed");
-            })
-            .await
-    }
-
-    /// zipline#12: the OIDC IdPs a node advertises in HelloResponse are kept
-    /// on the adapter's link for the actor's evidence, and forgotten when
-    /// the link is cleaned up so a re-dock cannot use a stale list.
-    #[tokio::test]
-    async fn test_hello_response_oidc_idps_kept_until_cleanup() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
-                let idp = auth::OidcIdpInfo {
-                    issuer: "https://idp.test".to_string(),
-                    client_id: "test-client".to_string(),
-                    client_secret: None,
-                    scopes: vec!["openid".to_string()],
-                    allow_offline_access: false,
-                };
-                let peer = asm.peer_table.get(link_id).unwrap();
-                let link = &peer.link_state_machine;
-                {
-                    let mut fsm = link.locked_fsm.lock().unwrap();
-                    fsm.status = LinkStatus::Up;
-                    fsm.set_state(LinkState::Helloing);
-                }
-                link.process_hello_response(
-                    &asm,
-                    HelloResponse {
-                        status: ResponseCode::Success,
-                        aaa_address: Some(
-                            "fd5a:5052:0:aaa::1"
-                                .parse::<std::net::IpAddr>()
-                                .unwrap()
-                                .into(),
-                        ),
-                        oidc_idps: Some(vec![idp.clone()]),
-                        vs_bootstrap: false,
-                    },
-                )
-                .unwrap();
-                assert_eq!(link.oidc_idps().len(), 1);
-                assert_eq!(link.oidc_idps()[0].issuer, idp.issuer);
-
-                link.test_set_state(LinkState::Closing);
-                let _ = link.clean_up_link_state(&asm);
-                assert!(link.oidc_idps().is_empty());
             })
             .await
     }

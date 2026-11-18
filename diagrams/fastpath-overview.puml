@@ -17,7 +17,7 @@ end split
 :""forward()""; <<procedure>>
 
 switch (""egress_link"")
-case (link/docking session)
+case (link)
     :""substrate_egress()""; <<procedure>>
     :substrate ""send()""; <<output>>
     stop

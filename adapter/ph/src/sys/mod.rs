@@ -41,8 +41,9 @@ pub(crate) mod macos_ifconfig;
 // The manual add-address hint printed when a node ZPR address cannot be
 // applied to, or is missing from, the TUN device (zipline#161). Compiled on
 // every OS, same pattern and reason as `macos_route`: the per-platform
-// command strings stay unit-testable from Linux builds. Only `main.rs`
-// calls it, so the library's copy of the module is dead code by design.
+// command strings stay unit-testable from Linux builds. `main.rs` calls the
+// hints, and the Windows `add_address` calls `netsh_add_address_args`
+// (zl-zipline#272), so most of the library's copy is dead code by design.
 #[allow(dead_code)]
 pub(crate) mod addr_hint;
 

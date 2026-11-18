@@ -649,10 +649,10 @@ fn main() -> ExitCode {
             // hand-configured or script-configured device already carries
             // them and nothing is called; on macOS and Windows nobody else
             // addresses a node's TUN at all. On Windows this also installs
-            // the /128 visa-service host route, because `netsh add address`
-            // ignores the prefix and the address alone makes nothing
-            // on-link. Failure means the node cannot reach the visa service
-            // and every symptom would appear somewhere other than here, so
+            // the /128 visa-service host route (see
+            // `ensure_local_zpr_addrs_on_tun` for why). Failure means the
+            // node cannot reach the visa service and every symptom would
+            // appear somewhere other than here, so
             // refuse to start — naming the manual command that matches what
             // actually failed (PR #61 review): an address failure gets the
             // add-address command, a route failure the add-route command,
@@ -673,7 +673,7 @@ fn main() -> ExitCode {
                             "{e}; configure it manually with: {}",
                             sys::addr_hint::manual_add_address_hint(
                                 addr,
-                                ZPRNET_PREFIX_LEN as usize,
+                                ZPRNET_PREFIX_LEN,
                                 &ifname
                             )
                         );
@@ -718,7 +718,7 @@ fn main() -> ExitCode {
                          configure it with: {}",
                         sys::addr_hint::manual_add_address_hint(
                             addr,
-                            ZPRNET_PREFIX_LEN as usize,
+                            ZPRNET_PREFIX_LEN,
                             &ifname
                         )
                     );

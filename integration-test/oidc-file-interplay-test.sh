@@ -119,18 +119,30 @@ function assert_user_actor() {
 }
 
 # What the visa service logs once a trusted-service change has reconciled
-# the actors behind live visas (vs/src/event_mgr.rs).
+# the actors behind live visas, and when it then re-checks the visas
+# (vs/src/event_mgr.rs, the visa sweep).
 ACTORS_REFRESHED='trusted service changed: actors refreshed=[1-9]'
+VISA_SWEEP='visa sweep reason=AttributeChange'
 
 # Drive one deterministic refresh cycle: flush happyfile's file store
 # (TrustedServiceChange: reconcile stale or TTL-expired attributes on
-# actors behind live visas), and wait for the visa service to refresh an
-# actor, so the assertions after it read a refreshed actor.
+# actors behind live visas). Wait for the visa service to refresh an actor
+# and to re-check the visas, and assert that the re-check revoked none:
+# the lazy visa survives the refresh.
 function refresh_cycle() {
-  local REFRESHES
+  local REFRESHES SWEEPS
   REFRESHES=$(log_count vs.log "$ACTORS_REFRESHED")
+  SWEEPS=$(log_count vs.log "$VISA_SWEEP")
   vs_admin services --id happyfile --flush
-  wait_log_after 10 vs.log "$ACTORS_REFRESHED" "$REFRESHES" "the visa service refreshes zb's actor"
+  wait_log_after 10 vs.log "$ACTORS_REFRESHED" "$REFRESHES" "the visa service refreshes zb's actor" || return 1
+  wait_log_after 10 vs.log "$VISA_SWEEP" "$SWEEPS" "the visa service re-checks the visas" || return 1
+  if grep -E -- "$VISA_SWEEP" vs.log | tail -n 1 | grep -q ' revoked=0 '; then
+    echo "assertion OK: the re-check revokes no visa"
+  else
+    echo "ASSERTION FAILED: the re-check revoked a visa:"
+    grep -E -- "$VISA_SWEEP" vs.log | tail -n 1
+    return 1
+  fi
 }
 
 if [[ "$PASS" == 0 ]]; then
@@ -168,7 +180,12 @@ fi
 
 # TTL leg: wait out happyfile's expiration_seconds so the next reconcile
 # takes the TTL-expired path rather than the revision-moved one, then
-# assert again and check that the visa still carries traffic.
+# assert again and check that zb still reaches Web. The lazy visa is
+# bounded by happyfile's TTL, so it has expired by now; while a stream
+# bound before the expiry still outlives it (zl-zipline#274), this ping
+# rides that stream, and the actor assertions are the evidence. Once ph
+# drops an expired visa's streams, the ping needs a new lazy visa, which
+# only the refreshed attributes can get.
 if [[ "$PASS" == 0 ]]; then
   echo "== 5. waiting out happyfile's TTL (${HAPPYFILE_TTL}s + slack), then refresh"
   sleep $((HAPPYFILE_TTL + 5))

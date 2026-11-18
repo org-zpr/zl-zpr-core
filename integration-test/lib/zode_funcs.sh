@@ -880,18 +880,23 @@ function zb_actor() {
   vs_admin actors --addr "$ZB_ZPR_ADDR"
 }
 
-# Succeed when the visa service's actor of zb has attribute $1, with value
-# list $2 (JSON, e.g. '["user-a"]') if given. Returns 1 when it does not,
-# and 2 when there is no actor descriptor to tell (vs-admin failed, or its
-# answer has no `attrs` list), so a failed lookup never reads as a missing
-# attribute.
-function zb_actor_has() {
+# Run the jq condition $1 (with the --arg/--argjson options after it) on
+# the visa service's descriptor of zb's actor. Returns 0 when it holds, 1
+# when it does not, and 2 when there is no actor descriptor to tell
+# (vs-admin failed, or its answer has no `attrs` list), so a failed lookup
+# never reads as a missing attribute.
+function zb_actor_query() {
   local DESC
   DESC=$(zb_actor) || return 2
   jq -e '.attrs | type == "array"' > /dev/null 2>&1 <<< "$DESC" || return 2
-  jq -e --arg key "$1" --argjson value "${2:-null}" \
-    'any(.attrs[]; .key == $key and ($value == null or .value == $value))' \
-    > /dev/null <<< "$DESC" || return 1
+  jq -e "${@:2}" "$1" > /dev/null <<< "$DESC" || return 1
+}
+
+# Succeed when the visa service's actor of zb has attribute $1, with value
+# list $2 (JSON, e.g. '["user-a"]') if given; [zb_actor_query]'s statuses.
+function zb_actor_has() {
+  zb_actor_query 'any(.attrs[]; .key == $key and ($value == null or .value == $value))' \
+    --arg key "$1" --argjson value "${2:-null}"
 }
 
 # Assert that the visa service's actor of zb has attribute $2, with value
@@ -906,14 +911,15 @@ function assert_zb_actor() {
   fi
 }
 
-# Assert that the visa service's actor of zb has no attribute $2, and that
-# the visa service answered for it; $1 is the assertion message.
+# Assert that the visa service's actor of zb has no attribute whose key
+# starts with $2 (e.g. `user.`, the whole user namespace), and that the
+# visa service answered for it; $1 is the assertion message.
 function assert_zb_actor_lacks() {
   local RESULT=0
-  zb_actor_has "$2" || RESULT=$?
+  zb_actor_query 'any(.attrs[]; .key | startswith($prefix))' --arg prefix "$2" || RESULT=$?
   case "$RESULT" in
     1) echo "assertion OK: $1" ;;
-    0) echo "ASSERTION FAILED: $1 (the actor still has $2)" ;;
+    0) echo "ASSERTION FAILED: $1 (the actor still has an attribute $2*)" ;;
     *) echo "ASSERTION FAILED: $1 (no actor descriptor from the visa service)" ;;
   esac
   (( RESULT == 1 )) || { zb_actor || true; return 1; }

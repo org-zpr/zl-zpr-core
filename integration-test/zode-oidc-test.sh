@@ -18,12 +18,12 @@
 #      `ph-cli connect` on zb then presents a token with a key ID the visa
 #      service does not know: the visa service fetches the IdP's live JWKS
 #      once, admits the login, and the user flow is admitted.
-#   2. Revocation. A resident `ph-cli auth-agent` logs zb in, then
-#      `fake-idp.py --revoke-refresh` models the user withdrawing the
+#   2. Revocation. A resident `ph-cli auth-agent` logs zb in and renews
+#      the login once, then `fake-idp.py --revoke-refresh` models the user withdrawing the
 #      application's access. The next silent renewal presents the refresh
 #      grant and the IdP refuses it (`invalid_grant`). zb retries until the
 #      login expires and then logs the user out itself: the visa service's
-#      actor of zb loses the user's attributes, and a new user flow is
+#      actor of zb loses every user attribute, and a new user flow is
 #      denied while the device flow still works.
 #
 #      The leg binds no user flow while logged in. The visa service bounds
@@ -60,7 +60,7 @@ JWKS_FETCH_FAILED='JWKS refresh after validation failure failed'
 # answers 200, so a 400 is the revoked grant.
 REFRESH_REFUSED='"POST /token[^"]*" 400'
 
-# The login expires 60 s after it was granted; the first renewal is due
+# The login expires 60 s after its last renewal; the next renewal is due
 # 30 s in and is retried every 10 s, so the expiry comes at most about
 # 60 s after the grant is revoked. Generous for a slow runner.
 REVOCATION_WAIT=90
@@ -92,13 +92,21 @@ if [[ "$PASS" == 0 ]]; then
   drive_login_url agent.out 0 || PASS=1
   wait_log_after 15 zb.log "$LOGGED_IN" "$LOGINS" "the agent logs zb in" || PASS=1
   assert_zb_actor "the visa service's actor of zb carries the user's subject" user.oidc-subject '["user-zb"]' || PASS=1
+  # The grant works before it is revoked: the IdP refuses an unknown
+  # refresh token the same way as a revoked one.
+  RENEWALS=$(log_count zb.log "$RENEWED")
+  wait_log_after 45 zb.log "$RENEWED" "$RENEWALS" "the agent renews the login once with its refresh grant" || PASS=1
+fi
 
+if [[ "$PASS" == 0 ]]; then
+  REFUSALS=$(log_count idp-zb.log "$REFRESH_REFUSED")
+  FAILURES=$(log_count zb.log "$RENEWAL_FAILED: .*invalid_grant")
   python3 "$FAKE_IDP" --state-dir idp-state --revoke-refresh
-  wait_log_after "$REVOCATION_WAIT" idp-zb.log "$REFRESH_REFUSED" 0 "the IdP refuses the revoked refresh grant" || PASS=1
-  wait_log_after 15 zb.log "$RENEWAL_FAILED: .*invalid_grant" 0 "zb's silent renewal fails with invalid_grant" || PASS=1
+  wait_log_after "$REVOCATION_WAIT" idp-zb.log "$REFRESH_REFUSED" "$REFUSALS" "the IdP refuses the revoked refresh grant" || PASS=1
+  wait_log_after 15 zb.log "$RENEWAL_FAILED: .*invalid_grant" "$FAILURES" "zb's silent renewal fails with invalid_grant" || PASS=1
   wait_log_after "$REVOCATION_WAIT" zb.log "$EXPIRED" 0 "the login expires and zb logs the user out" || PASS=1
   assert_status 5 "Last failure: LoginExpired" "login-status: logged out, the login expired" || PASS=1
-  assert_zb_actor_lacks "the visa service's actor of zb lost the user's attributes" user.oidc-subject || PASS=1
+  assert_zb_actor_lacks "the visa service's actor of zb has no user attribute left" user. || PASS=1
   zode_no_ping zb "$RELAY_ZPR_ADDR" "a new user flow is denied" || PASS=1
   zode_ping zb "$VS_ZPR_ADDR" "the device flow still works: the machine stays connected" || PASS=1
 fi

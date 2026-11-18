@@ -107,10 +107,14 @@ Enter the integration-test container (host network; the capabilities and
 the apparmor opt-out are what TUN creation needs):
 
 ```sh
+# Where integration-test/vs points (a linked worktree's sibling checkout or a
+# build-set directory may lie outside the parent mounted below).
+VS_DIR=$(dirname "$(realpath integration-test/vs)")
 docker run --rm -it --network host \
   --cap-add=NET_ADMIN --cap-add=SYS_ADMIN --cap-add=NET_RAW \
   --security-opt apparmor=unconfined --device /dev/net/tun \
   -v "$(realpath ..)":"$(realpath ..)" -v "$WORK":"$WORK" -e WORK \
+  -v "$VS_DIR":"$VS_DIR" \
   -w "$PWD/integration-test" zpr-integration-test bash
 ```
 

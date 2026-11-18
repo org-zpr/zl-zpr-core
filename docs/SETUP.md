@@ -19,8 +19,8 @@ step here is unclear or has drifted.
 You need these binaries on hand:
 
 * `ph` from this repository (`make`, then `target/debug/ph`).
-* `vs` from the [zpr-visaservice repository](https://github.com/org-zpr/zpr-visaservice).
-* `zplc` from the [zpr-compiler repository](https://github.com/org-zpr/zpr-compiler),
+* `vs` from the [zl-zpr-visaservice repository](https://github.com/org-zpr/zl-zpr-visaservice).
+* `zplc` from the [zl-zpr-compiler repository](https://github.com/org-zpr/zl-zpr-compiler),
   unless you already have a compiled policy.
 
 Take `vs` and `zplc` from a build set compatible with this `ph` (see

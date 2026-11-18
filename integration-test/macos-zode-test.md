@@ -108,10 +108,14 @@ Enter the integration-test container (host network; the capabilities and
 the apparmor opt-out are what TUN creation needs):
 
 ```sh
+# Where integration-test/vs points (a linked worktree's sibling checkout or a
+# build-set directory may lie outside the parent mounted below).
+VS_DIR=$(dirname "$(realpath integration-test/vs)")
 docker run --rm -it --network host \
   --cap-add=NET_ADMIN --cap-add=SYS_ADMIN --cap-add=NET_RAW \
   --security-opt apparmor=unconfined --device /dev/net/tun \
   -v "$(realpath ..)":"$(realpath ..)" -v "$WORK":"$WORK" -e WORK \
+  -v "$VS_DIR":"$VS_DIR" \
   -w "$PWD/integration-test" zpr-integration-test bash
 ```
 
@@ -286,6 +290,7 @@ Then undo the changes to the Mac:
 ```sh
 # Only if section 3 trusted the IdP CA:
 sudo security remove-trusted-cert -d ~/zpr-zode/idp-ca.crt
+sudo security delete-certificate -c zpr-test-idp-ca /Library/Keychains/System.keychain
 # Only if a socketfilterfw rule was added:
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --remove ~/zpr-zode/ph
 ```

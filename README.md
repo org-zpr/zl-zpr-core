@@ -33,11 +33,11 @@ protocol) are libraries `ph` is built from.
 A ZPRnet needs more than this repository:
 
 * **A running visa service**, `vs`, from the
-  [zpr-visaservice repository](https://github.com/org-zpr/zpr-visaservice).
+  [zl-zpr-visaservice repository](https://github.com/org-zpr/zl-zpr-visaservice).
   Nothing connects without it: every link is authorized by a visa it issues.
   It needs Valkey (or Redis) at runtime.
 * **A compiled policy**, produced by `zplc` from the
-  [zpr-compiler repository](https://github.com/org-zpr/zpr-compiler).
+  [zl-zpr-compiler repository](https://github.com/org-zpr/zl-zpr-compiler).
   The visa service evaluates it.
 
 The **`zpr-dev-context`** repository, checked out beside this one, holds

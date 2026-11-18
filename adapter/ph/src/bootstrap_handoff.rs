@@ -807,11 +807,7 @@ mod tests {
 
     #[test]
     fn test_check_refuses_a_link_that_is_not_a_zode_link() {
-        for link_type in [
-            LinkType::NodeToAdapter,
-            LinkType::AdapterToNode,
-            LinkType::Internal,
-        ] {
+        for link_type in [LinkType::NodeToAdapter, LinkType::Internal] {
             let ctx = HandoffContext {
                 link_type,
                 ..good_ctx()

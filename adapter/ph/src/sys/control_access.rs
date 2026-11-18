@@ -1,7 +1,7 @@
 //! Platform-neutral pieces of control-channel access control
 //! (zipline#154). Compiled on every OS so the Windows DACL string and the
 //! warning wording stay unit-testable from Linux builds — the same pattern
-//! as `macos_route` in `sys/mod.rs`.
+//! as `macos_ifconfig` in `sys/mod.rs`.
 
 /// The startup warning for a configured `control_group` that does not
 /// exist on this host. One builder for both control arms (posix socket,

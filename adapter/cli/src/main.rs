@@ -274,30 +274,15 @@ async fn process_command(command: Commands, socket: &PathBuf) -> Result<bool, Cl
                 Commands::Link(link) => match link.command {
                     LinkCommands::Show { id: None } => show_link_summary_task(service).await?,
                     LinkCommands::Show { id: Some(id) } => show_link_task(service, id).await?,
-                    LinkCommands::Configure { id } => configure_link_task(service, id).await?,
                     LinkCommands::Start { id } => start_link_task(service, id).await?,
                     LinkCommands::Stop { id } => stop_link_task(service, id).await?,
                     LinkCommands::Reset { id } => reset_link_task(service, id).await?,
                 },
                 Commands::Logging { logs } => change_logging_task(service, logs).await?,
                 Commands::Tun => get_tun_info_task(service).await?,
-                Commands::Connect {
-                    id: Some(id),
-                    no_browser,
-                } => connect_task(service, id, no_browser).await?,
-                Commands::AuthAgent {
-                    id: Some(id),
-                    no_browser,
-                } => auth_agent_task(service, id, no_browser).await?,
-                // zl-zipline#233: no link id logs in on a Zode.
-                Commands::Connect {
-                    id: None,
-                    no_browser,
-                } => login_task(service, no_browser, false).await?,
-                Commands::AuthAgent {
-                    id: None,
-                    no_browser,
-                } => login_task(service, no_browser, true).await?,
+                // zl-zipline#233: `connect` and `auth-agent` log the Zode in.
+                Commands::Connect { no_browser } => login_task(service, no_browser, false).await?,
+                Commands::AuthAgent { no_browser } => login_task(service, no_browser, true).await?,
                 Commands::Logout => logout_task(service).await?,
                 Commands::LoginStatus => login_status_task(service).await?,
                 Commands::OidcLogin { .. } => unreachable!("handled before connecting"),
@@ -331,124 +316,6 @@ async fn oidc_login_task(
     }
 }
 
-/// How long `connect` waits for the actor to be authorized. Slightly above
-/// ph's 300 s user-interaction window (`OIDC_USER_INTERACTION_TIMEOUT`), so
-/// ph decides the outcome and this deadline only catches a wedged link.
-const CONNECT_DEADLINE: Duration = Duration::from_secs(330);
-
-/// How often `connect` polls `showLink` while waiting for the outcome.
-const CONNECT_POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-/// `connect`: start a link, supplying this process as its AuthAgent
-/// (`AuthAgent` in adapter/admin-api/cli.capnp), and hold the RPC
-/// connection open so the packet handler's `getOidcCredential` callback can reach us while the link authenticates.
-///
-/// `startLink` returns as soon as the Start event is accepted, so the
-/// outcome is observed by polling `showLink` until the state is `Active`
-/// (exit 0) or `Error` (exit per the failure-class contract: 2 declined,
-/// 3 timeout, 4 IdP unreachable, 5 VS rejected token, 6 policy denied,
-/// 7 device blob rejected, 1 anything else). On a device-only link the
-/// agent is supplied but never called and the link simply comes up.
-///
-/// ph only accepts Start from Inactive; any other state answers
-/// `UnexpectedTransition`, but the agent is registered by then (zipline#111).
-/// A link tearing down (e.g. before its holddown restart) is retried until
-/// Start is accepted. An attempt already in flight authenticates with our
-/// agent, so its outcome is polled like our own. An already-Active link is
-/// still an error on the first call, but a success on a retry: an attempt
-/// ran between two retries and came up with our agent.
-async fn connect_task(service: svc::Client, id: u32, no_browser: bool) -> Result<(), CliError> {
-    println!("Connecting link {id}…");
-    let deadline = tokio::time::Instant::now() + CONNECT_DEADLINE;
-    let mut first_attempt = true;
-    loop {
-        let mut request = service.start_link_request();
-        request.get().set_id(id);
-        // Register the agent on the first call only. It stays on the link
-        // for the link's lifetime, so retries must not spawn another bridge.
-        // The agent prints its own progress ("Authentication with <issuer>
-        // required…") when — and only when — ph calls back for a credential,
-        // since the issuer is not known until then.
-        if first_attempt {
-            request
-                .get()
-                .set_auth_agent(capnp_rpc::new_client(interactive_auth_agent(no_browser)));
-        }
-
-        let response = request.send().promise.await?;
-        let results = response.get()?;
-        let cli::success_or_error::Which::Error(e) = results.get_result()?.which()? else {
-            break; // Start accepted.
-        };
-        let msg = e?.get_txt()?.to_string()?;
-        match oidc::classify_start_link_error(&msg) {
-            oidc::StartLinkError::AlreadyActive if !first_attempt => {
-                println!("Link {id} up");
-                return Ok(());
-            }
-            oidc::StartLinkError::InFlight => {
-                println!("Link {id} already connecting; waiting for that attempt");
-                break;
-            }
-            oidc::StartLinkError::TearingDown if tokio::time::Instant::now() < deadline => {
-                println!(
-                    "Link {id} not startable yet ({}), retrying…",
-                    msg.trim_end()
-                );
-            }
-            class => {
-                // A TearingDown that reaches this arm means the deadline
-                // expired while the link stayed in teardown — the wedged
-                // link CONNECT_DEADLINE exists to catch — so it reports the
-                // documented timeout outcome (exit 3), matching the polling
-                // loop below. Everything else is a generic failure (exit 1).
-                let code = oidc::exit_code_for_start_link_giveup(&class);
-                if code == 3 {
-                    eprintln!(
-                        "connect failed: timed out waiting for link {id} to come up ({})",
-                        msg.trim_end()
-                    );
-                } else {
-                    eprintln!("connect failed: {msg}");
-                }
-                std::process::exit(code);
-            }
-        }
-        first_attempt = false;
-        sleep(CONNECT_POLL_INTERVAL).await;
-    }
-
-    // Started. Poll showLink for the outcome; the RpcSystem stays alive on
-    // this LocalSet the whole time, serving getOidcCredential callbacks.
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            eprintln!("connect failed: timed out waiting for link {id} to come up");
-            std::process::exit(3);
-        }
-        sleep(CONNECT_POLL_INTERVAL).await;
-
-        let mut show = service.show_link_request();
-        show.get().set_id(id);
-        let response = show.send().promise.await?;
-        let text = response.get()?.get_result()?.to_string()?;
-        match oidc::parse_show_link_state(&text) {
-            oidc::LinkOutcome::Up => {
-                println!("Link {id} up");
-                return Ok(());
-            }
-            oidc::LinkOutcome::Failed(reason) => {
-                if reason.is_empty() {
-                    eprintln!("connect failed: link {id} is in the Error state");
-                } else {
-                    eprintln!("connect failed: {reason}");
-                }
-                std::process::exit(oidc::exit_code_for_auth_failure(&reason));
-            }
-            oidc::LinkOutcome::Pending => {}
-        }
-    }
-}
-
 /// Build the interactive [`oidc::CliAuthAgent`] shared by `connect` and
 /// `auth-agent`: `--no-browser` prints authorization URLs through the
 /// progress path instead of launching a browser.
@@ -456,52 +323,16 @@ fn interactive_auth_agent(no_browser: bool) -> oidc::CliAuthAgent {
     oidc::CliAuthAgent::new(!no_browser, None)
 }
 
-/// `auth-agent`: register as the authentication agent for a link and serve
-/// interactive OIDC requests until SIGINT.
-///
-/// Registration goes through `startLink` with the agent capability: ph
-/// registers the agent before firing the Start event, so on a link that is
-/// already started the resulting `UnexpectedTransition` error is benign and
-/// tolerated (see [oidc::start_link_error_is_fatal]).
-async fn auth_agent_task(service: svc::Client, id: u32, no_browser: bool) -> Result<(), CliError> {
-    let mut request = service.start_link_request();
-    request.get().set_id(id);
-    request
-        .get()
-        .set_auth_agent(capnp_rpc::new_client(interactive_auth_agent(no_browser)));
-
-    let response = request.send().promise.await?;
-    let results = response.get()?;
-    match results.get_result()?.which()? {
-        cli::success_or_error::Which::Success(_) => {
-            println!("Registered as authentication agent for link {id} (link started)");
-        }
-        cli::success_or_error::Which::Error(e) => {
-            let msg = e?.get_txt()?.to_string()?;
-            if oidc::start_link_error_is_fatal(&msg) {
-                eprintln!("auth-agent registration failed: {msg}");
-                std::process::exit(1);
-            }
-            println!("Registered as authentication agent for already-started link {id}");
-        }
-    }
-
-    println!("Serving authentication requests until interrupted (Ctrl-C)…");
-    tokio::signal::ctrl_c().await?;
-    println!("auth-agent: interrupted, exiting");
-    Ok(())
-}
-
 /// The exit code of a failed Zode `login` (zl-zipline#233). ph answers
-/// with the AuthFailureReason spelling, so the codes are those of a link
-/// `connect`; ph's own refusals ("already logged in", "not a Zode") are 1.
+/// with the AuthFailureReason spelling ([oidc::exit_code_for_auth_failure]);
+/// ph's own refusals ("already logged in") are 1.
 fn login_exit_code(error_text: &str) -> i32 {
     oidc::exit_code_for_auth_failure(error_text)
 }
 
-/// `connect` / `auth-agent` without a link id on a Zode (zl-zipline#233):
-/// log the Zode's own actor in with an interactive agent, served over this
-/// connection while `login` is pending. `connect` then exits;
+/// `connect` / `auth-agent` (zl-zipline#233): log the Zode's own actor
+/// in with an interactive agent, served over this connection while
+/// `login` is pending. `connect` then exits;
 /// `auth-agent` (`resident`) stays until Ctrl-C so ph can ask it for
 /// silent renewals and, after the visa service drops the login, for a new
 /// login. A failure exits with [login_exit_code].
@@ -792,16 +623,6 @@ async fn show_link_task(service: svc::Client, id: u32) -> Result<(), CliError> {
     let response = request.send().promise.await?;
     let results = response.get()?;
     println!("{}", results.get_result()?.to_str()?);
-
-    Ok(())
-}
-
-async fn configure_link_task(service: svc::Client, id: u32) -> Result<(), CliError> {
-    let mut request = service.show_link_request();
-    request.get().set_id(id);
-
-    request.send().promise.await?;
-    println!("Command currently unsupported");
 
     Ok(())
 }

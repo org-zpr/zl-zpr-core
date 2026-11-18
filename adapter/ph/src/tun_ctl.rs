@@ -22,6 +22,8 @@ pub trait TunCtl: Sync {
     fn add_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()>;
 
     /// Add AAA as a valid but non-preferred source; authentication binds it explicitly.
+    // AAA kept unused in v1 (zodes plan §5.4)
+    #[cfg_attr(not(test), allow(dead_code))]
     fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()>;
 
     /// Clear an IP address from the TUN device.  Does not error if address is not set to begin with.
@@ -33,15 +35,6 @@ pub trait TunCtl: Sync {
     /// inspect (currently IPv4 on both Linux and macOS), which callers must
     /// distinguish from a definite "not present".
     fn has_address(&self, addr: IpAddr) -> Result<bool>;
-
-    /// Ensure `dest/prefix_len` is routed on-link via the TUN device.
-    ///
-    /// Idempotent: installing a route that is already present is not an
-    /// error. Used on link activation to give every adapter a return route
-    /// covering the whole ZPR internal network, so replies to peers on
-    /// fabric-assigned (dynamic-pool) addresses have somewhere to go
-    /// (zipline#88).
-    fn add_route(&self, dest: IpAddr, prefix_len: u8) -> Result<()>;
 
     /// Tear the TUN device down on graceful shutdown, releasing whatever
     /// state outlives the process on this platform (zipline#130).
@@ -59,18 +52,6 @@ pub trait TunCtl: Sync {
     fn teardown(&self) -> Result<()> {
         Ok(())
     }
-
-    /// Report the name of another **live** interface that already carries
-    /// the route for `dest/prefix_len`, if any (zipline#101).
-    ///
-    /// Only one adapter per host can own the ZPR internal network: a
-    /// second adapter whose route loses to another interface docks,
-    /// activates, and then silently receives no traffic. `Ok(None)` means
-    /// the route is absent, on our own TUN, or (Linux) only on a
-    /// `linkdown` interface; `Ok(Some(ifname))` names the conflicting
-    /// owner. `Err` means the routing table could not be queried at all —
-    /// callers must treat that as "unknown", not as a conflict.
-    fn route_owner_conflict(&self, dest: IpAddr, prefix_len: u8) -> Result<Option<String>>;
 }
 
 /// Canonical implementation of the `TunCtl` interface, just a thin wrapper
@@ -104,9 +85,6 @@ impl TunCtl for TunCtlImpl {
     fn has_address(&self, addr: IpAddr) -> Result<bool> {
         self.tun.has_address(addr)
     }
-    fn add_route(&self, dest: IpAddr, prefix_len: u8) -> Result<()> {
-        self.tun.add_route(dest, prefix_len)
-    }
     /// Windows only: the Wintun session is shut down so the ring quiesces;
     /// see `sys/windows/zprtun.rs` for why the adapter device itself is
     /// removed by the OS at process exit rather than from here. The unix
@@ -115,8 +93,5 @@ impl TunCtl for TunCtlImpl {
     #[cfg(windows)]
     fn teardown(&self) -> Result<()> {
         self.tun.teardown()
-    }
-    fn route_owner_conflict(&self, dest: IpAddr, prefix_len: u8) -> Result<Option<String>> {
-        self.tun.route_owner_conflict(dest, prefix_len)
     }
 }

@@ -104,56 +104,37 @@ pub enum Commands {
     /// `utun7` on macOS); each further line is one ZPR address confirmed on
     /// that interface.
     Tun,
-    /// Connect (start) a link, authenticate interactively if the packet
-    /// handler asks, then exit reporting the outcome.
+    /// Log this Zode in (you, on this machine), authenticating
+    /// interactively, then exit reporting the outcome.
     ///
-    /// On a Zode, run it without a link id: it logs the Zode in (you, on
-    /// this machine) and exits. The login lasts until it expires, because
-    /// nothing is left to renew it silently; use `auth-agent` for that.
+    /// The login lasts until it expires, because nothing is left to renew
+    /// it silently; use `auth-agent` for that.
     ///
-    /// For scripts and CI: it blocks until the link is up or the attempt
-    /// fails and says which through its exit code (2 declined, 3 timeout,
-    /// 4 IdP unreachable, 5 visa service rejected the token, 6 policy
-    /// denied, 7 device blob rejected).
-    ///
-    /// The authentication agent it registers dies with this process, so it
-    /// cannot serve a later credential request. For an interactive session
-    /// use `auth-agent`, which stays resident — and do not run `connect` on
-    /// a link that already has one, because the registration overwrites it
-    /// and replaces a live agent with one that is about to exit.
+    /// For scripts and CI: it blocks until the login succeeds or fails and
+    /// says which through its exit code (2 declined, 3 timeout, 4 IdP
+    /// unreachable, 5 visa service rejected the token, 6 policy denied).
     #[command(verbatim_doc_comment)]
     Connect {
-        /// Id of an adapter-side link to connect; omit it to log this Zode in
-        id: Option<u32>,
         /// Print authentication URLs instead of opening a browser
         #[arg(long)]
         no_browser: bool,
     },
-    /// Start a link and stay resident serving its authentication requests.
-    /// This is how a human logs in.
+    /// Log this Zode in and stay resident serving its authentication
+    /// requests. This is how a human logs in.
     ///
     /// The browser opens once, and the process then runs until interrupted
-    /// (Ctrl-C). It does not report the link's outcome — use
-    /// `link show <id>`, which also reports the authentication expiry.
+    /// (Ctrl-C). `login-status` reports the login and its expiry.
     ///
     /// Keeping this process resident is what makes silent renewal happen:
     /// when a renewal comes due, the packet handler asks this agent for a
-    /// fresh credential (zipline#66) and it is served from the refresh
-    /// token held in memory, with no browser. The browser paste is
-    /// therefore needed once per session ceiling (max_auth_age_seconds),
-    /// not once per expiration_seconds.
-    ///
-    /// On a Zode, run it without a link id: it logs the Zode in and stays
-    /// resident to renew the login silently. If the visa service drops the
-    /// login (a reconnect or restart), it asks you to log in again.
+    /// fresh credential and it is served from the refresh token held in
+    /// memory, with no browser. If the visa service drops the login (a
+    /// reconnect or restart), it asks you to log in again.
     ///
     /// Under sudo, pass --no-browser and paste the printed URL into your own
     /// browser: a root process cannot usefully open one.
     #[command(verbatim_doc_comment)]
     AuthAgent {
-        /// Id of an adapter-side link to serve as authentication agent for;
-        /// omit it to log this Zode in
-        id: Option<u32>,
         /// Print authentication URLs instead of opening a browser
         #[arg(long)]
         no_browser: bool,
@@ -236,13 +217,11 @@ pub struct LinkArgs {
 pub enum LinkCommands {
     /// Show a link's status
     Show { id: Option<u32> },
-    /// Configure a link
-    Configure { id: u32 },
     /// Start a link
     Start { id: u32 },
     /// Stop a link
     Stop { id: u32 },
-    /// Reset a link.  It will require a configure before starting again
+    /// Reset a link
     Reset { id: u32 },
 }
 
@@ -264,34 +243,32 @@ mod tests {
     use super::*;
     use admin_api::control_socket_path;
 
-    /// `auth-agent <id> --no-browser` must parse, setting the flag
+    /// `auth-agent --no-browser` must parse, setting the flag
     /// (zipline#20).
     #[test]
     fn auth_agent_accepts_no_browser_flag() {
-        let parsed = CmdlineArgs::try_parse_from(["ph-cli", "auth-agent", "1", "--no-browser"]);
+        let parsed = CmdlineArgs::try_parse_from(["ph-cli", "auth-agent", "--no-browser"]);
         match parsed {
             Ok(CmdlineArgs {
-                command: Some(Commands::AuthAgent { id, no_browser }),
+                command: Some(Commands::AuthAgent { no_browser }),
                 ..
             }) => {
-                assert_eq!(id, Some(1));
                 assert!(no_browser);
             }
             other => panic!("auth-agent should accept --no-browser: {other:?}"),
         }
     }
 
-    /// Without the flag, `auth-agent <id>` still parses with the flag
-    /// defaulting off.
+    /// Without the flag, `auth-agent` still parses with the flag defaulting
+    /// off.
     #[test]
     fn auth_agent_parses_without_no_browser_flag() {
-        let parsed = CmdlineArgs::try_parse_from(["ph-cli", "auth-agent", "1"]);
+        let parsed = CmdlineArgs::try_parse_from(["ph-cli", "auth-agent"]);
         match parsed {
             Ok(CmdlineArgs {
-                command: Some(Commands::AuthAgent { id, no_browser }),
+                command: Some(Commands::AuthAgent { no_browser }),
                 ..
             }) => {
-                assert_eq!(id, Some(1));
                 assert!(!no_browser, "--no-browser must default off");
             }
             other => panic!("auth-agent without --no-browser should parse: {other:?}"),
@@ -368,28 +345,31 @@ mod tests {
         }
     }
 
-    /// zl-zipline#233: on a Zode, `connect` and `auth-agent` take no link id
-    /// and log the Zode in; with an id they start that link as before.
+    /// zl-zipline#234: `connect` and `auth-agent` take no link id (they
+    /// log the Zode in), so a link id is refused; `link configure` is gone.
     #[test]
-    fn connect_and_auth_agent_take_an_optional_link_id() {
-        for (args, want_id, want_resident) in [
-            (vec!["ph-cli", "connect"], None, false),
-            (vec!["ph-cli", "connect", "--no-browser"], None, false),
-            (vec!["ph-cli", "connect", "3"], Some(3), false),
-            (vec!["ph-cli", "auth-agent"], None, true),
-            (vec!["ph-cli", "auth-agent", "--no-browser"], None, true),
-            (vec!["ph-cli", "auth-agent", "3"], Some(3), true),
+    fn connect_and_auth_agent_take_no_link_id() {
+        for args in [
+            vec!["ph-cli", "connect"],
+            vec!["ph-cli", "connect", "--no-browser"],
+            vec!["ph-cli", "auth-agent"],
+            vec!["ph-cli", "auth-agent", "--no-browser"],
         ] {
             let parsed = CmdlineArgs::try_parse_from(&args).expect("parses");
-            match parsed.command {
-                Some(Commands::Connect { id, .. }) if !want_resident => {
-                    assert_eq!(id, want_id, "{args:?}")
-                }
-                Some(Commands::AuthAgent { id, .. }) if want_resident => {
-                    assert_eq!(id, want_id, "{args:?}")
-                }
-                other => panic!("{args:?} parsed to {other:?}"),
-            }
+            assert!(
+                matches!(
+                    parsed.command,
+                    Some(Commands::Connect { .. } | Commands::AuthAgent { .. })
+                ),
+                "{args:?}"
+            );
+        }
+        for args in [
+            vec!["ph-cli", "connect", "3"],
+            vec!["ph-cli", "auth-agent", "3"],
+            vec!["ph-cli", "link", "configure", "3"],
+        ] {
+            assert!(CmdlineArgs::try_parse_from(&args).is_err(), "{args:?}");
         }
     }
 

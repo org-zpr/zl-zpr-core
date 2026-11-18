@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::*;
 
-mod actor_activation;
 mod actor_auth;
 mod actor_renewal;
 mod adapter_manager_worker;
@@ -438,7 +437,6 @@ fn main() -> ExitCode {
     //
 
     let asm = Arc::new(Assembly {
-        actor_rejected: std::sync::atomic::AtomicBool::new(false),
         topology_config,
         mgmt_substrate_egress: MgmtSubstrateEgress::new(mgmt_substrate_inq),
         actor_output_requeue: ActorOutputRequeue::new(actor_requeue_inqs),
@@ -474,10 +472,7 @@ fn main() -> ExitCode {
         certx: Some(certx),
         system_start_time,
         address_pool: std::sync::Mutex::new(None),
-        configured_zpr_addr_demand: config.zpr_addr.clone(),
         config: rcu::RcuBox::new(config),
-        fatal_error: Mutex::new(None),
-        fatal_notify: tokio::sync::Notify::new(),
         logging: Mutex::new(logging_map),
         reload_handle,
     });
@@ -582,26 +577,6 @@ fn main() -> ExitCode {
     //
 
     let mut js = JoinSet::new();
-
-    // zipline#83: a worker can declare the process dead (e.g. the fabric
-    // granted a ZPR address differing from the configured --zpr-addr).
-    // Exit non-zero with the message on stderr — a misaddressed adapter
-    // must not keep running looking healthy.
-    {
-        let asm = asm.clone();
-        js.spawn_local(async move {
-            asm.fatal_notify.notified().await;
-            let msg = asm
-                .get_fatal_error()
-                .unwrap_or_else(|| "unspecified fatal error".to_string());
-            error!(target: STARTUP, "fatal: {msg}");
-            eprintln!("ph: fatal: {msg}");
-            // Give the link teardown a moment to put the Terminate on the
-            // wire, then exit hard: this is unrecoverable by design.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            process::exit(1);
-        });
-    }
 
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(mgmt_dispatch_worker::launch(asm.clone(), md_outq, mhd_outq));

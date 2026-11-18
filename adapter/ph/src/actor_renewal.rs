@@ -18,10 +18,6 @@
 //! - The visa service can also ask for a re-auth at once, e.g. after a
 //!   policy change ([request_renewal_now]).
 //!
-//! Adapter side: [receive_renew_request] answers with one blob per
-//! authority namespace the actor authenticated with — a self-signed device
-//! leg and/or an OIDC user leg obtained NON-interactively from the AuthAgent.
-//!
 //! A failed renewal never tears the link down; the existing expiry is left
 //! to the visa service's sweep.
 
@@ -143,12 +139,6 @@ struct RenewalData {
     /// request. The response must echo exactly these bytes; taken on
     /// completion or attempt timeout.
     challenge: Option<[u8; 48]>,
-    /// Adapters only: the task awaiting the AuthAgent's answer to the
-    /// current renewal request. A new request supersedes it: the node only
-    /// retries after abandoning its previous attempt, so the old task is
-    /// aborted — dropping its reply receiver, which the agent bridge
-    /// observes and uses to cancel the in-flight RPC (PR #17 review).
-    adapter_task: Option<tokio::task::AbortHandle>,
     /// Nodes only: the one-shot "renewal due but nothing can renew it"
     /// warning has fired for the current authentication window.
     no_agent_warned: bool,
@@ -220,14 +210,10 @@ impl RenewalState {
     }
 
     /// Forget everything about the current actor session. Called when the
-    /// link goes down: on an adapter the actor object outlives the link, and
-    /// a new session must not inherit the old one's namespaces or tasks.
+    /// link goes down, so a new session does not inherit the old one's
+    /// namespaces or challenge.
     pub fn reset(&self) {
-        let mut data = self.data.lock().unwrap();
-        if let Some(task) = data.adapter_task.take() {
-            task.abort();
-        }
-        *data = RenewalData::default();
+        *self.data.lock().unwrap() = RenewalData::default();
     }
 
     /// Stash the challenge minted for an in-flight renewal request.
@@ -574,147 +560,6 @@ fn send_credential_request(asm: &Arc<Assembly>, link_id: LinkId, auth_expires: S
     });
 }
 
-/// R8 (zipline#66) / N2 (zipline#122), adapter side: the node asked for a
-/// renewed credential. Answer with one blob per namespace the actor
-/// authenticated with (K4): the SS (device) leg signs the fresh challenge
-/// with the bootstrap key synchronously; the OIDC (user) leg goes through
-/// the registered AuthAgent with `interactive: false`. If any required leg
-/// is unproducible — no bootstrap key, no agent, no advertised IdP, agent
-/// failure — the answer is [AuthenticationStatus::Retryable] with no blob
-/// rather than a partial set, so the node records why renewal is impossible.
-pub fn receive_renew_request(
-    asm: &Arc<Assembly>,
-    link_id: LinkId,
-    payload: auth::ZdpInitAuthenticationPayload,
-) -> HandleMgmtResult {
-    let peer = asm
-        .peer_table
-        .get(link_id)
-        .ok_or(HandleMgmtError::LinkClosed)?;
-    // Renewal runs on an Active link with an authorized actor.
-    if peer.link_state_machine.get_link_type() != LinkType::AdapterToNode
-        || peer.link_state_machine.get_state() != LinkState::Active
-    {
-        return Err(HandleMgmtError::MessageNotPermitted);
-    }
-    let actor = peer.actor_auth.clone();
-    let idp = peer.link_state_machine.oidc_idps().into_iter().next();
-    drop(peer);
-
-    // Assembled before any answer so every response — success or failure —
-    // echoes it for correlation on the node side (PR #17 review).
-    let challenge = payload.challenge_bytes();
-    let refuse = |why: &str| {
-        info!(target: LINK_STATE, "{}: {why}; answering renewal as unavailable", asm.formatted_link_id(link_id));
-        mgmt::requests::send_renew_authentication_response(
-            asm,
-            link_id,
-            AuthenticationStatus::Retryable,
-            &challenge,
-            &[],
-        )
-        .enqueue();
-        Ok(())
-    };
-
-    // A new request supersedes any still-outstanding agent call: the node
-    // only retries after abandoning its previous attempt.
-    if let Some(task) = actor.renewal.data.lock().unwrap().adapter_task.take() {
-        debug!(target: LINK_STATE, "{}: a new renewal request supersedes the outstanding one; cancelling it", asm.formatted_link_id(link_id));
-        task.abort();
-    }
-
-    // Which legs to produce: one blob per namespace the actor authenticated
-    // with. An actor with no recorded set is treated as user-only, the
-    // pre-zipline#122 OIDC behavior.
-    let namespaces = actor
-        .renewal
-        .namespaces()
-        .unwrap_or_else(|| [auth::AuthNamespace::User].into());
-    let need_oidc = namespaces.contains(&auth::AuthNamespace::User);
-
-    let ss_blob = if namespaces.contains(&auth::AuthNamespace::Device) {
-        let signed = asm
-            .config
-            .get()
-            .bootstrap
-            .as_ref()
-            .map(|bs| bs.authenticate_blob(&payload));
-        match signed {
-            Some(Ok(blob)) => Some(AuthBlob::SelfSigned(blob)),
-            Some(Err(e)) => {
-                warn!(target: LINK_STATE, "{}: failed to sign the renewal challenge: {e:?}", asm.formatted_link_id(link_id));
-                return refuse("device leg required but the bootstrap key cannot sign it");
-            }
-            None => return refuse("device leg required but no bootstrap key is configured"),
-        }
-    } else {
-        None
-    };
-
-    if !need_oidc {
-        // Device-only: every leg is in hand, answer synchronously.
-        let blob = auth::encode_blobs(&[ss_blob.expect("device namespace holds here")]);
-        mgmt::requests::send_renew_authentication_response(
-            asm,
-            link_id,
-            AuthenticationStatus::Success,
-            &challenge,
-            blob.as_bytes(),
-        )
-        .enqueue();
-        return Ok(());
-    }
-
-    let (Some(agent), Some(idp)) = (actor.auth_agent(), idp) else {
-        return refuse("no AuthAgent or advertised IdP can produce the user leg");
-    };
-
-    let task_asm = asm.clone();
-    let task_actor = actor.clone();
-    let task = tokio::task::spawn_local(async move {
-        // The bridge bounds each call by OIDC_USER_INTERACTION_TIMEOUT and
-        // answers or drops the reply either way; this bound is a backstop.
-        let outcome = auth_agent::request_oidc_blob(
-            &agent,
-            idp,
-            &challenge,
-            false, // renewal must never open a browser
-            config::OIDC_USER_INTERACTION_TIMEOUT,
-        )
-        .await;
-        let (status, blob) = match outcome {
-            Ok(oidc_blob) => {
-                // The SS leg (when required) rides alongside the OIDC leg,
-                // both bound to the same echoed challenge (K4).
-                let mut blobs: Vec<AuthBlob> = ss_blob.into_iter().collect();
-                blobs.push(AuthBlob::Oidc(oidc_blob));
-                (AuthenticationStatus::Success, auth::encode_blobs(&blobs))
-            }
-            Err(reason) => {
-                if reason == AuthFailureReason::NoAgent {
-                    // The bridge task is gone: clear the stale slot (C2).
-                    task_actor.clear_auth_agent_if(&agent);
-                }
-                warn!(target: LINK_STATE, "{}: AuthAgent could not renew the credential: {reason:?}", task_asm.formatted_link_id(link_id));
-                (AuthenticationStatus::Retryable, String::new())
-            }
-        };
-        mgmt::requests::send_renew_authentication_response(
-            &task_asm,
-            link_id,
-            status,
-            &challenge,
-            blob.as_bytes(),
-        )
-        .enqueue();
-    });
-    // Remember the wait task so the NEXT request can cancel it. Aborting an
-    // already-finished task is a no-op, so a stale handle here is harmless.
-    actor.renewal.data.lock().unwrap().adapter_task = Some(task.abort_handle());
-    Ok(())
-}
-
 /// R8 (zipline#66) / N2 (zipline#122), node side: the adapter answered the
 /// renewal request. Verify the returned blob array against the stashed
 /// challenge — the namespace set must EQUAL the set the actor
@@ -900,21 +745,16 @@ mod tests {
         (Arc::new(create_assembly(builder)), egress_rx)
     }
 
-    /// A config carrying the test bootstrap key (CN `test.cn.zpr`), so the
-    /// adapter can sign the SS (device) leg.
-    fn bootstrap_config() -> config::Config {
-        let mut config = <config::Config as std::default::Default>::default();
-        config.bootstrap = Some(bootstrap());
-        config
-    }
-
-    /// The test bootstrap key, for signing SS blobs by hand.
-    fn bootstrap() -> auth::RsaBootstrapAuth {
-        let mut keypath = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        keypath.push("tests");
-        keypath.push("data");
-        keypath.push("rsa-key.pem");
-        auth::RsaBootstrapAuth::new("test.cn.zpr", &keypath).unwrap()
+    /// A self-signed (device) blob answering `payload`. The node never
+    /// checks its signature: the visa service verifies identity.
+    fn ss_blob(payload: &auth::ZdpInitAuthenticationPayload) -> auth::ZdpSelfSignedBlob {
+        auth::ZdpSelfSignedBlob {
+            blob_type: auth::BLOB_TYPE_SS.to_string(),
+            ts: 0,
+            cn: "test.cn.zpr".to_string(),
+            challenge: BASE64_STANDARD.encode(payload.challenge_bytes()),
+            sig: String::new(),
+        }
     }
 
     /// Insert a peer of `link_type` in `state` and return its link id. Each
@@ -938,24 +778,15 @@ mod tests {
         link_id
     }
 
-    /// An Active adapter-side (AdapterToNode) peer.
-    fn add_adapter_peer(asm: &Arc<Assembly>) -> LinkId {
-        add_peer(asm, LinkType::AdapterToNode, LinkState::Active)
+    /// An Active peer that is not the node side of a dock (a Zode link), so
+    /// its actor renews through a local AuthAgent rather than over ZDP.
+    fn add_agent_peer(asm: &Arc<Assembly>) -> LinkId {
+        add_peer(asm, LinkType::NodeToNode, LinkState::Active)
     }
 
     /// An Active node-side (NodeToAdapter) peer.
     fn add_node_peer(asm: &Arc<Assembly>) -> LinkId {
         add_peer(asm, LinkType::NodeToAdapter, LinkState::Active)
-    }
-
-    /// A fixed challenge payload. The adapter side does not verify the HMAC
-    /// (the node minted it), so arbitrary bytes are fine.
-    fn test_challenge_payload() -> auth::ZdpInitAuthenticationPayload {
-        auth::ZdpInitAuthenticationPayload {
-            nonce: [7u8; 8],
-            ctime: 424242u64.into(),
-            hmac: [9u8; 32],
-        }
     }
 
     /// The payload whose challenge bytes are `challenge`.
@@ -1014,17 +845,6 @@ mod tests {
             .ok()
     }
 
-    /// Yield until a packet egresses (the adapter answers from a task).
-    async fn recv_egress(rx: &mut Egress) -> Option<Packet> {
-        for _ in 0..50 {
-            tokio::task::yield_now().await;
-            if let Some(pkt) = try_recv_egress(rx) {
-                return Some(pkt);
-            }
-        }
-        None
-    }
-
     /// Yield until the actor's renewal attempt is no longer in flight (the
     /// node completes it from a task).
     async fn settle(asm: &Arc<Assembly>, link_id: LinkId) {
@@ -1053,31 +873,6 @@ mod tests {
             "expected a RenewAuthenticationRequest"
         );
         pkt.body()[12..60].try_into().unwrap()
-    }
-
-    /// A decoded RenewAuthenticationResponse packet: status, echoed
-    /// challenge, and the blobs it carries (empty when it carries none).
-    /// body: [0]=type, [1]=excess, [2..10]=seq, [10]=status,
-    /// [11..13]=blob_len, [13..61]=echoed challenge, [61..]=blob.
-    fn decode_response(pkt: &Packet) -> (AuthenticationStatus, [u8; 48], Vec<AuthBlob>) {
-        let body = pkt.body();
-        assert_eq!(
-            body[0],
-            ZdpPacketType::RenewAuthenticationResponse.0,
-            "expected a RenewAuthenticationResponse"
-        );
-        let blob_len = u16::from_be_bytes([body[11], body[12]]) as usize;
-        let blobs = if blob_len == 0 {
-            Vec::new()
-        } else {
-            let blob_str = std::str::from_utf8(&body[61..61 + blob_len]).expect("utf8 blob");
-            auth::decode_blobs(blob_str).expect("valid blob encoding")
-        };
-        (
-            AuthenticationStatus(body[10]),
-            body[13..61].try_into().unwrap(),
-            blobs,
-        )
     }
 
     /// Assert the node's renewal completion reached the `reauthorize` step:
@@ -1294,7 +1089,7 @@ mod tests {
                 let (asm, mut egress_rx) = assembly_with_observable_egress(None);
 
                 // Adapter-side link, Active: wrong link type.
-                let adapter_link = add_adapter_peer(&asm);
+                let adapter_link = add_agent_peer(&asm);
                 assert_eq!(
                     request_renewal_now(&asm, adapter_link),
                     RenewalStart::Ignored
@@ -1378,303 +1173,6 @@ mod tests {
                     Some(challenge),
                     "the sent challenge must be stashed for verification"
                 );
-            })
-            .await
-    }
-
-    /// R8 (zipline#66) step 3: an Active adapter link with a registered
-    /// AuthAgent that receives a RenewAuthenticationRequest forwards exactly
-    /// one `OidcCredentialRequest { interactive: false }` to the agent and
-    /// returns the resulting blob in a Success RenewAuthenticationResponse
-    /// that echoes the request's challenge. The link never leaves Active.
-    #[tokio::test]
-    async fn test_adapter_renew_request_asks_agent_and_answers_with_blob() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress(None);
-                let link_id = add_adapter_peer(&asm);
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    peer.actor_auth.set_auth_agent(agent_tx);
-                }
-
-                let challenge_payload = test_challenge_payload();
-                let challenge = challenge_payload.challenge_bytes();
-                receive_renew_request(&asm, link_id, challenge_payload).unwrap();
-                tokio::task::yield_now().await; // the agent is asked from a task
-
-                // Exactly one non-interactive request, bound to the
-                // advertised IdP and the challenge-derived nonce.
-                let req = agent_rx.try_recv().expect("agent must be called once");
-                assert!(
-                    !req.interactive,
-                    "renewal must never open a browser (interactive must be false)"
-                );
-                assert_eq!(req.idp.issuer, "https://idp.test");
-                assert_eq!(req.nonce, auth::oidc_nonce_for_challenge(&challenge));
-                assert!(agent_rx.try_recv().is_err(), "a second agent call was made");
-
-                // The agent answers; the response goes out with the blob.
-                req.reply.send(Ok("renewed-id-token".to_string())).unwrap();
-                let pkt = recv_egress(&mut egress_rx)
-                    .await
-                    .expect("a RenewAuthenticationResponse must be sent");
-                assert_eq!(pkt.metadata().egress_link_id, link_id);
-                let (status, echoed, blobs) = decode_response(&pkt);
-                assert_eq!(status, AuthenticationStatus::Success);
-                assert_eq!(
-                    echoed, challenge,
-                    "the response must echo the request's challenge"
-                );
-                match &blobs[..] {
-                    [AuthBlob::Oidc(oidc)] => {
-                        assert_eq!(oidc.id_token, "renewed-id-token");
-                        assert_eq!(oidc.issuer, "https://idp.test");
-                        assert_eq!(
-                            oidc.challenge,
-                            BASE64_STANDARD.encode(challenge),
-                            "the blob must be bound to the node's challenge"
-                        );
-                    }
-                    other => panic!("expected one OIDC blob, got {other:?}"),
-                }
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Active
-                );
-            })
-            .await
-    }
-
-    /// R8 (zipline#66) step 3: an adapter link WITHOUT a registered agent
-    /// answers a RenewAuthenticationRequest with
-    /// [AuthenticationStatus::Retryable] (formerly AuthUnavailable) instead
-    /// of dropping the packet, and stays Active.
-    #[tokio::test]
-    async fn test_adapter_renew_request_without_agent_answers_retryable() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) = assembly_with_observable_egress(None);
-                let link_id = add_adapter_peer(&asm); // no agent, no IdP
-
-                receive_renew_request(&asm, link_id, test_challenge_payload()).unwrap();
-
-                let pkt = try_recv_egress(&mut egress_rx)
-                    .expect("an agentless adapter must still answer");
-                let (status, echoed, blobs) = decode_response(&pkt);
-                assert_eq!(status, AuthenticationStatus::Retryable);
-                assert_eq!(echoed, test_challenge_payload().challenge_bytes());
-                assert!(blobs.is_empty());
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Active,
-                    "answering must not perturb the link"
-                );
-            })
-            .await
-    }
-
-    /// Codex P1 (PR #17, thread 1): a second RenewAuthenticationRequest on
-    /// the same link supersedes the first — the node only retries after
-    /// abandoning its previous attempt, so the adapter must cancel the
-    /// superseded agent call (drop its reply channel, which the serial
-    /// bridge observes via `reply.closed()`) instead of leaving it to run
-    /// for up to OIDC_USER_INTERACTION_TIMEOUT while retries queue behind
-    /// it.
-    #[tokio::test]
-    async fn test_adapter_second_renew_request_cancels_superseded_agent_call() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, _egress_rx) = assembly_with_observable_egress(None);
-                let link_id = add_adapter_peer(&asm);
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    peer.actor_auth.set_auth_agent(agent_tx);
-                }
-
-                // Attempt A: the agent receives the call and sits on it
-                // (a hung or slow AuthAgent).
-                receive_renew_request(&asm, link_id, test_challenge_payload()).unwrap();
-                tokio::task::yield_now().await;
-                let req_a = agent_rx.try_recv().expect("first agent call");
-                assert!(
-                    !req_a.reply.is_closed(),
-                    "attempt A's reply channel must be open while A is current"
-                );
-
-                // The node abandoned A (its attempt timeout fired) and
-                // retried: attempt B's request arrives on the same link.
-                let payload_b = auth::ZdpInitAuthenticationPayload {
-                    nonce: [8u8; 8],
-                    ctime: 434343u64.into(),
-                    hmac: [10u8; 32],
-                };
-                receive_renew_request(&asm, link_id, payload_b).unwrap();
-                tokio::task::yield_now().await;
-                let _req_b = agent_rx.try_recv().expect("second agent call");
-
-                // The superseded call must be cancelled: aborting the wait
-                // task drops its reply receiver, which tells the bridge to
-                // drop the in-flight RPC and service the next request.
-                let mut closed = false;
-                for _ in 0..50 {
-                    tokio::task::yield_now().await;
-                    if req_a.reply.is_closed() {
-                        closed = true;
-                        break;
-                    }
-                }
-                assert!(
-                    closed,
-                    "the superseded renewal call must be cancelled so the \
-                     serial bridge can service the retry"
-                );
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 4: an adapter whose actor authenticated
-    /// device-only ({Device} recorded) answers a RenewAuthenticationRequest
-    /// synchronously with a Success response carrying ONE SS blob bound to
-    /// the echoed challenge — no AuthAgent involved.
-    #[tokio::test]
-    async fn test_adapter_renew_request_device_only_answers_with_ss_no_agent() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) =
-                    assembly_with_observable_egress(Some(bootstrap_config()));
-                let link_id = add_adapter_peer(&asm);
-                asm.peer_table
-                    .get(link_id)
-                    .unwrap()
-                    .actor_auth
-                    .renewal
-                    .set_namespaces([auth::AuthNamespace::Device].into());
-                // no agent, no IdP: an SS-only actor needs neither
-
-                let challenge_payload = test_challenge_payload();
-                let challenge = challenge_payload.challenge_bytes();
-                receive_renew_request(&asm, link_id, challenge_payload).unwrap();
-
-                let pkt = try_recv_egress(&mut egress_rx)
-                    .expect("a device-only adapter must answer synchronously");
-                let (status, _, blobs) = decode_response(&pkt);
-                assert_eq!(status, AuthenticationStatus::Success);
-                match &blobs[..] {
-                    [AuthBlob::SelfSigned(ss)] => {
-                        assert_eq!(ss.cn, "test.cn.zpr");
-                        assert_eq!(
-                            ss.challenge,
-                            BASE64_STANDARD.encode(challenge),
-                            "the SS blob must be bound to the node's challenge"
-                        );
-                    }
-                    other => panic!("device-only means exactly one SS blob, got {other:?}"),
-                }
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 4: an adapter whose actor authenticated with
-    /// SS+OIDC ({Device, User} recorded) but has NO AuthAgent cannot
-    /// produce every leg, so it answers Retryable — never a partial set.
-    #[tokio::test]
-    async fn test_adapter_renew_request_ss_oidc_without_agent_answers_retryable() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) =
-                    assembly_with_observable_egress(Some(bootstrap_config()));
-                let link_id = add_adapter_peer(&asm);
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.actor_auth.renewal.set_namespaces(
-                        [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
-                    );
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    // bootstrap key present, but NO agent: the user leg is
-                    // unproducible, so the whole answer is Retryable.
-                }
-
-                receive_renew_request(&asm, link_id, test_challenge_payload()).unwrap();
-
-                let pkt = try_recv_egress(&mut egress_rx).expect("the adapter must still answer");
-                let (status, _, blobs) = decode_response(&pkt);
-                assert_eq!(
-                    status,
-                    AuthenticationStatus::Retryable,
-                    "an unproducible leg must fail the WHOLE answer (no partial set)"
-                );
-                assert!(blobs.is_empty(), "no partial blob set may be sent");
-            })
-            .await
-    }
-
-    /// N2 (zipline#122) step 4: an SS+OIDC adapter WITH an agent answers a
-    /// Success response whose blob array carries BOTH legs, each bound to
-    /// the echoed challenge.
-    #[tokio::test]
-    async fn test_adapter_renew_request_ss_oidc_with_agent_answers_both_legs() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, mut egress_rx) =
-                    assembly_with_observable_egress(Some(bootstrap_config()));
-                let link_id = add_adapter_peer(&asm);
-                let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
-                {
-                    let peer = asm.peer_table.get(link_id).unwrap();
-                    peer.actor_auth.renewal.set_namespaces(
-                        [auth::AuthNamespace::Device, auth::AuthNamespace::User].into(),
-                    );
-                    peer.link_state_machine.test_set_oidc_idps(vec![test_idp()]);
-                    peer.actor_auth.set_auth_agent(agent_tx);
-                }
-
-                let challenge_payload = test_challenge_payload();
-                let challenge_b64 = BASE64_STANDARD.encode(challenge_payload.challenge_bytes());
-                receive_renew_request(&asm, link_id, challenge_payload).unwrap();
-                tokio::task::yield_now().await;
-
-                let req = agent_rx.try_recv().expect("agent must be called once");
-                assert!(!req.interactive);
-                req.reply.send(Ok("renewed-id-token".to_string())).unwrap();
-
-                let pkt = recv_egress(&mut egress_rx)
-                    .await
-                    .expect("a RenewAuthenticationResponse must be sent");
-                let (status, _, blobs) = decode_response(&pkt);
-                assert_eq!(status, AuthenticationStatus::Success);
-                assert_eq!(blobs.len(), 2, "SS+OIDC means exactly two blobs");
-                let ss = blobs
-                    .iter()
-                    .find_map(|b| match b {
-                        AuthBlob::SelfSigned(ss) => Some(ss),
-                        _ => None,
-                    })
-                    .expect("the array must carry the SS leg");
-                assert_eq!(ss.cn, "test.cn.zpr");
-                assert_eq!(ss.challenge, challenge_b64);
-                let oidc = blobs
-                    .iter()
-                    .find_map(|b| match b {
-                        AuthBlob::Oidc(oidc) => Some(oidc),
-                        _ => None,
-                    })
-                    .expect("the array must carry the OIDC leg");
-                assert_eq!(oidc.id_token, "renewed-id-token");
-                assert_eq!(oidc.issuer, "https://idp.test");
-                assert_eq!(oidc.challenge, challenge_b64);
             })
             .await
     }
@@ -1985,7 +1483,7 @@ mod tests {
                 // HMAC-valid with this link's auth key.
                 let other =
                     auth::ZdpInitAuthenticationPayload::new(&[42u8; auth::AUTH_KEY_SIZE_BYTES]);
-                let ss = bootstrap().authenticate_blob(&other).unwrap();
+                let ss = ss_blob(&other);
                 let blob = auth::encode_blobs(&[AuthBlob::SelfSigned(ss)]);
                 receive_renew_response(&asm, link_id, outstanding, Ok(blob)).unwrap();
 
@@ -2022,9 +1520,7 @@ mod tests {
                 );
 
                 // The adapter signs the outstanding challenge.
-                let ss = bootstrap()
-                    .authenticate_blob(&payload_of(&challenge))
-                    .unwrap();
+                let ss = ss_blob(&payload_of(&challenge));
                 let blob = auth::encode_blobs(&[AuthBlob::SelfSigned(ss)]);
                 receive_renew_response(&asm, link_id, challenge, Ok(blob)).unwrap();
                 settle(&asm, link_id).await;
@@ -2066,9 +1562,7 @@ mod tests {
                     &try_recv_egress(&mut egress_rx).expect("request must be sent"),
                 );
 
-                let ss = bootstrap()
-                    .authenticate_blob(&payload_of(&challenge))
-                    .unwrap();
+                let ss = ss_blob(&payload_of(&challenge));
                 let blob = auth::encode_blobs(&[
                     AuthBlob::SelfSigned(ss),
                     oidc_blob("https://idp.test", "renewed-id-token", &challenge),
@@ -2132,9 +1626,7 @@ mod tests {
                     renewal.data.lock().unwrap().in_flight = true;
                 }
 
-                let ss = bootstrap()
-                    .authenticate_blob(&payload_of(&challenge))
-                    .unwrap();
+                let ss = ss_blob(&payload_of(&challenge));
                 let blob = auth::encode_blobs(&[
                     AuthBlob::SelfSigned(ss),
                     oidc_blob("https://idp.test", "renewed-id-token", &challenge),
@@ -2275,7 +1767,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
+                let link_id = add_agent_peer(&asm);
                 let peer = asm.peer_table.get(link_id).unwrap();
                 let actor = &peer.actor_auth;
 
@@ -2292,12 +1784,12 @@ mod tests {
                 assert_eq!(actor.last_failure(), Some(AuthFailureReason::NoAgent));
 
                 // Second due tick: no new failure is recorded (warned flag
-                // holds), and nothing is attempted. (operator_retry is the
-                // production way to clear the recorded failure.)
-                actor.operator_retry(&asm);
+                // holds), and nothing is attempted.
+                actor.record_failure(AuthFailureReason::PolicyDenied);
                 maybe_renew(&asm, link_id);
-                assert!(
-                    actor.last_failure().is_none(),
+                assert_eq!(
+                    actor.last_failure(),
+                    Some(AuthFailureReason::PolicyDenied),
                     "no-agent warning repeated on a later tick"
                 );
                 assert!(!actor.renewal.test_in_flight());
@@ -2312,7 +1804,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
+                let link_id = add_agent_peer(&asm);
                 let peer = asm.peer_table.get(link_id).unwrap();
                 let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
                 peer.actor_auth.set_auth_agent(agent_tx);
@@ -2345,7 +1837,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
+                let link_id = add_agent_peer(&asm);
                 let peer = asm.peer_table.get(link_id).unwrap();
                 let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
                 peer.actor_auth.set_auth_agent(agent_tx);
@@ -2388,7 +1880,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
+                let link_id = add_agent_peer(&asm);
                 let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
                 {
                     let peer = asm.peer_table.get(link_id).unwrap();
@@ -2461,7 +1953,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
+                let link_id = add_agent_peer(&asm);
                 let current_uid = asm.peer_table.get(link_id).unwrap().actor_auth.renewal.uid;
                 let token = |id_token: &str| {
                     vec![zpr::vsapi_types::AuthBlob::Oidc(
@@ -2511,7 +2003,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let link_id = add_adapter_peer(&asm);
+                let link_id = add_agent_peer(&asm);
                 let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
                 {
                     let peer = asm.peer_table.get(link_id).unwrap();
@@ -2585,23 +2077,15 @@ mod tests {
         assert!(!state.test_no_agent_warned());
     }
 
-    /// Link teardown forgets the session and cancels the adapter's task.
-    #[tokio::test]
-    async fn test_reset_clears_session_and_aborts_task() {
-        let local = tokio::task::LocalSet::new();
-        local
-            .run_until(async {
-                let state = RenewalState::new();
-                state.set_namespaces([auth::AuthNamespace::Device].into());
-                state.stash_challenge([9; 48]);
-                let task = tokio::task::spawn_local(std::future::pending::<()>());
-                state.data.lock().unwrap().adapter_task = Some(task.abort_handle());
-                state.reset();
-                assert!(state.namespaces().is_none());
-                assert!(state.test_challenge().is_none());
-                assert!(task.await.unwrap_err().is_cancelled());
-            })
-            .await;
+    /// Link teardown forgets the session.
+    #[test]
+    fn test_reset_clears_session() {
+        let state = RenewalState::new();
+        state.set_namespaces([auth::AuthNamespace::Device].into());
+        state.stash_challenge([9; 48]);
+        state.reset();
+        assert!(state.namespaces().is_none());
+        assert!(state.test_challenge().is_none());
     }
 
     /// Distinct actors get distinct uids, so a completion for a torn-down

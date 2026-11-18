@@ -52,7 +52,7 @@ pub fn dispatch_mgmt_packet_with_addr(
                     LinkType::NodeToNode => {
                         asm.start_zode_link(&peer_sa, &interface_addr, ZodeEnd::Answerer)
                     }
-                    _ => asm.start_tether(&peer_sa, &interface_addr, LinkType::NodeToAdapter, true),
+                    _ => asm.start_tether(&peer_sa, &interface_addr),
                 };
                 let Some(i_link_id) = started.ok() else {
                     core::count_event(asm, ManagementCounterType::UnknownPeer);

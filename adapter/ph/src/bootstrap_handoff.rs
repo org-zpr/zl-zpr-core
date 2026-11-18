@@ -1184,16 +1184,23 @@ mod tests {
                     dst_port: VISA_SERVICE_PORT,
                 };
                 {
-                    let visa_table = asm.visa_table.read().unwrap();
+                    let mut visa_table = asm.visa_table.write().unwrap();
                     assert_eq!(visa_table.successor_of(FWD_ID), Some(J5A_ID));
-                    assert_eq!(visa_table.match_traffic(&vs_api_packet), Some(J5A_ID));
+                    assert_eq!(
+                        visa_table.match_traffic(&asm.peer_table, &vs_api_packet).0,
+                        Some(J5A_ID)
+                    );
                 }
 
                 asm.drop_peer(link);
                 assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
                 assert!(holds(&asm, J5A_ID), "the successor survives the link");
                 assert_eq!(
-                    asm.visa_table.read().unwrap().match_traffic(&vs_api_packet),
+                    asm.visa_table
+                        .write()
+                        .unwrap()
+                        .match_traffic(&asm.peer_table, &vs_api_packet)
+                        .0,
                     Some(J5A_ID)
                 );
             })

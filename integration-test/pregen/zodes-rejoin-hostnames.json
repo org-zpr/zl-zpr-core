@@ -1,0 +1,5 @@
+{
+  "device.zpr.adapter.cn": {
+    "zb": { "device.hostname": ["zb"] }
+  }
+}

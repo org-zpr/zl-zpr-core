@@ -15,7 +15,7 @@ use crate::forwarding_tables;
 use crate::peer_table::PeerType;
 use crate::prelude::*;
 use crate::visa_mgmt;
-use crate::visa_table::{StreamBinding, VisaTable, VisaTableError};
+use crate::visa_table::{StreamBinding, Visa, VisaTable, VisaTableError};
 
 use dashmap::DashMap;
 use std::num::NonZero;
@@ -173,15 +173,19 @@ pub fn bind_actor_address(
         return requested_visa_denied(asm, ingress_link_id, txn_id);
     }
 
-    // Check if we already have a visa which matches this traffic.
+    // Check if we already have a visa which matches this traffic. Under the
+    // write lock: the match ejects an expired visa (zl-zipline#271).
 
-    let visa_table = asm.visa_table.read().unwrap();
+    let (matched, withdrawn) = asm
+        .visa_table
+        .write()
+        .unwrap()
+        .match_traffic(&asm.peer_table, &five_tuple);
+    // Outside the visa-table lock (zipline#9).
+    asm.withdraw_streams(withdrawn, None);
 
-    if let Some(matched) = visa_table.match_traffic(&five_tuple) {
+    if let Some(matched_visa_id) = matched {
         // We matched a visa we already have.
-
-        let matched_visa_id = matched;
-        drop(visa_table);
 
         let egress_link_id_query = visa_mgmt::get_egress_link_for_visa(asm, matched_visa_id);
         match egress_link_id_query {
@@ -377,10 +381,28 @@ pub fn request_stream(
     // Check if we already have the indicated visa. The visa-table lock is
     // released before the bind goes on: `requested_visa_granted` looks up
     // the egress link and sends, neither of which may run under it.
-    let have_visa = asm.visa_table.read().unwrap().contains(visa_id);
-    if have_visa {
+    let held_visa_expired = asm
+        .visa_table
+        .read()
+        .unwrap()
+        .get(visa_id)
+        .map(Visa::has_expired);
+    match held_visa_expired {
         // Visa found.
-        return requested_visa_granted(asm, ingress_link_id, txn_id, visa_id);
+        Some(false) => return requested_visa_granted(asm, ingress_link_id, txn_id, visa_id),
+        // zl-zipline#271: an expired visa is refused, never bound, and not
+        // fetched again (the visa service has forgotten it). It is not
+        // ejected either, unlike at a match (VisaTable::match_traffic): its
+        // live transit streams come from an upstream Zode that no
+        // withdrawal reaches (F5), and freeing their stream IDs here could
+        // hand them to an unrelated stream while that Zode still sends on
+        // them. It goes when it is revoked (a sweep is zl-zipline#274).
+        Some(true) => {
+            info!(target: FLOW_MGMT, "refusing Stream ID Request {txn_id} from {}: visa {visa_id} has expired",
+                asm.formatted_link_id(ingress_link_id.get()));
+            return requested_visa_denied(asm, ingress_link_id, txn_id);
+        }
+        None => (),
     }
 
     // We do not have an existing visa.  Request one.
@@ -807,6 +829,11 @@ pub fn rebind_stream(asm: &Assembly, old: VisaId, new: VisaId, ingress: Forwardi
 /// If the commit is refused (the old binding or the successor is gone
 /// meanwhile), the stream stays as it is, and the stream the next hop just
 /// granted goes unused until `new` expires or is revoked there.
+///
+/// One refusal is no failure (zl-zipline#271, gate q5): a visa newer than
+/// `new` superseded it while the rebind was in flight. That newer visa's
+/// own rebind, started when it arrived, moves the stream, so this is
+/// logged at INFO and not counted as `Rebind Failed`.
 fn rebind_granted(
     asm: &Assembly,
     old: VisaId,
@@ -814,15 +841,19 @@ fn rebind_granted(
     ingress: ForwardingEntry,
     new_egress: ForwardingEntry,
 ) {
-    let committed = asm.visa_table.write().unwrap().commit_supersede(
-        &asm.peer_table,
-        old,
-        new,
-        ingress.clone(),
-        new_egress,
-    );
-    if let Err(e) = committed {
-        rebind_failed(asm, old, new, &ingress, &e.to_string());
+    let mut visa_table = asm.visa_table.write().unwrap();
+    let committed =
+        visa_table.commit_supersede(&asm.peer_table, old, new, ingress.clone(), new_egress);
+    // Read under the same lock as the refusal, so the two agree.
+    let newer = visa_table.successor_of(old);
+    drop(visa_table);
+    match (committed, newer) {
+        (Ok(()), _) => (),
+        (Err(VisaTableError::NotSuccessor(..)), Some(newer)) => {
+            info!(target: FLOW_MGMT, "stream {} on {}: its rebind from visa {old} onto visa {new} is dropped, as visa {newer} superseded visa {new} meanwhile; the rebind onto visa {newer} moves it",
+                ingress.1, asm.formatted_link_id(ingress.0));
+        }
+        (Err(e), _) => rebind_failed(asm, old, new, &ingress, &e.to_string()),
     }
 }
 
@@ -2885,6 +2916,9 @@ mod tests {
     /// before stream 2's A -> B grant: every stream not yet on C, stream 2
     /// included, is rebound onto C, and stream 2's late A -> B grant is
     /// refused, so no stream is left on a superseded visa.
+    ///
+    /// That refusal is not a failure (zl-zipline#271, gate q5): C's own
+    /// rebind moves stream 2, so `Rebind Failed` stays at zero.
     #[tokio::test(flavor = "local")]
     async fn test_a_newer_successor_takes_over_every_stream_still_moving() {
         let (asm, mut egress_rx, _hairpin_rx, zode_link, streams) = ingress_with_live_streams(2);
@@ -2908,7 +2942,8 @@ mod tests {
         );
         assert_eq!(
             asm.counters.management[ManagementCounterType::RebindFailed].get_count(),
-            1
+            0,
+            "a rebind whose target a newer visa superseded is no failure"
         );
 
         install_tether(&asm, zode, &to_c_1, 45).unwrap();
@@ -2922,5 +2957,217 @@ mod tests {
                 == Some((ForwardingEntry(zode_link, 46), NEWEST_VISA))
         );
         while try_recv_packet(&mut egress_rx).is_some() {}
+    }
+
+    /// J11 (zl-zipline#271, gate q5): a refused commit is still a failure
+    /// when no newer visa took the rebind over. Here the successor is
+    /// revoked while its rebind is in flight, so the late grant finds no
+    /// successor at all: the stream really stays on the old visa, which
+    /// `Rebind Failed` counts.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_refused_rebind_with_no_newer_successor_is_a_failure() {
+        let (asm, mut egress_rx, _hairpin_rx, zode_link, streams) = ingress_with_live_streams(1);
+        visa_mgmt::insert_visa(&asm, own_visa(NEW_VISA)).unwrap();
+        let egress_txn = expect_rebind_request(&asm, &mut egress_rx, zode_link);
+
+        asm.visa_table
+            .write()
+            .unwrap()
+            .revoke(&asm.peer_table, NEW_VISA)
+            .unwrap();
+        install_tether(&asm, NonZero::new(zode_link).unwrap(), &egress_txn, 43).unwrap();
+
+        assert!(
+            local_actor_entry(&asm, streams[0]) == Some((ForwardingEntry(zode_link, 42), OLD_VISA))
+        );
+        assert_eq!(
+            asm.counters.management[ManagementCounterType::RebindFailed].get_count(),
+            1
+        );
+    }
+
+    // ---- Visa expiry at match time (zl-zipline#271) ----
+
+    /// The source of the expired full visa below: an actor behind an adapter.
+    const EXPIRED_CLIENT: &str = "fd5a:5052:8::1";
+
+    /// The destination of the expired full visa below.
+    const EXPIRED_SERVICE: &str = "fd5a:5052:8::10";
+
+    /// A full visa EXPIRED_CLIENT:any -> EXPIRED_SERVICE:80 over TCP,
+    /// expiring at `expires`.
+    fn client_visa(visa_id: VisaId, expires: std::time::SystemTime) -> zpr::vsapi_types::Visa {
+        zpr::vsapi_types::Visa::new(
+            visa_id,
+            1,
+            expires,
+            EXPIRED_CLIENT.parse().unwrap(),
+            EXPIRED_SERVICE.parse().unwrap(),
+            zpr::vsapi_types::DockPepType::TCP(zpr::vsapi_types::TcpUdpPep::new(
+                0,
+                80,
+                zpr::vsapi_types::EndpointT::Any,
+            )),
+            zpr::vsapi_types::KeySet::default(),
+            None,
+        )
+    }
+
+    /// The first packet of a TCP flow EXPIRED_CLIENT:40000 ->
+    /// EXPIRED_SERVICE:80, as an adapter sends it with its bind request:
+    /// an IPv6 header and a bare TCP SYN header.
+    fn client_syn() -> Vec<u8> {
+        let src: std::net::Ipv6Addr = EXPIRED_CLIENT.parse().unwrap();
+        let dst: std::net::Ipv6Addr = EXPIRED_SERVICE.parse().unwrap();
+        let mut pkt = vec![0x60, 0, 0, 0, 0, 20, net_defs::ip_number::TCP, 64];
+        pkt.extend_from_slice(&src.octets());
+        pkt.extend_from_slice(&dst.octets());
+        pkt.extend_from_slice(&40000u16.to_be_bytes());
+        pkt.extend_from_slice(&80u16.to_be_bytes());
+        pkt.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]);
+        pkt
+    }
+
+    /// zl-zipline#271: a bind whose first packet matches an expired visa is
+    /// handled as if this Zode held no visa for it. The expired visa is
+    /// ejected and the visa service is asked for a new one. Granting the
+    /// expired visa instead would bind the flow under a visa the next hop
+    /// can no longer fetch (the visa service forgets a visa at expiry), so
+    /// every new flow would be refused, for good.
+    ///
+    /// The adapter's live stream under the expired visa is withdrawn, so
+    /// its next packet binds afresh (VISA_SERVICE.md: on expiry a node
+    /// tears down the tethers to its adapters).
+    #[tokio::test]
+    async fn test_a_bind_matching_an_expired_visa_asks_for_a_new_visa() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
+                let adapter = add_peer(&asm, LinkType::NodeToAdapter, 1);
+                let zode_link = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
+                asm.peer_table
+                    .get(adapter)
+                    .unwrap()
+                    .actor_auth
+                    .test_set_addresses(vec![IpAddress::new_from_std(
+                        &EXPIRED_CLIENT.parse().unwrap(),
+                    )]);
+                let expired: VisaId = VISA_ID + 200;
+                let mut visa_table = asm.visa_table.write().unwrap();
+                visa_table
+                    .insert_visa(client_visa(
+                        expired,
+                        crate::visa_table::tests::ALREADY_EXPIRED,
+                    ))
+                    .unwrap();
+                // A stream the adapter bound under the visa before it expired.
+                let live_stream = asm
+                    .peer_table
+                    .get(adapter)
+                    .unwrap()
+                    .pft
+                    .insert(forwarding_tables::PftPep::new(
+                        ForwardingEntry(zode_link, 42),
+                        expired,
+                    ))
+                    .unwrap();
+                visa_table
+                    .bind(
+                        expired,
+                        StreamBinding {
+                            ingress: ForwardingEntry(adapter, live_stream),
+                            egress: ForwardingEntry(zode_link, 42),
+                        },
+                    )
+                    .unwrap();
+                drop(visa_table);
+                let requested = &asm.counters.management[ManagementCounterType::VisaRequested];
+
+                bind_actor_address(
+                    &asm,
+                    NonZero::new(adapter).unwrap(),
+                    7,
+                    L3Type::Ipv6,
+                    &client_syn(),
+                );
+
+                assert_eq!(requested.get_count(), 1, "a new visa is requested");
+                assert!(
+                    !asm.visa_table.read().unwrap().contains(expired),
+                    "the expired visa is ejected"
+                );
+                let pkt = try_recv_packet(&mut egress_rx).expect("a withdrawal to the adapter");
+                assert_eq!(pkt.metadata().egress_link_id, adapter);
+                assert!(
+                    decode_per_flow(&pkt) == (zdp::ZdpPacketType::StreamIdWithdrawal, live_stream)
+                );
+            })
+            .await
+    }
+
+    /// zl-zipline#271, further down the path: a Stream ID Request for a
+    /// visa this Zode holds but which has expired is refused, and nothing
+    /// else changes. The visa is not fetched again (the visa service has
+    /// forgotten it), and it is not ejected: its live transit streams came
+    /// from an upstream Zode, which no withdrawal reaches (F5), and freeing
+    /// their stream IDs here could hand them to an unrelated stream while
+    /// that Zode still sends on them.
+    #[tokio::test]
+    async fn test_a_stream_request_for_an_expired_visa_is_refused() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
+                let link_a =
+                    NonZero::new(insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop())).unwrap();
+                let link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
+                let expired: VisaId = VISA_ID + 201;
+                let mut visa_table = asm.visa_table.write().unwrap();
+                visa_table
+                    .insert_visa(new_vsapi_visa_forward_only_from(
+                        expired,
+                        crate::visa_table::tests::ALREADY_EXPIRED,
+                        Some(prev_hop()),
+                        next_hop(),
+                    ))
+                    .unwrap();
+                // A transit stream A bound under the visa before it expired.
+                let live_stream = asm
+                    .peer_table
+                    .get(link_a.get())
+                    .unwrap()
+                    .pft
+                    .insert(forwarding_tables::PftPep::new(
+                        ForwardingEntry(link_b, 42),
+                        expired,
+                    ))
+                    .unwrap();
+                visa_table
+                    .bind(
+                        expired,
+                        StreamBinding {
+                            ingress: ForwardingEntry(link_a.get(), live_stream),
+                            egress: ForwardingEntry(link_b, 42),
+                        },
+                    )
+                    .unwrap();
+                drop(visa_table);
+                let asked = &asm.counters.management[ManagementCounterType::VisaByIdRequested];
+
+                request_stream(&asm, link_a, 7, expired);
+
+                assert_only_stream_id_error_response(&mut egress_rx, link_a.get());
+                assert_eq!(asked.get_count(), 0, "an expired visa is not fetched again");
+                assert!(asm.visa_table.read().unwrap().contains(expired));
+                assert!(
+                    asm.peer_table
+                        .get(link_a.get())
+                        .unwrap()
+                        .pft
+                        .inspect(live_stream, |pep| pep.next_hop())
+                        == Some(ForwardingEntry(link_b, 42)),
+                    "the live transit stream keeps its stream ID"
+                );
+            })
+            .await
     }
 }

@@ -307,6 +307,7 @@ if [[ "$PASS" == 0 ]]; then
   echo "== 3. a policy without zb's bootstrap key"
   # The deadline clock starts at the install.
   LEG3_INSTALL_TS=$SECONDS
+  LEG3_ZC_REAUTHS=$(log_count vs.log "$ZC_REAUTHORIZED")
   install_zode_policy "$POLICY_NO_ZB_BIN" || PASS=1
 fi
 
@@ -326,9 +327,12 @@ if [[ "$PASS" == 0 ]]; then
 fi
 
 if [[ "$PASS" == 0 ]]; then
-  # zc is unaffected: still logged in, and its device still reaches the
-  # visa service, while zb, disconnected and its visas gone, is not
-  # answered at all (zero replies, not merely fewer than sent).
+  # zc is unaffected: the visa service accepted its renewal (login and
+  # all) under the new policy, and its device still reaches the visa
+  # service, while zb, disconnected and its visas gone, is not answered at
+  # all (zero replies, not merely fewer than sent).
+  wait_log_after "$REAUTH_WAIT" vs.log "$ZC_REAUTHORIZED" "$LEG3_ZC_REAUTHS" \
+    "the visa service reauthorizes zc under the policy without zb" || PASS=1
   zode_ping zc "$VS_ZPR_ADDR" "zc still reaches the visa service" || PASS=1
   zode_no_ping zc "$ZB_ZPR_ADDR" "zb no longer answers zc's user flow" || PASS=1
 fi
@@ -340,6 +344,11 @@ fi
 if [[ "$PASS" == 0 ]]; then
   echo "== 4. a policy without zc's bootstrap key"
   LEG4_INSTALL_TS=$SECONDS
+  # Fresh evidence only: a transient failure in an earlier leg must not
+  # satisfy the checks below.
+  LEG4_REFUSALS=$(log_count vs.log "$ZC_REAUTH_REFUSED")
+  LEG4_FALLBACKS=$(log_count zc.log "$NO_POLICY_RENEWAL")
+  LEG4_SELF_FAILS=$(log_count zc.log "$SELF_REAUTH_FAILED")
   install_zode_policy "$POLICY_NO_ZC_BIN" || PASS=1
 fi
 
@@ -347,9 +356,9 @@ if [[ "$PASS" == 0 ]]; then
   # The same end-to-end discipline as leg 3: zc must try the renewal and
   # be refused, then fall back to the in-place re-authentication and be
   # refused again.
-  wait_log_after "$REAUTH_WAIT" vs.log "$ZC_REAUTH_REFUSED" 0 "the visa service refuses zc's renewal" || PASS=1
-  wait_log_after "$REAUTH_WAIT" zc.log "$NO_POLICY_RENEWAL" 0 "zc falls back to an in-place re-authentication" || PASS=1
-  wait_log_after "$REAUTH_WAIT" zc.log "$SELF_REAUTH_FAILED" 0 "zc's in-place re-authentication fails" || PASS=1
+  wait_log_after "$REAUTH_WAIT" vs.log "$ZC_REAUTH_REFUSED" "$LEG4_REFUSALS" "the visa service refuses zc's renewal" || PASS=1
+  wait_log_after "$REAUTH_WAIT" zc.log "$NO_POLICY_RENEWAL" "$LEG4_FALLBACKS" "zc falls back to an in-place re-authentication" || PASS=1
+  wait_log_after "$REAUTH_WAIT" zc.log "$SELF_REAUTH_FAILED" "$LEG4_SELF_FAILS" "zc's in-place re-authentication fails" || PASS=1
 fi
 
 if [[ "$PASS" == 0 ]]; then

@@ -97,6 +97,17 @@ function zode_begin() {
   create_ca_key_and_cert ca
 }
 
+# Kill every ph-cli this test started, e.g. a resident `auth-agent`.
+# common_funcs' get_descendants does not match ph-cli, and killing the
+# background job that started one (its PID in $!) leaves ph-cli running.
+function kill_zode_clis() {
+  local PID
+  for PID in $(pstree -pT "$$" | grep -oE 'ph-cli\([0-9]+\)' | grep -oE '[0-9]+')
+  do
+    kill -9 "$PID" 2> /dev/null || true
+  done
+}
+
 # The EXIT trap: print every log under the working directory when
 # ZPR_TEST_VERBOSE is set, including those of a test's legs in
 # subdirectories, then common_funcs' cleanup (which stops everything and
@@ -113,6 +124,7 @@ function zode_cleanup() {
       esac
     done < <(cd "$TMPDIR" && find . -name '*.log' -printf '%P\n' | sort)
   fi
+  kill_zode_clis
   cleanup
 }
 
@@ -121,6 +133,7 @@ function zode_cleanup() {
 # common_funcs' cleanup, which the EXIT trap still runs at the end.
 function zode_stop_all() {
   local PID
+  kill_zode_clis
   for PID in $(get_descendants) $(jobs -p)
   do
     kill -9 "$PID" 2> /dev/null || true

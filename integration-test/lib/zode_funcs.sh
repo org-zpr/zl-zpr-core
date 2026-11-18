@@ -178,15 +178,17 @@ function create_zode_network() {
 # Write the visa service's config, certificate and admin API key, start
 # valkey and the visa service with the Zode policy in the relay's
 # namespace, and wait until the relay has registered with the visa service.
-# Run from the test's working directory, after launch_relay: the visa
-# service binds its listeners to vs.zpr, which must already be on the
-# relay's TUN. Returns non-zero if the relay does not register.
+# A test that needs its own vs-config.toml or admin keys (vs_keys.toml)
+# writes them first; they are kept. Run from the test's working directory,
+# after launch_relay: the visa service binds its listeners to vs.zpr, which
+# must already be on the relay's TUN. Returns non-zero if the relay does
+# not register.
 function launch_zode_vs() {
   # The visa service still serves TLS on VS-API and admin with this
   # certificate.
   create_actor_key_and_cert ca vs.zpr
-  emit_vs_config ca vs.zpr > vs-config.toml
-  write_vs_admin_key
+  [ -e vs-config.toml ] || emit_vs_config ca vs.zpr > vs-config.toml
+  [ -e vs_keys.toml ] || write_vs_admin_key
 
   in_ns zpr-relay "$VALKEY_SERVER_BIN" \
     --save "" \
@@ -270,9 +272,9 @@ function launch_zode_idp() {
     --output /dev/null "$IDP_ISSUER/.well-known/openid-configuration"
 }
 
-# Mint an admin API key the way vsapikey does (vs/src/apikey.rs), as
-# one-node-policy-reauth-test.sh does: the visa service reads vs_keys.toml
-# from its config directory, and vs-admin reads vs-admin.key.
+# Mint an admin API key the way vsapikey does (vs/src/apikey.rs): the visa
+# service reads vs_keys.toml from its config directory, and vs-admin reads
+# vs-admin.key.
 function write_vs_admin_key() {
   python3 - <<'PYEOF'
 import base64, hashlib, secrets
@@ -739,6 +741,47 @@ function stop_vs() {
 # Let the visa service that stop_vs stopped run again (SIGCONT).
 function cont_vs() {
   kill -CONT "$(vs_pid)"
+}
+
+# core-tests-reauth helpers (zl-zipline#234): log a Zode's user in, for
+# zode-policy-reauth-test.sh and attr-query-test.sh.
+
+# Run ph-cli against Zode NAME ($1) in its namespace, trusting the fake
+# IdP (whose certificate the test CA signs); the other arguments go to
+# ph-cli.
+function zode_cli() {
+  local NAME=$1
+  shift
+  in_ns "zpr-$NAME" env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
+    "$PH_DEBUG_BIN" -p "$NAME.sock" "$@"
+}
+
+# Start `ph-cli $2 --no-browser` on Zode $1 in the background, writing its
+# output to file $3, and drive the login it starts: wait for the
+# authorization URL ph-cli prints and GET it with curl in the Zode's
+# namespace, so the fake IdP redirects to ph-cli's loopback callback. $2
+# is `connect` (exits once logged in) or `auth-agent` (stays resident, to
+# answer silent renewals). Sets LOGIN_PID to ph-cli's PID. Returns non-zero
+# if no URL appears within 60 s.
+function start_zode_login() {
+  local NAME=$1 COMMAND=$2 OUT=$3 URL=""
+  zode_cli "$NAME" "$COMMAND" --no-browser > "$OUT" 2>&1 &
+  LOGIN_PID=$!
+  for _ in $(seq 1 60)
+  do
+    URL=$(sed -n 's/.*Open this URL to continue: //p' "$OUT" | head -n 1)
+    if [ -n "$URL" ] || ! kill -0 "$LOGIN_PID" 2> /dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  if [ -z "$URL" ]; then
+    echo "ASSERTION FAILED: ph-cli $COMMAND on $NAME printed no authorization URL:"
+    cat "$OUT"
+    return 1
+  fi
+  in_ns "zpr-$NAME" curl --silent --show-error --location --cacert ca.crt \
+    --output /dev/null "$URL" || true
 }
 
 # Print the verdict for $1 (0 = pass) and exit with it.

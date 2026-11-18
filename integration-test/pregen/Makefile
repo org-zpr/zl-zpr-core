@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2 zodes.bin2 zodes-unlinked.bin2 zodes-pair.bin2 zodes-direct.bin2 zodes-login.bin2 zodes-rejoin.bin2
+OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-test.bin2 oidc-renewal.bin2 oidc-file-interplay.bin2 attr-query.bin2 zodes-policy-reauth.bin2 zodes-policy-reauth-no-zb.bin2 zodes-policy-reauth-no-zc.bin2 zodes.bin2 zodes-unlinked.bin2 zodes-pair.bin2 zodes-direct.bin2 zodes-login.bin2 zodes-rejoin.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -59,27 +59,13 @@ oidc-renewal.bin2: oidc-renewal.zplc oidc-test.zpl oidc-test-seed-jwks.json
 oidc-file-interplay.bin2: oidc-file-interplay.zpl oidc-file-interplay.zplc oidc-test-seed-jwks.json
 	$(ZPLC) -c oidc-file-interplay.zplc -k $(KEY) -f v2 -o $@ oidc-file-interplay.zpl
 
-# Policy-install re-authentication fixtures (zipline#124). One ZPL, three
-# configs: the base policy plus two variants whose only difference is a
-# removed [bootstrap] key (adapter2's for leg 3, the node's for leg 4) —
-# the same one-source trick oidc-renewal.bin2 plays on oidc-test.zpl. Same
-# omitted-`service` warning as oidc-test; expected. Needs zplc 0.21.x
-# (the policy version the visa service accepts, zl-zipline#256).
-policy-reauth.bin2: policy-reauth.zplc policy-reauth.zpl oidc-test-seed-jwks.json
-	$(ZPLC) -c policy-reauth.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
-
-policy-reauth-no-adapter2.bin2: policy-reauth-no-adapter2.zplc policy-reauth.zpl oidc-test-seed-jwks.json
-	$(ZPLC) -c policy-reauth-no-adapter2.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
-
-policy-reauth-no-node.bin2: policy-reauth-no-node.zplc policy-reauth.zpl oidc-test-seed-jwks.json
-	$(ZPLC) -c policy-reauth-no-node.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
-
 # oidc + zpr-attr/1 interplay fixture (zipline#81): oidc-file-interplay with
-# the file decorator replaced by the networked attribute service. Needs
-# zplc >= 0.19.0 (zipline#76: api = "zpr-attr/1" parsing) — an older zplc
-# fails with "trusted_service zipline missing provider". Same omitted-
+# the file decorator replaced by the networked attribute service, on the
+# Zode layout of zodes-pair (zl-zipline#234). Needs a zplc that knows node
+# links (feature/zodes) and api = "zpr-attr/1" (zipline#76; an older zplc
+# fails with "trusted_service zipline missing provider"). Same omitted-
 # `service` warning as oidc-test; expected.
-attr-query.bin2: attr-query.zpl attr-query.zplc oidc-test-seed-jwks.json
+attr-query.bin2: attr-query.zpl attr-query.zplc zb-rsa-pubkey.pem zc-rsa-pubkey.pem oidc-test-seed-jwks.json
 	$(ZPLC) -c attr-query.zplc -k $(KEY) -f v2 -o $@ attr-query.zpl
 
 # Fake-IdP signing keys (checked in; test-only, no secrecy requirement) and
@@ -135,3 +121,18 @@ zodes-rejoin.bin2: zodes-rejoin.zplc zodes-rejoin.zpl zb-rsa-pubkey.pem zc-rsa-p
 # omitted-`service` warning as oidc-test; expected.
 zodes-login.bin2: zodes-login.zplc zodes-login.zpl zb-rsa-pubkey.pem oidc-test-seed-jwks.json
 	$(ZPLC) -c zodes-login.zplc -k $(KEY) -f v2 -o $@ zodes-login.zpl
+
+# Policy-install re-authentication fixtures for Zodes (zipline#124, ported
+# by zl-zipline#234): the relay linked to zb and zc, plus the fake IdP as an
+# OIDC trusted service. One ZPL, three configs: the base policy, the same
+# without zb's bootstrap key (leg 3), and without zb's and zc's (leg 4), the
+# one-source trick zodes-pair.bin2 plays. Same omitted-`service` warning as
+# oidc-test; expected.
+zodes-policy-reauth.bin2: zodes-policy-reauth.zplc zodes-policy-reauth.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.pem oidc-test-seed-jwks.json
+	$(ZPLC) -c zodes-policy-reauth.zplc -k $(KEY) -f v2 -o $@ zodes-policy-reauth.zpl
+
+zodes-policy-reauth-no-zb.bin2: zodes-policy-reauth-no-zb.zplc zodes-policy-reauth.zpl zc-rsa-pubkey.pem oidc-test-seed-jwks.json
+	$(ZPLC) -c zodes-policy-reauth-no-zb.zplc -k $(KEY) -f v2 -o $@ zodes-policy-reauth.zpl
+
+zodes-policy-reauth-no-zc.bin2: zodes-policy-reauth-no-zc.zplc zodes-policy-reauth.zpl oidc-test-seed-jwks.json
+	$(ZPLC) -c zodes-policy-reauth-no-zc.zplc -k $(KEY) -f v2 -o $@ zodes-policy-reauth.zpl

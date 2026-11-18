@@ -97,12 +97,14 @@ function zode_begin() {
   create_ca_key_and_cert ca
 }
 
-# Kill every ph-cli this test started, e.g. a resident `auth-agent`.
-# common_funcs' get_descendants does not match ph-cli, and killing the
-# background job that started one (its PID in $!) leaves ph-cli running.
-function kill_zode_clis() {
+# Kill every helper process this test started that common_funcs'
+# get_descendants does not match: ph-cli (e.g. a resident `auth-agent`),
+# the Python fake IdPs and echo servers, and zpr-attr-server. Killing only
+# the background job that started one (its PID in $!) leaves it running,
+# holding its log pipeline open.
+function kill_zode_helpers() {
   local PID
-  for PID in $(pstree -pT "$$" | grep -oE 'ph-cli\([0-9]+\)' | grep -oE '[0-9]+')
+  for PID in $(pstree -pT "$$" | grep -oE '(ph-cli|python3|zpr-attr-server)\([0-9]+\)' | grep -oE '[0-9]+')
   do
     kill -9 "$PID" 2> /dev/null || true
   done
@@ -124,7 +126,7 @@ function zode_cleanup() {
       esac
     done < <(cd "$TMPDIR" && find . -name '*.log' -printf '%P\n' | sort)
   fi
-  kill_zode_clis
+  kill_zode_helpers
   cleanup
 }
 
@@ -133,7 +135,7 @@ function zode_cleanup() {
 # common_funcs' cleanup, which the EXIT trap still runs at the end.
 function zode_stop_all() {
   local PID
-  kill_zode_clis
+  kill_zode_helpers
   for PID in $(get_descendants) $(jobs -p)
   do
     kill -9 "$PID" 2> /dev/null || true

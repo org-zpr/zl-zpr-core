@@ -88,7 +88,8 @@ name as its CN:
 
 ```sh
 for NAME in relay web laptop; do
-  ./integration-test/lib/zpr-pki genkey >$NAME-noise.key
+  # umask 077: the private key is readable by its owner only
+  (umask 077; ./integration-test/lib/zpr-pki genkey >$NAME-noise.key)
   # First extract a public key from the private one
   ./integration-test/lib/zpr-pki pubkey <$NAME-noise.key >$NAME-noise-pub.pem
   # Then sign the public key

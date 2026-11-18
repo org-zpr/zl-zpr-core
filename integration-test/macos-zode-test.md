@@ -51,9 +51,12 @@ Linux host:
 
 * Binaries built on the host: `make` at the `zl-zpr-core` root (gives
   `target/debug/ph`, `ph-cli`), plus `vs` from a sibling
-  `zl-zpr-visaservice` checkout and `zplc` 0.21.0 or later from a sibling
-  `zl-zpr-compiler` checkout. Link `vs` into `integration-test/`, as for the
-  netns tests (see the README), or set `VS_BIN`.
+  `zl-zpr-visaservice` checkout and `zplc` from a sibling `zl-zpr-compiler`
+  checkout, both from a compatible build set with this core (see
+  `docs/BUILD.md`, "Compatible build sets", in `zl-zpr-dev-context`).
+  Symlink `vs` into `integration-test/`, as for the netns tests (see the
+  README): the container below mounts the sibling checkouts at the same
+  paths, so the link resolves inside it.
 * Docker running, caller in the `docker` group. Build the test image once:
   `make -C integration-test docker-image`.
 
@@ -120,6 +123,10 @@ PREGEN=$WORK/pregen ZODE_POLICY_BIN=zodes-remote.bin2
 RELAY_IP=192.168.0.212      # the host as the Mac sees it
 mkdir -p "$WORK/run" && cd "$WORK/run"
 create_ca_key_and_cert ca
+# A fresh, one-day CA for the fake IdP's certificate (section 3). The test
+# CA's key is a checked-in fixture, so it is never put in a trust store.
+openssl req -x509 -newkey rsa:2048 -nodes -keyout idp-ca.key -out idp-ca.crt \
+  -subj /CN=zpr-test-idp-ca -days 1 2> /dev/null
 ip tuntap add name zrelay mode tun multi_queue && ip link set zrelay up
 create_actor_key_and_cert ca relay
 # The relay lists vs.zpr after its own address and applies both to zrelay.
@@ -135,7 +142,7 @@ until ip -6 addr show dev zrelay | grep -q "inet6 $VS_ZPR_ADDR/"; do sleep 1; do
 create_actor_key_and_cert ca vs.zpr
 emit_vs_config ca vs.zpr > vs-config.toml && write_vs_admin_key
 "$VALKEY_SERVER_BIN" --save "" --appendonly no > valkey.log 2>&1 &
-env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/ca.crt" "$VS_BIN" -c vs-config.toml \
+env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/idp-ca.crt" "$VS_BIN" -c vs-config.toml \
   --clear-state "$PREGEN/$ZODE_POLICY_BIN" > vs.log 2>&1 &
 wait_for 30 check_registered relay.log   # the relay registered with the VS
 create_actor_key_and_cert ca zb      # the Mac Zode's identity
@@ -207,13 +214,13 @@ in.
 Setup, beyond sections 1 and 2:
 
 * **The fake IdP on the Linux host's address**, with a server certificate
-  for that IP signed by the test CA. In the container shell, in
+  for that IP signed by section 1's IdP CA. In the container shell, in
   `$WORK/run`:
 
   ```sh
   HOST_IP=192.168.0.212
   openssl req -new -newkey rsa:2048 -nodes -keyout idp.key -subj "/CN=$HOST_IP" -out idp.csr
-  openssl x509 -req -in idp.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+  openssl x509 -req -in idp.csr -CA idp-ca.crt -CAkey idp-ca.key -CAcreateserial -days 1 \
     -out idp.crt -extfile <(printf "subjectAltName=IP:$HOST_IP")
   mkdir -p idp-state
   python3 "$FAKE_IDP" --host "$HOST_IP" --port 9443 \
@@ -223,13 +230,14 @@ Setup, beyond sections 1 and 2:
     --hd example.com > idp.log 2>&1 &
   ```
 
-* **macOS must trust the test CA** for `ph-cli` to reach the IdP: `ph-cli`
-  uses the system trust store (the System keychain). This is a change to
-  the test host; section 4 undoes it:
+* **macOS must trust the IdP CA** for `ph-cli` to reach the IdP: `ph-cli`
+  uses the system trust store (the System keychain). Copy `idp-ca.crt` from
+  `$WORK/run` to `~/zpr-zode` (never `idp-ca.key`). This is a change to the
+  test host; section 4 undoes it:
 
   ```sh
   sudo security add-trusted-cert -d -r trustRoot \
-    -k /Library/Keychains/System.keychain ~/zpr-zode/ca.crt
+    -k /Library/Keychains/System.keychain ~/zpr-zode/idp-ca.crt
   ```
 
   Without it, the login stops at the IdP with `IdpUnreachable` (exit 4),
@@ -276,8 +284,8 @@ command line must come up cleanly (it re-binds the leftover
 Then undo the changes to the Mac:
 
 ```sh
-# Only if section 3 trusted the test CA:
-sudo security remove-trusted-cert -d ~/zpr-zode/ca.crt
+# Only if section 3 trusted the IdP CA:
+sudo security remove-trusted-cert -d ~/zpr-zode/idp-ca.crt
 # Only if a socketfilterfw rule was added:
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --remove ~/zpr-zode/ph
 ```

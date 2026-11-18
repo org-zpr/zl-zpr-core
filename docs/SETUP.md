@@ -23,6 +23,11 @@ You need these binaries on hand:
 * `zplc` from the [zpr-compiler repository](https://github.com/org-zpr/zpr-compiler),
   unless you already have a compiled policy.
 
+Take `vs` and `zplc` from a build set compatible with this `ph` (see
+`docs/BUILD.md`, "Compatible build sets", in `zl-zpr-dev-context`): a
+compiler without Zode support rejects the policy below, whose endpoint
+Zodes have no substrate addresses.
+
 This walkthrough uses three Linux hosts:
 
 * the relay, `relay`, on substrate address `129.6.7.1`, with ZPR address

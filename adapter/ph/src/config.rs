@@ -886,9 +886,10 @@ pub struct GlobalConfigSection {
     pub io_engine: Option<String>,
 }
 
+// The `[authentication]` section of a Zode config file.
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticationConfigSection {
-    // TODO move this here: pub bootstrap_key: Option<PathBuf>,
     auth_private_key: Option<PathBuf>,
 }
 

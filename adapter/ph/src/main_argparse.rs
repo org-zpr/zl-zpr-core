@@ -991,6 +991,33 @@ mod test {
         assert!(err.to_string().contains("adapter"), "{err}");
     }
 
+    /// zl-zipline#234: no backwards compatibility, so an unknown key is
+    /// refused in every section, not ignored: adapter keys in `[global]` and
+    /// `[node]`, and a misspelt key in `[authentication]`.
+    #[test]
+    #[parallel(env)]
+    fn test_zode_config_refuses_unknown_keys() {
+        for (global_extra, rest, key) in [
+            (r#"name = "adapter1""#, DIAL, "name"),
+            ("", "auto_connect = true", "auto_connect"),
+            (
+                "",
+                "[authentication]\nauth_private_ky = \"key.pem\"",
+                "auth_private_ky",
+            ),
+        ] {
+            let (cfg, _keys) = node_config_file_global(global_extra, rest);
+            let err = argparse(Some(vec![
+                "ph",
+                "zode",
+                "-c",
+                cfg.get_path().to_str().unwrap(),
+            ]))
+            .expect_err(key);
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
+    }
+
     /// The shipped example config parses: it names no refused section or key.
     #[test]
     #[parallel(env)]

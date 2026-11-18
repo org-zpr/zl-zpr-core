@@ -8,7 +8,7 @@
 # relay only with the logged-in user's OIDC subject (the user flow). A fake
 # IdP runs in zpr-zb, for ph-cli's login, and in zpr-relay, for the visa
 # service's JWKS (the relay hosts the visa service, zl-zipline#229). ph-cli runs with --no-browser, and curl in zpr-zb drives
-# the authorization URL it prints, as in one-node-oidc-test.sh.
+# the authorization URL it prints (lib/zode_funcs.sh, core-tests-oidc helpers).
 #
 # Scenarios:
 #   1. zb logged out: the user flow is denied, the device flow works.
@@ -41,82 +41,14 @@ enter_test_namespace "$@"
 
 zode_begin
 
-create_zode_network "zb:$ZB_SUBSTRATE_ADDR"
-create_idp_cert
 PASS=0
-launch_zode_idp relay user-vs-unused || PASS=1
-launch_zode_idp zb user-zb || PASS=1
-launch_relay || PASS=1
-launch_zode_vs || PASS=1
+launch_login_zodes user-zb || PASS=1
 
-# What the logs say (zode_login.rs, vss_worker.rs, visa_table.rs) and what
-# ph-cli prints (adapter/cli/src/main.rs, zode_login.rs format_status).
-REGISTERED='registered VSS'
-IDP_LIST='received services update with [1-9]'
-LOGGED_IN="Zode login: logged in with $(ere_escape "$IDP_ISSUER")"
-LOGGED_OUT='Zode login: logged out'
-REVOKED='Revoked visa [0-9]+'
-# The visa service's re-check after an attribute change (its visa sweep).
-VS_SWEEP_REVOKED='visa sweep reason=AttributeChange .* revoked=[1-9]'
+# What the logs say beyond the shared patterns in lib/zode_funcs.sh
+# (zode_login.rs).
 POLICY_RENEWAL='Zode login: policy re-authentication answered with a renewal'
-RENEWED='Zode login: renewed; expires in'
-EXPIRED='Zode login: expired without a renewal'
 REPLACED="Zode login: the visa service replaced this node's VS-API session, which dropped the login"
 ASK_AGENT='Zode login: asking the resident auth agent for a new login'
-URL_LINE='Open this URL to continue: '
-
-# Run ph-cli against zb, in zb's namespace, trusting the fake IdP.
-function zb_cli() {
-  in_ns zpr-zb env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
-    "$PH_DEBUG_BIN" -p zb.sock "$@"
-}
-
-# Succeed when `ph-cli login-status` on zb has the line $1.
-function zb_status_is() {
-  zb_cli login-status 2> /dev/null | grep -qxF -- "$1"
-}
-
-# Wait up to $1 seconds for `ph-cli login-status` on zb to have the line
-# $2; $3 is the assertion message.
-function assert_status() {
-  if wait_for "$1" zb_status_is "$2"; then
-    echo "assertion OK: $3"
-  else
-    echo "ASSERTION FAILED: $3 (no line '$2' in login-status):"
-    zb_cli login-status || true
-    return 1
-  fi
-}
-
-# Succeed when ph-cli output file $1 holds more than $2 authorization URLs.
-function url_count_above() {
-  (( $(grep -cF -- "$URL_LINE" "$1" || true) > $2 ))
-}
-
-# Wait for ph-cli output file $1 to print an authorization URL beyond the
-# first $2, and drive it with curl in zpr-zb: the fake IdP redirects to
-# ph-cli's loopback callback.
-function drive_login_url() {
-  local URL
-  if ! wait_for 30 url_count_above "$1" "$2"; then
-    echo "ASSERTION FAILED: ph-cli printed no new authorization URL:"
-    cat "$1"
-    return 1
-  fi
-  URL=$(sed -n "s/.*$URL_LINE//p" "$1" | tail -n 1)
-  in_ns zpr-zb curl --silent --show-error --location --cacert ca.crt \
-    --output /dev/null "$URL" || true
-}
-
-# zode_ping's warm-up for the user flow right after a login: the first
-# echoes wait for the visa request that the login now lets through.
-USER_FLOW_WARMUP=20
-
-if [[ "$PASS" == 0 ]]; then
-  launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
-  wait_log_after 60 zb.log "$REGISTERED" 0 "zb joins and registers its VSS" || PASS=1
-  wait_log_after 30 zb.log "$IDP_LIST" 0 "zb has the identity-provider list" || PASS=1
-fi
 
 if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
@@ -127,17 +59,7 @@ if [[ "$PASS" == 0 ]]; then
   zode_no_ping zb "$RELAY_ZPR_ADDR" "the user flow (zb to the relay) is denied" || PASS=1
 
   echo "== 2. ph-cli connect"
-  zb_cli connect --no-browser > connect.out 2>&1 &
-  CONNECT_PID=$!
-  drive_login_url connect.out 0 || PASS=1
-  if wait "$CONNECT_PID"; then
-    echo "assertion OK: connect exits 0"
-  else
-    echo "ASSERTION FAILED: connect exited non-zero:"
-    cat connect.out
-    PASS=1
-  fi
-  wait_log_after 5 zb.log "$LOGGED_IN" 0 "zb logs the login" || PASS=1
+  zb_connect || PASS=1
   assert_status 0 "State: logged in" "login-status: logged in" || PASS=1
   zode_ping zb "$RELAY_ZPR_ADDR" "the user flow is admitted" "$USER_FLOW_WARMUP" || PASS=1
 

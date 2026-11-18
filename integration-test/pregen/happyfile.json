@@ -2,8 +2,7 @@
   "user.sub": {
     "user-a": {
       "hair_color": ["brown"],
-      "lazy": ["yes"],
-      "zpr_addr": ["fd5a:5052:8888::1:1"]
+      "lazy": ["yes"]
     }
   }
 }

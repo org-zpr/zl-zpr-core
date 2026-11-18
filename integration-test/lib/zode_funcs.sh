@@ -239,7 +239,8 @@ function restart_zode_vs() {
 # The fake IdP the OIDC Zode tests use (lib/fake-idp.py). Every consumer
 # dials the policy's issuer on its own loopback, so one instance runs in
 # each namespace that needs it; they share the signing keys, the TLS
-# certificate and one state directory, as in one-node-oidc-test.sh.
+# certificate and one state directory, so one `fake-idp.py --rotate` or
+# `--revoke-refresh` reaches them all.
 IDP_PORT=9000
 IDP_ISSUER="https://127.0.0.1:$IDP_PORT"
 FAKE_IDP=$(realpath "$(dirname "$0")/lib/fake-idp.py")
@@ -257,12 +258,15 @@ function create_idp_cert() {
 
 # Start a fake IdP in namespace zpr-$1 that mints tokens for subject $2,
 # and wait until it answers discovery. Returns non-zero if it does not.
+# It signs with the first key until `fake-idp.py --rotate` switches it to
+# the second, which the policies' seed JWKS leaves out.
 function launch_zode_idp() {
   in_ns "zpr-$1" python3 "$FAKE_IDP" \
     --port "$IDP_PORT" \
     --state-dir idp-state \
     --tls-cert idp.crt --tls-key idp.key \
     --signing-key "$PREGEN/fake-idp-rsa.key" \
+    --signing-key-2 "$PREGEN/fake-idp-rsa-2.key" \
     --client-id zpr-test-client \
     --sub "$2" --email "$2@example.com" --hd example.com \
     2>&1 | tee "idp-$1.log" | prefix_log "idp-$1" &
@@ -749,4 +753,145 @@ function zode_report() {
   else echo "FAILURE"
   fi
   exit "$1"
+}
+
+# core-tests-oidc helpers
+#
+# For the tests where a user logs in on zb (zode-login-test.sh,
+# zode-oidc-test.sh, oidc-file-interplay-test.sh): the relay with the visa
+# service and zb, a fake IdP in each of their namespaces, and ph-cli
+# driving the login with --no-browser while curl in zpr-zb follows the
+# authorization URL it prints.
+
+# What ph logs (vs_worker.rs, vss_worker.rs, zode_login.rs, visa_table.rs)
+# and the visa service logs, and what ph-cli prints, about a Zode login.
+REGISTERED='registered VSS'
+IDP_LIST='received services update with [1-9]'
+LOGGED_IN="Zode login: logged in with $(ere_escape "$IDP_ISSUER")"
+LOGGED_OUT='Zode login: logged out'
+RENEWED='Zode login: renewed; expires in'
+RENEWAL_FAILED='Zode login: silent renewal failed'
+EXPIRED='Zode login: expired without a renewal'
+REVOKED='Revoked visa [0-9]+'
+# The visa service's re-check after an attribute change (its visa sweep).
+VS_SWEEP_REVOKED='visa sweep reason=AttributeChange .* revoked=[1-9]'
+URL_LINE='Open this URL to continue: '
+
+# zode_ping's warm-up for the user flow right after a login: the first
+# echoes wait for the visa request that the login now lets through.
+USER_FLOW_WARMUP=20
+
+# Start the Zodes of a login test and wait until zb can log in: the
+# network, a fake IdP in the relay's namespace (for the visa service's
+# JWKS) and one in zb's minting subject $1, the relay, the visa service
+# with ZODE_POLICY_BIN, and zb. Returns non-zero, after the first failed
+# step, unless zb has registered its VSS and received the policy's
+# identity providers.
+function launch_login_zodes() {
+  create_zode_network "zb:$ZB_SUBSTRATE_ADDR"
+  create_idp_cert
+  launch_zode_idp relay user-vs-unused || return 1
+  launch_zode_idp zb "$1" || return 1
+  launch_relay || return 1
+  launch_zode_vs || return 1
+  launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
+  wait_log_after 60 zb.log "$REGISTERED" 0 "zb joins and registers its VSS" || return 1
+  wait_log_after 30 zb.log "$IDP_LIST" 0 "zb has the identity-provider list"
+}
+
+# Run ph-cli against zb, in zb's namespace, trusting the fake IdP.
+function zb_cli() {
+  in_ns zpr-zb env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
+    "$PH_DEBUG_BIN" -p zb.sock "$@"
+}
+
+# Succeed when `ph-cli login-status` on zb has the line $1.
+function zb_status_is() {
+  zb_cli login-status 2> /dev/null | grep -qxF -- "$1"
+}
+
+# Wait up to $1 seconds for `ph-cli login-status` on zb to have the line
+# $2; $3 is the assertion message.
+function assert_status() {
+  if wait_for "$1" zb_status_is "$2"; then
+    echo "assertion OK: $3"
+  else
+    echo "ASSERTION FAILED: $3 (no line '$2' in login-status):"
+    zb_cli login-status || true
+    return 1
+  fi
+}
+
+# Succeed when ph-cli output file $1 holds more than $2 authorization URLs.
+function url_count_above() {
+  (( $(grep -cF -- "$URL_LINE" "$1" || true) > $2 ))
+}
+
+# Wait for ph-cli output file $1 to print an authorization URL beyond the
+# first $2, and drive it with curl in zpr-zb: the fake IdP redirects to
+# ph-cli's loopback callback.
+function drive_login_url() {
+  local URL
+  if ! wait_for 30 url_count_above "$1" "$2"; then
+    echo "ASSERTION FAILED: ph-cli printed no new authorization URL:"
+    cat "$1"
+    return 1
+  fi
+  URL=$(sed -n "s/.*$URL_LINE//p" "$1" | tail -n 1)
+  in_ns zpr-zb curl --silent --show-error --location --cacert ca.crt \
+    --output /dev/null "$URL" || true
+}
+
+# Log a user in on zb with `ph-cli connect` (no resident agent): drive the
+# authorization URL, and assert that connect exits 0 and that zb logs the
+# login. ph-cli's output goes to connect.out.
+function zb_connect() {
+  local CONNECT_PID LOGINS
+  LOGINS=$(log_count zb.log "$LOGGED_IN")
+  zb_cli connect --no-browser > connect.out 2>&1 &
+  CONNECT_PID=$!
+  drive_login_url connect.out 0 || return 1
+  if wait "$CONNECT_PID"; then
+    echo "assertion OK: connect exits 0"
+  else
+    echo "ASSERTION FAILED: connect exited non-zero:"
+    cat connect.out
+    return 1
+  fi
+  wait_log_after 5 zb.log "$LOGGED_IN" "$LOGINS" "zb logs the login"
+}
+
+# Run vs-admin against the admin API, from inside the relay's netns.
+function vs_admin() {
+  in_ns zpr-relay \
+    "$VS_ADMIN_BIN" --svc-url "$ADMIN_URL" --ca-cert ca.crt \
+    --api-key-file vs-admin.key --format compact "$@"
+}
+
+# Print the visa service's descriptor of zb's own actor (JSON with an
+# `attrs` list of {key, value}).
+function zb_actor() {
+  vs_admin actors --addr "$ZB_ZPR_ADDR"
+}
+
+# Succeed when the visa service's actor of zb has attribute $1, with value
+# list $2 (JSON, e.g. '["user-a"]') if given.
+function zb_actor_has() {
+  local DESC
+  DESC=$(zb_actor) || return 1
+  jq -e --arg key "$1" --argjson value "${2:-null}" \
+    '.attrs[] | select(.key == $key) | select($value == null or .value == $value)' \
+    > /dev/null <<< "$DESC"
+}
+
+# Assert that the visa service's actor of zb has attribute $2, with value
+# list $3 if given ([zb_actor_has]); $1 is the assertion message.
+function assert_zb_actor() {
+  if zb_actor_has "${@:2}"; then
+    echo "assertion OK: $1"
+  else
+    echo "ASSERTION FAILED: $1 (no attribute $2 ${3:-})"
+    zb_actor || true
+    return 1
+  fi
 }

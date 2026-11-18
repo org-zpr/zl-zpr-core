@@ -81,6 +81,8 @@ from login with no silent renewal.
 - [ ] The authorization URL from the runs above carries **no**
       `offline_access` scope and no `access_type=offline`, `prompt=consent`
       or `max_age` parameters.
+- [ ] `ph-cli logout` the login of the runs above, so that the agent's
+      login is a new one rather than refused as `AlreadyLoggedIn`.
 - [ ] Leave a `ph-cli auth-agent` login up past `expiration_seconds`
       (set it short, e.g. 600, for this run). No browser opens, and the
       Zode's renewal attempt cannot succeed without a refresh token:

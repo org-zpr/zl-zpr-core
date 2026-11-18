@@ -13,11 +13,13 @@
 # refresh token about 30 s after each login.
 #
 # Legs:
-#   1. Key rotation. `fake-idp.py --rotate` switches every IdP instance to
-#      its second signing key, which the policy's seed JWKS leaves out. A
-#      `ph-cli connect` on zb then presents a token with a key ID the visa
-#      service does not know: the visa service fetches the IdP's live JWKS
-#      once, admits the login, and the user flow is admitted.
+#   1. Key rotation. A `ph-cli connect` on zb logs in with the IdP's first
+#      signing key, which the visa service knows from the policy's seed
+#      JWKS, so it fetches nothing; zb logs out. `fake-idp.py --rotate`
+#      then switches every IdP instance to its second key, which the seed
+#      leaves out. The next login presents a key ID the visa service's
+#      cache does not know: it fetches the IdP's live JWKS once, admits
+#      the login, and the user flow is admitted.
 #   2. Revocation. A resident `ph-cli auth-agent` logs zb in and renews
 #      the login once, then `fake-idp.py --revoke-refresh` models the user withdrawing the
 #      application's access. The next silent renewal presents the refresh
@@ -69,6 +71,15 @@ if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
 
   echo "== 1. the IdP rotates its signing key"
+  # A login with the first key needs no fetch: the seed JWKS has it.
+  zb_connect || PASS=1
+  assert_no_log idp-relay.log "$JWKS_FETCH" "the visa service checks the first key against its seed JWKS, with no fetch" || PASS=1
+  if zb_cli logout; then
+    echo "assertion OK: logout exits 0"
+  else
+    echo "ASSERTION FAILED: logout exited non-zero"
+    PASS=1
+  fi
   python3 "$FAKE_IDP" --state-dir idp-state --rotate
   FETCHES=$(log_count idp-relay.log "$JWKS_FETCH")
   zb_connect || PASS=1

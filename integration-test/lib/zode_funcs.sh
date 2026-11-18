@@ -70,6 +70,12 @@ BULK_PAYLOAD=$((BULK_COUNT * BULK_SIZE))
 # Check that every binary and fixture the Zode tests use is present.
 function zode_preflight() {
   local F
+  # create_zode_network applies no link impairment: refuse the classic
+  # tests' override rather than test an unimpaired link in its name.
+  if [ -n "${NETEM_PARAMS:-}" ]; then
+    echo "NETEM_PARAMS is not supported by the Zode tests"
+    exit 1
+  fi
   for F in "$VS_BIN" "$VS_ADMIN_BIN" "$VALKEY_SERVER_BIN" "$PREGEN/$ZODE_POLICY_BIN"
   do
     if [ ! -e "$F" ]; then
@@ -875,13 +881,17 @@ function zb_actor() {
 }
 
 # Succeed when the visa service's actor of zb has attribute $1, with value
-# list $2 (JSON, e.g. '["user-a"]') if given.
+# list $2 (JSON, e.g. '["user-a"]') if given. Returns 1 when it does not,
+# and 2 when there is no actor descriptor to tell (vs-admin failed, or its
+# answer has no `attrs` list), so a failed lookup never reads as a missing
+# attribute.
 function zb_actor_has() {
   local DESC
-  DESC=$(zb_actor) || return 1
+  DESC=$(zb_actor) || return 2
+  jq -e '.attrs | type == "array"' > /dev/null 2>&1 <<< "$DESC" || return 2
   jq -e --arg key "$1" --argjson value "${2:-null}" \
-    '.attrs[] | select(.key == $key) | select($value == null or .value == $value)' \
-    > /dev/null <<< "$DESC"
+    'any(.attrs[]; .key == $key and ($value == null or .value == $value))' \
+    > /dev/null <<< "$DESC" || return 1
 }
 
 # Assert that the visa service's actor of zb has attribute $2, with value
@@ -894,4 +904,17 @@ function assert_zb_actor() {
     zb_actor || true
     return 1
   fi
+}
+
+# Assert that the visa service's actor of zb has no attribute $2, and that
+# the visa service answered for it; $1 is the assertion message.
+function assert_zb_actor_lacks() {
+  local RESULT=0
+  zb_actor_has "$2" || RESULT=$?
+  case "$RESULT" in
+    1) echo "assertion OK: $1" ;;
+    0) echo "ASSERTION FAILED: $1 (the actor still has $2)" ;;
+    *) echo "ASSERTION FAILED: $1 (no actor descriptor from the visa service)" ;;
+  esac
+  (( RESULT == 1 )) || { zb_actor || true; return 1; }
 }

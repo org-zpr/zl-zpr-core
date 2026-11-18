@@ -47,6 +47,8 @@ The security requirement (docs/OIDC.md "Security requirements"): match on
 `hd` claim**, and that absence must fail the domain check even if the
 account's email address is made to look corporate.
 
+- [ ] `ph-cli logout` the Workspace user first: a Zode refuses a second
+      login while one is active (`AlreadyLoggedIn`).
 - [ ] Repeat the login as the consumer Gmail account.
 - [ ] `connect` fails (exit 5, visa service rejected the token) and the visa
       service reports the domain check failing with the `hd`-absent reason

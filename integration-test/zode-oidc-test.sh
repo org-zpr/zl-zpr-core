@@ -98,13 +98,7 @@ if [[ "$PASS" == 0 ]]; then
   wait_log_after 15 zb.log "$RENEWAL_FAILED: .*invalid_grant" 0 "zb's silent renewal fails with invalid_grant" || PASS=1
   wait_log_after "$REVOCATION_WAIT" zb.log "$EXPIRED" 0 "the login expires and zb logs the user out" || PASS=1
   assert_status 5 "Last failure: LoginExpired" "login-status: logged out, the login expired" || PASS=1
-  if zb_actor_has user.oidc-subject; then
-    echo "ASSERTION FAILED: the visa service's actor of zb still carries user.oidc-subject"
-    zb_actor || true
-    PASS=1
-  else
-    echo "assertion OK: the visa service's actor of zb lost the user's attributes"
-  fi
+  assert_zb_actor_lacks "the visa service's actor of zb lost the user's attributes" user.oidc-subject || PASS=1
   zode_no_ping zb "$RELAY_ZPR_ADDR" "a new user flow is denied" || PASS=1
   zode_ping zb "$VS_ZPR_ADDR" "the device flow still works: the machine stays connected" || PASS=1
 fi

@@ -1395,7 +1395,6 @@ fn resolve_next_hop_bind_originator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assembly::PhMode;
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::link_state::LinkType;
     use crate::packet::Packet;
@@ -1466,7 +1465,6 @@ mod tests {
         let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
         let (hairpin_tx, hairpin_rx) = tokio::sync::mpsc::channel(8);
         let mut builder = TestAssemblyBuilder::new();
-        builder.ph_mode = Some(PhMode::Node);
         builder.visa_table = Some(VisaTable::new());
         builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
         builder.mgmt_hairpin_dispatch = Some(crate::queues::MgmtHairpinDispatch::new(hairpin_tx));

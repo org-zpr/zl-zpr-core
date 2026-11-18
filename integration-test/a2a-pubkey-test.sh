@@ -76,7 +76,7 @@ zode_preflight
 
 # The mangle flag only exists in a feature build; bail early with a clear message
 # rather than failing obscurely at relay launch.
-if ! "$PH_BIN" node --help 2>&1 | grep -q -- --security-testing-mangle-forwarded-pings; then
+if ! "$PH_BIN" zode --help 2>&1 | grep -q -- --security-testing-mangle-forwarded-pings; then
   echo "ph binary was not built with the 'enable-security-testing' feature."
   echo "Rebuild with: cargo build -p ph --features enable-security-testing"
   exit 1

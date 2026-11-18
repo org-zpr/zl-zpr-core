@@ -280,7 +280,6 @@ async fn process_command(command: Commands, socket: &PathBuf) -> Result<bool, Cl
                     LinkCommands::Reset { id } => reset_link_task(service, id).await?,
                 },
                 Commands::Logging { logs } => change_logging_task(service, logs).await?,
-                Commands::Addr => get_node_addr_task(service).await?,
                 Commands::Tun => get_tun_info_task(service).await?,
                 Commands::Connect {
                     id: Some(id),
@@ -881,36 +880,6 @@ async fn change_logging_task(
     }
 
     Ok(())
-}
-
-async fn get_node_addr_task(service: svc::Client) -> Result<(), CliError> {
-    let request = service.get_node_info_request();
-    let response = request.send().promise.await?;
-
-    let results = response.get()?;
-    match results.get_result()?.which()? {
-        cli::success_or_error::Which::Success(s) => {
-            let sock_addr = s.unwrap().get_sock_addr()?;
-            let ip_addr = match sock_addr.get_addr()?.which()? {
-                cli::ip_addr::Which::V4(addr) => {
-                    IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(addr?)?))
-                }
-                cli::ip_addr::Which::V6(addr) => {
-                    IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(addr?)?))
-                }
-            };
-            let port = sock_addr.get_port();
-
-            println!("IP address: {ip_addr}, Port: {port}");
-            Ok(())
-        }
-        cli::success_or_error::Which::Error(e) => {
-            println!("error");
-            let result = e.unwrap().get_txt()?.to_string()?;
-            println!("{result}");
-            Err(CliError::RpcError(result))
-        }
-    }
 }
 
 /// `ph-cli tun` output (zipline#202): line 1 is the interface name, then

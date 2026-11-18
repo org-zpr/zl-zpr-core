@@ -1,17 +1,10 @@
-# Example of a node configuration file.
+# Example of a Zode configuration file: `ph zode -c <this file>`.
+# Unknown sections and keys are refused.
 
 # ============================================================================
-# GLOBAL section - Common for all PH instances (adapters and nods)
+# GLOBAL section
 # ============================================================================
 [global]
-
-
-    # ------------------------------------------------------------------------
-    # name
-    #
-    # [optional] - Used in log output. Defaults to "node".
-    # ------------------------------------------------------------------------
-# name = "node0"
 
     # ------------------------------------------------------------------------
     # control_path
@@ -25,19 +18,20 @@
     # ------------------------------------------------------------------------
     # self_addr
     #
-    # [optional] - Node dock listenting address and port.
-    #              Defaults to "0.0.0.0:0" which is probably not what you
-    #              want since OS will pick the port.
+    # [optional] - The substrate address and port this Zode's peers dial.
+    #              Defaults to "0.0.0.0:0"; port 0 becomes the default
+    #              tether port.
     # ------------------------------------------------------------------------
 # self_addr = "192.168.0.1:12345"
 
     # ------------------------------------------------------------------------
     # zpr_addr
     #
-    # [requried] - The ZPR address of the node's internal adapter.
-    #             An IPv6 address: the VS-API session to vs.zpr leaves from it.
+    # [required] - The Zode's ZPR addresses. The first is its own address,
+    #              an IPv6 address: the VS-API session to vs.zpr leaves
+    #              from it. A relay lists fd5a:5052::1 (vs.zpr) after it.
     # ------------------------------------------------------------------------
-zpr_addr = "fd5a:5052::2"
+zpr_addr = [ "fd5a:5052::2" ]
 
     # ------------------------------------------------------------------------
     # ca_file
@@ -71,10 +65,17 @@ private_key_file = "tests/private_key.pem"
     # ------------------------------------------------------------------------
 # tun_if = "tun23"
 
+# ============================================================================
+# NODE section
+# ============================================================================
+[node]
+
     # ------------------------------------------------------------------------
-    # debug
+    # relay / initial_link
     #
-    # [optional] - Enable debug log output. Default false.
+    # [required] - Exactly one of them. A relay (relay = true) never dials;
+    #              any other Zode dials its relay over its initial link.
     # ------------------------------------------------------------------------
-# debug = true
+# relay = true
+initial_link = { addr = "192.168.0.1:5000", cn = "relay.zpr" }
 

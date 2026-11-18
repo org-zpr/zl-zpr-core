@@ -10,7 +10,7 @@ use std::fs::create_dir_all;
 use std::io::BufWriter;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "This program creates the shell completion files for the PH/Adapter", long_about = None, override_usage = "cargo run --features complete --bin generate_completions -- --generate <PATH>")]
+#[command(version, about = "This program creates the shell completion files for ph", long_about = None, override_usage = "cargo run --features complete --bin generate_completions -- --generate <PATH>")]
 struct Args {
     // Path to the generations file you want to create
     #[arg(long, short = 'g')]

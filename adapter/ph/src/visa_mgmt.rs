@@ -381,7 +381,6 @@ mod tests {
     fn assembly_with_forwarding(forwarding: bool) -> Arc<Assembly> {
         use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
         let mut builder = TestAssemblyBuilder::new();
-        builder.ph_mode = Some(crate::assembly::PhMode::Node);
         builder.visa_table = Some(visa_table::VisaTable::new());
         builder.config = Some(rcu::RcuBox::new(crate::config::Config {
             forwarding,

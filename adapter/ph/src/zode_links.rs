@@ -950,7 +950,6 @@ pub(crate) mod tests {
     /// links.
     fn zode(config: Config, topology: &[(&str, &str)]) -> Assembly {
         let asm = create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(crate::assembly::PhMode::Node),
             config: Some(rcu::RcuBox::new(config)),
             ..TestAssemblyBuilder::new()
         });
@@ -1098,7 +1097,6 @@ pub(crate) mod tests {
         let ca = crate::pki::TestCa::new("zode-ca");
         let (keypair, certx) = crate::assembly::test::zode_link_keys(&ca, self_cn);
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(crate::assembly::PhMode::Node),
             self_noise_keypair: Some(keypair),
             certx: Some(certx),
             config: Some(rcu::RcuBox::new(config)),

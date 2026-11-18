@@ -10,9 +10,9 @@
 #    + visa service)
 #
 # The relay hosts the visa service in its own namespace, on its own TUN
-# (zl-zipline#229): the relay's `ph node` puts both its own ZPR address and
+# (zl-zipline#229): the relay's `ph zode` puts both its own ZPR address and
 # vs.zpr on tun0, so vs.zpr is a local actor of the relay, and the visa
-# service runs next to it. There is no `ph adapter` for the visa service.
+# service runs next to it.
 # The relay's VS-API session to vs.zpr, and the visa service's VSS session
 # to the relay, stay in the host (over lo). The other Zodes sit on one
 # substrate segment (a bridge
@@ -21,7 +21,7 @@
 # (zl-zipline#252): the relay hands it bootstrap visas for its own
 # visa-service session.
 #
-# Each Zode is a `ph node` with its own certificate (CN = its policy node
+# Each Zode is a `ph zode` with its own certificate (CN = its policy node
 # name), signed by the test CA unless a test says otherwise.
 #
 
@@ -162,7 +162,7 @@ function create_other_ca() {
 # one per Zode on the bridge (e.g. zb:10.2.0.2); each gets namespace
 # zpr-NAME with ADDR/24 on its veth0.
 #
-# No TUN gets an address here: each `ph node` applies its own ZPR
+# No TUN gets an address here: each `ph zode` applies its own ZPR
 # addresses, the relay's vs.zpr included (Assembly::
 # ensure_local_zpr_addrs_on_tun), which this layout tests.
 function create_zode_network() {
@@ -214,7 +214,7 @@ function launch_zode_vs() {
   in_ns zpr-relay "$VALKEY_SERVER_BIN" \
     --save "" \
     --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
-  # check_vs_valkey_port, in the relay's namespace.
+  # Wait for valkey's port, in the relay's namespace.
   wait_for 15 in_ns zpr-relay bash -c 'exec 3<>/dev/tcp/127.0.0.1/6379'
 
   start_vs --clear-state
@@ -342,7 +342,7 @@ function launch_relay() {
   create_actor_key_and_cert ca relay
 
   in_ns zpr-relay "$PH_BIN" \
-    node \
+    zode \
     --logging "$DEBUG_TARGETS" \
     --control-path relay.sock \
     --advertised-substrate-addr "$RELAY_SUBSTRATE_ADDR:$ZODE_PORT" \
@@ -412,7 +412,7 @@ function launch_zode() {
   [ -e "$NAME.crt" ] || create_actor_key_and_cert "$SIGNING_CA" "$NAME"
 
   in_ns "zpr-$NAME" "$PH_BIN" \
-    node \
+    zode \
     --logging "$DEBUG_TARGETS" \
     --control-path "$NAME.sock" \
     --self-addr "$SUBSTRATE:$ZODE_PORT" \

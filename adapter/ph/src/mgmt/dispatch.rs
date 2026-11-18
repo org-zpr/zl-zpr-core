@@ -481,7 +481,6 @@ mod test {
         let ca = crate::pki::TestCa::new("zode-ca");
         let (kp, certx) = crate::assembly::test::zode_link_keys(&ca, "relay.zpr");
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(crate::assembly::PhMode::Node),
             self_noise_keypair: Some(kp),
             certx: Some(certx),
             ..TestAssemblyBuilder::new()
@@ -528,7 +527,6 @@ mod test {
         let mut cfg = crate::config::Config::default();
         cfg.zpr_addr = vec!["fd5a:5052::10".parse().unwrap()];
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(crate::assembly::PhMode::Node),
             self_noise_keypair: Some(kp),
             certx: Some(certx),
             config: Some(rcu::RcuBox::new(cfg)),

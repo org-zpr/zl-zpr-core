@@ -20,7 +20,7 @@
 # zodes-policy-reauth-no-zb.zplc (leg 3) and zodes-policy-reauth-no-zc.zplc
 # (leg 4).
 #
-# `service` (the JWKS CONNECT proxy) is omitted, as in oidc-test.zplc, so
+# `service` (the JWKS CONNECT proxy) is omitted, as in zodes-login.zplc, so
 # zplc warns; expected.
 
 [resolver]

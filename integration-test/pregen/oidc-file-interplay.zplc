@@ -1,57 +1,49 @@
 # -*- mode: toml -*-
-# oidc + file interplay integration-test fixture config (zipline#27).
 #
-# oidc-test.zplc's one-node topology and fake-IdP pinning, plus the two
-# trusted services of zipline#22 (rationale:
+# oidc + file interplay netns fixture (zipline#27), used by
+# oidc-file-interplay-test.sh. zodes-login.zplc's relay and zb, with the
+# two trusted services of zipline#22 (rationale:
 # zl-zpr-dev-context/docs/VISA_SERVICE.md, "Design decisions"):
 #   - `google` (api = "oidc") is the compiler fixture
 #     test-oidc-file-interplay.zplc's service re-pinned to the fake IdP the
 #     test runs on each namespace's loopback (issuer, client_id, seed JWKS).
 #   - `happyfile` (api = "file") decorates on google's identity attribute;
-#     the vs loads its data from file_ts_dir/happyfile.json keyed on
-#     user.sub. expiration_seconds = 90 deliberately exceeds the vs's 60 s
-#     MIN_ATTRIBUTE_TTL while keeping the test's refresh leg short.
+#     the visa service loads its data from file_ts_dir/happyfile.json, keyed
+#     on user.sub. expiration_seconds = 90 deliberately exceeds the visa
+#     service's 60 s MIN_ATTRIBUTE_TTL while keeping the test's refresh leg
+#     short.
 #
-# `service` (the JWKS CONNECT proxy) is deliberately omitted — the visa
-# service fetches the JWKS directly — so zplc emits a warning; expected.
+# `service` (the JWKS CONNECT proxy) is omitted, as in zodes-login.zplc, so
+# zplc warns; expected.
 
 [resolver]
 order = ["hosts", "dns"]
 
 [resolver.hosts]
-"n0.zpr" = "fd5a:5052::2"
-"n0.overlay" = "10.0.0.1"
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
 
-[nodes."node"]
-provider = [ [ "device.zpr.adapter.cn", "node" ] ]
-zpr_address = "n0.zpr"
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
 
-[nodes."node".substrate_addrs]
-in1 = "n0.overlay:12345"
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
 
 [trusted_services.default]
 cert_path = "ca-cert.pem"
 
-# zipline#107: the `addresses` file store grants adapter2 its static ZPR
-# address by vending device.zpr_addr on its authenticated device CN
-# (zipline#99). Data: pregen/addresses.json, copied in by
-# lib/common_funcs.sh::copy_address_store. adapter1's grant does NOT live
-# here — it is user-only and its grant rides the existing happyfile store
-# (see below). No ZPL statement references this store; the compiler retains
-# it because it vends a VS-interpreted attribute (zipline#105).
-[trusted_services.addresses]
-api = "file"
-returns_attributes = ["zpr_addr -> device.zpr_addr"]
-expiration_seconds = 3600
-
 [trusted_services.happyfile]
 api = "file"
-# zipline#107: happyfile also grants adapter1 its static ZPR address
-# (zpr_addr -> device.zpr_addr, zipline#99), keyed on user.sub:'user-a' —
-# the deployment already has a user-keyed file store, so it is extended
-# rather than adding a second (the plan's one-store-per-deployment rule).
-# This replaces the retired UserASvc join-policy pin (zipline#83/#96).
-returns_attributes = ["hair_color -> user.hair_color", "lazy -> #user.lazy", "zpr_addr -> device.zpr_addr"]
+returns_attributes = ["hair_color -> user.hair_color", "lazy -> #user.lazy"]
 expiration_seconds = 90
 
 [trusted_services.google]
@@ -63,6 +55,8 @@ scopes          = ["openid", "email", "profile"]
 allowed_domains = ["example.com"]
 seed_jwks       = "oidc-test-seed-jwks.json"
 
+# The login outlives the run, so no renewal is needed: the test logs in
+# with `ph-cli connect`, which leaves no agent behind.
 expiration_seconds   = 43200
 max_auth_age_seconds = 86400
 allow_offline_access = false
@@ -74,14 +68,12 @@ returns_attributes = [
 identity_attributes = ["sub"]
 
 [visa_service]
-dock_node = "node"
+dock_node = "relay"
 
-# adapter1 is deliberately absent: it authenticates user-only through the
-# fake IdP and never presents a bootstrap (device) key.
 [bootstrap]
-"node" = "node-rsa-pubkey.pem"
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
 "vs.zpr" = "actorvs.pem"
-"adapter2" = "actor2.pem"
 
 [protocols.ping]
 l4protocol = "iana.ICMP6"
@@ -90,18 +82,7 @@ icmp_codes = [ 128, 129 ]
 
 [services.Web]
 protocol = "ping"
-# zipline#107: adapter2's static ZPR address is granted by the `addresses`
-# trusted service on its device CN (device.zpr_addr, zipline#99), not pinned
-# in policy. The provider entry mirrors the .zpl define's device CN.
-provider = [["device.zpr.adapter.cn", "adapter2"]]
-
-# zipline#107: [services.UserASvc] is gone. It existed only to mint a join
-# policy carrying adapter1's address pin (zipline#83/#96); the happyfile
-# device.zpr_addr grant supplies that address now, so the workaround service
-# is retired (also removed from oidc-file-interplay.zpl).
+provider = [["device.zpr.adapter.cn", "relay"]]
 
 [services.PingableVs]
-protocol = "ping"
-
-[services.PingableNode]
 protocol = "ping"

@@ -85,15 +85,11 @@ REAUTH_WAIT=60
 SWEEP_PERIOD=30
 REVOKE_SLACK=15
 
-# What the logs say. ph: vss_worker.rs (in-place re-authentication, K2) and
-# zode_login.rs; the visa service: vsapi_worker.rs, auth_sweep.rs and
-# connection_control.rs.
-REGISTERED='registered VSS'
-IDP_LIST='received services update with [1-9]'
-LOGGED_IN="Zode login: logged in with $(ere_escape "$IDP_ISSUER")"
+# What the logs say beyond the shared login patterns in lib/zode_funcs.sh.
+# ph: vss_worker.rs (in-place re-authentication, K2) and zode_login.rs; the
+# visa service: vsapi_worker.rs, auth_sweep.rs and connection_control.rs.
 SELF_REAUTH_OK='self re-authentication with the visa service succeeded'
 SELF_REAUTH_FAILED='self re-authentication with the visa service failed'
-POLICY_RENEWAL='Zode login: policy re-authentication answered with a renewal'
 NO_POLICY_RENEWAL='Zode login: no renewal for the policy re-authentication'
 # The visa service logs the node's CN as an Option. It logs zc's login too.
 ZC_REAUTHORIZED="reauthorized node Some\\(\"zc\"\\) at address $(ere_escape "$ZC_ZPR_ADDR") "
@@ -104,8 +100,8 @@ SWEEP_DISCONNECT='reauth sweep: node .* by the deadline; disconnecting it'
 
 # The two IdP endpoints the OIDC leg counts in the fake IdP's log. A silent
 # renewal is a back-channel `grant_type=refresh_token` POST to /token; any
-# GET /auth after the login means the user was re-prompted.
-AUTH_REQUEST='"GET /auth'
+# GET /auth (AUTH_REQUEST, in lib/zode_funcs.sh) after the login means the
+# user was re-prompted.
 TOKEN_REQUEST='"POST /token'
 
 # Seconds left until the disconnect bound for an install made at $1 (a

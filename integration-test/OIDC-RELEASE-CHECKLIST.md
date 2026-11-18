@@ -1,7 +1,7 @@
 # Manual OIDC release checklist — real Google (zipline#16, zipline#40)
 
-CI (the fake-IdP `one-node-oidc-test.sh` and
-`one-node-oidc-renewal-test.sh`) cannot cover real Google. Before an
+CI (the fake-IdP `zode-login-test.sh`, `zode-oidc-test.sh` and
+`oidc-file-interplay-test.sh`) cannot cover real Google. Before an
 OIDC release is called done, run this checklist once against a real Google
 Workspace and record the outcome on the umbrella issue
 ([org-zpr/zl-zipline#1](https://github.com/org-zpr/zl-zipline/issues/1)).
@@ -22,17 +22,19 @@ model wrongly (docs/OIDC.md, "What CI cannot cover").
       `allowed_domains = ["<workspace-domain>"]`,
       `identity_attributes = ["sub"]`, and a seed JWKS snapshot of Google's
       current keys.
-- [ ] A running ZPRnet (node, visa service with that policy, one adapter
-      with **no** `--bootstrap-key` so authentication is forced through
-      OIDC).
+- [ ] A running ZPRnet (a relay Zode with the visa service and that
+      policy, and a Zode that joins it) and a policy rule that admits a
+      flow from that Zode only with the user's attributes, so a login is
+      visible in traffic.
 
 ## 1. Workspace happy path
 
-- [ ] `ph-cli connect <link>` opens a browser to a Google login.
+- [ ] `ph-cli connect` on the joined Zode opens a browser to a Google
+      login.
 - [ ] Log in as the Workspace test account; consent; the browser lands on
       the "you can close this window" page.
-- [ ] `connect` exits 0 and the link reaches Active; ping across the TUN
-      succeeds.
+- [ ] `connect` exits 0, `ph-cli login-status` reports `State: logged
+      in`, and the user flow across the TUN succeeds.
 - [ ] The visa service log shows the user admitted with identity `sub` and
       `user.domain = <workspace-domain>` (from `hd`), and **no** log line
       anywhere contains the `id_token`, the authorization code, or the PKCE
@@ -45,6 +47,8 @@ The security requirement (docs/OIDC.md "Security requirements"): match on
 `hd` claim**, and that absence must fail the domain check even if the
 account's email address is made to look corporate.
 
+- [ ] `ph-cli logout` the Workspace user first: a Zode refuses a second
+      login while one is active (`AlreadyLoggedIn`).
 - [ ] Repeat the login as the consumer Gmail account.
 - [ ] `connect` fails (exit 5, visa service rejected the token) and the visa
       service reports the domain check failing with the `hd`-absent reason
@@ -77,31 +81,33 @@ from login with no silent renewal.
 - [ ] The authorization URL from the runs above carries **no**
       `offline_access` scope and no `access_type=offline`, `prompt=consent`
       or `max_age` parameters.
-- [ ] Leave a `ph-cli auth-agent <link>` login up past `expiration_seconds`
+- [ ] `ph-cli logout` the login of the runs above, so that the agent's
+      login is a new one rather than refused as `AlreadyLoggedIn`.
+- [ ] Leave a `ph-cli auth-agent` login up past `expiration_seconds`
       (set it short, e.g. 600, for this run). No browser opens, and the
-      node's renewal attempt cannot succeed without a refresh token:
-      `ph-cli show-link <link>`'s `Auth expires:` never advances, the visa
-      service's authentication-expiry sweep disconnects the actor at
-      expiry, and traffic across the TUN stops.
+      Zode's renewal attempt cannot succeed without a refresh token:
+      `ph-cli login-status`'s `Expires in:` never advances, and at expiry
+      the Zode logs the user out (`Last failure: LoginExpired`). A new
+      user flow is then denied, while the Zode itself stays connected.
 
 ## 5. Silent renewal against Google (`allow_offline_access = true`)
 
 What this section settles is **Google's** behaviour on the renewal path,
 which the fake IdP only models (docs/OIDC.md, "Credential lifetimes and
 re-authentication"). It is not a test of the renewal loop itself, so run
-`one-node-oidc-renewal-test.sh` green against the fake IdP **first**. Its
-banner records that it has not yet been observed passing; if it fails,
-stop here and fix that, since a failure below would be uninterpretable.
+`zode-login-test.sh` and `zode-oidc-test.sh` green against the fake IdP
+**first**; if either fails, stop here and fix that, since a failure below
+would be uninterpretable.
 
 Policy for this run, on the Google trusted service:
 `allow_offline_access = true`, `expiration_seconds = 600`,
 `max_auth_age_seconds = 1800`. (The compiler requires
 `max_auth_age_seconds > 0` with offline access, and
-`max_auth_age_seconds >= expiration_seconds`.) With the node's default
+`max_auth_age_seconds >= expiration_seconds`.) With the Zode's default
 300 s renewal lead, renewals fall due about every 5 minutes, and the
 session ceiling lands 30 minutes after login.
 
-- [ ] Run `ph-cli auth-agent <link>` and **leave it running**: renewal
+- [ ] Run `ph-cli auth-agent` and **leave it running**: renewal
       only happens while the agent is alive, so `connect` cannot be used
       here. The authorization URL carries `offline_access` in `scope`, plus
       `access_type=offline`, `prompt=consent` and `max_age=31536000`.
@@ -114,8 +120,8 @@ session ceiling lands 30 minutes after login.
       **Record:** `auth_time` present in the login `id_token`: YES / NO.
 - [ ] Wait for the first renewal (about 5 minutes). **No browser opens**,
       the visa service logs `re-authorizing ... (proven session renewal)`,
-      `ph-cli show-link <link>` reports a later `Auth expires:` than
-      before, and ping across the TUN keeps working.
+      `ph-cli login-status` reports a later `Expires in:` than the time
+      left before, and the user flow across the TUN keeps working.
 - [ ] If the renewal is rejected instead (`reauthorize failed for actor
       ...` in the visa service log), record the reason verbatim. The
       likeliest real-Google divergence is the refreshed `id_token` itself:
@@ -124,12 +130,12 @@ session ceiling lands 30 minutes after login.
       Google's refreshed `id_token` carries `auth_time`: YES / NO.
 - [ ] Let several renewals pass silently, then confirm the session
       ceiling. At about 30 minutes after login, renewal can no longer move
-      the expiry forward. The visa service's authentication-expiry sweep
-      disconnects the actor, and traffic stops. Getting back on needs a
-      fresh interactive login.
+      the expiry forward. The Zode logs the user out at expiry, and a new
+      user flow is denied. Getting back on needs a fresh interactive
+      login.
 - [ ] Revocation: in the Google account's security settings, remove the
       application's access while an agent is logged in. The next renewal
-      fails (`invalid_grant`), and the actor is disconnected at its
+      fails (`invalid_grant`), and the Zode logs the user out at the
       current expiry, not at the ceiling.
 - [ ] Throughout, no log line anywhere contains the refresh token, an
       `id_token` or an authorization code.

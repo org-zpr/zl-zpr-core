@@ -1,12 +1,13 @@
 # -*- mode: toml -*-
 #
-# Zode login netns fixture (zl-zipline#233), used by zode-login-test.sh.
-# zodes.zplc (the relay linked to zb, the visa service docked on the relay)
-# plus the fake IdP as an OIDC trusted service, as in oidc-renewal.zplc: zb's
-# own actor gains the user's attributes when someone logs in on zb.
+# Zode login netns fixture (zl-zipline#233), used by zode-login-test.sh and
+# zode-oidc-test.sh. zodes.zplc (the relay linked to zb, the visa service
+# docked on the relay) plus the fake IdP as an OIDC trusted service: zb's
+# own actor gains the user's attributes when someone logs in on zb. The
+# seed JWKS carries only the IdP's first signing key, so zode-oidc-test.sh's
+# key rotation makes the visa service fetch the live JWKS.
 #
-# `service` (the JWKS CONNECT proxy) is omitted, as in oidc-test.zplc, so
-# zplc warns; expected.
+# `service` (the JWKS CONNECT proxy) is omitted, so zplc warns; expected.
 
 [resolver]
 order = ["hosts", "dns"]

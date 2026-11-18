@@ -142,17 +142,21 @@ create_actor_key_and_cert ca relay
 until ip -6 addr show dev zrelay | grep -q "inet6 $VS_ZPR_ADDR/"; do sleep 1; done
 # The visa service binds vs.zpr, so it starts only now, in the same namespace.
 # `vs --clear-state` flushes whatever answers on its Valkey port, so the test
-# Valkey gets a port of its own: if anything already answers there, stop
-# and pick another VK_PORT.
-VK_PORT=6390
-(exec 3<>/dev/tcp/127.0.0.1/$VK_PORT) 2> /dev/null && echo "STOP: 127.0.0.1:$VK_PORT is in use"
+# Valkey gets a port of its own, and the visa service starts only once that
+# Valkey is up and is the one holding the port.
 create_actor_key_and_cert ca vs.zpr
+VK_PORT=6390
 emit_vs_config ca vs.zpr | sed "s|127.0.0.1:6379|127.0.0.1:$VK_PORT|" > vs-config.toml
 write_vs_admin_key
-"$VALKEY_SERVER_BIN" --port "$VK_PORT" --save "" --appendonly no > valkey.log 2>&1 &
-wait_for 15 bash -c "exec 3<>/dev/tcp/127.0.0.1/$VK_PORT"   # our Valkey listens
-env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/idp-ca.crt" "$VS_BIN" -c vs-config.toml \
-  --clear-state "$PREGEN/$ZODE_POLICY_BIN" > vs.log 2>&1 &
+if (exec 3<>/dev/tcp/127.0.0.1/$VK_PORT) 2> /dev/null; then
+  echo "127.0.0.1:$VK_PORT is in use: set another VK_PORT and run these lines again"
+else
+  "$VALKEY_SERVER_BIN" --port "$VK_PORT" --save "" --appendonly no > valkey.log 2>&1 &
+  VK_PID=$!
+  wait_for 15 bash -c "exec 3<>/dev/tcp/127.0.0.1/$VK_PORT" && kill -0 "$VK_PID" &&
+    env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/idp-ca.crt" "$VS_BIN" -c vs-config.toml \
+      --clear-state "$PREGEN/$ZODE_POLICY_BIN" > vs.log 2>&1 &
+fi
 wait_for 30 check_registered relay.log   # the relay registered with the VS
 create_actor_key_and_cert ca zb      # the Windows Zode's identity
 ```

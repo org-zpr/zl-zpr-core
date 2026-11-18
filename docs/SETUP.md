@@ -119,8 +119,10 @@ The schema, with every key explained, is
 Unknown sections and keys are refused. Most settings can also be given on
 the command line (`ph zode --help`). `--relay`, `--initial-link`,
 `--forwarding`, `--advertised-substrate-addr` and `--control-group`
-override the file; for any other `[global]` setting the file sets, the file
-wins, so change it there.
+override the file. For the other `[global]` settings the file sets, the
+file wins, so change them there, except `--zpr-addr`, whose addresses are
+put *before* the file's list. The first address is the Zode's own, so give
+the whole list in one place.
 
 The relay, `relay-conf.toml`. It lists its own ZPR address first and
 `vs.zpr` after it, and puts both on its TUN. `forwarding = true` lets it

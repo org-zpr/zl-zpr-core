@@ -17,7 +17,6 @@ const COMMANDS: &[&str] = &[
     "capture",
     "link",
     "logging",
-    "addr",
     "quit",
     "help",
 ];
@@ -158,8 +157,7 @@ fn get_command_parameter_info(command: &str) -> &str {
         "perf-sample" => " Start performance sampling",
         "capture" => " Set up or tear down packet captures",
         "link" => " Change link state",
-        "logging" => " Change the log level of a node or adapter",
-        "addr" => " Gets the address of an adapter's node",
+        "logging" => " Change the log level of a Zode",
         "quit" => " Exit the CLI",
         "set-file" => " Set a capture file",
         "close-file" => " Close a capture file",

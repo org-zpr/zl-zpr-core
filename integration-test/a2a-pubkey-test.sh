@@ -2,13 +2,19 @@
 #
 # SECURITY TESTING integration test.
 #
-# Models a malicious node (a compromised binary) that corrupts forwarded ICMP
-# echo requests and re-forges their A2A MICV.  A correct receiver rejects the
-# forgery, so the mangled ping never reaches zpr-b.  A tcpdump running in the
-# zpr-b namespace watches for the injected "YOU HAVE BEEN PWNED" payload and
-# FAILS the test if it ever arrives.
+# Models a malicious relay (a compromised binary) that corrupts the ICMP echo
+# requests it forwards between two Zodes and re-forges their A2A MICV. A
+# correct receiver rejects the forgery, so the mangled ping never reaches zc.
+# A tcpdump on zc's TUN watches for the injected "YOU HAVE BEEN PWNED"
+# payload and FAILS the test if it ever arrives.
 #
-# The node is launched with --security-testing-mangle-forwarded-pings, so the
+# Layout (pregen/zodes-pair.zplc, lib/zode_funcs.sh): zb - relay - zc. zb and
+# zc are not linked to each other, so zb's pings to zc cross the relay on a
+# forward-only visa, which tells the relay neither the flow nor zc's A2A key.
+# The relay rebuilds the flow from the visa's previous and next hop (zb and
+# zc), as an attacker on that path could, and forges an unkeyed MICV.
+#
+# The relay is launched with --security-testing-mangle-forwarded-pings, so the
 # PH binaries MUST be built with the `enable-security-testing` feature:
 #   cargo build -p ph --features enable-security-testing
 #
@@ -17,49 +23,41 @@
 #   ./a2a-pubkey-test.sh --unkeyed           # unkeyed MICV: FAILS (forgery accepted)
 #   ./a2a-pubkey-test.sh --unkeyed --reuse   # unkeyed, no recompute: PASSES
 #
-# The last case is the key extra evidence: with --reuse the node mangles the
+# The last case is the key extra evidence: with --reuse the relay mangles the
 # payload but keeps the original MICV, so even an unkeyed receiver rejects it --
 # proving the MICV genuinely covers the payload (not just a prefix of it).
 #
+# Every run also checks that the relay did mangle pings (so a pass is not
+# just a relay that left them alone), and, when the forgery is meant to be
+# rejected, that zc rejected them on their MICV.
+#
 set -euo pipefail
 
-export RUST_BACKTRACE=1
-DEBUG_TARGETS=${DEBUG_TARGETS:-all=INFO}
-KM_IMPL=${KM_IMPL:-noise}
+source "$(dirname "$0")/lib/common_funcs.sh"
+source "$(dirname "$0")/lib/zode_funcs.sh"
 
-PH_BIN="${PH_BIN:-$(realpath "$(dirname "$0")/../target/debug/ph")}"
-PH_DEBUG_BIN="${PH_DEBUG_BIN:-$(realpath "$(dirname "$0")/../target/debug/ph-cli")}"
-VS_BIN="${VS_BIN:-$(realpath "$(dirname "$0")/vs")}"
-VS_ADMIN_BIN="${VS_ADMIN_BIN:-$(realpath "$(dirname "$0")/vs-admin")}"
-VALKEY_SERVER_BIN="${VALKEY_SERVER_BIN:-$(realpath -s "$(dirname "$0")/valkey-server")}"
-
-PREGEN=$(realpath "$(dirname $0)/pregen")
-NODE_AUTH_PRIVATE_KEY="${NODE_AUTH_PRIVATE_KEY:-$PREGEN/node-rsa-key.pem}"
-
-# The payload the malicious node injects; see security_testing_mangle_ping().
+# The payload the malicious relay injects; see security_testing_mangle_ping().
 PWNED_STRING="YOU HAVE BEEN PWNED"
-
-source "$(dirname $0)/lib/common_funcs.sh"
 
 # Re-exec inside an unprivileged user+network namespace; everything below
 # runs there and needs no sudo.
 enter_test_namespace "$@"
 
-# Optionally force old-style unkeyed A2A MICVs on all PH instances (the "old way"
-# the A2A key replaced).  With this set the forgery succeeds and the test fails.
-UNKEYED_ARG=""
-# By default the node recomputes the MICV after mangling (the forgery). With
+# Optionally force old-style unkeyed A2A MICVs on every Zode (the "old way"
+# the A2A key replaced). With this set the forgery succeeds and the test fails.
+UNKEYED_ARGS=()
+# By default the relay recomputes the MICV after mangling (the forgery). With
 # --reuse it keeps the original MICV instead, so the mangled ping is rejected
 # regardless of keying.
-RECOMPUTE_ARG=""
+RECOMPUTE_ARGS=()
 while [[ "$#" -gt 0 ]]; do
   case $1 in
     --unkeyed)
-      UNKEYED_ARG="--security-testing-unkeyed-a2a-micv"
+      UNKEYED_ARGS=(--security-testing-unkeyed-a2a-micv)
       shift
       ;;
     --reuse)
-      RECOMPUTE_ARG="--security-testing-recompute-micvs false"
+      RECOMPUTE_ARGS=(--security-testing-recompute-micvs false)
       shift
       ;;
     --help)
@@ -74,75 +72,13 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-# Substrate (underlay) addresses.
-NODE_SUBSTRATE_ADDR_VS=10.0.0.1
-NODE_SUBSTRATE_ADDR_A=10.0.1.1
-NODE_SUBSTRATE_ADDR_B=10.0.2.1
-NODE_SUBSTRATE_ADDR_C=10.0.3.1
-NODE_SUBSTRATE_ADDR_C_ALT=10.0.3.129
-VS_SUBSTRATE_ADDR=10.0.0.2
-A_SUBSTRATE_ADDR=10.0.1.2
-B_SUBSTRATE_ADDR=10.0.2.2
-C_SUBSTRATE_ADDR=10.0.3.2
-
-# ZPR (overlay) addresses -- IPv6, matching the v6 ping policy.  create_network
-# sets up a zpr-c namespace unconditionally, so its address must be defined even
-# though this test runs no adapter there.
-NODE_ZPR_ADDR=fd5a:5052::2
-VS_ZPR_ADDR=fd5a:5052::1
-A_ZPR_ADDR=fd5a:5052:8888::1:1
-B_ZPR_ADDR=fd5a:5052:8888::2:1
-C_ZPR_ADDR=fd5a:5052:8888::3:1
-ZPR_SUBNET=fd5a:5052::/32
-
-POLICY_BIN="v6-1node-2actor-ping.bin2"
-
-if [ ! -e "$VS_BIN" ]; then
-  echo "vs binary not found, expected it at $VS_BIN"
-  exit 1
-fi
-
-if [ ! -e "$VS_ADMIN_BIN" ]; then
-  echo "vs-admin binary not found, expected it at $VS_ADMIN_BIN"
-  exit 1
-fi
-
-if systemctl is-active --quiet valkey-server 2>/dev/null; then
-  echo "valkey-server system service is running. Please stop it before running this test:"
-  echo "  sudo systemctl stop valkey-server"
-  exit 1
-fi
-
-if [ ! -e "$VALKEY_SERVER_BIN" ]; then
-  echo "valkey-server binary not found, expected it at $VALKEY_SERVER_BIN"
-  exit 1
-fi
-
-if [ ! -e "$PREGEN/$POLICY_BIN" ]; then
-  echo "policy file not found (expected .bin2): $PREGEN/$POLICY_BIN"
-  exit 1
-fi
-
-if [ ! -x "$PH_BIN" ]; then
-  echo "ph binary not found or not executable: $PH_BIN"
-  exit 1
-fi
+zode_preflight
 
 # The mangle flag only exists in a feature build; bail early with a clear message
-# rather than failing obscurely at node launch.
+# rather than failing obscurely at relay launch.
 if ! "$PH_BIN" node --help 2>&1 | grep -q -- --security-testing-mangle-forwarded-pings; then
   echo "ph binary was not built with the 'enable-security-testing' feature."
   echo "Rebuild with: cargo build -p ph --features enable-security-testing"
-  exit 1
-fi
-
-if [ ! -x "$PH_DEBUG_BIN" ]; then
-  echo "ph-cli binary not found or not executable: $PH_DEBUG_BIN"
-  exit 1
-fi
-
-if [ ! -e "$NODE_AUTH_PRIVATE_KEY" ]; then
-  echo "node auth private key not found: $NODE_AUTH_PRIVATE_KEY"
   exit 1
 fi
 
@@ -151,181 +87,62 @@ if ! command -v tcpdump > /dev/null; then
   exit 1
 fi
 
-NODE_SOCK=node.sock
-VS_SOCK=vs.sock
-ADAPTER1_SOCK=adapter1.sock
-ADAPTER2_SOCK=adapter2.sock
+# What the relay logs for each ping it mangles (fastpath.rs).
+MANGLED='SECURITY TESTING: mangled forwarded ping'
+# What zc's fastpath counts for each packet whose A2A MICV does not verify.
+MICV_FAILURE='MICV Failure'
 
-#
-# Set up automatic cleanup
-#
+# The sum of Zode $1's counter $2 over its fastpath workers (`ph-cli
+# counters` prints one line per worker). Prints nothing if ph-cli fails.
+function counter_sum() {
+  local OUT
+  OUT=$("$PH_DEBUG_BIN" -p "$1.sock" counters) || return 1
+  awk -F': ' -v name="$2" '$1 == name { sum += $2 } END { print sum + 0 }' <<< "$OUT"
+}
 
-trap cleanup EXIT
+ZODE_POLICY_BIN=zodes-pair.bin2
+zode_begin
 
-TMPDIR=$(mktemp -d)
-pushd "$TMPDIR" > /dev/null
+PWNED_PCAP="$TMPDIR/zc-icmp.pcap"
 
-PWNED_PCAP="$TMPDIR/zpr-b-icmp.pcap"
-
-echo "Setting up network"
-
-destroy_network
-create_network
-
-create_ca_key_and_cert ca
-create_actor_key_and_cert ca vs.zpr
-create_actor_key_and_cert ca adapter1
-create_actor_key_and_cert ca adapter2
-
-# Temporary hack until our policy compiler is in-repo
-cp "$PREGEN/node.key" node.key
-cp "$PREGEN/node-cert.pem" node.crt
-cp "$PREGEN/node-pubkey.pem" node.pubkey
-cp "$PREGEN/actor1-rsa.key" actor1-rsa.key
-cp "$PREGEN/actor2-rsa.key" actor2-rsa.key
-cp "$PREGEN/actorvs-rsa.key" actorvs-rsa.key
-
-emit_vs_config ca vs.zpr > vs-config.toml
-
-# The policy's `addresses` trusted service reads its grant data from
-# file_ts_dir/addresses.json (file_ts_dir defaults to the vs config's
-# directory, i.e. here). See lib/common_funcs.sh (zipline#107).
-copy_address_store
-
-#
-# Launch ValKey + Visa Service
-#
-
-echo "Launching ValKey"
-
-in_ns zpr-vs "$VALKEY_SERVER_BIN" \
-    --save "" \
-    --appendonly no 2>&1 | tee valkey.log | prefix_log valkey &
-
-wait_for 15 check_vs_valkey_port
-
-echo "Launching Visa Service"
-
-in_ns zpr-vs env XDG_DATA_HOME=/tmp "$VS_BIN" \
-    -c vs-config.toml \
-    --clear-state \
-    "$PREGEN/$POLICY_BIN" 2>&1 | tee vs.log | prefix_log vs &
-
-sleep 2
-
-#
-# Launch PHs
-#
-
-echo "Launching Node (MALICIOUS: mangling forwarded pings${UNKEYED_ARG:+, unkeyed MICVs}${RECOMPUTE_ARG:+, reusing original MICV})"
-
-in_ns zpr-node "$PH_BIN" \
-  node \
-  --logging "$DEBUG_TARGETS" \
-  --control-path "$NODE_SOCK" \
-  --ca-file ca.crt \
-  --certificate-file node.crt \
-  --private-key-file node.key \
-  --auth-private-key "$NODE_AUTH_PRIVATE_KEY" \
-  --advertised-substrate-addr "$NODE_SUBSTRATE_ADDR_VS":5000 \
-  --km-impl "$KM_IMPL" \
-  --tun-if tun0 \
-  --zpr-addr "$NODE_ZPR_ADDR" \
-  --security-testing-mangle-forwarded-pings \
-  $UNKEYED_ARG $RECOMPUTE_ARG 2>&1 | tee node.log | prefix_log zpr-node &
-
-sleep 2
-
-echo "Launching Adapters"
-
-in_ns zpr-vs "$PH_BIN" \
-  adapter \
-  --logging "$DEBUG_TARGETS" \
-  --control-path "$VS_SOCK" \
-  --self-addr "$VS_SUBSTRATE_ADDR" \
-  --ca-file ca.crt \
-  --certificate-file vs.zpr.crt \
-  --private-key-file vs.zpr.key \
-  --bootstrap-key actorvs-rsa.key \
-  --km-impl "$KM_IMPL" \
-  --tun-if tun0 \
-  --io-engine auto \
-  --node-addr "$NODE_SUBSTRATE_ADDR_VS" \
-  --zpr-addr "$VS_ZPR_ADDR" \
-  $UNKEYED_ARG 2>&1 | tee adapter-vs.log | prefix_log zpr-vs &
-
-sleep 5
-
-in_ns zpr-a "$PH_BIN" \
-  adapter \
-  --logging "$DEBUG_TARGETS" \
-  --control-path "$ADAPTER1_SOCK" \
-  --self-addr "$A_SUBSTRATE_ADDR" \
-  --ca-file ca.crt \
-  --bootstrap-key actor1-rsa.key \
-  --name adapter1 \
-  --km-impl "$KM_IMPL" \
-  --tun-if tun0 \
-  --io-engine io_uring \
-  --node-addr "$NODE_SUBSTRATE_ADDR_A" \
-  --zpr-addr "$A_ZPR_ADDR" \
-  $UNKEYED_ARG 2>&1 | tee adapter1.log | prefix_log zpr-a &
-
-in_ns zpr-b "$PH_BIN" \
-  adapter \
-  --logging "$DEBUG_TARGETS" \
-  --control-path "$ADAPTER2_SOCK" \
-  --self-addr "$B_SUBSTRATE_ADDR" \
-  --ca-file ca.crt \
-  --bootstrap-key actor2-rsa.key \
-  --name adapter2 \
-  --km-impl "$KM_IMPL" \
-  --tun-if tun0 \
-  --io-engine posix_unbatched \
-  --node-addr "$NODE_SUBSTRATE_ADDR_B" \
-  --zpr-addr "$B_ZPR_ADDR" \
-  $UNKEYED_ARG 2>&1 | tee adapter2.log | prefix_log zpr-b &
-
-#
-# Wait for connectivity
-#
+create_zode_network "zb:$ZB_SUBSTRATE_ADDR" "zc:$ZC_SUBSTRATE_ADDR"
 PASS=0
-echo "Wait for TUN carrier..."
-wait_for 15 check_carrier zpr-node tun0 || { PASS=1; }
-if [[ "$PASS" == 0 ]]; then wait_for 15 check_carrier zpr-vs tun0 || { PASS=1; }; fi
-if [[ "$PASS" == 0 ]]; then wait_for 15 check_carrier zpr-a tun0 || { PASS=1; }; fi
-if [[ "$PASS" == 0 ]]; then wait_for 15 check_carrier zpr-b tun0 || { PASS=1; }; fi
+echo "Launching relay (MALICIOUS: mangling forwarded pings${UNKEYED_ARGS[*]:+, unkeyed MICVs}${RECOMPUTE_ARGS[*]:+, reusing original MICV})"
+launch_relay true \
+  --security-testing-mangle-forwarded-pings \
+  "${UNKEYED_ARGS[@]}" "${RECOMPUTE_ARGS[@]}" || PASS=1
+launch_zode_vs || PASS=1
 
 if [[ "$PASS" == 0 ]]; then
-  echo "Wait for actor authorization..."
-  for socket in "$VS_SOCK" "$ADAPTER1_SOCK" "$ADAPTER2_SOCK"; do
-    wait_for 15 check_actor_authorized "$socket" || { PASS=1; }
-  done
+  launch_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem" ca "${UNKEYED_ARGS[@]}"
+  launch_zode zc "$ZC_SUBSTRATE_ADDR" "$ZC_ZPR_ADDR" "$PREGEN/zc-rsa-key.pem" ca "${UNKEYED_ARGS[@]}"
+  wait_log_after 60 zb.log 'node access granted to visa service' 0 "zb authenticates" || PASS=1
+  wait_log_after 60 zc.log 'node access granted to visa service' 0 "zc authenticates" || PASS=1
 fi
 
 if [[ "$PASS" == 0 ]]; then
-  echo "Carrier has arrived."
-  sleep 1
-
   #
-  # Watch zpr-b for the injected payload.  We capture the decapsulated ICMP the
-  # zpr-b adapter delivers to its TUN: a rejected forgery never reaches here, an
-  # accepted one arrives carrying the PWNED string.
+  # Watch zc for the injected payload. We capture the decapsulated ICMP zc
+  # delivers to its TUN: a rejected forgery never reaches here, an accepted
+  # one arrives carrying the PWNED string.
   #
-  echo "Starting packet capture on zpr-b..."
+  echo "Starting packet capture on zc..."
   # Safety net: SIGTERM lets tcpdump exit cleanly (and restore the terminal it
   # touched); --kill-after escalates to SIGKILL only if it's wedged in an idle
   # poll() ignoring catchable signals. -U writes each packet immediately, so the
   # pcap is complete even under a hard kill.
   # The unique pcap path makes the pkill match exactly this tcpdump.
-  in_ns zpr-b timeout -s TERM --kill-after=3 30 \
+  in_ns zpr-zc timeout -s TERM --kill-after=3 60 \
     tcpdump -Z root -i tun0 -n -U -w "$PWNED_PCAP" icmp6 2>/dev/null &
   sleep 2
 
-  echo "TEST STARTING: ping zpr-a -> zpr-b"
-  # We do NOT check whether the ping succeeds: a correctly-rejected forgery just
-  # means no reply, which is the passing case.
-  in_ns zpr-a ping -6 -q -c 5 -w 5 "$B_ZPR_ADDR" || true
+  MICV_BEFORE=$(counter_sum zc "$MICV_FAILURE") || PASS=1
+
+  echo "TEST STARTING: ping zb -> zc through the relay"
+  # We do NOT check whether the pings are answered: a correctly rejected
+  # forgery just means no reply, which is the passing case. The first echoes
+  # wait for zb's visa, so send enough for some to cross the relay.
+  in_ns zpr-zb ping -6 -q -c 10 -w 15 "$ZC_ZPR_ADDR" || true
 
   sleep 2
   # Stop the capture: SIGTERM first so tcpdump cleans up and restores the tty,
@@ -337,14 +154,34 @@ if [[ "$PASS" == 0 ]]; then
   pkill_own -KILL -f "tcpdump -Z root -i tun0 -n -U -w $PWNED_PCAP" 2>/dev/null || true
   stty sane 2>/dev/null || true
 
+  # The relay must have mangled pings, or a pass below proves nothing.
+  if grep -q "$MANGLED" relay.log; then
+    echo "assertion OK: the relay mangled forwarded pings"
+  else
+    echo "ASSERTION FAILED: the relay mangled no forwarded ping"
+    PASS=1
+  fi
+
   #
   # Verdict: any captured packet containing the injected string is a breach.
   #
   if grep -a -q "$PWNED_STRING" "$PWNED_PCAP" 2>/dev/null; then
-    echo "SECURITY FAILURE: mangled payload \"$PWNED_STRING\" reached zpr-b!"
+    echo "SECURITY FAILURE: mangled payload \"$PWNED_STRING\" reached zc!"
     PASS=1
   else
-    echo "No mangled payload reached zpr-b (forgery rejected)."
+    echo "No mangled payload reached zc (forgery rejected)."
+    # And zc dropped the mangled pings on a failed MICV, not for another
+    # reason. The counter also counts link-HMAC failures, but the relay
+    # mangles before it seals the packet for the link to zc, so the mangle
+    # cannot fail zc's link check; and --unkeyed shows the same forgery
+    # passing that link check and reaching zc's A2A check.
+    MICV_AFTER=$(counter_sum zc "$MICV_FAILURE") || PASS=1
+    if (( MICV_AFTER > MICV_BEFORE )); then
+      echo "assertion OK: zc rejected $((MICV_AFTER - MICV_BEFORE)) packets on their MICV"
+    else
+      echo "ASSERTION FAILED: zc's '$MICV_FAILURE' counter did not rise ($MICV_BEFORE -> $MICV_AFTER)"
+      PASS=1
+    fi
   fi
 fi
 
@@ -352,29 +189,4 @@ fi
 # explicit removal so the trap cleanup's rm never prompts.
 rm -f "$PWNED_PCAP" 2>/dev/null || true
 
-#
-# Cleanup
-#
-
-for pid in $(get_descendants)
-do
-  echo
-  echo "Terminating $pid"
-  sleep 1
-  kill -SIGINT "$pid"
-  sleep 1
-done
-
-stty sane || true
-
-#
-# Report status
-#
-
-echo
-if [[ "$PASS" == 0 ]]
-then echo "SUCCESS"
-else echo "FAILURE"
-fi
-
-exit "$PASS"
+zode_report "$PASS"

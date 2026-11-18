@@ -309,8 +309,9 @@ function install_zode_policy() {
 # ZPR address first and vs.zpr after it (zl-zipline#229), and wait until
 # vs.zpr is on its TUN. $1 is its `forwarding` setting, `true` (the
 # default) or `false`: a relay that does not forward refuses forward-only
-# visas (visa_mgmt.rs insert_visa). Returns non-zero if vs.zpr never
-# appears.
+# visas (visa_mgmt.rs insert_visa). Any further arguments go to `ph` as
+# they are (e.g. a security-testing flag); pass $1 to use them. Returns
+# non-zero if vs.zpr never appears.
 function launch_relay() {
   local FORWARDING=${1:-true}
   create_actor_key_and_cert ca relay
@@ -329,7 +330,8 @@ function launch_relay() {
     --forwarding "$FORWARDING" \
     --tun-if tun0 \
     --zpr-addr "$RELAY_ZPR_ADDR" \
-    --zpr-addr "$VS_ZPR_ADDR" 2>&1 | tee relay.log | prefix_log relay &
+    --zpr-addr "$VS_ZPR_ADDR" \
+    "${@:2}" 2>&1 | tee relay.log | prefix_log relay &
 
   wait_for 15 relay_has_vs_addr || {
     echo "the relay did not put $VS_ZPR_ADDR on its TUN"
@@ -376,9 +378,10 @@ function assert_relay_conn() {
 # $4 = its RSA authentication key, $5 = the CA that signs its certificate
 # (default `ca`, the test CA). Its own --ca-file is always the test CA, so
 # with another signing CA the Zode still accepts the relay, and it is the
-# relay that must refuse the Zode. Its key and certificate are made on the
-# first launch and reused on a restart. The log is appended to, so a
-# restart keeps the earlier lines.
+# relay that must refuse the Zode. Any further arguments go to `ph` as they
+# are (e.g. --io-engine io_uring); pass $5 to use them. Its key and
+# certificate are made on the first launch and reused on a restart. The log
+# is appended to, so a restart keeps the earlier lines.
 function launch_zode() {
   local NAME=$1 SUBSTRATE=$2 ZPR_ADDR=$3 AUTH_KEY=$4 SIGNING_CA=${5:-ca}
   [ -e "$NAME.crt" ] || create_actor_key_and_cert "$SIGNING_CA" "$NAME"
@@ -395,7 +398,8 @@ function launch_zode() {
     --auth-private-key "$AUTH_KEY" \
     --km-impl "$KM_IMPL" \
     --tun-if tun0 \
-    --zpr-addr "$ZPR_ADDR" 2>&1 | tee -a "$NAME.log" | prefix_log "$NAME" &
+    --zpr-addr "$ZPR_ADDR" \
+    "${@:6}" 2>&1 | tee -a "$NAME.log" | prefix_log "$NAME" &
 }
 
 # Kill Zode NAME ($1) at once, as a crash or force-quit would, and wait for

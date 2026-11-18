@@ -18,3 +18,5 @@ need a zplc that knows node links and peer CNs (`zl-zpr-compiler`
 `attr-query.bin2` and the `zodes-policy-reauth*.bin2` fixtures
 (zl-zipline#234) were compiled with zpc 0.21.0 (v0.18.1-23-g3e16a94,
 compiler `feature/zodes`).
+`zodes-ping.bin2` (zl-zipline#234) was compiled with zpc 0.21.0
+(v0.18.1-23-g3e16a94, compiler `feature/zodes`).

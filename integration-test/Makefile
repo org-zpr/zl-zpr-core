@@ -7,9 +7,8 @@
 # root in a container instead:
 #
 #   make docker-test                      # every *-test.sh (see TESTS), PASS/FAIL summary
-#   make docker-test TEST=one-node-test.sh
-#   make docker-test TEST="one-node-test.sh --actor_protocol ipv4"
-#   make docker-test TEST=one-node-test.sh DEBUG_TARGETS="all=INFO zdp=DEBUG"
+#   make docker-test TEST=zode-ping-test.sh
+#   make docker-test TEST=zode-ping-test.sh DEBUG_TARGETS="all=INFO zdp=DEBUG"
 #   make docker-shell                     # root shell in this directory
 #
 # Host prerequisites: Docker running and the caller in the `docker` group.
@@ -44,7 +43,6 @@ TESTS := $(filter-out a2a-pubkey-test.sh,$(sort $(wildcard *-test.sh)))
 # mentioned at all, so the image's own ENV (USER, VALKEY_SERVER_BIN, ...) stands.
 FORWARD_ENV := DEBUG_TARGETS KM_IMPL NETEM_PARAMS NODE_AUTH_PRIVATE_KEY FAKE_IDP_PORT \
                SKIP_NOTIFY ZPR_TEST_VERBOSE \
-               RESTART_ROUNDS GRACEFUL_ROUND \
                PH_BIN PH_DEBUG_BIN VS_BIN VS_ADMIN_BIN ZPR_ATTR_SERVER_BIN ZPDUMP_BIN VALKEY_SERVER_BIN
 DOCKER_ENV := $(foreach v,$(FORWARD_ENV),$(if $(filter undefined,$(origin $(v))),,-e $(v)))
 

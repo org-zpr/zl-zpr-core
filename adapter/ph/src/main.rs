@@ -55,7 +55,6 @@ mod prelude;
 mod queues;
 mod sample_ring;
 mod signal_worker;
-mod special_peers;
 mod sys;
 mod tc;
 mod test_packet;
@@ -450,7 +449,6 @@ fn main() -> ExitCode {
         zode_links: Default::default(),
         zode_login: Default::default(),
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
-        deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
         vs_session_up: std::sync::atomic::AtomicBool::new(false),
         bootstrap_handoff: Default::default(),

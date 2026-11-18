@@ -4,7 +4,6 @@
 //! and any config file, returning a PH configuration.
 
 #[cfg(not(feature = "complete"))]
-use crate::auth::AuthError;
 use crate::batch_io;
 use crate::logging::{levels, targets};
 use clap::{Args, Parser, Subcommand};
@@ -28,9 +27,6 @@ pub enum ArgsError {
 
     #[error("{0}")]
     PathError(String),
-
-    #[error("bootstrap config error: {0}")]
-    AuthError(#[from] AuthError),
 }
 
 /// ZPR Packet Handler

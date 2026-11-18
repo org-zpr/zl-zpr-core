@@ -34,12 +34,8 @@ pub async fn launch(asm: Arc<Assembly>, mut queue: mpsc::Receiver<VSSMessage>) {
             }
 
             VSSMessage::RevokeAuth(addrs, resp_tx) => {
-                // zipline#45 C5: for each revoked ZPR address docked on this
-                // node, terminate the actor's link via the existing close
-                // path (which deregisters the actor's addresses and removes
-                // its visas — see deregister_actor_addresses /
-                // clean_up_link_state). Unknown addresses are a no-op: the
-                // VS may broadcast revocations for actors docked elsewhere.
+                // zipline#45 C5: no actor docks on a Zode, so every revoked
+                // address is acked as a no-op (zl-zipline#234).
                 let processed = process_revoke_auth(&asm, &addrs);
                 let _ = resp_tx.send(ListProcessingResponse::Ack { processed });
             }
@@ -104,44 +100,14 @@ pub fn process_visaop(asm: &Arc<Assembly>, op: VisaOp) -> Result<(), visa_table:
     Ok(())
 }
 
-/// Terminate the link of every actor in `addrs` that is docked on this node
-/// (zipline#45 C5). Termination runs the normal close path, which notifies
-/// the VS of the disconnect and clears the actor's visas; addresses not
-/// docked here are counted but otherwise ignored (no-op ack). Returns the
-/// number of addresses processed (all of them: a revocation for an unknown
-/// address is *successfully* processed as a no-op).
-pub fn process_revoke_auth(asm: &Arc<Assembly>, addrs: &[std::net::IpAddr]) -> u32 {
-    use crate::link_state::LinkEvent;
-    use crate::zdp::TerminateReason;
-
+/// Process a VSS `revokeAuthentication` (zipline#45 C5). No actor docks
+/// on a Zode (zl-zipline#234), so there is no link to terminate: every
+/// address is logged and acked as successfully processed, a no-op. The
+/// Zode's own address is no exception: its `Internal` local-actor link is
+/// never closed. Returns the number of addresses processed (all of them).
+pub fn process_revoke_auth(_asm: &Arc<Assembly>, addrs: &[std::net::IpAddr]) -> u32 {
     for addr in addrs {
-        let addr = zpr_utils::net_defs::IpAddress::new_from_std(addr);
-        // Only peer links dock actors; a match against a local/self address
-        // is not a docked actor, so search the peer table directly.
-        let docked_link = asm
-            .peer_table
-            .find(|(_id, peer)| peer.actor_auth.owns_address(&addr));
-        match docked_link {
-            Some((link_id, _peer)) => {
-                let link_id = link_id.get();
-                warn!(target: VSS_RPC,
-                    "revoke_auth: terminating {} (actor {addr} revoked by the visa service)",
-                    asm.formatted_link_id(link_id));
-                // Shutdown quells restart behavior; the close path
-                // deregisters the actor's addresses (removing visas).
-                if let Err(e) = asm
-                    .process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Shutdown))
-                {
-                    error!(target: VSS_RPC,
-                        "revoke_auth: failed to terminate {}: {e}",
-                        asm.formatted_link_id(link_id));
-                }
-            }
-            None => {
-                debug!(target: VSS_RPC,
-                    "revoke_auth: {addr} is not docked on this node (no-op)");
-            }
-        }
+        debug!(target: VSS_RPC, "revoke_auth: {addr} is not docked on this node (no-op)");
     }
     addrs.len() as u32
 }
@@ -166,11 +132,8 @@ pub struct RequestAuthOutcome {
 ///   ([Assembly::self_reauth_in_flight] stays set until that attempt
 ///   resolves; a coalesced address is still counted, because re-auth for it
 ///   *is* underway).
-/// - A docked adapter's address: start the on-demand ZDP renewal on its
-///   link (zipline#122, [crate::actor_renewal::request_renewal_now]) — counted,
-///   and coalesced onto an in-flight renewal attempt if one is outstanding
-///   (a coalesced address is still counted: its re-auth is underway).
-/// - An unknown address: skipped and not counted.
+/// - Any other address: skipped and not counted. No actor docks on a Zode
+///   (zl-zipline#234).
 ///
 /// Sets [Assembly::self_reauth_in_flight] when it decides to start a self
 /// re-auth; the caller must then actually spawn it (see [spawn_self_reauth])
@@ -207,42 +170,9 @@ pub fn process_request_authentication(
             continue;
         }
 
-        let addr_ip = zpr_utils::net_defs::IpAddress::new_from_std(addr);
-        let docked_link = asm
-            .peer_table
-            .find(|(_id, peer)| peer.actor_auth.owns_address(&addr_ip));
-        match docked_link {
-            Some((link_id, peer)) => {
-                // A docked adapter (zipline#122, K1/K4): start the on-demand
-                // ZDP renewal on its link. Count only what actually started:
-                // Accepted (new attempt) and Coalesced (already underway)
-                // count; Ignored — the link left `Active` during shutdown
-                // while still holding its actor address, so the state guard
-                // refused — must not be acknowledged as underway (Codex
-                // review, zl-zpr-core#45).
-                let link_id = link_id.get();
-                drop(peer);
-                match crate::actor_renewal::request_renewal_now(asm, link_id) {
-                    crate::actor_renewal::RenewalStart::Accepted
-                    | crate::actor_renewal::RenewalStart::Coalesced => {
-                        info!(target: VSS_RPC,
-                            "request_auth: on-demand re-auth underway for {addr} on {}",
-                            asm.formatted_link_id(link_id));
-                        processed += 1;
-                    }
-                    crate::actor_renewal::RenewalStart::Ignored => {
-                        debug!(target: VSS_RPC,
-                            "request_auth: {addr} resolves to {} but no renewal could start; not counted",
-                            asm.formatted_link_id(link_id));
-                    }
-                }
-            }
-            None => {
-                // Unknown address: skipped, not counted (K1).
-                debug!(target: VSS_RPC,
-                    "request_auth: {addr} is not this node and not docked here; skipping");
-            }
-        }
+        // Not this Zode's address: skipped, not counted (K1).
+        debug!(target: VSS_RPC,
+            "request_auth: {addr} is not this node's address; skipping");
     }
 
     RequestAuthOutcome {
@@ -382,11 +312,10 @@ fn process_topology(asm: &Arc<Assembly>, links: Vec<Link>) -> SetTopologyRespons
 mod tests {
     use super::*;
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
-    use crate::link_state::{LinkState, LinkType};
-    use crate::peer_table;
+    use crate::link_state::LinkState;
     use std::net::IpAddr;
     use tokio::task::LocalSet;
-    use zpr_utils::net_defs::{self, IpAddress};
+    use zpr_utils::net_defs::IpAddress;
 
     /// With `forwarding` off, a pushed forward-only visa is refused and
     /// dropped, but the op is still acked so the visa service's push queue
@@ -515,42 +444,6 @@ mod tests {
         }
     }
 
-    fn add_active_peer_with_actor(asm: &Arc<Assembly>, actor: IpAddr) -> zpr::packet_info::LinkId {
-        let entry = asm.peer_table.vacant_entry().unwrap();
-        let link_id = entry.key();
-        let ps = peer_table::test::create_dummy_peer_state(
-            link_id,
-            LinkType::NodeToAdapter,
-            SubstrateAddr::from(([127, 0, 0, 1], 9000 + link_id.get() as u16)),
-            net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2).into()),
-        );
-        entry.insert(ps);
-        let peer = asm.peer_table.get(link_id.get()).unwrap();
-        peer.link_state_machine.test_set_state(LinkState::Active);
-        peer.actor_auth
-            .test_set_addresses(vec![IpAddress::new_from_std(&actor)]);
-        link_id.get()
-    }
-
-    /// Like [add_active_peer_with_actor] but node-side (NodeToAdapter), the
-    /// link type the on-demand renewal hook (zipline#122) requires.
-    fn add_node_peer_with_actor(asm: &Arc<Assembly>, actor: IpAddr) -> zpr::packet_info::LinkId {
-        let entry = asm.peer_table.vacant_entry().unwrap();
-        let link_id = entry.key();
-        let ps = peer_table::test::create_dummy_peer_state(
-            link_id,
-            LinkType::NodeToAdapter,
-            SubstrateAddr::from(([127, 0, 0, 1], 9200 + link_id.get() as u16)),
-            net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2).into()),
-        );
-        entry.insert(ps);
-        let peer = asm.peer_table.get(link_id.get()).unwrap();
-        peer.link_state_machine.test_set_state(LinkState::Active);
-        peer.actor_auth
-            .test_set_addresses(vec![IpAddress::new_from_std(&actor)]);
-        link_id.get()
-    }
-
     /// A Zode assembly whose own address `own` is held by its `Internal`
     /// local-actor peer, as `main.rs` sets it up, plus one Active Zode link
     /// that owns no address. Returns the Zode link's id.
@@ -638,61 +531,6 @@ mod tests {
             .await
     }
 
-    /// C5 (zipline#45): revoke_auth for an actor docked here terminates the
-    /// actor's link via the existing close path; an unknown address is a
-    /// no-op — both count as processed in the ack.
-    #[tokio::test]
-    async fn test_revoke_auth_terminates_docked_actor_and_ignores_unknown() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let docked: IpAddr = "10.9.8.7".parse().unwrap();
-                let unknown: IpAddr = "10.0.0.99".parse().unwrap();
-                let link_id = add_active_peer_with_actor(&asm, docked);
-
-                let processed = process_revoke_auth(&asm, &[docked, unknown]);
-                assert_eq!(processed, 2, "both addresses count as processed");
-
-                let state = asm
-                    .peer_table
-                    .get(link_id)
-                    .unwrap()
-                    .link_state_machine
-                    .get_state();
-                assert!(
-                    !matches!(state, LinkState::Active),
-                    "docked actor's link must leave Active after revoke_auth, got {state:?}"
-                );
-            })
-            .await
-    }
-
-    /// C5 (zipline#45): revoke_auth with only unknown addresses changes no
-    /// link state and still acks every address.
-    #[tokio::test]
-    async fn test_revoke_auth_unknown_address_is_noop() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let docked: IpAddr = "10.9.8.7".parse().unwrap();
-                let unknown: IpAddr = "10.0.0.99".parse().unwrap();
-                let link_id = add_active_peer_with_actor(&asm, docked);
-
-                let processed = process_revoke_auth(&asm, &[unknown]);
-                assert_eq!(processed, 1);
-                assert_eq!(
-                    asm.peer_table
-                        .get(link_id)
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    LinkState::Active,
-                    "an unrelated link must not be disturbed"
-                );
-            })
-            .await
-    }
-
     /// zipline#121 K1: the node's own address in a `requestAuthentication`
     /// starts exactly one self re-auth and counts in the ack; an unknown
     /// address is skipped and NOT counted.
@@ -756,122 +594,6 @@ mod tests {
                 assert!(
                     third.start_self_reauth,
                     "after the attempt resolves a new request must start again"
-                );
-            })
-            .await
-    }
-
-    /// zipline#122 (N2): a docked adapter's address in a
-    /// `requestAuthentication` starts an on-demand ZDP renewal on the
-    /// adapter's link — counted in the ack (K1) — while the link stays
-    /// Active and visas are untouched. A second request while the renewal
-    /// is in flight is coalesced but still counted: re-auth IS underway.
-    #[tokio::test]
-    async fn test_request_auth_adapter_address_starts_renewal_and_is_counted() {
-        use crate::visa_table::tests::new_vsapi_visa_tcp_default;
-        use std::time::{Duration, SystemTime};
-
-        LocalSet::new()
-            .run_until(async {
-                let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
-                let own: IpAddr = "10.1.1.1".parse().unwrap();
-                let docked: IpAddr = "10.9.8.7".parse().unwrap();
-                let mut builder = node_builder(own);
-                builder.mgmt_substrate_egress =
-                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_node_peer_with_actor(&asm, docked);
-                asm.visa_table
-                    .write()
-                    .unwrap()
-                    .insert_visa(new_vsapi_visa_tcp_default(
-                        77,
-                        SystemTime::now() + Duration::from_secs(3600),
-                    ))
-                    .unwrap();
-
-                let outcome = process_request_authentication(&asm, &[docked]);
-                assert_eq!(
-                    outcome.processed, 1,
-                    "an adapter address with a started renewal counts in the ack (K1)"
-                );
-                assert!(!outcome.start_self_reauth);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                assert!(
-                    peer.actor_auth.renewal.test_in_flight(),
-                    "the adapter's link must have a renewal in flight"
-                );
-                let pkt = egress_rx
-                    .try_recv(vec![0u8; 2048].into_boxed_slice())
-                    .expect("a RenewAuthenticationRequest must go out");
-                assert_eq!(
-                    pkt.body()[0],
-                    crate::zdp::ZdpPacketType::RenewAuthenticationRequest.0,
-                    "expected a RenewAuthenticationRequest (144)"
-                );
-                assert_eq!(
-                    peer.link_state_machine.get_state(),
-                    LinkState::Active,
-                    "the adapter's link must stay Active"
-                );
-                assert!(
-                    asm.visa_table.read().unwrap().contains(77),
-                    "visas must be untouched"
-                );
-
-                // Coalescing: a second request is counted but sends nothing.
-                let second = process_request_authentication(&asm, &[docked]);
-                assert_eq!(
-                    second.processed, 1,
-                    "a coalesced adapter address still counts: its re-auth is underway"
-                );
-                assert!(
-                    egress_rx
-                        .try_recv(vec![0u8; 2048].into_boxed_slice())
-                        .is_err(),
-                    "no second request while the renewal is in flight"
-                );
-            })
-            .await
-    }
-
-    /// Codex review (zl-zpr-core#45, P2): a docked link that has left
-    /// `Active` (shutdown race) but still retains its actor address must
-    /// NOT be counted in the ack — `request_renewal_now`'s state guard
-    /// returns without sending, so no re-authentication attempt started
-    /// and reporting one as underway would be a lie.
-    #[tokio::test]
-    async fn test_request_auth_non_active_docked_link_not_counted() {
-        LocalSet::new()
-            .run_until(async {
-                let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
-                let own: IpAddr = "10.1.1.1".parse().unwrap();
-                let docked: IpAddr = "10.9.8.7".parse().unwrap();
-                let mut builder = node_builder(own);
-                builder.mgmt_substrate_egress =
-                    Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
-                let asm = Arc::new(create_assembly(builder));
-                let link_id = add_node_peer_with_actor(&asm, docked);
-                let peer = asm.peer_table.get(link_id).unwrap();
-                // The link is being torn down: it has left Active but its
-                // actor address is still in the table.
-                peer.link_state_machine.test_set_state(LinkState::Closing);
-
-                let outcome = process_request_authentication(&asm, &[docked]);
-                assert_eq!(
-                    outcome.processed, 0,
-                    "an ignored renewal (state guard) must not count as underway"
-                );
-                assert!(!outcome.start_self_reauth);
-                assert!(
-                    !peer.actor_auth.renewal.test_in_flight(),
-                    "no renewal attempt may be in flight on a non-Active link"
-                );
-                assert!(
-                    egress_rx
-                        .try_recv(vec![0u8; 2048].into_boxed_slice())
-                        .is_err(),
-                    "no request may go out on a non-Active link"
                 );
             })
             .await

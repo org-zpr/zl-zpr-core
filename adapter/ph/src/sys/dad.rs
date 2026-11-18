@@ -1,5 +1,5 @@
 //! Waiting out IPv6 duplicate-address detection on a freshly added address
-//! (zipline#162, checklist item 1 of `integration-test/windows-node-test.md`).
+//! (zipline#162, checklist item 1 of `integration-test/windows-zode-test.md`).
 //!
 //! Windows runs DAD on the Wintun adapter: an address added with `netsh`
 //! sits in the *tentative* state for about a second (`DadTransmits` = 1,

@@ -13,7 +13,6 @@ use crate::peer_table;
 use crate::peer_table::PeerInsertError;
 use crate::prelude::*;
 use crate::queues::*;
-use crate::special_peers::SpecialPeerName;
 use crate::tun_ctl::TunCtl;
 use crate::visa_table;
 use crate::zdpr_worker;
@@ -30,7 +29,7 @@ use tracing_subscriber::filter::targets::Targets;
 use tracing_subscriber::{Layer, Registry, filter, fmt, reload};
 use x25519_dalek::ReusableSecret;
 use zpr::addrs::ZPRNET_PREFIX_LEN;
-use zpr::vsapi_types::{AuthServicesList, ConnectRequest};
+use zpr::vsapi_types::AuthServicesList;
 use zpr_utils::net_defs::{IpAddress, ScopedIpAddr, SocketAddrExt};
 
 /// The build-identity string reported by this assembly, e.g. on the
@@ -61,7 +60,6 @@ pub struct Assembly {
 
     pub vsconn: Option<libnode::vsconn::VSConnHandle>, // present only on nodes
     pub vs_auth_services: std::sync::RwLock<AuthServicesList>, // present only on nodes, may be empty, managed by visa service
-    pub deferred_vs_connect: Mutex<Option<(LinkId, IpAddress, ConnectRequest)>>, // present only on nodes, the VS adapter's connect request and self-granted address, held until the node has VSAPI access
     /// Node only (zipline#121): true while an in-place self re-authentication
     /// against the visa service is in flight. A VSS `requestAuthentication`
     /// naming this node's own address while set is coalesced into the running
@@ -170,12 +168,8 @@ impl Assembly {
     async fn shutdown_node(self: &Arc<Self>) {
         let mut join_set = tokio::task::JoinSet::new();
 
-        let vs_peer = self
-            .peer_table
-            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
-
         self.peer_table.for_each(|(peer_id, peer)| {
-            if Some(peer_id) != vs_peer && !peer.is_internal() {
+            if !peer.is_internal() {
                 // This should be a short block and must be blocked on,
                 // otherwise the messages won't get sent
                 let spawn_self = self.clone();
@@ -184,13 +178,9 @@ impl Assembly {
         });
 
         join_set.join_all().await;
-
-        if let Some(vs_peer) = vs_peer {
-            self.reset_peer(vs_peer.get()).await;
-        }
     }
 
-    /// Disconnect all non-internal, non-vs adapters.
+    /// Disconnect all non-internal peers.
     /// Used in a node context when (for example) we loose all state with the visa service.
     ///
     /// Zode links are reset too, except the one carrying the VS-API session
@@ -201,13 +191,10 @@ impl Assembly {
     /// Does not remove visas related to the adapter/peer.
     pub async fn disconnect_adapters(self: &Arc<Self>) {
         let mut join_set = tokio::task::JoinSet::new();
-        let vs_peer = self
-            .peer_table
-            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
         let session_link = *self.bootstrap_handoff.borrow();
         self.peer_table.for_each(|(peer_id, peer)| {
             let carries_session = session_link == Some(peer_id.get());
-            if Some(peer_id) != vs_peer && !peer.is_internal() && !carries_session {
+            if !peer.is_internal() && !carries_session {
                 // This should be a short block and must be blocked on,
                 // otherwise the messages won't get sent
                 let spawn_self = self.clone();
@@ -374,14 +361,7 @@ impl Assembly {
     /// Caled from `LinkStateWrapper::complete_close`.`
     /// Also drops visas related to the peer.
     pub fn drop_peer(self: &Arc<Self>, link_id: LinkId) {
-        let vs_link_id = self
-            .peer_table
-            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
-        if vs_link_id.is_some() && link_id == vs_link_id.unwrap().get() {
-            debug!(target: PEER_MGMT, "Removing peer {} [VISA SERVICE]", self.formatted_link_id(link_id));
-        } else {
-            debug!(target: PEER_MGMT, "Removing peer {}", self.formatted_link_id(link_id));
-        }
+        debug!(target: PEER_MGMT, "Removing peer {}", self.formatted_link_id(link_id));
         let zode_link = self
             .peer_table
             .get(link_id)
@@ -485,19 +465,6 @@ impl Assembly {
     /// Calls down to `LinkStateWrapper::reset` which will ultimately end up calling back
     /// here to [Assembly::drop_peer].
     pub async fn reset_peer(self: &Arc<Self>, link_id: LinkId) {
-        let vs_link_id = self
-            .peer_table
-            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
-        if vs_link_id.is_some() && link_id == vs_link_id.unwrap().get() {
-            if let Some(vsconn) = self.vsconn.as_ref() {
-                if let Err(e) = vsconn.stop(true).await {
-                    error!(target: PEER_MGMT, "stop command to VSConn failed: {e}");
-                } else {
-                    // Let VSConn runloop process/send the command.
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-        }
         if let Some(peer) = self.peer_table.get(link_id) {
             peer.link_state_machine.reset(self).await;
         }
@@ -1269,7 +1236,6 @@ pub mod test {
             zode_links: Default::default(),
             zode_login: Default::default(),
             vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
-            deferred_vs_connect: Mutex::new(None),
             self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
             vs_session_up: std::sync::atomic::AtomicBool::new(false),
             bootstrap_handoff: Default::default(),

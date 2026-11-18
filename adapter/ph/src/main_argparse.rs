@@ -897,7 +897,7 @@ mod test {
     }
 
     /// zl-zipline#234: `ph zode` parses the argv zipline passes
-    /// (`zipline-cmd` `ph_args`), with every flag `ph node` took.
+    /// (`zipline-cmd` `ph_args`).
     #[test]
     #[parallel(env)]
     fn test_zode_parses_zipline_argv() {

@@ -621,8 +621,8 @@ mod tests {
     /// such wakes are expected) makes every engine's batch receive fail
     /// its FIRST item with `WouldBlock`, which the batch loop returns as
     /// the batch error. That must classify as an empty batch — the smoke
-    /// test's `ph.exe adapter` panicked here (`fastpath_io.rs`
-    /// `.unwrap()`, os error 10035) right after docking.
+    /// test's `ph.exe` panicked here (`fastpath_io.rs` `.unwrap()`, os
+    /// error 10035) right after its link came up.
     #[test]
     fn substrate_recv_on_empty_socket_is_empty_batch() {
         for name in batch_io::engine_names() {

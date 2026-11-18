@@ -19,7 +19,6 @@ use std::net::{IpAddr, SocketAddr};
 use tokio::sync::{broadcast, watch};
 
 use crate::prelude::*;
-use crate::visa_mgmt;
 use crate::vss_worker;
 
 use libnode::error::VSApiError;
@@ -176,24 +175,6 @@ pub async fn launch(
                 // routes a joiner's VSS only over a link both ends report up
                 // (zl-zipline#252).
                 asm.zode_links.request_report();
-                // VSS registration snapshots both actors' A2A keys into its callback
-                // visa. Register the bootstrapped VS adapter before minting that visa.
-                let deferred = asm.deferred_vs_connect.lock().unwrap().take();
-                if let Some((vs_link_id, assigned_addr, conn_req)) = deferred {
-                    if let Err(e) = visa_mgmt::send_deferred_vs_connect(
-                        &asm,
-                        vs_link_id,
-                        assigned_addr,
-                        conn_req,
-                    )
-                    .await
-                    {
-                        panic!(
-                            "{}: deferred visa service adapter connect failed: {e}",
-                            asm.formatted_link_id(vs_link_id)
-                        );
-                    }
-                }
                 // J10: a joiner whose initial link is lost meanwhile stops
                 // registering and rejoins at once.
                 let registered = tokio::select! {

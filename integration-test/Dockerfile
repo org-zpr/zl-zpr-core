@@ -16,7 +16,7 @@
 ARG BASE_IMAGE=ubuntu:26.04
 FROM ${BASE_IMAGE}
 
-# iproute2         ip link / ip netns (remote-node-host-env.sh) / tc
+# iproute2         ip link / ip netns / tc
 # util-linux       unshare / nsenter (already in the base image; listed so
 #                  dropping it is a visible decision)
 # iputils-ping     ping_test

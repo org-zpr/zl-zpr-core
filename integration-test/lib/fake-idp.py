@@ -429,7 +429,7 @@ def main() -> int:
         "--host",
         default="127.0.0.1",
         help="IPv4 address to listen on and name in the issuer (default 127.0.0.1); "
-        "a LAN address serves a remote node (windows-node-test.md, macos-node-test.md)",
+        "a LAN address serves a remote Zode (windows-zode-test.md, macos-zode-test.md)",
     )
     parser.add_argument(
         "--state-dir",

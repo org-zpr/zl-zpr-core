@@ -117,14 +117,6 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration:
 /// timeout, 3 misses gives roughly 9-12 s of grace before teardown.
 pub const KEEP_ALIVE_MAX_MISSES: u32 = 3;
 
-/// Default authentication-renewal lead: how far ahead of `auth_expires` the
-/// node starts trying to renew an actor's authentication on the keep-alive
-/// tick (zipline#45). Configurable per node via `auth_renewal_lead_seconds`
-/// in the `[node]` config section; the effective lead is further clamped to
-/// half the granted authentication lifetime so short `expiration_seconds`
-/// values stay workable (see [crate::link_state::renewal_lead]).
-pub const DEFAULT_AUTH_RENEWAL_LEAD: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// Maximum length of payload to include in a Bind Request.
 ///
 /// 256 octects is more than enough to capture the longest common headers
@@ -221,13 +213,6 @@ pub struct Config {
     /// parent directory is auto-created; an explicit path keeps today's
     /// "parent must already exist" contract (zipline#39).
     pub(crate) control_path_derived: bool,
-
-    /// Node only — how far ahead of an actor's `auth_expires` the node
-    /// starts attempting silent authentication renewal (zipline#45).
-    /// Configured via `auth_renewal_lead_seconds` in the `[node]` config
-    /// section; defaults to [DEFAULT_AUTH_RENEWAL_LEAD]. The effective lead
-    /// on a link is `min(this, remaining_lifetime / 2)`.
-    pub auth_renewal_lead: std::time::Duration,
 
     /// Node only — whether this node carries other nodes' traffic, that is,
     /// accepts forward-only visas (zl-zipline#219, Zodes plan §5.7, §5.9).
@@ -613,9 +598,6 @@ impl Config {
             if let Some(advertised) = &config.advertised_substrate_addr {
                 self.advertised_substrate_addr = Some(resolve_advertised_addr(advertised)?);
             }
-            if let Some(lead_seconds) = config.auth_renewal_lead_seconds {
-                self.auth_renewal_lead = std::time::Duration::from_secs(lead_seconds);
-            }
             if let Some(forwarding) = config.forwarding {
                 self.forwarding = forwarding;
             }
@@ -743,7 +725,6 @@ impl Default for Config {
             km_impl: KM_ID_NOISE,
             socket_owner: None,
             control_path_derived: true,
-            auth_renewal_lead: DEFAULT_AUTH_RENEWAL_LEAD,
             forwarding: false,
             initial_link: None,
             relay: false,
@@ -777,10 +758,6 @@ pub struct NodeConfigSection {
     /// The substrate address this node advertises to the visa service, as a
     /// literal `"IP:port"` string (IPv6 in square-bracket notation).
     pub advertised_substrate_addr: Option<String>,
-
-    /// How far ahead of an actor's authentication expiry the node starts
-    /// attempting silent renewal, in seconds (zipline#45). Default 300.
-    pub auth_renewal_lead_seconds: Option<u64>,
 
     /// Whether this node accepts forward-only visas, i.e. carries other
     /// nodes' traffic (zl-zipline#219). Default false. A relay sets it.
@@ -1090,7 +1067,6 @@ pub fn get_noise_cn(certificate_file: &Path) -> Result<String, ArgsError> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::time::Duration;
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1178,40 +1154,16 @@ mod test {
         assert_eq!(config.advertised_substrate_addr, None);
     }
 
-    /// `auth_renewal_lead_seconds` in the `[node]` section overrides the
-    /// renewal lead; absent, the 300s default stands (zipline#45).
+    /// `auth_renewal_lead_seconds` configured the renewal of docked
+    /// adapters, which are gone (zl-zipline#234): the key is refused as
+    /// unknown, not ignored.
     #[test]
-    fn test_node_config_auth_renewal_lead_seconds() {
-        // Default: 300 s.
-        let config = Config::default();
-        assert_eq!(config.auth_renewal_lead, DEFAULT_AUTH_RENEWAL_LEAD);
-        assert_eq!(config.auth_renewal_lead, Duration::from_secs(300));
-
-        // Config file overrides.
-        let toml_str = r#"
-            [global]
-            self_addr = "10.0.0.1:5000"
-
-            [node]
-            auth_renewal_lead_seconds = 60
-            "#;
-        let file_config: NodeConfig = toml::from_str(toml_str).unwrap();
-        let mut config = Config::default();
-        config.set_from_node(&file_config.node).unwrap();
-        assert_eq!(config.auth_renewal_lead, Duration::from_secs(60));
-
-        // A [node] section without the key preserves the default.
-        let toml_str = r#"
-            [global]
-            self_addr = "10.0.0.1:5000"
-
-            [node]
-            advertised_substrate_addr = "203.0.113.7:6000"
-            "#;
-        let file_config: NodeConfig = toml::from_str(toml_str).unwrap();
-        let mut config = Config::default();
-        config.set_from_node(&file_config.node).unwrap();
-        assert_eq!(config.auth_renewal_lead, DEFAULT_AUTH_RENEWAL_LEAD);
+    fn test_node_config_refuses_auth_renewal_lead_seconds() {
+        let err = config_from_node_section("auth_renewal_lead_seconds = 60").unwrap_err();
+        assert!(
+            err.to_string().contains("auth_renewal_lead_seconds"),
+            "the error names the refused key: {err}"
+        );
     }
 
     /// `forwarding` in the `[node]` section turns on forward-only visas;
@@ -1230,7 +1182,6 @@ mod test {
         };
         assert!(parse("forwarding = true"));
         assert!(!parse("forwarding = false"));
-        assert!(!parse("auth_renewal_lead_seconds = 60"));
     }
 
     /// Apply a `[node]` section body (after `[node]`, so it may open

@@ -990,4 +990,13 @@ mod test {
         .expect_err("[adapter] section");
         assert!(err.to_string().contains("adapter"), "{err}");
     }
+
+    /// The shipped example config parses: it names no refused section or key.
+    #[test]
+    #[parallel(env)]
+    fn test_example_node_config_parses() {
+        let config: NodeConfig = toml::from_str(include_str!("../example-node-config.toml"))
+            .expect("example-node-config.toml must parse");
+        assert!(config.node.unwrap().initial_link.is_some());
+    }
 }

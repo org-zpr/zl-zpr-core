@@ -28,7 +28,7 @@ function fail() {
 # Start a fake ph serving control socket $1 and set FAKE_PH_PID to its PID
 # and FAKE_WRAPPER_PID to the PID of the process wrapping it.
 #
-# The tests launch ph through wrappers (`nsenter ... env ... $PH_BIN adapter
+# The tests launch ph through wrappers (`nsenter ... env ... $PH_BIN zode
 # --control-path S`) whose command lines may also contain "--control-path
 # S", and the outermost wrapper has the lowest PID. Model that with a bash
 # parent whose command line contains the whole ph invocation, and a child
@@ -38,7 +38,7 @@ function fail() {
 # An optional $2 prefixes the launch, e.g. `unshare -r` to start the fake
 # in a different user namespace, the way a concurrent test run's ph is.
 function start_fake_ph() {
-  ${2:-} bash -c "(exec -a '$PH_BIN adapter --control-path $1 --name adapter1' sleep 30); true" 2> /dev/null &
+  ${2:-} bash -c "(exec -a '$PH_BIN zode --control-path $1 --initial-link relay@10.0.0.1:5000' sleep 30); true" 2> /dev/null &
   FAKE_WRAPPER_PID=$!
   WRAPPER_PIDS+=("$FAKE_WRAPPER_PID")
 

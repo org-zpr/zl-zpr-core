@@ -1,6 +1,10 @@
 @0xdd33f90089b3556f;
 
-interface CmdLineInter {
+# The explicit interface ID changed when getNodeInfo was removed and the
+# later ordinals renumbered (zl-zipline#234): ph and ph-cli ship together
+# with no compatibility, and a new ID makes a mismatched client fail at the
+# call instead of reaching the method that now holds its old ordinal.
+interface CmdLineInter @0x9fbc8d516b6d2e66 {
     echo                 @0 () -> ();
     resetCounters        @1 () -> ();
     counters             @2 () -> (counts: Counters);

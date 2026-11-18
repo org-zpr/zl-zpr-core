@@ -141,10 +141,16 @@ create_actor_key_and_cert ca relay
   --zpr-addr "$RELAY_ZPR_ADDR" --zpr-addr "$VS_ZPR_ADDR" > relay.log 2>&1 &
 until ip -6 addr show dev zrelay | grep -q "inet6 $VS_ZPR_ADDR/"; do sleep 1; done
 # The visa service binds vs.zpr, so it starts only now, in the same namespace.
-# valkey takes 127.0.0.1:6379 there: stop any other valkey on the host first.
+# `vs --clear-state` flushes whatever answers on its Valkey port, so the test
+# Valkey gets a port of its own: if anything already answers there, stop
+# and pick another VK_PORT.
+VK_PORT=6390
+(exec 3<>/dev/tcp/127.0.0.1/$VK_PORT) 2> /dev/null && echo "STOP: 127.0.0.1:$VK_PORT is in use"
 create_actor_key_and_cert ca vs.zpr
-emit_vs_config ca vs.zpr > vs-config.toml && write_vs_admin_key
-"$VALKEY_SERVER_BIN" --save "" --appendonly no > valkey.log 2>&1 &
+emit_vs_config ca vs.zpr | sed "s|127.0.0.1:6379|127.0.0.1:$VK_PORT|" > vs-config.toml
+write_vs_admin_key
+"$VALKEY_SERVER_BIN" --port "$VK_PORT" --save "" --appendonly no > valkey.log 2>&1 &
+wait_for 15 bash -c "exec 3<>/dev/tcp/127.0.0.1/$VK_PORT"   # our Valkey listens
 env XDG_DATA_HOME=/tmp SSL_CERT_FILE="$PWD/idp-ca.crt" "$VS_BIN" -c vs-config.toml \
   --clear-state "$PREGEN/$ZODE_POLICY_BIN" > vs.log 2>&1 &
 wait_for 30 check_registered relay.log   # the relay registered with the VS

@@ -579,8 +579,8 @@ machine's own traffic.
 * **A single, unbatched datapath worker** — the macOS `posix_unbatched`
   engine forces one worker (`new_mq` rejects more). Wildcard and
   multi-homed binds are allowed (pktinfo), as on Windows.
-* **IPv6 ZPR addresses only** — `TunCtl::add_address` (and `add_route`)
-  return `Unsupported` for IPv4 on macOS; the ZPR internal network is
+* **IPv6 ZPR addresses only** — `TunCtl::add_address`
+  returns `Unsupported` for IPv4 on macOS; the ZPR internal network is
   IPv6 (`fd5a:5052::/32`).
 * **One `ph` instance per user without `--control-path`**: the default
   control path is derived from the owner alone

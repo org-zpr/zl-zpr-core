@@ -881,15 +881,19 @@ function zb_actor() {
 }
 
 # Run the jq condition $1 (with the --arg/--argjson options after it) on
-# the visa service's descriptor of zb's actor. Returns 0 when it holds, 1
-# when it does not, and 2 when there is no actor descriptor to tell
-# (vs-admin failed, or its answer has no `attrs` list), so a failed lookup
-# never reads as a missing attribute.
+# the visa service's descriptor of zb's actor. Returns 0 when it is true,
+# 1 when it is false, and 2 for anything else: no descriptor (vs-admin
+# failed, or its answer has no `attrs` list) or a jq error. So a failed
+# lookup never reads as a missing attribute.
 function zb_actor_query() {
-  local DESC
+  local DESC RESULT
   DESC=$(zb_actor) || return 2
-  jq -e '.attrs | type == "array"' > /dev/null 2>&1 <<< "$DESC" || return 2
-  jq -e "${@:2}" "$1" > /dev/null <<< "$DESC" || return 1
+  RESULT=$(jq "${@:2}" "if (.attrs | type) == \"array\" then ($1) else null end" <<< "$DESC" 2> /dev/null) || return 2
+  case "$RESULT" in
+    true) return 0 ;;
+    false) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 # Succeed when the visa service's actor of zb has attribute $1, with value

@@ -127,8 +127,9 @@ VISA_SWEEP='visa sweep reason=AttributeChange'
 # Drive one deterministic refresh cycle: flush happyfile's file store
 # (TrustedServiceChange: reconcile stale or TTL-expired attributes on
 # actors behind live visas). Wait for the visa service to refresh an actor
-# and to re-check the visas, and assert that the re-check revoked none:
-# the lazy visa survives the refresh.
+# and to re-check the visas, and assert that the re-check revoked none and
+# failed or skipped as unresolved none: the lazy visa survives the
+# refresh.
 function refresh_cycle() {
   local REFRESHES SWEEPS
   REFRESHES=$(log_count vs.log "$ACTORS_REFRESHED")
@@ -136,10 +137,11 @@ function refresh_cycle() {
   vs_admin services --id happyfile --flush
   wait_log_after 10 vs.log "$ACTORS_REFRESHED" "$REFRESHES" "the visa service refreshes zb's actor" || return 1
   wait_log_after 10 vs.log "$VISA_SWEEP" "$SWEEPS" "the visa service re-checks the visas" || return 1
-  if grep -E -- "$VISA_SWEEP" vs.log | tail -n 1 | grep -q ' revoked=0 '; then
-    echo "assertion OK: the re-check revokes no visa"
+  if grep -E -- "$VISA_SWEEP" vs.log | tail -n 1 \
+    | grep -qE ' revoked=0 .*skipped_unresolved=0 .*failed=0$'; then
+    echo "assertion OK: the re-check revokes no visa and fails on none"
   else
-    echo "ASSERTION FAILED: the re-check revoked a visa:"
+    echo "ASSERTION FAILED: the re-check revoked, could not resolve or failed on a visa:"
     grep -E -- "$VISA_SWEEP" vs.log | tail -n 1
     return 1
   fi

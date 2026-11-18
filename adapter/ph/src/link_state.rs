@@ -441,7 +441,7 @@ impl LinkStateWrapper {
     /// Install `aaa` on the TUN interface as this link's authentication
     /// address and remember it, so link cleanup clears it again. An address
     /// the interface already carried is not ours to clear, so
-    /// `installed_aaa` is set only when this call added it.
+    /// `installed_aaa` is set only when this link added it.
     // AAA kept unused in v1 (zodes plan §5.4)
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn install_aaa(
@@ -457,7 +457,9 @@ impl LinkStateWrapper {
         asm.tun_ctl
             .add_authentication_address(aaa.into(), ZPRNET_PREFIX_LEN)
             .map_err(|e| LinkStateError::InvalidOperation(format!("configure AAA: {e}")))?;
-        self.locked_data.lock().unwrap().installed_aaa = !exists;
+        // A repeated install finds the address this link already added:
+        // keep owning it.
+        self.locked_data.lock().unwrap().installed_aaa |= !exists;
         Ok(())
     }
 
@@ -1450,8 +1452,8 @@ mod tests {
     }
 
     /// `install_aaa` puts the AAA on the TUN and records it, and link
-    /// cleanup clears it again; an AAA the TUN already carried is not ours,
-    /// so cleanup leaves it in place.
+    /// cleanup clears it again, even after a repeated install; an AAA the
+    /// TUN already carried is not ours, so cleanup leaves it in place.
     #[tokio::test(flavor = "local")]
     async fn install_aaa_is_cleared_by_cleanup_only_when_it_added_it() {
         let aaa_ip: std::net::IpAddr = "fd5a:5052:0:aaa::1".parse().unwrap();
@@ -1466,6 +1468,8 @@ mod tests {
                 ..TestAssemblyBuilder::new()
             }));
             let link = LinkStateWrapper::new(3, LinkType::NodeToNode);
+            link.install_aaa(&asm, aaa_ip.into()).unwrap();
+            // A repeated install must not forget that this link added it.
             link.install_aaa(&asm, aaa_ip.into()).unwrap();
             assert_eq!(link.aaa_address(), Some(aaa_ip.into()));
             assert!(tun.lock().unwrap().contains(&aaa_ip));

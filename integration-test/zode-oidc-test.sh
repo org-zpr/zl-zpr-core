@@ -58,6 +58,8 @@ launch_login_zodes user-zb || PASS=1
 # failed one (connection_control.rs).
 JWKS_FETCH='"GET /jwks'
 JWKS_FETCH_FAILED='JWKS refresh after validation failure failed'
+# A request to the IdP's authorization endpoint (an interactive login).
+AUTH_REQUEST='"GET /auth'
 # The IdP's refusal of a refresh grant: the login's token-endpoint request
 # answers 200, so a 400 is the revoked grant.
 REFRESH_REFUSED='"POST /token[^"]*" 400'
@@ -106,7 +108,11 @@ if [[ "$PASS" == 0 ]]; then
   # The grant works before it is revoked: the IdP refuses an unknown
   # refresh token the same way as a revoked one.
   RENEWALS=$(log_count zb.log "$RENEWED")
+  AUTH_REQUESTS=$(log_count idp-zb.log "$AUTH_REQUEST")
   wait_log_after 45 zb.log "$RENEWED" "$RENEWALS" "the agent renews the login once with its refresh grant" || PASS=1
+  # Silent means back-channel only: a refresh-grant POST, no request to
+  # the authorization endpoint.
+  assert_log_count idp-zb.log "$AUTH_REQUEST" "$AUTH_REQUESTS" "the renewal made no authorization-endpoint request" || PASS=1
 fi
 
 if [[ "$PASS" == 0 ]]; then

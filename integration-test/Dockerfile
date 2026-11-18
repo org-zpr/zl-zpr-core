@@ -22,7 +22,7 @@ FROM ${BASE_IMAGE}
 # iputils-ping     ping_test
 # psmisc, procps   pstree (get_descendants), pkill / pgrep
 # jq curl openssl  OIDC and attribute-service assertions
-# tcpdump          capture-test.sh
+# tcpdump          a2a-pubkey-test.sh
 # python3          lib/fake-idp.py
 # valkey-server    backing store for the visa service
 # libssl3t64 libzstd1 zlib1g   linked by vs, vs-admin, zpdump

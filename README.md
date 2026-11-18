@@ -109,13 +109,13 @@ path runs them in a privileged Docker container:
 
 ```sh
 make integration-test-docker                                   # every test
-make -C integration-test docker-test TEST=one-node-test.sh     # one test
+make -C integration-test docker-test TEST=zode-ping-test.sh    # one test
 ```
 
 With passwordless `sudo` on a Linux host, each script also runs directly:
 
 ```sh
-integration-test/one-node-test.sh
+integration-test/zode-ping-test.sh
 ```
 
 Either way the scripts look next to themselves for binaries from the other

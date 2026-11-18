@@ -754,6 +754,11 @@ impl VisaTable {
     /// flow is handled exactly as if that visa had never been held: with
     /// no live match, the caller asks the visa service for a new visa.
     ///
+    /// Returns the match, and the ingress entries of the streams that were
+    /// bound under the visas it ejected: the caller withdraws them from
+    /// their adapters ([crate::assembly::Assembly::withdraw_streams]) once
+    /// it has released the visa-table lock.
+    ///
     /// Security: a visa is the visa service's permission for a flow, and
     /// only for its lifetime. Matching an expired one would admit a new
     /// flow the policy may no longer allow. It also breaks the flow: the
@@ -764,13 +769,17 @@ impl VisaTable {
         &mut self,
         peer_table: &peer_table::PeerTable,
         five_tuple: &FiveTuple,
-    ) -> Option<VisaId> {
+    ) -> (Option<VisaId>, Vec<ForwardingEntry>) {
         let five_tuple = VsapiFiveTuple::from(*five_tuple);
+        let mut withdrawn = Vec::new();
         // Each pass either returns or ejects one visa, so this ends.
         loop {
-            let visa_id = self.lookup_table.find_match(five_tuple)?;
-            if !self.eject_if_expired(peer_table, visa_id) {
-                return Some(visa_id);
+            let Some(visa_id) = self.lookup_table.find_match(five_tuple) else {
+                return (None, withdrawn);
+            };
+            match self.eject_if_expired(peer_table, visa_id) {
+                Some(entries) => withdrawn.extend(entries),
+                None => return (Some(visa_id), withdrawn),
             }
         }
     }
@@ -779,31 +788,43 @@ impl VisaTable {
     /// whether a Stream ID Request for it may be bound from the visa held
     /// here. An expired visa is ejected, as in
     /// [VisaTable::match_traffic], so the caller handles it as one it does
-    /// not hold.
-    pub fn holds_unexpired(&mut self, peer_table: &peer_table::PeerTable, visa_id: VisaId) -> bool {
-        self.table.contains_key(&visa_id) && !self.eject_if_expired(peer_table, visa_id)
+    /// not hold, and withdraws the returned streams that were bound under
+    /// it.
+    pub fn holds_unexpired(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        visa_id: VisaId,
+    ) -> (bool, Vec<ForwardingEntry>) {
+        match self.eject_if_expired(peer_table, visa_id) {
+            Some(withdrawn) => (false, withdrawn),
+            None => (self.table.contains_key(&visa_id), Vec::new()),
+        }
     }
 
     /// If this Zode holds the visa `visa_id` and it has expired, eject it,
     /// with its bindings and their PFT entries, through the one removal
-    /// path ([VisaTable::revoke]). Returns whether it did.
-    ///
-    /// As for every expiry, no peer is told (see
-    /// [VisaTable::handle_expirations]): the withdrawn streams are dropped,
-    /// and a peer still sending on one gets `UnknownStreamId`.
+    /// path ([VisaTable::revoke]). Returns the ingress entries of its
+    /// bindings if it did, for the caller to withdraw from their adapters:
+    /// on expiry a node tears down the tethers to its adapters, so their
+    /// next packet binds afresh (VISA_SERVICE.md). Zode links get no
+    /// withdrawal (F5); a Zode upstream ejects its own copy at its next
+    /// match.
     ///
     /// Only a match calls this: no timer sweeps the table for expired
     /// visas (operator decision, 2026-11-18; a sweep is zl-zipline#274).
     /// So an expired visa with live streams keeps them until a new flow
     /// matches it, or it is revoked.
-    fn eject_if_expired(&mut self, peer_table: &peer_table::PeerTable, visa_id: VisaId) -> bool {
+    fn eject_if_expired(
+        &mut self,
+        peer_table: &peer_table::PeerTable,
+        visa_id: VisaId,
+    ) -> Option<Vec<ForwardingEntry>> {
         if !self.table.get(&visa_id).is_some_and(Visa::has_expired) {
-            return false;
+            return None;
         }
         info!(target: VISA_MGMT, "visa {visa_id} has expired: ejecting it");
-        // `revoke` cannot fail for a held visa.
-        let _withdrawn = self.revoke(peer_table, visa_id);
-        true
+        // `revoke` never fails: a visa already gone withdraws nothing.
+        self.revoke(peer_table, visa_id).ok()
     }
 
     /// Revoke (or otherwise remove) a visa.
@@ -828,8 +849,10 @@ impl VisaTable {
     /// Remove every expired visa from the table.
     ///
     /// No production code calls this: `ph` enforces expiry only when a
-    /// flow is matched ([VisaTable::match_traffic], zl-zipline#271).
-    /// Whether to sweep periodically as well is zl-zipline#274.
+    /// flow is matched ([VisaTable::match_traffic], zl-zipline#271), and
+    /// withdraws the streams of an ejected visa from its adapters. Whether
+    /// to sweep periodically as well, and whether a sweep notifies, is
+    /// zl-zipline#274.
     ///
     /// Returns the withdrawn forwarding entries. Unlike revocation
     /// ([`Self::revoke_for_link`] via `Assembly::drop_peer`), expiry
@@ -1250,14 +1273,18 @@ pub mod tests {
             IpAddress::new_from_std(&next_hop_addr())
         );
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &FiveTuple::default()),
+            visa_table
+                .match_traffic(&asm_less_peer_table(), &FiveTuple::default())
+                .0,
             None
         );
         assert_eq!(
-            visa_table.match_traffic(
-                &asm_less_peer_table(),
-                &tcp_tuple("fd5a:5052:8::1", "fd5a:5052:8::99", 80)
-            ),
+            visa_table
+                .match_traffic(
+                    &asm_less_peer_table(),
+                    &tcp_tuple("fd5a:5052:8::1", "fd5a:5052:8::99", 80)
+                )
+                .0,
             None
         );
         assert!(visa_table.table[&visa_id].get_tc().is_none());
@@ -1304,7 +1331,7 @@ pub mod tests {
         assert!(withdrawn == vec![ForwardingEntry(link_a, tether_revoked)]);
         assert!(!visa_table.table.contains_key(&5001));
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &full_tuple),
+            visa_table.match_traffic(&asm.peer_table, &full_tuple).0,
             Some(4000)
         );
 
@@ -1312,7 +1339,7 @@ pub mod tests {
         visa_table.handle_expirations(&asm.peer_table);
         assert!(!visa_table.table.contains_key(&5002));
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &full_tuple),
+            visa_table.match_traffic(&asm.peer_table, &full_tuple).0,
             Some(4000)
         );
 
@@ -1320,7 +1347,7 @@ pub mod tests {
         visa_table.revoke_for_link(link_a, &asm.peer_table);
         assert!(!visa_table.table.contains_key(&5003));
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &full_tuple),
+            visa_table.match_traffic(&asm.peer_table, &full_tuple).0,
             Some(4000)
         );
         assert_eq!(peer_a.pft.len(), 0);
@@ -1749,11 +1776,11 @@ pub mod tests {
         };
 
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &visa1_tuple),
+            visa_table.match_traffic(&asm.peer_table, &visa1_tuple).0,
             None
         );
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &visa2_tuple),
+            visa_table.match_traffic(&asm.peer_table, &visa2_tuple).0,
             Some(visa2_id)
         );
     }
@@ -1826,7 +1853,9 @@ pub mod tests {
         assert_eq!(visa_table.bindings(5200), &[binding]);
         assert_eq!(visa_table.timeout_queue.len(), 1);
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &full_tuple),
+            visa_table
+                .match_traffic(&asm_less_peer_table(), &full_tuple)
+                .0,
             Some(5200)
         );
     }
@@ -1868,13 +1897,13 @@ pub mod tests {
             dst_port: VISA_SERVICE_PORT,
         };
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &packet),
+            visa_table.match_traffic(&asm_less_peer_table(), &packet).0,
             None
         );
 
         visa_table.regrant_vs_visas(&peer_table, &addr);
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &packet),
+            visa_table.match_traffic(&asm_less_peer_table(), &packet).0,
             Some(1)
         );
         assert!(visa_table.contains(2));
@@ -1914,7 +1943,9 @@ pub mod tests {
             "the old session's J5a visa is gone"
         );
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &vs_api_packet(&addr)),
+            visa_table
+                .match_traffic(&asm_less_peer_table(), &vs_api_packet(&addr))
+                .0,
             Some(1)
         );
     }
@@ -1950,7 +1981,9 @@ pub mod tests {
         assert!(!visa_table.contains(5200) && !visa_table.contains(5201));
         assert!(visa_table.contains(1500) && visa_table.contains(1501));
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &vs_api_packet(&addr)),
+            visa_table
+                .match_traffic(&asm_less_peer_table(), &vs_api_packet(&addr))
+                .0,
             Some(1500)
         );
     }
@@ -2100,7 +2133,9 @@ pub mod tests {
         visa_table.insert_visa(visa).unwrap();
 
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &client_to_service()),
+            visa_table
+                .match_traffic(&asm_less_peer_table(), &client_to_service())
+                .0,
             None
         );
     }
@@ -2110,6 +2145,7 @@ pub mod tests {
     /// and its place in the J11 indexes all go, through the one removal
     /// path. The five-tuple is then exactly as if the visa had never been
     /// held, so the next visa for it is installed and matched as a first.
+    /// The stream's ingress entry is returned, for the caller to withdraw.
     #[tokio::test] // a dummy peer spawns a task
     async fn test_matching_an_expired_visa_ejects_it_cleanly() {
         let mut expired = tcp_visa(7600, CLIENT, 0, SERVICE, 80);
@@ -2117,9 +2153,11 @@ pub mod tests {
         let (asm, link_a, _link_b, tether) = bound_visa(expired);
 
         let mut visa_table = asm.visa_table.write().unwrap();
-        assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
-            None
+        let (matched, withdrawn) = visa_table.match_traffic(&asm.peer_table, &client_to_service());
+        assert_eq!(matched, None);
+        assert!(
+            withdrawn == vec![ForwardingEntry(link_a, tether)],
+            "the live stream is handed back, to be withdrawn from its adapter"
         );
         assert!(!visa_table.contains(7600));
         assert!(visa_table.bindings(7600).is_empty());
@@ -2133,10 +2171,12 @@ pub mod tests {
             .unwrap();
         assert!(superseded.is_empty(), "nothing is left to supersede");
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
             Some(fresh)
         );
-        assert!(visa_table.holds_unexpired(&asm.peer_table, fresh));
+        assert!(visa_table.holds_unexpired(&asm.peer_table, fresh).0);
     }
 
     // ---- J11: a newer same-five-tuple visa supersedes (zl-zipline#252) ----
@@ -2358,7 +2398,9 @@ pub mod tests {
 
         // Before the commit: everything still on the old visa.
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
             Some(7100)
         );
         assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 42), 7100)));
@@ -2378,7 +2420,9 @@ pub mod tests {
             egress: ForwardingEntry(link_b, 43),
         };
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
             Some(7101)
         );
         assert!(visa_table.bindings(7100).is_empty());
@@ -2404,7 +2448,9 @@ pub mod tests {
         assert_eq!(visa_table.bindings(7101), &[moved]);
         assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 43), 7101)));
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
             Some(7101)
         );
         assert_eq!(visa_table.get(7101).unwrap().visa(), &new_visa);
@@ -2424,7 +2470,9 @@ pub mod tests {
             .unwrap();
 
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &client_to_service()),
+            visa_table
+                .match_traffic(&asm_less_peer_table(), &client_to_service())
+                .0,
             Some(7201)
         );
         assert!(
@@ -2438,7 +2486,9 @@ pub mod tests {
         // its successor goes first.
         visa_table.revoke(&asm_less_peer_table(), 7201).unwrap();
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &client_to_service()),
+            visa_table
+                .match_traffic(&asm_less_peer_table(), &client_to_service())
+                .0,
             None
         );
     }
@@ -2465,7 +2515,9 @@ pub mod tests {
             assert!(visa_table.bindings(7301).is_empty());
             assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 42), 7300)));
             assert_eq!(
-                visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+                visa_table
+                    .match_traffic(&asm.peer_table, &client_to_service())
+                    .0,
                 Some(7300)
             );
         };
@@ -2527,7 +2579,9 @@ pub mod tests {
         visa_table.revoke(&asm.peer_table, 7400).unwrap();
 
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
             None
         );
         assert!(visa_table.contains(7401));
@@ -2537,7 +2591,9 @@ pub mod tests {
         // review), so it takes the empty place in the lookup.
         assert_eq!(visa_table.bind(7401, binding_on(link_a, 9)).unwrap(), None);
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
             Some(7401)
         );
     }
@@ -2605,7 +2661,9 @@ pub mod tests {
         );
 
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
             Some(7502)
         );
         assert!(pft_entry(&asm, link_a, stream_2) == Some((ForwardingEntry(link_b, 50), 7500)));
@@ -2687,7 +2745,9 @@ pub mod tests {
                 .is_err()
         );
         assert_eq!(
-            visa_table.match_traffic(&asm.peer_table, &client_to_service()),
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
             None
         );
         assert!(pft_entry(&asm, link_a, stream_2) == Some((ForwardingEntry(link_b, 50), 7700)));
@@ -2728,7 +2788,9 @@ pub mod tests {
 
         assert_eq!(visa_table.bind(7900, binding_on(1, 10)).unwrap(), None);
         assert_eq!(
-            visa_table.match_traffic(&asm_less_peer_table(), &client_to_service()),
+            visa_table
+                .match_traffic(&asm_less_peer_table(), &client_to_service())
+                .0,
             None
         );
     }
@@ -2767,7 +2829,7 @@ pub mod tests {
             src_port: 20345,
             dst_port: 80,
         };
-        let matched = visa_table.match_traffic(&asm.peer_table, &traffic);
+        let matched = visa_table.match_traffic(&asm.peer_table, &traffic).0;
         assert!(matched.is_some());
         assert_eq!(matched.unwrap(), 1000);
     }

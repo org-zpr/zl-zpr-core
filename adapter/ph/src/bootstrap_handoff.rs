@@ -1187,7 +1187,7 @@ mod tests {
                     let mut visa_table = asm.visa_table.write().unwrap();
                     assert_eq!(visa_table.successor_of(FWD_ID), Some(J5A_ID));
                     assert_eq!(
-                        visa_table.match_traffic(&asm.peer_table, &vs_api_packet),
+                        visa_table.match_traffic(&asm.peer_table, &vs_api_packet).0,
                         Some(J5A_ID)
                     );
                 }
@@ -1199,7 +1199,8 @@ mod tests {
                     asm.visa_table
                         .write()
                         .unwrap()
-                        .match_traffic(&asm.peer_table, &vs_api_packet),
+                        .match_traffic(&asm.peer_table, &vs_api_packet)
+                        .0,
                     Some(J5A_ID)
                 );
             })

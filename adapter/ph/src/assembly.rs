@@ -634,10 +634,10 @@ impl Assembly {
     /// visa-table write lock — the send path takes the peer's `zdpr_send`
     /// mutex, which must never nest under it.
     ///
-    /// Note the expiry path (`VisaTable::handle_expirations`) deliberately
-    /// does not notify: both ends share the visa expiry and eject on their
-    /// own clocks, and a peer that sends early gets UnknownStreamId and
-    /// re-requests.
+    /// Expiry (zl-zipline#271) withdraws too: a match that ejects an expired
+    /// visa (`VisaTable::match_traffic`) hands its streams here, so the
+    /// adapter's next packet binds afresh. `VisaTable::handle_expirations`
+    /// has no production caller (a periodic sweep is zl-zipline#274).
     pub(crate) fn withdraw_streams(
         &self,
         withdrawn: Vec<ForwardingEntry>,

@@ -176,11 +176,13 @@ pub fn bind_actor_address(
     // Check if we already have a visa which matches this traffic. Under the
     // write lock: the match ejects an expired visa (zl-zipline#271).
 
-    let matched = asm
+    let (matched, withdrawn) = asm
         .visa_table
         .write()
         .unwrap()
         .match_traffic(&asm.peer_table, &five_tuple);
+    // Outside the visa-table lock (zipline#9).
+    asm.withdraw_streams(withdrawn, None);
 
     if let Some(matched_visa_id) = matched {
         // We matched a visa we already have.
@@ -381,11 +383,12 @@ pub fn request_stream(
     // The visa-table lock is released before the bind goes on:
     // `requested_visa_granted` looks up the egress link and sends, neither
     // of which may run under it.
-    let have_visa = asm
+    let (have_visa, withdrawn) = asm
         .visa_table
         .write()
         .unwrap()
         .holds_unexpired(&asm.peer_table, visa_id);
+    asm.withdraw_streams(withdrawn, None);
     if have_visa {
         // Visa found.
         return requested_visa_granted(asm, ingress_link_id, txn_id, visa_id);
@@ -3020,12 +3023,17 @@ mod tests {
     /// expired visa instead would bind the flow under a visa the next hop
     /// can no longer fetch (the visa service forgets a visa at expiry), so
     /// every new flow would be refused, for good.
+    ///
+    /// The adapter's live stream under the expired visa is withdrawn, so
+    /// its next packet binds afresh (VISA_SERVICE.md: on expiry a node
+    /// tears down the tethers to its adapters).
     #[tokio::test]
     async fn test_a_bind_matching_an_expired_visa_asks_for_a_new_visa() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (asm, _egress_rx) = node_with_visa_and_no_vs_session();
+                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
                 let adapter = add_peer(&asm, LinkType::NodeToAdapter, 1);
+                let zode_link = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
                 asm.peer_table
                     .get(adapter)
                     .unwrap()
@@ -3034,14 +3042,34 @@ mod tests {
                         &EXPIRED_CLIENT.parse().unwrap(),
                     )]);
                 let expired: VisaId = VISA_ID + 200;
-                asm.visa_table
-                    .write()
-                    .unwrap()
+                let mut visa_table = asm.visa_table.write().unwrap();
+                visa_table
                     .insert_visa(client_visa(
                         expired,
                         crate::visa_table::tests::ALREADY_EXPIRED,
                     ))
                     .unwrap();
+                // A stream the adapter bound under the visa before it expired.
+                let live_stream = asm
+                    .peer_table
+                    .get(adapter)
+                    .unwrap()
+                    .pft
+                    .insert(forwarding_tables::PftPep::new(
+                        ForwardingEntry(zode_link, 42),
+                        expired,
+                    ))
+                    .unwrap();
+                visa_table
+                    .bind(
+                        expired,
+                        StreamBinding {
+                            ingress: ForwardingEntry(adapter, live_stream),
+                            egress: ForwardingEntry(zode_link, 42),
+                        },
+                    )
+                    .unwrap();
+                drop(visa_table);
                 let requested = &asm.counters.management[ManagementCounterType::VisaRequested];
 
                 bind_actor_address(
@@ -3056,6 +3084,11 @@ mod tests {
                 assert!(
                     !asm.visa_table.read().unwrap().contains(expired),
                     "the expired visa is ejected"
+                );
+                let pkt = try_recv_packet(&mut egress_rx).expect("a withdrawal to the adapter");
+                assert_eq!(pkt.metadata().egress_link_id, adapter);
+                assert!(
+                    decode_per_flow(&pkt) == (zdp::ZdpPacketType::StreamIdWithdrawal, live_stream)
                 );
             })
             .await

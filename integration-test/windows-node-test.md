@@ -438,7 +438,7 @@ and the agent callback to `ph-cli`.
 Setup, beyond sections 1 and 2:
 
 * **An OIDC provider in the policy.** Add a `[trusted_services.fake-idp]`
-  block to the policy's `.zplc` as in `pregen/oidc-test.zplc`, with
+  block to the policy's `.zplc` as in `pregen/zodes-login.zplc`, with
   `issuer = "https://<Linux host IP>:9443"`, the matching `jwks_uri`,
   `seed_jwks = "oidc-test-seed-jwks.json"` and
   `allow_offline_access = true`, and recompile.

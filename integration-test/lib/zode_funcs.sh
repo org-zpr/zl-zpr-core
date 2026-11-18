@@ -103,6 +103,19 @@ function zode_begin() {
   create_ca_key_and_cert ca
 }
 
+# Kill every helper process this test started that common_funcs'
+# get_descendants does not match: ph-cli (e.g. a resident `auth-agent`),
+# the Python fake IdPs and echo servers, and zpr-attr-server. Killing only
+# the background job that started one (its PID in $!) leaves it running,
+# holding its log pipeline open.
+function kill_zode_helpers() {
+  local PID
+  for PID in $(pstree -pT "$$" | grep -oE '(ph-cli|python3|zpr-attr-server)\([0-9]+\)' | grep -oE '[0-9]+')
+  do
+    kill -9 "$PID" 2> /dev/null || true
+  done
+}
+
 # The EXIT trap: print every log under the working directory when
 # ZPR_TEST_VERBOSE is set, including those of a test's legs in
 # subdirectories, then common_funcs' cleanup (which stops everything and
@@ -119,6 +132,7 @@ function zode_cleanup() {
       esac
     done < <(cd "$TMPDIR" && find . -name '*.log' -printf '%P\n' | sort)
   fi
+  kill_zode_helpers
   cleanup
 }
 
@@ -127,6 +141,7 @@ function zode_cleanup() {
 # common_funcs' cleanup, which the EXIT trap still runs at the end.
 function zode_stop_all() {
   local PID
+  kill_zode_helpers
   for PID in $(get_descendants) $(jobs -p)
   do
     kill -9 "$PID" 2> /dev/null || true
@@ -184,15 +199,17 @@ function create_zode_network() {
 # Write the visa service's config, certificate and admin API key, start
 # valkey and the visa service with the Zode policy in the relay's
 # namespace, and wait until the relay has registered with the visa service.
-# Run from the test's working directory, after launch_relay: the visa
-# service binds its listeners to vs.zpr, which must already be on the
-# relay's TUN. Returns non-zero if the relay does not register.
+# A test that needs its own vs-config.toml or admin keys (vs_keys.toml)
+# writes them first; they are kept. Run from the test's working directory,
+# after launch_relay: the visa service binds its listeners to vs.zpr, which
+# must already be on the relay's TUN. Returns non-zero if the relay does
+# not register.
 function launch_zode_vs() {
   # The visa service still serves TLS on VS-API and admin with this
   # certificate.
   create_actor_key_and_cert ca vs.zpr
-  emit_vs_config ca vs.zpr > vs-config.toml
-  write_vs_admin_key
+  [ -e vs-config.toml ] || emit_vs_config ca vs.zpr > vs-config.toml
+  [ -e vs_keys.toml ] || write_vs_admin_key
 
   in_ns zpr-relay "$VALKEY_SERVER_BIN" \
     --save "" \
@@ -280,9 +297,9 @@ function launch_zode_idp() {
     --output /dev/null "$IDP_ISSUER/.well-known/openid-configuration"
 }
 
-# Mint an admin API key the way vsapikey does (vs/src/apikey.rs), as
-# one-node-policy-reauth-test.sh does: the visa service reads vs_keys.toml
-# from its config directory, and vs-admin reads vs-admin.key.
+# Mint an admin API key the way vsapikey does (vs/src/apikey.rs): the visa
+# service reads vs_keys.toml from its config directory, and vs-admin reads
+# vs-admin.key.
 function write_vs_admin_key() {
   python3 - <<'PYEOF'
 import base64, hashlib, secrets
@@ -317,8 +334,9 @@ function install_zode_policy() {
 # ZPR address first and vs.zpr after it (zl-zipline#229), and wait until
 # vs.zpr is on its TUN. $1 is its `forwarding` setting, `true` (the
 # default) or `false`: a relay that does not forward refuses forward-only
-# visas (visa_mgmt.rs insert_visa). Returns non-zero if vs.zpr never
-# appears.
+# visas (visa_mgmt.rs insert_visa). Any further arguments go to `ph` as
+# they are (e.g. a security-testing flag); pass $1 to use them. Returns
+# non-zero if vs.zpr never appears.
 function launch_relay() {
   local FORWARDING=${1:-true}
   create_actor_key_and_cert ca relay
@@ -337,7 +355,8 @@ function launch_relay() {
     --forwarding "$FORWARDING" \
     --tun-if tun0 \
     --zpr-addr "$RELAY_ZPR_ADDR" \
-    --zpr-addr "$VS_ZPR_ADDR" 2>&1 | tee relay.log | prefix_log relay &
+    --zpr-addr "$VS_ZPR_ADDR" \
+    "${@:2}" 2>&1 | tee relay.log | prefix_log relay &
 
   wait_for 15 relay_has_vs_addr || {
     echo "the relay did not put $VS_ZPR_ADDR on its TUN"
@@ -384,9 +403,10 @@ function assert_relay_conn() {
 # $4 = its RSA authentication key, $5 = the CA that signs its certificate
 # (default `ca`, the test CA). Its own --ca-file is always the test CA, so
 # with another signing CA the Zode still accepts the relay, and it is the
-# relay that must refuse the Zode. Its key and certificate are made on the
-# first launch and reused on a restart. The log is appended to, so a
-# restart keeps the earlier lines.
+# relay that must refuse the Zode. Any further arguments go to `ph` as they
+# are (e.g. --io-engine io_uring); pass $5 to use them. Its key and
+# certificate are made on the first launch and reused on a restart. The log
+# is appended to, so a restart keeps the earlier lines.
 function launch_zode() {
   local NAME=$1 SUBSTRATE=$2 ZPR_ADDR=$3 AUTH_KEY=$4 SIGNING_CA=${5:-ca}
   [ -e "$NAME.crt" ] || create_actor_key_and_cert "$SIGNING_CA" "$NAME"
@@ -403,7 +423,8 @@ function launch_zode() {
     --auth-private-key "$AUTH_KEY" \
     --km-impl "$KM_IMPL" \
     --tun-if tun0 \
-    --zpr-addr "$ZPR_ADDR" 2>&1 | tee -a "$NAME.log" | prefix_log "$NAME" &
+    --zpr-addr "$ZPR_ADDR" \
+    "${@:6}" 2>&1 | tee -a "$NAME.log" | prefix_log "$NAME" &
 }
 
 # Kill Zode NAME ($1) at once, as a crash or force-quit would, and wait for
@@ -749,6 +770,47 @@ function stop_vs() {
 # Let the visa service that stop_vs stopped run again (SIGCONT).
 function cont_vs() {
   kill -CONT "$(vs_pid)"
+}
+
+# core-tests-reauth helpers (zl-zipline#234): log a Zode's user in, for
+# zode-policy-reauth-test.sh and attr-query-test.sh.
+
+# Run ph-cli against Zode NAME ($1) in its namespace, trusting the fake
+# IdP (whose certificate the test CA signs); the other arguments go to
+# ph-cli.
+function zode_cli() {
+  local NAME=$1
+  shift
+  in_ns "zpr-$NAME" env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
+    "$PH_DEBUG_BIN" -p "$NAME.sock" "$@"
+}
+
+# Start `ph-cli $2 --no-browser` on Zode $1 in the background, writing its
+# output to file $3, and drive the login it starts: wait for the
+# authorization URL ph-cli prints and GET it with curl in the Zode's
+# namespace, so the fake IdP redirects to ph-cli's loopback callback. $2
+# is `connect` (exits once logged in) or `auth-agent` (stays resident, to
+# answer silent renewals). Sets LOGIN_PID to ph-cli's PID. Returns non-zero
+# if no URL appears within 60 s.
+function start_zode_login() {
+  local NAME=$1 COMMAND=$2 OUT=$3 URL=""
+  zode_cli "$NAME" "$COMMAND" --no-browser > "$OUT" 2>&1 &
+  LOGIN_PID=$!
+  for _ in $(seq 1 60)
+  do
+    URL=$(sed -n 's/.*Open this URL to continue: //p' "$OUT" | head -n 1)
+    if [ -n "$URL" ] || ! kill -0 "$LOGIN_PID" 2> /dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  if [ -z "$URL" ]; then
+    echo "ASSERTION FAILED: ph-cli $COMMAND on $NAME printed no authorization URL:"
+    cat "$OUT"
+    return 1
+  fi
+  in_ns "zpr-$NAME" curl --silent --show-error --location --cacert ca.crt \
+    --output /dev/null "$URL" || true
 }
 
 # Print the verdict for $1 (0 = pass) and exit with it.

@@ -1,7 +1,7 @@
 ZPLC ?= zplc
 KEY := zpr-rsa-key.pem
 
-OBJS := v4-1node-2actor-ping.bin2 v4-1node-3actor-ping.bin2 v6-1node-2actor-ping.bin2 v6-1node-3actor-ping.bin2 oidc-file-interplay.bin2 attr-query.bin2 policy-reauth.bin2 policy-reauth-no-adapter2.bin2 policy-reauth-no-node.bin2 zodes.bin2 zodes-unlinked.bin2 zodes-pair.bin2 zodes-direct.bin2 zodes-login.bin2 zodes-rejoin.bin2
+OBJS := oidc-file-interplay.bin2 attr-query.bin2 zodes-policy-reauth.bin2 zodes-policy-reauth-no-zb.bin2 zodes-policy-reauth-no-zc.bin2 zodes.bin2 zodes-unlinked.bin2 zodes-pair.bin2 zodes-direct.bin2 zodes-login.bin2 zodes-rejoin.bin2 zodes-ping.bin2
 
 info:
 	@echo Makefile to help with compiling the ZPR policies
@@ -23,14 +23,6 @@ clean:
 
 rebuild: clean all
 
-v6-1node-2actor-ping.bin2: v6-1node-2actor-ping.zplc v4-1node-2actor-ping.zpl
-	$(ZPLC) -c v6-1node-2actor-ping.zplc -k $(KEY) -f v2 -o $@ v4-1node-2actor-ping.zpl
-
-
-v6-1node-3actor-ping.bin2: v6-1node-3actor-ping.zplc v4-1node-3actor-ping.zpl
-	$(ZPLC) -c v6-1node-3actor-ping.zplc -k $(KEY) -f v2 -o $@ v4-1node-3actor-ping.zpl
-
-
 %.bin2: %.zpl %.zplc
 	$(ZPLC) -k $(KEY) $<
 
@@ -45,27 +37,13 @@ v6-1node-3actor-ping.bin2: v6-1node-3actor-ping.zplc v4-1node-3actor-ping.zpl
 oidc-file-interplay.bin2: oidc-file-interplay.zpl oidc-file-interplay.zplc zb-rsa-pubkey.pem oidc-test-seed-jwks.json
 	$(ZPLC) -c oidc-file-interplay.zplc -k $(KEY) -f v2 -o $@ oidc-file-interplay.zpl
 
-# Policy-install re-authentication fixtures (zipline#124). One ZPL, three
-# configs: the base policy plus two variants whose only difference is a
-# removed [bootstrap] key (adapter2's for leg 3, the node's for leg 4) —
-# the same one-source trick oidc-renewal.bin2 plays on oidc-test.zpl. Same
-# omitted-`service` warning as oidc-test; expected. Needs zplc 0.21.x
-# (the policy version the visa service accepts, zl-zipline#256).
-policy-reauth.bin2: policy-reauth.zplc policy-reauth.zpl oidc-test-seed-jwks.json
-	$(ZPLC) -c policy-reauth.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
-
-policy-reauth-no-adapter2.bin2: policy-reauth-no-adapter2.zplc policy-reauth.zpl oidc-test-seed-jwks.json
-	$(ZPLC) -c policy-reauth-no-adapter2.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
-
-policy-reauth-no-node.bin2: policy-reauth-no-node.zplc policy-reauth.zpl oidc-test-seed-jwks.json
-	$(ZPLC) -c policy-reauth-no-node.zplc -k $(KEY) -f v2 -o $@ policy-reauth.zpl
-
 # oidc + zpr-attr/1 interplay fixture (zipline#81): oidc-file-interplay with
-# the file decorator replaced by the networked attribute service. Needs
-# zplc >= 0.19.0 (zipline#76: api = "zpr-attr/1" parsing) — an older zplc
-# fails with "trusted_service zipline missing provider". Same omitted-
-# `service` warning as oidc-test; expected.
-attr-query.bin2: attr-query.zpl attr-query.zplc oidc-test-seed-jwks.json
+# the file decorator replaced by the networked attribute service, on the
+# Zode layout of zodes-pair (zl-zipline#234). Needs a zplc that knows node
+# links (feature/zodes) and api = "zpr-attr/1" (zipline#76; an older zplc
+# fails with "trusted_service zipline missing provider"). Same omitted-
+# `service` warning as zodes-login; expected.
+attr-query.bin2: attr-query.zpl attr-query.zplc zb-rsa-pubkey.pem zc-rsa-pubkey.pem oidc-test-seed-jwks.json
 	$(ZPLC) -c attr-query.zplc -k $(KEY) -f v2 -o $@ attr-query.zpl
 
 # Fake-IdP signing keys (checked in; test-only, no secrecy requirement) and
@@ -103,8 +81,8 @@ zodes-unlinked.bin2: zodes-unlinked.zplc zodes.zpl zb-rsa-pubkey.pem
 
 # Two-joiner Zode fixtures (zl-zipline#254): the relay linked to zb and zc,
 # and the same plus a direct zb-zc link. One ZPL, two configs, the same
-# trick v6-1node-2actor-ping.bin2 plays. zc's RSA authentication key is
-# checked in, like zb's.
+# trick zodes-policy-reauth.bin2 plays. zc's RSA authentication key is checked in,
+# like zb's.
 zodes-pair.bin2: zodes-pair.zplc zodes-pair.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.pem
 	$(ZPLC) -c zodes-pair.zplc -k $(KEY) -f v2 -o $@ zodes-pair.zpl
 
@@ -121,3 +99,23 @@ zodes-rejoin.bin2: zodes-rejoin.zplc zodes-rejoin.zpl zb-rsa-pubkey.pem zc-rsa-p
 # is omitted, so zplc warns; expected, do not add --Werror here.
 zodes-login.bin2: zodes-login.zplc zodes-login.zpl zb-rsa-pubkey.pem oidc-test-seed-jwks.json
 	$(ZPLC) -c zodes-login.zplc -k $(KEY) -f v2 -o $@ zodes-login.zpl
+
+# Policy-install re-authentication fixtures for Zodes (zipline#124, ported
+# by zl-zipline#234): the relay linked to zb and zc, plus the fake IdP as an
+# OIDC trusted service. One ZPL, three configs: the base policy, the same
+# without zb's bootstrap key (leg 3), and without zb's and zc's (leg 4), the
+# one-source trick zodes-pair.bin2 plays. Same omitted-`service` warning as
+# zodes-login; expected.
+zodes-policy-reauth.bin2: zodes-policy-reauth.zplc zodes-policy-reauth.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.pem oidc-test-seed-jwks.json
+	$(ZPLC) -c zodes-policy-reauth.zplc -k $(KEY) -f v2 -o $@ zodes-policy-reauth.zpl
+
+zodes-policy-reauth-no-zb.bin2: zodes-policy-reauth-no-zb.zplc zodes-policy-reauth.zpl zc-rsa-pubkey.pem oidc-test-seed-jwks.json
+	$(ZPLC) -c zodes-policy-reauth-no-zb.zplc -k $(KEY) -f v2 -o $@ zodes-policy-reauth.zpl
+
+zodes-policy-reauth-no-zc.bin2: zodes-policy-reauth-no-zc.zplc zodes-policy-reauth.zpl oidc-test-seed-jwks.json
+	$(ZPLC) -c zodes-policy-reauth-no-zc.zplc -k $(KEY) -f v2 -o $@ zodes-policy-reauth.zpl
+
+# Ping-mesh fixture (zl-zipline#234): zodes-pair plus a third endpoint, zd,
+# whose RSA authentication key is checked in like zb's and zc's.
+zodes-ping.bin2: zodes-ping.zplc zodes-ping.zpl zb-rsa-pubkey.pem zc-rsa-pubkey.pem zd-rsa-pubkey.pem
+	$(ZPLC) -c zodes-ping.zplc -k $(KEY) -f v2 -o $@ zodes-ping.zpl

@@ -407,18 +407,19 @@ impl FastpathWorker {
                 egress_link_id = next_hop.0;
                 egress_stream_id = next_hop.1;
 
-                // Security Testing: if this is an adapter-to-adapter transit
-                // stream, corrupt forwarded ICMP echo requests to prove the A2A
-                // MICV catches a malicious node.
+                // Security Testing: if this is a transit stream (in from one
+                // peer and out to another, neither of them this node's own
+                // actor), corrupt forwarded ICMP echo requests to prove the
+                // A2A MICV catches a malicious node. On a Zode relay both are
+                // Zode links; on a classic node both are adapter docks.
                 #[cfg(feature = "enable-security-testing")]
                 if self.config.mangle_forwarded_pings
-                    && matches!(
-                        ingress_peer_state.peer_type(),
-                        crate::peer_table::PeerType::Adapter
-                    )
-                    && self.asm.peer_table.get(egress_link_id).is_some_and(|p| {
-                        matches!(p.peer_type(), crate::peer_table::PeerType::Adapter)
-                    })
+                    && !ingress_peer_state.is_internal()
+                    && self
+                        .asm
+                        .peer_table
+                        .get(egress_link_id)
+                        .is_some_and(|p| !p.is_internal())
                 {
                     self.security_testing_mangle_ping(&mut pkt, pep.visa_id());
                 }
@@ -459,15 +460,43 @@ impl FastpathWorker {
             let Some(visa) = visa_table.get(visa_id) else {
                 return;
             };
-            // A forward-only visa has no flow to inspect.
-            let Some(tc) = visa.get_tc() else {
-                return;
-            };
-            (
-                *tc.five_tuple(),
-                tc.compression_mode(),
-                visa.get_egress_a2a_dh_pubkey(),
-            )
+            match visa.get_tc() {
+                Some(tc) => (
+                    *tc.five_tuple(),
+                    tc.compression_mode(),
+                    visa.get_egress_a2a_dh_pubkey(),
+                ),
+                // A forward-only visa (a Zode relay's) names no flow and no
+                // A2A key, so guess the flow as an attacker on the path
+                // could: a ping from the visa's previous hop to its next
+                // hop. That holds when both are the endpoint Zodes (zb -
+                // relay - zc); if the guess is wrong, the ping is left alone.
+                // ICMP has no port compression, so the mode is 0.
+                None => {
+                    let (Some(prev_hop), Ok(next_hop)) =
+                        (visa.prev_hop(), visa_table.get_visa_next_hop_addr(visa_id))
+                    else {
+                        return;
+                    };
+                    let l3_type = L3Type::new_from_addr(&prev_hop);
+                    let l4_protocol = match l3_type {
+                        L3Type::Ipv4 => net_defs::ip_number::ICMP,
+                        _ => net_defs::ip_number::IPV6_ICMP,
+                    };
+                    (
+                        crate::defs::FiveTuple::new(
+                            l3_type,
+                            prev_hop.into(),
+                            next_hop,
+                            l4_protocol,
+                            0,
+                            0,
+                        ),
+                        0,
+                        None,
+                    )
+                }
+            }
         };
 
         // We only handle ICMP echo requests (IPv4 or IPv6).

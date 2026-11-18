@@ -1,18 +1,21 @@
 # -*- mode: toml -*-
-# oidc + zpr-attr/1 interplay integration-test fixture config (zipline#81).
+# oidc + zpr-attr/1 interplay integration-test fixture config (zipline#81;
+# ported to Zodes by zl-zipline#234), used by attr-query-test.sh.
 #
-# oidc-file-interplay.zplc's one-node topology and fake-IdP pinning, with
-# the `happyfile` file store replaced by the `zipline` zpr-attr/1 attribute
-# service (mirrors the compiler fixture test-attr-query.zplc, zipline#76):
+# zodes-pair.zplc's layout (the relay Zode docks the visa service and is
+# linked to Zodes zb and zc) with oidc-file-interplay.zplc's trusted
+# services, the `happyfile` file store replaced by the `zipline` zpr-attr/1
+# attribute service (mirrors the compiler fixture test-attr-query.zplc,
+# zipline#76):
 #   - `google` (api = "oidc") is the fake IdP the test runs on each
 #     namespace's loopback (issuer, client_id, seed JWKS).
 #   - `zipline` (api = "zpr-attr/1") decorates on google's identity
-#     attribute: the test runs the reference zpr-attr-server on the zpr-vs
-#     namespace's loopback, TLS-pinned to the pregen test CA (ca-cert.pem),
-#     authenticated by the bearer token the vs reads from
-#     ts_secrets_dir/zipline.token. expiration_seconds = 90 deliberately
-#     exceeds the vs's 60 s MIN_ATTRIBUTE_TTL while keeping any TTL-derived
-#     wait in the test bounded.
+#     attribute: the test runs the reference zpr-attr-server on the relay
+#     namespace's loopback, next to the visa service, TLS-pinned to the
+#     pregen test CA (ca-cert.pem), authenticated by the bearer token the
+#     vs reads from ts_secrets_dir/zipline.token. expiration_seconds = 90
+#     deliberately exceeds the vs's 60 s MIN_ATTRIBUTE_TTL while keeping
+#     any TTL-derived wait in the test bounded.
 #
 # `service` (the JWKS CONNECT proxy) is deliberately omitted — the visa
 # service fetches the JWKS directly — so zplc emits a warning; expected.
@@ -21,32 +24,36 @@
 order = ["hosts", "dns"]
 
 [resolver.hosts]
-"n0.zpr" = "fd5a:5052::2"
-"n0.overlay" = "10.0.0.1"
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+"zc.zpr" = "fd5a:5052::4"
 
-[nodes."node"]
-provider = [ [ "device.zpr.adapter.cn", "node" ] ]
-zpr_address = "n0.zpr"
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
 
-[nodes."node".substrate_addrs]
-in1 = "n0.overlay:12345"
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+# No substrate_addrs for zb and zc (zl-zipline#255, W10): the visa service
+# learns their addresses from what they report when they connect.
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[nodes.zc]
+provider = [ [ "device.zpr.adapter.cn", "zc" ] ]
+zpr_address = "zc.zpr"
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
+
+[links.relay-zc]
+peers = [ { node = "relay" }, { node = "zc" } ]
 
 [trusted_services.default]
 cert_path = "ca-cert.pem"
-
-# zipline#107: the `addresses` file store grants adapter2 its static ZPR
-# address by vending device.zpr_addr on its authenticated device CN
-# (zipline#99). Data: pregen/addresses.json, copied in by
-# lib/common_funcs.sh::copy_address_store. adapter1 deliberately gets NO
-# grant — it is the one dynamic-path test (zipline#88): user-only, no
-# --zpr-addr, and this policy maps `sub` to user.sub while the store's only
-# user-keyed section is user.oidc-subject, so nothing matches it. No ZPL
-# statement references the store; the compiler retains it because it vends a
-# VS-interpreted attribute (zipline#105).
-[trusted_services.addresses]
-api = "file"
-returns_attributes = ["zpr_addr -> device.zpr_addr"]
-expiration_seconds = 3600
 
 [trusted_services.zipline]
 api = "zpr-attr/1"
@@ -76,14 +83,13 @@ returns_attributes = [
 identity_attributes = ["sub"]
 
 [visa_service]
-dock_node = "node"
+dock_node = "relay"
 
-# adapter1 is deliberately absent: it authenticates user-only through the
-# fake IdP and never presents a bootstrap (device) key.
 [bootstrap]
-"node" = "node-rsa-pubkey.pem"
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
+"zc" = "zc-rsa-pubkey.pem"
 "vs.zpr" = "actorvs.pem"
-"adapter2" = "actor2.pem"
 
 [protocols.ping]
 l4protocol = "iana.ICMP6"
@@ -92,14 +98,7 @@ icmp_codes = [ 128, 129 ]
 
 [services.Web]
 protocol = "ping"
-# zipline#107: adapter2's static ZPR address is granted by the `addresses`
-# trusted service on its device CN (device.zpr_addr, zipline#99), not pinned
-# in policy. The provider entry mirrors the .zpl define's device CN.
-# adapter1 stays dynamic — the one dynamic-path test (zipline#88).
-provider = [["device.zpr.adapter.cn", "adapter2"]]
+provider = [["device.zpr.adapter.cn", "zc"]]
 
 [services.PingableVs]
-protocol = "ping"
-
-[services.PingableNode]
 protocol = "ping"

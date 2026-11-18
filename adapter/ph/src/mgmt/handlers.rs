@@ -339,10 +339,6 @@ pub async fn handle_terminate_link_or_docking_session(
 ///
 pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
     let ingress_link_id = pkt.metadata().ingress_link_id;
-    if asm.ph_mode != PhMode::Node {
-        warn!(target: ZDP, "{} received Hello Request but not in node mode", asm.formatted_link_id(ingress_link_id));
-        return Err(HandleMgmtError::MessageNotPermitted);
-    }
     debug!(target: ZDP, "Received Hello Request for {}", asm.formatted_link_id(ingress_link_id));
 
     let tlv_data = match tlv::parse_from_buf(&mut pkt) {
@@ -1419,7 +1415,6 @@ mod test {
         config.initial_link =
             Some(crate::config::InitialLink::parse_cli("relay.zpr@10.9.9.9:5000").unwrap());
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(crate::assembly::PhMode::Node),
             config: Some(rcu::RcuBox::new(config)),
             mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
             ..TestAssemblyBuilder::new()
@@ -1597,7 +1592,6 @@ mod teardown_test {
     fn node() -> (Arc<Assembly>, EgressRx) {
         let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(8);
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(crate::assembly::PhMode::Node),
             mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
             ..TestAssemblyBuilder::new()
         }));

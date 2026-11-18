@@ -83,7 +83,7 @@ pub enum Commands {
     Capture(CaptureArgs),
     /// Change link state
     Link(LinkArgs),
-    /// Change the log level of a node or adapter
+    /// Change the log level of a Zode
     /// Format: logging [<level>=<target>]*
     /// There must be at least level, target pair
     /// The options for targets are:
@@ -98,14 +98,11 @@ pub enum Commands {
     },
     /// Exit the CLI
     Quit,
-    /// Gets the address of an adapter's node
-    Addr,
     /// Print the TUN interface ph uses and its ZPR address(es).
     ///
     /// Line 1 is the interface name (e.g. `tun0`, or the kernel-assigned
     /// `utun7` on macOS); each further line is one ZPR address confirmed on
-    /// that interface. An adapter prints no address line until its address
-    /// is granted. Works against a node as well as an adapter.
+    /// that interface.
     Tun,
     /// Connect (start) a link, authenticate interactively if the packet
     /// handler asks, then exit reporting the outcome.

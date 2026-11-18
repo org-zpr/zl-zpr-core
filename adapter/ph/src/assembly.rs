@@ -16,7 +16,6 @@ use crate::queues::*;
 use crate::special_peers::SpecialPeerName;
 use crate::tun_ctl::TunCtl;
 use crate::visa_table;
-use crate::zdp::TerminateReason;
 use crate::zdpr_worker;
 use km_noise::NoiseKeypair;
 use rcu;
@@ -30,15 +29,9 @@ use tracing_subscriber::filter::targets::Targets;
 #[allow(unused_imports)]
 use tracing_subscriber::{Layer, Registry, filter, fmt, reload};
 use x25519_dalek::ReusableSecret;
-use zpr::addrs::{VISA_SERVICE_ADDR, ZPRNET_PREFIX_LEN};
+use zpr::addrs::ZPRNET_PREFIX_LEN;
 use zpr::vsapi_types::{AuthServicesList, ConnectRequest};
 use zpr_utils::net_defs::{IpAddress, ScopedIpAddr, SocketAddrExt};
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PhMode {
-    Node,
-    Adapter,
-}
 
 /// The build-identity string reported by this assembly, e.g. on the
 /// mgmt-channel version TLV: `<pkg-version> (<git describe>)` (zipline#64).
@@ -62,7 +55,6 @@ pub const VERSION: &'static str = build_info::BUILD_VERSION;
 
 pub struct Assembly {
     pub actor_rejected: std::sync::atomic::AtomicBool,
-    pub ph_mode: PhMode,
     pub topology_config: config::TopologyConfig,
 
     pub mgmt_substrate_egress: MgmtSubstrateEgress,
@@ -158,14 +150,9 @@ pub struct Assembly {
         reload::Handle<filter::Filtered<fmt::Layer<Registry>, Targets, Registry>, Registry>,
 }
 
-/// What went wrong in [`Assembly::ensure_local_zpr_addrs_on_tun`], split by
-/// remediation (PR #61 review): an address failure is fixed with the
-/// platform's add-address command, a visa-service route failure with its
-/// add-route command, and a route owned by another live interface means a
-/// co-resident ZPR instance already carries visa-service traffic — starting
-/// anyway would steal its route (the Windows `add_route` deletes other
-/// owners), so the node refuses to start instead. The node branch of
-/// `main.rs` matches on this to print the remediation that actually fits.
+/// What went wrong in [`Assembly::ensure_local_zpr_addrs_on_tun`]: a node
+/// ZPR address could not be inspected on, or applied to, the TUN device.
+/// `main.rs` prints the platform's add-address command for it.
 #[derive(Debug, thiserror::Error)]
 pub enum SelfAddressError {
     /// A node ZPR address could not be inspected on, or applied to, the
@@ -176,20 +163,6 @@ pub enum SelfAddressError {
         #[source]
         source: std::io::Error,
     },
-    /// The visa-service /128 host route could not be installed.
-    #[error("could not install the visa-service host route {VISA_SERVICE_ADDR}/128: {source}")]
-    VsRoute {
-        #[source]
-        source: std::io::Error,
-    },
-    /// Another live interface already owns the visa-service host route —
-    /// a second ZPR instance on this host. Installing ours would steal it.
-    #[error(
-        "the visa-service host route {VISA_SERVICE_ADDR}/128 already routes to interface \
-         {owner} — another ZPR node or adapter on this host owns visa-service traffic; \
-         refusing to take it over"
-    )]
-    VsRouteConflict { owner: String },
 }
 
 impl Assembly {
@@ -199,10 +172,7 @@ impl Assembly {
 
     /// Graceful shutdown routine.  Not guaranteed to be called
     pub async fn shutdown(self: &Arc<Self>) {
-        match self.ph_mode {
-            PhMode::Node => self.shutdown_node().await,
-            PhMode::Adapter => self.shutdown_adapter().await,
-        }
+        self.shutdown_node().await;
         // Tear the TUN device down last, after the peers are gone
         // (zipline#130): on Windows this quiesces the Wintun session; the
         // unix TUNs are process-scoped and their teardown is a no-op.
@@ -214,61 +184,25 @@ impl Assembly {
 
     // The node quickly sends Terminate Indications
     async fn shutdown_node(self: &Arc<Self>) {
-        if matches!(self.ph_mode, PhMode::Node) {
-            let mut join_set = tokio::task::JoinSet::new();
-
-            let vs_peer = self
-                .peer_table
-                .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
-
-            self.peer_table.for_each(|(peer_id, peer)| {
-                if Some(peer_id) != vs_peer && !peer.is_internal() {
-                    // This should be a short block and must be blocked on,
-                    // otherwise the messages won't get sent
-                    let spawn_self = self.clone();
-                    join_set.spawn_local(async move { spawn_self.reset_peer(peer_id.get()).await });
-                }
-            });
-
-            join_set.join_all().await;
-
-            if let Some(vs_peer) = vs_peer {
-                self.reset_peer(vs_peer.get()).await;
-            }
-        }
-    }
-
-    // The adapter sends a more policy Terminate Request.
-    async fn shutdown_adapter(self: &Arc<Self>) {
         let mut join_set = tokio::task::JoinSet::new();
 
-        self.peer_table.for_each(|(peer_id, peer)| {
-            if peer.is_internal() {
-                return;
-            }
+        let vs_peer = self
+            .peer_table
+            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
 
-            if let Err(e) = peer
-                .link_state_machine
-                .process_event(self, LinkEvent::Close(TerminateReason::Shutdown))
-            {
-                error!(target: PEER_MGMT, "Failed to nicely close peer {}: {e}", self.formatted_link_id(peer_id.get()));
-                // So try harder...
+        self.peer_table.for_each(|(peer_id, peer)| {
+            if Some(peer_id) != vs_peer && !peer.is_internal() {
+                // This should be a short block and must be blocked on,
+                // otherwise the messages won't get sent
                 let spawn_self = self.clone();
                 join_set.spawn_local(async move { spawn_self.reset_peer(peer_id.get()).await });
             }
         });
+
         join_set.join_all().await;
 
-        let mut npeers = self.peer_table.len() - 1; // - 1 accounts for local actor
-        info!(
-            target: PEER_MGMT,
-            "Waiting for {} peer{} to disconnect...",
-            npeers,
-            if npeers == 1 { "" } else { "s" }
-        );
-        while npeers > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            npeers = self.peer_table.len() - 1; // - 1 accounts for local actor
+        if let Some(vs_peer) = vs_peer {
+            self.reset_peer(vs_peer.get()).await;
         }
     }
 
@@ -282,23 +216,21 @@ impl Assembly {
     ///
     /// Does not remove visas related to the adapter/peer.
     pub async fn disconnect_adapters(self: &Arc<Self>) {
-        if matches!(self.ph_mode, PhMode::Node) {
-            let mut join_set = tokio::task::JoinSet::new();
-            let vs_peer = self
-                .peer_table
-                .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
-            let session_link = *self.bootstrap_handoff.borrow();
-            self.peer_table.for_each(|(peer_id, peer)| {
-                let carries_session = session_link == Some(peer_id.get());
-                if Some(peer_id) != vs_peer && !peer.is_internal() && !carries_session {
-                    // This should be a short block and must be blocked on,
-                    // otherwise the messages won't get sent
-                    let spawn_self = self.clone();
-                    join_set.spawn_local(async move { spawn_self.reset_peer(peer_id.get()).await });
-                }
-            });
-            join_set.join_all().await;
-        }
+        let mut join_set = tokio::task::JoinSet::new();
+        let vs_peer = self
+            .peer_table
+            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
+        let session_link = *self.bootstrap_handoff.borrow();
+        self.peer_table.for_each(|(peer_id, peer)| {
+            let carries_session = session_link == Some(peer_id.get());
+            if Some(peer_id) != vs_peer && !peer.is_internal() && !carries_session {
+                // This should be a short block and must be blocked on,
+                // otherwise the messages won't get sent
+                let spawn_self = self.clone();
+                join_set.spawn_local(async move { spawn_self.reset_peer(peer_id.get()).await });
+            }
+        });
+        join_set.join_all().await;
     }
 
     #[allow(dead_code)]
@@ -309,31 +241,9 @@ impl Assembly {
         }
     }
 
-    pub fn adapter_owns_address(&self, addr: IpAddress) -> bool {
-        self.peer_table.get(DOCK_LINK_ID).is_some_and(|peer| {
-            peer.link_state_machine.is_ready()
-                && (peer.actor_auth.owns_address(&addr)
-                    || peer.link_state_machine.aaa_address() == Some(addr))
-        })
-    }
-
-    /// Get a copy of the local ZPR addresses. May be empty on an adapter until we
-    /// have been granted a ZPR address.
+    /// Get a copy of the local ZPR addresses: the configured `zpr_addr`.
     pub fn get_local_zpr_addrs_std(&self) -> Vec<IpAddr> {
-        if self.ph_mode == PhMode::Adapter {
-            self.peer_table
-                .get(DOCK_LINK_ID)
-                .map(|p| {
-                    p.actor_auth
-                        .addresses()
-                        .into_iter()
-                        .map(Into::into)
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            self.config.get().zpr_addr.clone()
-        }
+        self.config.get().zpr_addr.clone()
     }
 
     /// Record `msg` as a fatal, unrecoverable error and wake main's watcher
@@ -410,8 +320,9 @@ impl Assembly {
 
     /// Node self-addressing (zipline#159, decision N3 of the Windows node
     /// plan): apply each local ZPR address this node believes it owns to the
-    /// TUN device, and make the visa service's well-known address reachable
-    /// through it where the address alone does not.
+    /// TUN device. `add_address` applies `ZPRNET_PREFIX_LEN` on every
+    /// platform, which puts the whole internal network, the visa service
+    /// included, on-link: no host route is needed (zl-zipline#272, #234).
     ///
     /// Idempotent: an address the device already carries is left untouched,
     /// so hand-configured setups and the integration scripts' out-of-band
@@ -420,34 +331,13 @@ impl Assembly {
     /// (`ErrorKind::Unsupported`) is skipped, exactly as
     /// [`Self::local_zpr_addrs_missing_from_tun`] treats it: a helper that
     /// cannot see the truth must not act on it. Any other failure — from the
-    /// inspection, from `add_address`, or from the visa-service route install
-    /// — is propagated as a [`SelfAddressError`] naming which step failed, so
-    /// the node branch of `main.rs` can print the matching manual remediation
+    /// inspection or from `add_address` — is propagated as a
+    /// [`SelfAddressError`], so `main.rs` can print the manual remediation
     /// before exiting rather than run misaddressed.
     ///
     /// Reads the *current* address set via [`Self::get_local_zpr_addrs_std`],
     /// the same source as the missing-address check that runs after it.
-    /// Node use only: adapter addressing belongs to link activation
-    /// (`link_state.rs`), which this deliberately does not touch (N2).
     pub fn ensure_local_zpr_addrs_on_tun(&self) -> Result<(), SelfAddressError> {
-        // On every platform `add_address` applies `ZPRNET_PREFIX_LEN`, which
-        // puts the whole internal network — the visa service included —
-        // on-link. Windows also installs the visa-service host route. It
-        // dates from when the Windows `add_address` dropped the prefix
-        // (zl-zipline#272), and it still covers an address configured by
-        // hand with a longer prefix, which this function leaves alone. Linux
-        // and macOS have never installed it. #234 decides whether it stays.
-        self.ensure_local_zpr_addrs_on_tun_impl(cfg!(windows))
-    }
-
-    /// The platform-independent body of [`Self::ensure_local_zpr_addrs_on_tun`],
-    /// with the one platform fact — whether on-link reachability of the visa
-    /// service needs an explicit host route — passed in so both arms are
-    /// unit-testable everywhere.
-    fn ensure_local_zpr_addrs_on_tun_impl(
-        &self,
-        vs_route_needed: bool,
-    ) -> Result<(), SelfAddressError> {
         for addr in self.get_local_zpr_addrs_std() {
             match self.tun_ctl.has_address(addr) {
                 Ok(true) => {}
@@ -462,34 +352,6 @@ impl Assembly {
                 }
                 Err(source) => return Err(SelfAddressError::Address { addr, source }),
             }
-        }
-        if vs_route_needed {
-            // PR #61 review (P1): the Windows `add_route` is
-            // replacement-oriented — it deletes every owner on another
-            // interface before adding its own. Installing over a live
-            // owner would silently steal a co-resident ZPR instance's
-            // visa-service traffic, and our exit would leave that instance
-            // routeless. So probe ownership first and refuse to start on a
-            // conflict, exactly as adapter activation does for the
-            // internal-network route (zipline#101). Per the same ruling, a
-            // probe that cannot run means "unknown", not "conflict" — warn
-            // and continue to the install.
-            match self.tun_ctl.route_owner_conflict(VISA_SERVICE_ADDR, 128) {
-                Ok(None) => {}
-                Ok(Some(owner)) => {
-                    return Err(SelfAddressError::VsRouteConflict { owner });
-                }
-                Err(e) => {
-                    warn!(target: NET_OS, "could not check the owner of the visa-service host route {VISA_SERVICE_ADDR}/128: {e}; continuing");
-                }
-            }
-            // A /128 host route: the narrowest statement of what the node
-            // needs — "the visa service is on-link via the TUN" — without
-            // claiming the whole internal network, which is the adapter
-            // activation path's decision to make, not ours (N2).
-            self.tun_ctl
-                .add_route(VISA_SERVICE_ADDR, 128)
-                .map_err(|source| SelfAddressError::VsRoute { source })?;
         }
         Ok(())
     }
@@ -566,40 +428,38 @@ impl Assembly {
             // withdrawal below triggers already waits for the `down` report.
             self.zode_links.register_loss();
         }
-        if self.ph_mode == PhMode::Node {
-            // F3 (zl-zipline#251): revoke every visa with a stream bound
-            // over this link, on either side. Rule 9 (zl-zipline#252): also
-            // revoke the bootstrap visas installed for it, bound or not.
-            // Revoke under the write lock, but hold the withdrawn entries
-            // until the lock is released: the send path takes the peer's
-            // `zdpr_send` mutex, which must never nest under the visa-table
-            // lock (zipline#9).
-            let withdrawn = {
-                let mut visa_table = self.visa_table.write().unwrap();
-                let mut withdrawn = visa_table.revoke_for_link(link_id, &self.peer_table);
-                withdrawn.extend(crate::bootstrap_handoff::revoke_for_lost_link(
-                    &mut visa_table,
-                    &self.peer_table,
-                    link_id,
-                ));
-                withdrawn
-            };
-            // The VS-API worker no longer has a hand-off on this link.
-            self.bootstrap_handoff.send_if_modified(|handoff| {
-                let lost = *handoff == Some(link_id);
-                if lost {
-                    *handoff = None;
-                }
-                lost
-            });
+        // F3 (zl-zipline#251): revoke every visa with a stream bound
+        // over this link, on either side. Rule 9 (zl-zipline#252): also
+        // revoke the bootstrap visas installed for it, bound or not.
+        // Revoke under the write lock, but hold the withdrawn entries
+        // until the lock is released: the send path takes the peer's
+        // `zdpr_send` mutex, which must never nest under the visa-table
+        // lock (zipline#9).
+        let withdrawn = {
+            let mut visa_table = self.visa_table.write().unwrap();
+            let mut withdrawn = visa_table.revoke_for_link(link_id, &self.peer_table);
+            withdrawn.extend(crate::bootstrap_handoff::revoke_for_lost_link(
+                &mut visa_table,
+                &self.peer_table,
+                link_id,
+            ));
+            withdrawn
+        };
+        // The VS-API worker no longer has a hand-off on this link.
+        self.bootstrap_handoff.send_if_modified(|handoff| {
+            let lost = *handoff == Some(link_id);
+            if lost {
+                *handoff = None;
+            }
+            lost
+        });
 
-            // Withdraw each revoked stream from the *surviving* adapters so
-            // they drop their egress bindings and re-request visas instead
-            // of blackholing traffic on dead streams (zipline#21). The
-            // dying link's own entries are skipped — that peer is gone —
-            // and so are Zode links, which carry no teardown messages (F5).
-            self.withdraw_streams(withdrawn, Some(link_id));
-        }
+        // Withdraw each revoked stream from the *surviving* adapters so
+        // they drop their egress bindings and re-request visas instead
+        // of blackholing traffic on dead streams (zipline#21). The
+        // dying link's own entries are skipped — that peer is gone —
+        // and so are Zode links, which carry no teardown messages (F5).
+        self.withdraw_streams(withdrawn, Some(link_id));
         // Rule 9: pending binds on other links that involve this link, in
         // either direction, are cleared while the link is still in the
         // peer table. Its own bind tables go with its entry below.
@@ -935,7 +795,6 @@ pub mod test {
     #[allow(dead_code)]
     #[derive(Default)]
     pub struct TestAssemblyBuilder {
-        pub ph_mode: Option<PhMode>,
         pub topology_config: Option<TopologyConfig>,
         pub local_zpr_addresses: Option<Vec<IpAddr>>,
         pub mgmt_substrate_egress: Option<MgmtSubstrateEgress>,
@@ -1203,7 +1062,6 @@ pub mod test {
             ..Default::default()
         };
         create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(PhMode::Node),
             config: Some(rcu::RcuBox::new(config)),
             tun_ctl: Some(Box::new(FakeTunCtl {
                 addresses: parse(on_tun),
@@ -1267,17 +1125,6 @@ pub mod test {
         routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
         fail_add_address: bool,
         inspect_unsupported: bool,
-        /// With this set, `add_route` fails — modelling a routing table the
-        /// visa-service host route cannot be installed into (PR #61 review).
-        fail_add_route: bool,
-        /// With this set, `route_owner_conflict` names this interface as the
-        /// live owner of any queried route — modelling a second node on the
-        /// same host already carrying the visa-service /128 (PR #61 review).
-        vs_route_owner: Option<String>,
-        /// With this set, `route_owner_conflict` fails — modelling a routing
-        /// table that cannot be queried, which means "unknown", not
-        /// "conflict" (zipline#101 ruling).
-        probe_fails: bool,
     }
 
     #[cfg(test)]
@@ -1302,9 +1149,6 @@ pub mod test {
                     routes: routes.clone(),
                     fail_add_address: false,
                     inspect_unsupported: false,
-                    fail_add_route: false,
-                    vs_route_owner: None,
-                    probe_fails: false,
                 },
                 added,
                 routes,
@@ -1347,11 +1191,6 @@ pub mod test {
             Ok(self.on_tun.contains(&addr))
         }
         fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
-            if self.fail_add_route {
-                return Err(std::io::Error::other(
-                    "SelfAddressTunCtl: add_route deliberately failing",
-                ));
-            }
             self.routes.lock().unwrap().push((dest, prefix_len));
             Ok(())
         }
@@ -1360,12 +1199,7 @@ pub mod test {
             _dest: IpAddr,
             _prefix_len: u8,
         ) -> std::io::Result<Option<String>> {
-            if self.probe_fails {
-                return Err(std::io::Error::other(
-                    "SelfAddressTunCtl: route_owner_conflict deliberately failing",
-                ));
-            }
-            Ok(self.vs_route_owner.clone())
+            Ok(None)
         }
     }
 
@@ -1378,7 +1212,6 @@ pub mod test {
             ..Default::default()
         };
         create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(PhMode::Node),
             config: Some(rcu::RcuBox::new(config)),
             tun_ctl: Some(tun_ctl),
             ..Default::default()
@@ -1460,95 +1293,15 @@ pub mod test {
         assert!(added.lock().unwrap().is_empty());
     }
 
-    /// zipline#159: on Windows, a /128 host route to the visa service's
-    /// well-known address is installed via the TUN (kept for addresses
-    /// configured by hand; see `ensure_local_zpr_addrs_on_tun`).
+    /// zl-zipline#234 (gate g167 q7): self-addressing installs no route on
+    /// any platform. The address's `ZPRNET_PREFIX_LEN` puts the visa service
+    /// on-link, so the old Windows-only visa-service /128 host route is gone.
     #[test]
-    fn node_self_addressing_installs_vs_host_route_where_needed() {
-        let (tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
-        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
-        asm.ensure_local_zpr_addrs_on_tun_impl(true).unwrap();
-        assert_eq!(
-            *routes.lock().unwrap(),
-            vec![(zpr::addrs::VISA_SERVICE_ADDR, 128)]
-        );
-    }
-
-    /// zipline#159: where the address itself makes the ZPR internal network
-    /// on-link (Linux, macOS), no route is installed — hand-configured
-    /// routing is untouched.
-    #[test]
-    fn node_self_addressing_adds_no_route_where_address_is_onlink() {
-        let (tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
-        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
-        asm.ensure_local_zpr_addrs_on_tun_impl(false).unwrap();
-        assert!(routes.lock().unwrap().is_empty());
-    }
-
-    /// PR #61 review (P1): a visa-service host route already owned by
-    /// another live interface — a second ZPR node or adapter on the same
-    /// host — must not be stolen. The Windows `add_route` deletes every
-    /// owner on another interface before adding its own, so installing
-    /// ours would silently redirect the first instance's visa-service
-    /// traffic and leave it routeless when we exit. The helper refuses
-    /// (the node declines to start), naming the owning interface, and no
-    /// route call is made.
-    #[test]
-    fn node_self_addressing_refuses_to_steal_vs_route() {
-        let (mut tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
-        tun_ctl.vs_route_owner = Some("Ethernet 2".to_string());
-        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
-        let err = asm.ensure_local_zpr_addrs_on_tun_impl(true).unwrap_err();
-        assert!(
-            err.to_string().contains("Ethernet 2"),
-            "the error must name the owning interface: {err}"
-        );
-        assert!(
-            routes.lock().unwrap().is_empty(),
-            "no route may be installed over another instance's"
-        );
-    }
-
-    /// PR #61 review (P1), zipline#101 ruling: an ownership probe that
-    /// cannot run means "unknown", not "conflict" — the route is still
-    /// installed, exactly as the adapter activation path treats it.
-    #[test]
-    fn node_self_addressing_vs_route_probe_error_is_not_a_conflict() {
-        let (mut tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
-        tun_ctl.probe_fails = true;
-        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
-        asm.ensure_local_zpr_addrs_on_tun_impl(true).unwrap();
-        assert_eq!(
-            *routes.lock().unwrap(),
-            vec![(zpr::addrs::VISA_SERVICE_ADDR, 128)]
-        );
-    }
-
-    /// PR #61 review (P2): a failure installing the visa-service route is
-    /// reported as exactly that — not as an address failure, whose
-    /// remediation (`netsh ... add address`) would leave the missing /128
-    /// route unresolved and startup failing again.
-    #[test]
-    fn node_self_addressing_reports_route_failure_as_route_failure() {
-        let (mut tun_ctl, _added, _routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
-        tun_ctl.fail_add_route = true;
-        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
-        let err = asm.ensure_local_zpr_addrs_on_tun_impl(true).unwrap_err();
-        assert!(
-            err.to_string().contains("visa-service"),
-            "the error must identify the visa-service route, not the address: {err}"
-        );
-    }
-
-    /// zipline#159: the public entry point resolves the route decision from
-    /// the platform — the visa-service host route exists exactly on Windows.
-    #[test]
-    fn node_self_addressing_route_matches_platform() {
+    fn node_self_addressing_installs_no_route() {
         let (tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
         let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
         asm.ensure_local_zpr_addrs_on_tun().unwrap();
-        let expected = if cfg!(windows) { 1 } else { 0 };
-        assert_eq!(routes.lock().unwrap().len(), expected);
+        assert!(routes.lock().unwrap().is_empty());
     }
 
     impl TestAssemblyBuilder {
@@ -1592,7 +1345,6 @@ pub mod test {
                 // Node mode: shutdown_node over an empty peer table
                 // returns immediately (adapter mode's disconnect wait
                 // assumes the local actor peer exists).
-                builder.ph_mode = Some(PhMode::Node);
                 builder.tun_ctl = Some(Box::new(tun_ctl));
                 let asm = Arc::new(create_assembly(builder));
                 asm.shutdown().await;
@@ -1710,7 +1462,6 @@ pub mod test {
 
     #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {
-        let ph_mode = builder.ph_mode.unwrap_or(PhMode::Node);
         let topology_config = builder.topology_config.unwrap_or_default();
         let mgmt_substrate_egress = builder
             .mgmt_substrate_egress
@@ -1776,7 +1527,6 @@ pub mod test {
 
         Assembly {
             actor_rejected: std::sync::atomic::AtomicBool::new(false),
-            ph_mode,
             topology_config,
             mgmt_substrate_egress,
             actor_output_requeue,
@@ -1852,7 +1602,6 @@ pub mod test {
             let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
 
             let mut builder = TestAssemblyBuilder::new();
-            builder.ph_mode = Some(PhMode::Node);
             builder.visa_table = Some(VisaTable::new());
             builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
             let asm = Arc::new(create_assembly(builder));
@@ -2043,7 +1792,6 @@ pub mod test {
             let (egress_tx, mut egress_rx) = packet_queue::packet_queue(8);
 
             let mut builder = TestAssemblyBuilder::new();
-            builder.ph_mode = Some(PhMode::Node);
             builder.visa_table = Some(VisaTable::new());
             builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
             let asm = Arc::new(create_assembly(builder));
@@ -2108,7 +1856,6 @@ pub mod test {
         /// A Node-mode assembly with no links.
         fn node() -> Assembly {
             create_assembly(TestAssemblyBuilder {
-                ph_mode: Some(PhMode::Node),
                 ..TestAssemblyBuilder::new()
             })
         }

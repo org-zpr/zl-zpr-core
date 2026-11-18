@@ -130,10 +130,6 @@ fn serve_connection(
     });
 }
 
-/// The refusal of the Zode-login RPCs on an adapter (zl-zipline#233).
-/// ponytail: one mode check; #234 removes adapter mode and this with it.
-const NOT_A_ZODE: &str = "not a Zode";
-
 /// Fill a `SuccessOrError` from a Zode-login result.
 fn set_login_result(
     builder: cli::success_or_error::Builder<'_>,
@@ -623,54 +619,8 @@ impl svc::Server for AdminServiceImpl {
         Ok(())
     }
 
-    async fn get_node_info(
-        self: Rc<Self>,
-        _: svc::GetNodeInfoParams,
-        mut results: svc::GetNodeInfoResults,
-    ) -> Result<(), capnp::Error> {
-        debug!(target: RPC, "Get node info from adapter");
-        let task_asm = self.asm.clone();
-
-        let mut results_builder = results.get().init_result();
-
-        if let PhMode::Node = task_asm.ph_mode {
-            let resp = format!("Not in adapter mode");
-            let mut error_builder = results_builder.reborrow().init_error();
-            error_builder.set_txt(resp);
-            return Ok(());
-        }
-
-        match task_asm.peer_table.get(DOCK_LINK_ID) {
-            Some(pt) => {
-                let substrate_addr = pt.substrate_addr;
-                let success_builder = results_builder.init_success();
-                let mut sock_addr_builder = success_builder.init_sock_addr();
-
-                sock_addr_builder.set_port(substrate_addr.port());
-                let mut addr_builder = sock_addr_builder.init_addr();
-
-                match substrate_addr.ip() {
-                    IpAddr::V4(addr) => {
-                        addr_builder.set_v4(&addr.octets());
-                    }
-                    IpAddr::V6(addr) => {
-                        addr_builder.set_v6(&addr.octets());
-                    }
-                }
-            }
-            None => {
-                let resp = format!("No node found");
-                let mut error_builder = results_builder.init_error();
-                error_builder.set_txt(resp);
-            }
-        }
-
-        Ok(())
-    }
-
     /// `ph-cli tun` (zipline#202): the name of the TUN interface ph opened
-    /// and the local ZPR addresses confirmed on it. Answers on a node as
-    /// well as on an adapter. An address ph believes it owns is reported
+    /// and the local ZPR addresses confirmed on it. An address ph believes it owns is reported
     /// only when `has_address` confirms it on the TUN, so a stale or
     /// not-yet-applied address is never printed; one the platform cannot
     /// inspect (`Unsupported`) is omitted and logged at debug.
@@ -723,10 +673,6 @@ impl svc::Server for AdminServiceImpl {
         mut results: svc::LoginResults,
     ) -> Result<(), capnp::Error> {
         info!(target: RPC, "Zode login requested");
-        if self.asm.ph_mode != PhMode::Node {
-            results.get().init_result().init_error().set_txt(NOT_A_ZODE);
-            return Ok(());
-        }
         let agent = spawn_auth_agent_bridge(params.get()?.get_auth_agent()?);
         self.login_agents.borrow_mut().push(agent.clone());
         let result = crate::zode_login::login(&self.asm, agent).await;
@@ -741,10 +687,6 @@ impl svc::Server for AdminServiceImpl {
         mut results: svc::LogoutResults,
     ) -> Result<(), capnp::Error> {
         info!(target: RPC, "Zode logout requested");
-        if self.asm.ph_mode != PhMode::Node {
-            results.get().init_result().init_error().set_txt(NOT_A_ZODE);
-            return Ok(());
-        }
         let result = crate::zode_login::logout(&self.asm).await;
         set_login_result(results.get().init_result(), result);
         Ok(())
@@ -756,12 +698,7 @@ impl svc::Server for AdminServiceImpl {
         _: svc::ShowLoginParams,
         mut results: svc::ShowLoginResults,
     ) -> Result<(), capnp::Error> {
-        let text = if self.asm.ph_mode == PhMode::Node {
-            self.asm.zode_login.status_text()
-        } else {
-            NOT_A_ZODE.to_string()
-        };
-        results.get().set_result(text);
+        results.get().set_result(self.asm.zode_login.status_text());
         Ok(())
     }
 }
@@ -1980,12 +1917,6 @@ mod test {
                     .await
                     .expect("perfSample must succeed");
                 service
-                    .get_node_info_request()
-                    .send()
-                    .promise
-                    .await
-                    .expect("getNodeInfo must succeed");
-                service
                     .reset_counters_request()
                     .send()
                     .promise
@@ -1999,7 +1930,6 @@ mod test {
             "Show link summary procedure initiated",
             "Show link procedure initiated",
             "Perf sample procedure initiated",
-            "Get node info from adapter",
         ] {
             assert!(
                 !output.lines().any(|l| l.contains(read_only)),
@@ -2069,45 +1999,23 @@ mod test {
         }
     }
 
-    /// Calls `getTunInfo` over an in-process RPC pair on an assembly in
-    /// `mode` whose local ZPR addresses are `zpr_addr` and whose TUN is
+    /// Calls `getTunInfo` over an in-process RPC pair on a Zode assembly
+    /// whose configured local ZPR addresses are `zpr_addr` and whose TUN is
     /// `tun_ctl`. Returns the interface name and the reported addresses, or
     /// the error text when ph answered with an error.
-    ///
-    /// A node's local addresses are its configured `zpr_addr`; since #1410
-    /// an adapter's are the addresses granted to the actor on its dock link,
-    /// so for an adapter they are installed there instead.
     async fn get_tun_info(
-        mode: PhMode,
         zpr_addr: &[&str],
         tun_ctl: TunInfoTunCtl,
     ) -> Result<(String, Vec<IpAddr>), String> {
         let zpr_addr: Vec<IpAddr> = zpr_addr.iter().map(|a| a.parse().unwrap()).collect();
         let mut builder = TestAssemblyBuilder::new();
-        builder.ph_mode = Some(mode);
-        if mode == PhMode::Node {
-            let cfg = config::Config {
-                zpr_addr: zpr_addr.clone(),
-                ..Default::default()
-            };
-            builder.config = Some(rcu::RcuBox::new(cfg));
-        }
+        let cfg = config::Config {
+            zpr_addr,
+            ..Default::default()
+        };
+        builder.config = Some(rcu::RcuBox::new(cfg));
         builder.tun_ctl = Some(Box::new(tun_ctl));
         let asm = Arc::new(create_assembly(builder));
-        if mode == PhMode::Adapter && !zpr_addr.is_empty() {
-            // Fill the peer table up to the dock link, then grant there.
-            while add_adapter_peer(&asm) != DOCK_LINK_ID {}
-            asm.peer_table
-                .get(DOCK_LINK_ID)
-                .unwrap()
-                .actor_auth
-                .test_set_addresses(
-                    zpr_addr
-                        .iter()
-                        .map(zpr_utils::net_defs::IpAddress::new_from_std)
-                        .collect(),
-                );
-        }
 
         LocalSet::new()
             .run_until(async move {
@@ -2165,7 +2073,6 @@ mod test {
     #[tokio::test]
     async fn get_tun_info_reports_interface_name() {
         let (name, _) = get_tun_info(
-            PhMode::Adapter,
             &[],
             TunInfoTunCtl {
                 name: "utun7",
@@ -2178,11 +2085,10 @@ mod test {
         assert_eq!(name, "utun7");
     }
 
-    /// (b) A granted address that is on the TUN is reported.
+    /// (b) A configured address that is on the TUN is reported.
     #[tokio::test]
     async fn get_tun_info_reports_granted_address_on_tun() {
         let (name, addrs) = get_tun_info(
-            PhMode::Adapter,
             &["fd5a:5052::1234"],
             TunInfoTunCtl {
                 name: "tun0",
@@ -2201,7 +2107,6 @@ mod test {
     #[tokio::test]
     async fn get_tun_info_omits_address_absent_from_tun() {
         let (_, addrs) = get_tun_info(
-            PhMode::Adapter,
             &["fd5a:5052::1234", "fd5a:5052::99"],
             TunInfoTunCtl {
                 name: "tun0",
@@ -2214,31 +2119,11 @@ mod test {
         assert_eq!(addrs, vec![ip("fd5a:5052::99")]);
     }
 
-    /// (d) Before the grant an adapter has no address: the name alone is
-    /// reported, with an empty address list.
-    #[tokio::test]
-    async fn get_tun_info_before_grant_has_no_addresses() {
-        let (name, addrs) = get_tun_info(
-            PhMode::Adapter,
-            &[],
-            TunInfoTunCtl {
-                name: "tun0",
-                on_tun: vec![ip("fd5a:5052::1234")],
-                inspect_unsupported: false,
-            },
-        )
-        .await
-        .expect("getTunInfo must succeed");
-        assert_eq!(name, "tun0");
-        assert!(addrs.is_empty(), "no address before the grant: {addrs:?}");
-    }
-
     /// An address the platform cannot inspect (`Unsupported`) is omitted,
     /// not guessed (plan Q2).
     #[tokio::test]
     async fn get_tun_info_omits_uninspectable_address() {
         let (_, addrs) = get_tun_info(
-            PhMode::Adapter,
             &["10.0.0.5"],
             TunInfoTunCtl {
                 name: "tun0",
@@ -2252,24 +2137,6 @@ mod test {
             addrs.is_empty(),
             "uninspectable address reported: {addrs:?}"
         );
-    }
-
-    /// A node answers too, not only an adapter (plan Q3).
-    #[tokio::test]
-    async fn get_tun_info_answers_in_node_mode() {
-        let (name, addrs) = get_tun_info(
-            PhMode::Node,
-            &["fd5a:5052:90de::1"],
-            TunInfoTunCtl {
-                name: "tun-node",
-                on_tun: vec![ip("fd5a:5052:90de::1")],
-                inspect_unsupported: false,
-            },
-        )
-        .await
-        .expect("getTunInfo must succeed on a node");
-        assert_eq!(name, "tun-node");
-        assert_eq!(addrs, vec![ip("fd5a:5052:90de::1")]);
     }
 
     /// A capnp AuthAgent that answers every request at once with
@@ -2436,41 +2303,6 @@ mod test {
                     asm.zode_login.is_logged_in(),
                     "the login is kept until expiry"
                 );
-            })
-            .await
-    }
-
-    /// In adapter mode `login`, `logout` and `showLogin` refuse.
-    #[tokio::test]
-    async fn test_login_rpcs_refuse_in_adapter_mode() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-                    ph_mode: Some(PhMode::Adapter),
-                    ..TestAssemblyBuilder::new()
-                }));
-                let (service, _client) = duplex_admin_client(asm.clone());
-
-                let (err, seen) = call_login(&service).await;
-                assert_eq!(err.as_deref(), Some("not a Zode"));
-                assert!(seen.borrow().is_empty());
-                assert!(!asm.zode_login.has_agent());
-
-                let response = service.logout_request().send().promise.await.unwrap();
-                assert_eq!(
-                    error_text(response.get().unwrap().get_result().unwrap()).as_deref(),
-                    Some("not a Zode")
-                );
-
-                let response = service.show_login_request().send().promise.await.unwrap();
-                let text = response
-                    .get()
-                    .unwrap()
-                    .get_result()
-                    .unwrap()
-                    .to_string()
-                    .unwrap();
-                assert_eq!(text, "not a Zode");
             })
             .await
     }

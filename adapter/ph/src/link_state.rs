@@ -1558,60 +1558,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adapter_ownership_reads_do_not_wait_for_link_mutexes() {
-        use crate::peer_table::test::create_dummy_peer_state;
-        use std::net::{IpAddr, Ipv4Addr};
-        use zpr_utils::net_defs::ScopedIpAddr;
-
-        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-        assert!(!asm.adapter_owns_address(IpAddress::UNSPECIFIED));
-        for id in 1..=DOCK_LINK_ID {
-            let entry = asm.peer_table.vacant_entry().unwrap();
-            assert_eq!(entry.key().get(), id);
-            let peer = create_dummy_peer_state(
-                entry.key(),
-                LinkType::AdapterToNode,
-                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), id.try_into().unwrap()),
-                ScopedIpAddr::V4(Ipv4Addr::LOCALHOST),
-            );
-            entry.insert(peer);
-        }
-        let peer = asm.peer_table.get(DOCK_LINK_ID).unwrap();
-        let link = &peer.link_state_machine;
-        let aaa = "fd5a:5052:0:aaa::1".parse::<IpAddr>().unwrap().into();
-        link.process_assigned_aaa(&asm, aaa).unwrap();
-        assert!(!asm.adapter_owns_address(aaa));
-
-        let mut fsm = link.locked_fsm.lock().unwrap();
-        fsm.status = LinkStatus::Up;
-        fsm.set_state(LinkState::Active);
-        let data = link.locked_data.lock().unwrap();
-        std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let asm = &asm;
-            scope.spawn(move || {
-                tx.send((
-                    asm.adapter_owns_address(aaa),
-                    asm.adapter_owns_address(IpAddress::UNSPECIFIED),
-                ))
-                .unwrap();
-            });
-            let result = rx.recv_timeout(Duration::from_secs(2));
-            // Release before checking the result so a regressed reader can finish.
-            drop(data);
-            drop(fsm);
-            assert_eq!(result.unwrap(), (true, false));
-        });
-
-        link.locked_fsm
-            .lock()
-            .unwrap()
-            .set_state(LinkState::Closing);
-        assert_eq!(link.aaa_address(), Some(aaa));
-        assert!(!asm.adapter_owns_address(aaa));
-    }
-
-    #[tokio::test]
     async fn aaa_assignment_waits_for_cleanup_ownership() {
         use std::net::IpAddr;
 
@@ -1904,7 +1850,6 @@ mod tests {
         let mut cfg = <config::Config as std::default::Default>::default();
         cfg.zpr_addr = vec!["fd5a:5052::10".parse().unwrap()];
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(crate::assembly::PhMode::Node),
             self_noise_keypair: Some(keypair),
             certx: Some(certx),
             config: Some(rcu::RcuBox::new(cfg)),

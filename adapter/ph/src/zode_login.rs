@@ -862,7 +862,6 @@ pub fn answer_policy_reauth(asm: &Arc<Assembly>) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::assembly::PhMode;
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::auth_agent::OidcCredentialRequest;
     use crate::fake_vs::{FakeVsState, connected_vsconn, eventually};
@@ -906,7 +905,6 @@ pub(crate) mod tests {
         let addr: IpAddr = NODE_ADDR.parse().unwrap();
         let (fake, vs_handle) = connected_vsconn(state, addr).await;
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(PhMode::Node),
             vsconn: Some(Some(vs_handle)),
             config: Some(rcu::RcuBox::new(config::Config {
                 zpr_addr: vec![addr],

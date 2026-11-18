@@ -25,16 +25,6 @@ use zpr_ext::std::num::NonZeroExt;
 use zpr_ext::zerocopy::*;
 use zpr_utils::net_defs;
 
-/// Simple function used on an adapter to forward actor packets to the the tether and vice-versa.
-const fn adapter_next_hop_link(ingress_link_id: LinkId) -> LinkId {
-    // this optimization is checked by the static asserts below
-    // this allows us to avoid an unpredictable branch on every packet
-    (ingress_link_id % 2) + 1
-}
-
-const _: () = assert!(adapter_next_hop_link(LOCAL_ACTOR_LINK_ID) == DOCK_LINK_ID);
-const _: () = assert!(adapter_next_hop_link(DOCK_LINK_ID) == LOCAL_ACTOR_LINK_ID);
-
 #[cfg(debug_assertions)]
 /// This table is used to track whether a flow ever switches from one worker
 /// to another (indicating potential for out-of-order packets) -- meaning
@@ -300,12 +290,6 @@ impl FastpathWorker {
     pub fn actor_output_post_classify(&mut self, mut pkt: Packet, allow_bind_request: bool) {
         // lookup five tuple in ELT
         let five_tuple = *pkt.metadata().five_tuple(); // TODO: convince borrow checker we don't need to copy this out
-        if self.asm.ph_mode == crate::assembly::PhMode::Adapter
-            && !self.asm.adapter_owns_address(five_tuple.src_address)
-        {
-            self.drop_and_count(pkt, FastpathCounterType::OtherError);
-            return;
-        }
         let Some(entry) = self.asm.elt.get(&five_tuple) else {
             if !allow_bind_request {
                 // avoid the (all-but purely theoretical) chance of a packet loop,
@@ -379,50 +363,43 @@ impl FastpathWorker {
         let egress_link_id;
         let egress_stream_id;
 
-        match self.asm.ph_mode {
-            PhMode::Adapter => {
-                egress_link_id = adapter_next_hop_link(pkt.metadata().ingress_link_id);
-                egress_stream_id = pkt.metadata().ingress_stream_id;
-            }
+        // Scoped so the peer-table and stream-table guards are released
+        // before the packet moves on.
+        {
+            let Some(ingress_peer_state) = self.asm.peer_table.get(pkt.metadata().ingress_link_id)
+            else {
+                self.drop_and_count(pkt, FastpathCounterType::UnknownPeer);
+                return;
+            };
 
-            PhMode::Node => {
-                let Some(ingress_peer_state) =
-                    self.asm.peer_table.get(pkt.metadata().ingress_link_id)
-                else {
-                    self.drop_and_count(pkt, FastpathCounterType::UnknownPeer);
-                    return;
-                };
+            let Some(pep) = ingress_peer_state.pft.get(pkt.metadata().ingress_stream_id) else {
+                drop(ingress_peer_state);
+                self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
+                return;
+            };
 
-                let Some(pep) = ingress_peer_state.pft.get(pkt.metadata().ingress_stream_id) else {
-                    drop(ingress_peer_state);
-                    self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
-                    return;
-                };
+            // TODO: policy enforcement
 
-                // TODO: policy enforcement
+            // One load: a J11 rebind may swap the entry's target at
+            // any moment, and both IDs must come from the same target.
+            let next_hop = pep.next_hop();
+            egress_link_id = next_hop.0;
+            egress_stream_id = next_hop.1;
 
-                // One load: a J11 rebind may swap the entry's target at
-                // any moment, and both IDs must come from the same target.
-                let next_hop = pep.next_hop();
-                egress_link_id = next_hop.0;
-                egress_stream_id = next_hop.1;
-
-                // Security Testing: if this is a transit stream (in from one
-                // peer and out to another, neither of them this node's own
-                // actor), corrupt forwarded ICMP echo requests to prove the
-                // A2A MICV catches a malicious node. On a Zode relay both are
-                // Zode links; on a classic node both are adapter docks.
-                #[cfg(feature = "enable-security-testing")]
-                if self.config.mangle_forwarded_pings
-                    && !ingress_peer_state.is_internal()
-                    && self
-                        .asm
-                        .peer_table
-                        .get(egress_link_id)
-                        .is_some_and(|p| !p.is_internal())
-                {
-                    self.security_testing_mangle_ping(&mut pkt, pep.visa_id());
-                }
+            // Security Testing: if this is a transit stream (in from one
+            // peer and out to another, neither of them this node's own
+            // actor), corrupt forwarded ICMP echo requests to prove the
+            // A2A MICV catches a malicious node. Both are Zode links.
+            #[cfg(feature = "enable-security-testing")]
+            if self.config.mangle_forwarded_pings
+                && !ingress_peer_state.is_internal()
+                && self
+                    .asm
+                    .peer_table
+                    .get(egress_link_id)
+                    .is_some_and(|p| !p.is_internal())
+            {
+                self.security_testing_mangle_ping(&mut pkt, pep.visa_id());
             }
         }
 
@@ -615,15 +592,6 @@ impl FastpathWorker {
             self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
             return;
         };
-        if self.asm.ph_mode == crate::assembly::PhMode::Adapter
-            && !self
-                .asm
-                .adapter_owns_address(pep.tc.five_tuple().dst_address)
-        {
-            drop(pep);
-            self.drop_and_count(pkt, FastpathCounterType::OtherError);
-            return;
-        }
 
         compress::expand(pep.tc.compression_mode(), &pep.tc.five_tuple(), &mut pkt);
 
@@ -1280,7 +1248,6 @@ mod test {
         use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
         let (mgmt_tx, mut mgmt_rx) = crate::packet_queue::packet_queue(8);
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
-            ph_mode: Some(PhMode::Node),
             mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(mgmt_tx)),
             ..TestAssemblyBuilder::new()
         }));

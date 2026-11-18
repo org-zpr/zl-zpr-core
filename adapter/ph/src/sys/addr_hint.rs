@@ -86,31 +86,6 @@ pub fn manual_add_address_hint(addr: &IpAddr, prefix_len: u8, ifname: &str) -> S
     hint_for(CURRENT, addr, prefix_len, ifname)
 }
 
-/// The manual add-route hint in `platform`'s command syntax, or `None` when
-/// that platform's route-failure message carries no command (zipline#177).
-///
-/// Only Windows needs one: the /128 visa-service host route is a separate
-/// `netsh add route` step there (see `Assembly::ensure_local_zpr_addrs_on_tun`
-/// for why it is kept). On Linux and macOS no such route is installed, and
-/// the failure message has never suggested a command.
-fn route_hint_for(platform: Platform, addr: &IpAddr, ifname: &str) -> Option<String> {
-    match platform {
-        Platform::Linux | Platform::MacOs => None,
-        // The interface name is quoted: Wintun adapter names may contain
-        // spaces.
-        Platform::Windows => Some(format!(
-            "netsh interface ipv6 add route {addr}/128 \"{ifname}\""
-        )),
-    }
-}
-
-/// The command an operator runs to install the /128 host route to `addr` on
-/// `ifname` by hand, in the current platform's syntax — `None` where no
-/// manual command applies.
-pub fn manual_add_route_hint(addr: &IpAddr, ifname: &str) -> Option<String> {
-    route_hint_for(CURRENT, addr, ifname)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,43 +171,5 @@ mod tests {
             hint_for(Platform::Windows, &addr(), 32, "zpr0")
         };
         assert_eq!(manual_add_address_hint(&addr(), 32, "zpr0"), expected);
-    }
-
-    // --- route hint (zipline#177): the manual add-route command printed
-    // when the visa-service host route could not be installed. Only
-    // Windows needs one — the /128 route is a separate step there; on Linux
-    // and macOS the route failure message carries no command today, and None
-    // keeps it that way.
-
-    #[test]
-    fn windows_route_hint_is_netsh_add_route() {
-        // Exact current main.rs string, including the quotes around the
-        // interface name (Wintun adapter names may contain spaces).
-        assert_eq!(
-            route_hint_for(Platform::Windows, &addr(), "zpr0").as_deref(),
-            Some("netsh interface ipv6 add route fd5a:5052::a:b:c/128 \"zpr0\"")
-        );
-    }
-
-    #[test]
-    fn linux_route_hint_is_none() {
-        assert_eq!(route_hint_for(Platform::Linux, &addr(), "zpr0"), None);
-    }
-
-    #[test]
-    fn macos_route_hint_is_none() {
-        assert_eq!(route_hint_for(Platform::MacOs, &addr(), "utun4"), None);
-    }
-
-    #[test]
-    fn public_route_fn_uses_the_current_platform_arm() {
-        let expected = if cfg!(target_os = "linux") {
-            route_hint_for(Platform::Linux, &addr(), "zpr0")
-        } else if cfg!(target_os = "macos") {
-            route_hint_for(Platform::MacOs, &addr(), "zpr0")
-        } else {
-            route_hint_for(Platform::Windows, &addr(), "zpr0")
-        };
-        assert_eq!(manual_add_route_hint(&addr(), "zpr0"), expected);
     }
 }

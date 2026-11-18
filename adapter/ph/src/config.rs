@@ -10,7 +10,6 @@ use admin_api::{SocketOwner, control_socket_path};
 use base64::prelude::*;
 use serde::Deserialize;
 
-use crate::assembly::PhMode;
 use crate::auth::RsaBootstrapAuth;
 use crate::batch_io;
 use crate::pki::{NOISE_KEY_LEN, common_name, load_cert, load_noise_private_key};
@@ -159,9 +158,6 @@ impl ArgError for str {
 /// use [crate::main_argparse::argparse].
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Adapter CN fallback when no signed certificate is configured. Ignored by nodes.
-    pub name: String,
-
     /// Path to the unix domain socket for the control interface.
     pub control_path: PathBuf,
 
@@ -172,8 +168,8 @@ pub struct Config {
     /// [validate_control_group]; only a name, never interpolated into SDDL.
     pub control_group: Option<String>,
 
-    /// Source address for our UDP substrate socket. For an adapter this should (always?) be `0.0.0.0:0`.
-    /// For a node this is the nodes dock listening address.
+    /// Source address for our UDP substrate sockets: the address this Zode's
+    /// peers dial.
     pub self_addr: SocketAddr,
 
     /// Node only, optional - the substrate address this node advertises to the visa
@@ -208,21 +204,17 @@ pub struct Config {
     /// Enable debug logging for specified targets, or ALL
     pub logging: Vec<(String, String)>,
 
-    /// Required for adapter - the node dock address on substrate.
-    pub node_addr: Option<SocketAddr>,
-
-    /// Required for node, optional for adapter - the ZPR addresses (no port).
+    /// Required - the ZPR addresses (no port).
     /// On a node, `zpr_addr[0]` is the node's own address. A relay lists
     /// `vs.zpr` (fd5a:5052::1) after it, because it hosts the visa service;
     /// no other node lists `vs.zpr`, and no address appears twice
     /// (zl-zipline#229, see [Config::check_valid]).
     pub zpr_addr: Vec<IpAddr>,
 
-    /// Ignored for node, optional for adapter - Only set if the adapter is configured for bootstrap authentication.
+    /// Adapter side of a dock only; never set now that there is no adapter,
+    /// but still read by the `AdapterToNode` code.
+    // #234: deleted by core-adapter
     pub bootstrap: Option<RsaBootstrapAuth>,
-
-    /// Resolved path to the bootstrap RSA key file; used by finalize() to construct `bootstrap`.
-    pub bootstrap_key_path: Option<PathBuf>,
 
     /// The batch I/O engine to use.
     pub batch_io_engine: String,
@@ -230,12 +222,10 @@ pub struct Config {
     /// Type of key manager implementation
     pub km_impl: KmId,
 
-    /// Adapter only - whether the tether link connects (and reconnects) on
-    /// its own. `true` (the default) is today's behaviour: start keying at
-    /// startup and restart after the holddown when the link drops. `false`
-    /// leaves the link Inactive until a `startLink` RPC (ph-cli connect /
-    /// link start) wakes it, and a drop returns it to Inactive with no
-    /// automatic restart (zipline#28).
+    /// Adapter side of a dock only: whether the tether link connects (and
+    /// reconnects) on its own (zipline#28). Always `true` now that there is
+    /// no adapter, but still read by the `AdapterToNode` code.
+    // #234: deleted by core-adapter
     pub auto_connect: bool,
 
     /// The user the control socket should belong to, resolved from
@@ -263,19 +253,19 @@ pub struct Config {
     /// accepts forward-only visas (zl-zipline#219, Zodes plan §5.7, §5.9).
     /// Off by default: with it off, a forward-only visa from the visa
     /// service is refused and logged. Configured via `forwarding` in the
-    /// `[node]` config section or `ph node --forwarding`.
+    /// `[node]` config section or `ph zode --forwarding`.
     pub forwarding: bool,
 
     /// Node only — the Zode's initial link: the relay it dials at startup
     /// and keeps redialing, its lifeline to the network (ZODE_LINKS.md
     /// "Kinds of link", zl-zipline#250). At most one. Configured via
-    /// `[node.initial_link]` or `ph node --initial-link CN@IP:PORT`.
+    /// `[node.initial_link]` or `ph zode --initial-link CN@IP:PORT`.
     pub initial_link: Option<InitialLink>,
 
     /// Node only — whether this Zode is a relay (ZODE_LINKS.md rule 4). A
     /// relay never dials: it accepts a link from any peer whose CN is in its
     /// topology. Off by default. Configured via `relay` in the `[node]`
-    /// section or `ph node --relay`. A relay has no initial link. A relay
+    /// section or `ph zode --relay`. A relay has no initial link. A relay
     /// hosts the visa service on its own TUN, so it lists `vs.zpr` in
     /// `zpr_addr` after its own address (zl-zipline#229).
     pub relay: bool,
@@ -328,27 +318,9 @@ impl Config {
         return "".to_string();
     }
 
-    /// Create the [Config] struct using an optional configuration file plus
-    /// any passed "common" command line arguments.
-    ///
-    /// Note that additional, adapter specific command line arguments may get
-    /// folded into the returned object later.
-    pub fn new_for_adapter(
-        config_file: Option<AdapterConfig>,
-        common: &CommonArgs,
-    ) -> Result<Self, ArgsError> {
-        let mut config = Config::default();
-        config.set_from_common(common)?;
-        if let Some(config_file) = config_file {
-            let base_dir = config_file.config_path.parent().unwrap();
-            config.set_from_globals(&config_file.global, base_dir)?;
-            config_file.refuse_node_settings()?;
-            config.set_from_adapter(&config_file.adapter, base_dir)?;
-            config.set_from_authentication(&config_file.authentication, base_dir)?;
-        }
-        Ok(config)
-    }
-
+    /// Create the [Config] struct from an optional configuration file, the
+    /// optional `--auth-private-key` and the "common" command line arguments.
+    /// Command line arguments win over the configuration file.
     pub fn new_for_node(
         config_file: Option<NodeConfig>,
         auth_private_key: Option<PathBuf>,
@@ -373,29 +345,13 @@ impl Config {
         Ok(config)
     }
 
-    /// If we have a `certificate_file` use that to figure out our CN.
-    /// Otherwise we return the `global.name` value. Returns an error if both are absent.
+    /// The CN of this Zode's link certificate, read from `certificate_file`
+    /// (which [Config::check_valid] requires).
     pub fn get_noise_cn(&self) -> Result<String, ArgsError> {
         match self.certificate_file.as_ref() {
-            None => {
-                if self.name.is_empty() {
-                    Err("certificate_file or name (required for CN derivation)".arg_missing())
-                } else {
-                    Ok(self.name.clone())
-                }
-            }
+            None => Err("certificate_file".arg_missing()),
             Some(f) => get_noise_cn(&f),
         }
-    }
-
-    /// Construct auth objects from stored key paths, using the resolved CN.
-    /// Must be called after all name sources (config file and CLI) have been merged.
-    pub fn finalize(&mut self) -> Result<(), ArgsError> {
-        if let Some(path) = self.bootstrap_key_path.clone() {
-            let cn = self.get_noise_cn()?;
-            self.bootstrap = Some(RsaBootstrapAuth::new(&cn, &path)?);
-        }
-        Ok(())
     }
 
     /// Fold the resolved socket owner into the config (zipline#39): socket
@@ -519,9 +475,9 @@ impl Config {
         Ok(())
     }
 
-    // Check that the required bits are present based on mode.
-    // Also checks that the various files exist.
-    pub fn check_valid(&self, mode: PhMode) -> Result<(), ArgsError> {
+    /// Check that the required bits of a Zode configuration are present, and
+    /// that the files it names exist.
+    pub fn check_valid(&self) -> Result<(), ArgsError> {
         if self.control_path.as_os_str().is_empty() {
             return Err("control_path".arg_missing());
         }
@@ -548,61 +504,46 @@ impl Config {
                 return Err("private_key_data".arg_missing());
             }
         }
-        match mode {
-            PhMode::Node => {
-                // A relay never dials (ZODE_LINKS.md rule 4); the initial
-                // link is always an endpoint's.
-                if self.relay && self.initial_link.is_some() {
-                    return Err(ArgsError::ParseError(
-                        "a relay has no initial link: set relay or initial_link, not both"
-                            .to_string(),
-                    ));
-                }
-                // The initial link is dialed from the substrate sockets,
-                // which are bound to self_addr: an address of the other
-                // family could never be dialed.
-                if let Some(link) = &self.initial_link {
-                    if link.addr.is_ipv4() != self.self_addr.is_ipv4() {
-                        return Err(ArgsError::ParseError(format!(
-                            "initial_link addr {} and self_addr {} are of different address \
-                             families; set self_addr to an address of the relay's family",
-                            link.addr, self.self_addr
-                        )));
-                    }
-                }
-                if self.zpr_addr.is_empty() {
-                    return Err("zpr_addr".arg_missing());
-                }
-                self.check_node_zpr_addrs()?;
-                if self.certificate_file.is_none() {
-                    return Err("certificate_file".arg_missing());
-                }
-                if self.private_key_file.is_none() && self.private_key_data.is_none() {
-                    return Err("private_key_file or noise_private_key".arg_missing());
-                }
+        // A Zode is a relay, which never dials (ZODE_LINKS.md rule 4), or
+        // dials its relay over its initial link: never both, and never
+        // neither, since a Zode with neither could reach no visa service
+        // (zl-zipline#234).
+        match (self.relay, self.initial_link.is_some()) {
+            (true, true) => {
+                return Err(ArgsError::ParseError(
+                    "a relay has no initial link: set relay or initial_link, not both".to_string(),
+                ));
             }
-            PhMode::Adapter => {
-                if self.initial_link.is_some() || self.relay {
-                    return Err(ArgsError::ParseError(
-                        "initial_link and relay are Zode (node) settings".to_string(),
-                    ));
-                }
-                if self.node_addr.is_none() {
-                    return Err("node_addr".arg_missing());
-                }
-                if self.certificate_file.is_none() && self.name.is_empty() {
-                    return Err("name (required when certificate_file is absent)".arg_missing());
-                }
-                if self.private_key_file.is_none()
-                    && self.private_key_data.is_none()
-                    && self.name.is_empty()
-                {
-                    return Err(
-                        "adapter name must be set to CN when not using explicit link keys"
-                            .arg_missing(),
-                    );
-                }
+            (false, false) => {
+                return Err(ArgsError::ParseError(
+                    "a Zode needs relay or initial_link: set relay = true, or the relay \
+                     to dial with initial_link"
+                        .to_string(),
+                ));
             }
+            _ => {}
+        }
+        // The initial link is dialed from the substrate sockets, which are
+        // bound to self_addr: an address of the other family could never be
+        // dialed.
+        if let Some(link) = &self.initial_link {
+            if link.addr.is_ipv4() != self.self_addr.is_ipv4() {
+                return Err(ArgsError::ParseError(format!(
+                    "initial_link addr {} and self_addr {} are of different address \
+                     families; set self_addr to an address of the relay's family",
+                    link.addr, self.self_addr
+                )));
+            }
+        }
+        if self.zpr_addr.is_empty() {
+            return Err("zpr_addr".arg_missing());
+        }
+        self.check_node_zpr_addrs()?;
+        if self.certificate_file.is_none() {
+            return Err("certificate_file".arg_missing());
+        }
+        if self.private_key_file.is_none() && self.private_key_data.is_none() {
+            return Err("private_key_file or noise_private_key".arg_missing());
         }
         Ok(())
     }
@@ -663,33 +604,6 @@ impl Config {
         }
         if let Some(io_engine) = &config.io_engine {
             self.batch_io_engine = io_engine.clone();
-        }
-        Ok(())
-    }
-
-    // Overwrite our internal state with the values present in the adapter section
-    // of TOML config.
-    fn set_from_adapter(
-        &mut self,
-        config: &AdapterConfigSection,
-        base_dir: &Path,
-    ) -> Result<(), ArgsError> {
-        if let Some(cn) = &config.name {
-            self.name = cn.clone();
-        }
-        if let Some(node_addr) = &config.node_addr {
-            self.node_addr = Some(*node_addr);
-        }
-
-        if let Some(bootstrap_key_file) = &config.bootstrap_key {
-            if bootstrap_key_file.is_relative() {
-                self.bootstrap_key_path = Some(base_dir.join(bootstrap_key_file));
-            } else {
-                self.bootstrap_key_path = Some(bootstrap_key_file.clone());
-            }
-        }
-        if let Some(auto_connect) = config.auto_connect {
-            self.auto_connect = auto_connect;
         }
         Ok(())
     }
@@ -833,7 +747,6 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            name: String::new(),
             control_path: control_socket_path(None),
             control_group: None,
             self_addr: SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0),
@@ -845,10 +758,8 @@ impl Default for Config {
             auth_private_key: None,
             tun_if: None,
             logging: Vec::new(),
-            node_addr: None,
             zpr_addr: Vec::new(),
             bootstrap: None,
-            bootstrap_key_path: None,
             batch_io_engine: batch_io::AUTO_ENGINE_NAME.to_owned(),
             km_impl: KM_ID_NOISE,
             auto_connect: true,
@@ -868,42 +779,10 @@ impl Default for Config {
     }
 }
 
-// This describes the adapter configuration file TOML format.
+// This describes the Zode configuration file TOML format. Unknown sections,
+// `[adapter]` among them, are refused rather than ignored (zl-zipline#234).
 #[derive(Deserialize, Debug, Clone)]
-pub struct AdapterConfig {
-    #[serde(skip)]
-    pub config_path: PathBuf,
-
-    pub global: GlobalConfigSection,
-    pub adapter: AdapterConfigSection,
-    pub authentication: Option<AuthenticationConfigSection>,
-
-    /// Present only to be refused: an adapter has no `[node]` section
-    /// (zl-zipline#250). See [AdapterConfig::refuse_node_settings].
-    node: Option<toml::Value>,
-}
-
-impl AdapterConfig {
-    /// Refuse the node-only settings in an adapter config file, rather than
-    /// ignoring them: a `[node]` section, and `relay` or `initial_link` in
-    /// `[adapter]` (zl-zipline#250).
-    fn refuse_node_settings(&self) -> Result<(), ArgsError> {
-        if self.node.is_some()
-            || self.adapter.relay.is_some()
-            || self.adapter.initial_link.is_some()
-        {
-            return Err(ArgsError::ParseError(
-                "an adapter config has no [node] section, relay or initial_link: \
-                 those are Zode (node) settings"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-// This describes the node configuration file TOML format.
-#[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     #[serde(skip)]
     pub config_path: PathBuf,
@@ -913,8 +792,9 @@ pub struct NodeConfig {
     pub authentication: Option<AuthenticationConfigSection>,
 }
 
-// Node only bits.
+// The `[node]` section of a Zode config file.
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfigSection {
     /// The substrate address this node advertises to the visa service, as a
     /// literal `"IP:port"` string (IPv6 in square-bracket notation).
@@ -990,8 +870,9 @@ impl InitialLink {
     }
 }
 
-// Global section is shared by nodes and adapters.
+// The `[global]` section of a Zode config file.
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalConfigSection {
     pub control_path: Option<PathBuf>,
     pub control_group: Option<String>,
@@ -1003,19 +884,6 @@ pub struct GlobalConfigSection {
     pub zpr_addr: Option<Vec<IpAddr>>,
     pub logging: Option<Vec<(String, String)>>,
     pub io_engine: Option<String>,
-}
-
-// Adapter only bits.
-#[derive(Deserialize, Debug, Clone)]
-pub struct AdapterConfigSection {
-    pub name: Option<String>,
-    pub node_addr: Option<SocketAddr>,
-    pub bootstrap_key: Option<PathBuf>,
-    pub auto_connect: Option<bool>,
-    /// Present only to be refused (see [AdapterConfig::refuse_node_settings]).
-    relay: Option<toml::Value>,
-    /// Present only to be refused (see [AdapterConfig::refuse_node_settings]).
-    initial_link: Option<toml::Value>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1292,64 +1160,6 @@ mod test {
     }
 
     #[test]
-    fn test_deserialize_adapter_config() {
-        let toml_str = r#"
-            node_addr = "10.0.0.1:5000"
-            bootstrap_key = "rsa_key.pem"
-            "#;
-        let _config: AdapterConfigSection = toml::from_str(toml_str).unwrap();
-    }
-
-    /// `auto_connect = false` under `[adapter]` must deserialize, and an
-    /// omitted key must stay `None` so the built-in default applies.
-    #[test]
-    fn test_deserialize_adapter_config_auto_connect() {
-        let toml_str = r#"
-            node_addr = "10.0.0.1:5000"
-            auto_connect = false
-            "#;
-        let config: AdapterConfigSection = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.auto_connect, Some(false));
-
-        let toml_str = r#"
-            node_addr = "10.0.0.1:5000"
-            "#;
-        let config: AdapterConfigSection = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.auto_connect, None);
-    }
-
-    /// The default is auto-connect (today's behaviour): a default `Config`
-    /// has `auto_connect = true`, and `set_from_adapter` only overrides it
-    /// when the config file actually carries the key.
-    #[test]
-    fn test_set_from_adapter_auto_connect() {
-        // Default: on.
-        let config = Config::default();
-        assert!(config.auto_connect, "auto_connect must default to true");
-
-        // Config file says off.
-        let section: AdapterConfigSection = toml::from_str(
-            r#"
-            auto_connect = false
-            "#,
-        )
-        .unwrap();
-        let mut config = Config::default();
-        config
-            .set_from_adapter(&section, Path::new("/tmp"))
-            .unwrap();
-        assert!(!config.auto_connect);
-
-        // Config file silent: default preserved.
-        let section: AdapterConfigSection = toml::from_str("").unwrap();
-        let mut config = Config::default();
-        config
-            .set_from_adapter(&section, Path::new("/tmp"))
-            .unwrap();
-        assert!(config.auto_connect);
-    }
-
-    #[test]
     fn test_deserialize_node_config_section() {
         let toml_str = r#"
             advertised_substrate_addr = "203.0.113.7:5000"
@@ -1562,7 +1372,7 @@ mod test {
             initial_link: Some(InitialLink::parse_cli(link).unwrap()),
             ..Config::default()
         };
-        let ok = |s, l| node(s, l).check_valid(PhMode::Node).is_ok();
+        let ok = |s, l| node(s, l).check_valid().is_ok();
         assert!(ok("0.0.0.0:0", "r@10.0.0.9:5000"));
         assert!(ok("10.0.0.1:5000", "r@10.0.0.9:5000"));
         assert!(ok("[::]:5000", "r@[fd00::9]:5000"));
@@ -1571,8 +1381,8 @@ mod test {
         assert!(!ok("[fd00::1]:5000", "r@10.0.0.9:5000"));
     }
 
-    /// The initial link and relay knobs are node-only, and a relay never
-    /// dials (R4), so a relay with an initial link is a configuration error.
+    /// A Zode is a relay or has an initial link, exactly one of them: a relay
+    /// never dials (R4), and a Zode with neither reaches no visa service.
     #[test]
     fn test_check_valid_initial_link_and_relay() {
         let link = InitialLink::parse_cli("relay.zpr@10.0.0.9:5000").unwrap();
@@ -1586,32 +1396,26 @@ mod test {
 
         let mut config = node();
         config.initial_link = Some(link.clone());
-        assert!(config.check_valid(PhMode::Node).is_ok());
+        assert!(config.check_valid().is_ok());
 
         // A relay lists vs.zpr after its own address (zl-zipline#229), so
         // only the initial link makes this one invalid.
         config.relay = true;
         config.zpr_addr.push(VISA_SERVICE_ADDR);
-        assert!(config.check_valid(PhMode::Node).is_err());
+        assert!(config.check_valid().is_err());
 
         let mut config = node();
         config.relay = true;
         config.zpr_addr.push(VISA_SERVICE_ADDR);
-        assert!(config.check_valid(PhMode::Node).is_ok());
+        assert!(config.check_valid().is_ok());
 
-        let adapter = || Config {
-            node_addr: Some("10.0.0.9:5000".parse().unwrap()),
-            name: "adapter".to_owned(),
-            control_path: std::env::temp_dir().join("ctl.sock"),
-            ..Config::default()
+        // Neither: a Zode that is no relay and dials nothing could reach no
+        // visa service (zl-zipline#234).
+        let msg = match node().check_valid() {
+            Err(ArgsError::ParseError(msg)) => msg,
+            other => panic!("expected a ParseError, got {other:?}"),
         };
-        assert!(adapter().check_valid(PhMode::Adapter).is_ok());
-        let mut config = adapter();
-        config.initial_link = Some(link);
-        assert!(config.check_valid(PhMode::Adapter).is_err());
-        let mut config = adapter();
-        config.relay = true;
-        assert!(config.check_valid(PhMode::Adapter).is_err());
+        assert!(msg.contains("needs relay or initial_link"), "{msg}");
     }
 
     /// zl-zipline#229 (gate g117 q2): a relay hosts the visa service, so it
@@ -1625,12 +1429,14 @@ mod test {
             Config {
                 zpr_addr,
                 relay,
+                // A Zode that is not a relay dials one.
+                initial_link: (!relay).then(|| InitialLink::parse_cli("r@10.0.0.9:5000").unwrap()),
                 certificate_file: Some(std::env::temp_dir()),
                 private_key_data: Some("key".to_owned()),
                 control_path: std::env::temp_dir().join("ctl.sock"),
                 ..Config::default()
             }
-            .check_valid(PhMode::Node)
+            .check_valid()
         };
         let refusal = |relay: bool, zpr_addr: Vec<IpAddr>| match check(relay, zpr_addr) {
             Err(ArgsError::ParseError(msg)) => msg,

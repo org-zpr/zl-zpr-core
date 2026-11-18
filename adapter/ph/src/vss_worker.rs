@@ -507,7 +507,6 @@ mod tests {
 
     fn node_builder(own: IpAddr) -> TestAssemblyBuilder {
         TestAssemblyBuilder {
-            ph_mode: Some(crate::assembly::PhMode::Node),
             config: Some(rcu::RcuBox::new(crate::config::Config {
                 zpr_addr: vec![own],
                 ..Default::default()

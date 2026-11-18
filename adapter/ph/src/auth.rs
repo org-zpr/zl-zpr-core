@@ -158,6 +158,7 @@ pub struct OidcIdpInfo {
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("OpenSSL Error: {0}")]
+    #[cfg_attr(not(test), allow(dead_code))] // #234: deleted by core-adapter
     OpenSSLError(String),
 
     #[error("I/O Error: {0}")]
@@ -406,6 +407,7 @@ impl RsaBootstrapAuth {
     /// The `cn` is the common name of the actor.
     /// The `rsa_keyfile` is the path to the PEM file containing the RSA private key.
     /// The visa service (policy) must be configured with the corresponding public key.
+    #[cfg_attr(not(test), allow(dead_code))] // #234: deleted by core-adapter
     pub fn new(cn: &str, rsa_keyfile: &Path) -> Result<Self, AuthError> {
         let pemdata = std::fs::read(rsa_keyfile)?;
         let pkey = Arc::new(
@@ -455,11 +457,6 @@ impl RsaBootstrapAuth {
             sig: sig_str,
         };
         Ok(blob)
-    }
-
-    #[cfg(test)]
-    pub fn cn(&self) -> &str {
-        &self.cn
     }
 }
 

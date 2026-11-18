@@ -3,7 +3,6 @@
 //! The main entry point is [crate::main_argparse::argparse] which will parse the command line arguments
 //! and any config file, returning a PH configuration.
 
-#[cfg(not(feature = "complete"))]
 use crate::batch_io;
 use crate::logging::{levels, targets};
 use clap::{Args, Parser, Subcommand};

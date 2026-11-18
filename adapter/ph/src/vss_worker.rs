@@ -520,7 +520,7 @@ mod tests {
         let link_id = entry.key();
         let ps = peer_table::test::create_dummy_peer_state(
             link_id,
-            LinkType::AdapterToNode,
+            LinkType::NodeToAdapter,
             SubstrateAddr::from(([127, 0, 0, 1], 9000 + link_id.get() as u16)),
             net_defs::ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2).into()),
         );

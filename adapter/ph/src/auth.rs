@@ -1,12 +1,7 @@
-//! This module implements the bootstrap authentication scheme which is used
-//! when we need to join a ZPRnet but there are no authentication services
-//! attached yet.  Also includes other "auth" related functionality.
+//! Actor authentication evidence: the challenge a node issues to a docked
+//! actor, and the self-signed and OIDC blobs that answer it.
 
-use aws_lc_rs::signature::RsaKeyPair;
-
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use zerocopy::byteorder::network_endian::*;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -16,7 +11,6 @@ use thiserror::Error;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use zpr_utils::rsa_sign::{load_rsa_key, sign_rsa_key};
 
 /// When a node signs a challenge for an adapter it uses this sort of key.
 pub const AUTH_KEY_SIZE_BYTES: usize = 32; // blake3 256bit key
@@ -157,10 +151,6 @@ pub struct OidcIdpInfo {
 
 #[derive(Debug, Error)]
 pub enum AuthError {
-    #[error("OpenSSL Error: {0}")]
-    #[cfg_attr(not(test), allow(dead_code))] // #234: deleted by core-adapter
-    OpenSSLError(String),
-
     #[error("I/O Error: {0}")]
     IOError(#[from] std::io::Error),
 
@@ -178,17 +168,6 @@ pub enum AuthError {
 
     #[error("Challenge Too Old")]
     ChallengeTooOld,
-
-    /// The credentials were refused outright (as opposed to a transient
-    /// service failure). Actor authorization latches this (#1410).
-    #[error("authentication rejected: {0}")]
-    Rejected(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct RsaBootstrapAuth {
-    pkey: Arc<RsaKeyPair>,
-    cn: String,
 }
 
 impl ZdpSelfSignedBlob {
@@ -401,70 +380,9 @@ pub fn encode_blobs(blobs: &[AuthBlob]) -> String {
     BASE64_STANDARD.encode(&json_txt)
 }
 
-/// Implementes BootstrapAuth using our RSA signature scheme.
-impl RsaBootstrapAuth {
-    /// Create a new RsaBootstrapAuth object.
-    /// The `cn` is the common name of the actor.
-    /// The `rsa_keyfile` is the path to the PEM file containing the RSA private key.
-    /// The visa service (policy) must be configured with the corresponding public key.
-    #[cfg_attr(not(test), allow(dead_code))] // #234: deleted by core-adapter
-    pub fn new(cn: &str, rsa_keyfile: &Path) -> Result<Self, AuthError> {
-        let pemdata = std::fs::read(rsa_keyfile)?;
-        let pkey = Arc::new(
-            load_rsa_key(&pemdata)
-                .map_err(|e| AuthError::OpenSSLError(format!("Failed to load RSA key: {}", e)))?,
-        );
-        Ok(RsaBootstrapAuth {
-            pkey,
-            cn: cn.to_string(),
-        })
-    }
-
-    /// Sign the node's challenge, producing a [ZdpSelfSignedBlob] for the
-    /// actor's evidence array ([encode_blobs]).
-    ///
-    /// The signature here is created by signing:
-    ///  - the current timestamp (in seconds since the epoch)
-    ///  - the common name (cn) of the actor
-    ///  - the challenge from the ZDP server, which is the (nonce, ctime, hmac) all concatentated
-    ///    together in a byte buffer.
-    pub fn authenticate_blob(
-        &self,
-        payload: &ZdpInitAuthenticationPayload,
-    ) -> Result<ZdpSelfSignedBlob, AuthError> {
-        // TODO: Check the payload.flags?
-        let challenge = payload.challenge_bytes();
-
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u64;
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&ts.to_be_bytes());
-        data.extend_from_slice(self.cn.as_bytes());
-        data.extend_from_slice(&challenge);
-
-        let signature = sign_rsa_key(&self.pkey, &data);
-
-        let sig_str = BASE64_STANDARD.encode(&signature);
-
-        let blob = ZdpSelfSignedBlob {
-            blob_type: BLOB_TYPE_SS.to_string(),
-            ts,
-            cn: self.cn.clone(),
-            challenge: BASE64_STANDARD.encode(&challenge),
-            sig: sig_str,
-        };
-        Ok(blob)
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
-    use aws_lc_rs::signature::{KeyPair, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
-    use std::path::PathBuf;
 
     fn make_ss_blob() -> ZdpSelfSignedBlob {
         ZdpSelfSignedBlob {
@@ -555,7 +473,7 @@ mod test {
     fn test_expired_bootstrap_challenge_is_rejected() {
         let key = [42; 32];
         let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         let mut challenge = ZdpInitAuthenticationPayload {
@@ -644,7 +562,7 @@ mod test {
         // MAX_OIDC_BLOB_AGE_SECONDS (covers the browser flow), not the
         // 120-second SS window.
         let old_ctime = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             - MAX_OIDC_BLOB_AGE_SECONDS
@@ -664,66 +582,5 @@ mod test {
             Err(AuthError::ChallengeTooOld) => {}
             other => panic!("expected ChallengeTooOld, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_rsa_bootstrap_auth() {
-        let mut keypath = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        keypath.push("tests");
-        keypath.push("data");
-        keypath.push("rsa-key.pem");
-
-        let cn = "test.cn.zpr";
-        let bs = RsaBootstrapAuth::new(cn, &keypath).unwrap();
-
-        let ctime = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u64;
-
-        let payload = ZdpInitAuthenticationPayload {
-            nonce: [42u8; 8],
-            ctime: ctime.into(),
-            hmac: [24u8; 32],
-        };
-
-        let blob = bs.authenticate_blob(&payload).unwrap().encode();
-        assert!(!blob.is_empty());
-
-        let blob_json = BASE64_STANDARD.decode(&blob).unwrap();
-        let blob = serde_json::from_slice::<ZdpSelfSignedBlob>(&blob_json).unwrap();
-
-        assert_eq!(blob.blob_type, BLOB_TYPE_SS);
-        assert!(blob.ts > 0);
-        assert!(blob.ts >= ctime);
-        assert_eq!(blob.cn, cn);
-
-        let challenge_buffer = BASE64_STANDARD.decode(&blob.challenge).unwrap();
-        assert_eq!(challenge_buffer.len(), 48);
-        {
-            // Challenge buffer layout:
-            // [ 0..8 ] nonce
-            // [ 8..16] ctime
-            // [16..48] hmac
-            for i in 0..8 {
-                assert_eq!(challenge_buffer[i], payload.nonce[i]);
-                assert_eq!(challenge_buffer[i + 8], payload.ctime.to_bytes()[i]);
-            }
-            for i in 0..32 {
-                assert_eq!(challenge_buffer[i + 16], payload.hmac[i]);
-            }
-        }
-        let sig_data = BASE64_STANDARD.decode(&blob.sig).unwrap();
-
-        let mut data = Vec::new();
-        data.extend_from_slice(&blob.ts.to_be_bytes());
-        data.extend_from_slice(blob.cn.as_bytes());
-        data.extend_from_slice(&challenge_buffer);
-
-        let public_key =
-            UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, bs.pkey.public_key().as_ref());
-        public_key
-            .verify(&data, &sig_data)
-            .expect("signature verification failed");
     }
 }

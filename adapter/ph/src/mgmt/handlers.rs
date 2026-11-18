@@ -128,69 +128,6 @@ pub async fn handle_echo_request(_asm: &Arc<Assembly>, _pkt: Packet) -> HandleMg
     Ok(())
 }
 
-/// TODO: Not yet in RFC 6
-///
-/// Message from node requesting authentication.
-/// Sends a [zdp::ZdpInitAuthenticationResponse] back.
-///
-pub async fn handle_init_authentication_request(
-    asm: &Arc<Assembly>,
-    txn: TxnId,
-    mut pkt: Packet,
-) -> HandleMgmtResult {
-    let ingress_link_id = pkt.metadata().ingress_link_id;
-
-    let Ok(hdr) = zdp::ZdpInitAuthenticationRequestHeader::read_from_buf(&mut pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-    let is_bootstrap = hdr.flags & zdp::init_authentication_flags::BOOTSTRAP_SUPPORT != 0;
-
-    let challenge_opt: Option<auth::ZdpInitAuthenticationPayload>;
-
-    if !valid_auth_status(hdr.status)
-        || hdr.flags & !zdp::init_authentication_flags::BOOTSTRAP_SUPPORT != 0
-        || (hdr.status != zdp::AuthenticationStatus::Success
-            && (hdr.flags != 0 || hdr.data_len.get() != 0))
-    {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    if is_bootstrap {
-        if hdr.data_len.get() as usize != size_of::<auth::ZdpInitAuthenticationPayload>() {
-            return Err(HandleMgmtError::BadStructure);
-        }
-        debug!(target: ZDP, "Received Init Authentication +bootstrap for {}", asm.formatted_link_id(ingress_link_id));
-
-        let Ok(payload) = auth::ZdpInitAuthenticationPayload::read_from_buf(&mut pkt) else {
-            return Err(HandleMgmtError::BadStructure);
-        };
-        challenge_opt = Some(payload);
-    } else {
-        if hdr.data_len.get() != 0 {
-            return Err(HandleMgmtError::BadStructure);
-        }
-        debug!(target: ZDP, "Received Init Authentication for {} -- bootstrap not supported", asm.formatted_link_id(ingress_link_id));
-        challenge_opt = None;
-    }
-
-    // Upstream #1410 carries ASA TLVs here; zipline removed ASA with the
-    // BAS/OAuthRsa client (zipline#15), so any TLVs are parsed (to reject a
-    // malformed body) and ignored.
-    tlv::parse_from_buf(&mut pkt).map_err(|_| HandleMgmtError::BadStructure)?;
-    asm.peer_table
-        .get(ingress_link_id)
-        .ok_or(HandleMgmtError::LinkClosed)?
-        .actor_auth
-        .receive_offer(
-            txn,
-            crate::actor_auth::AuthenticationOffer {
-                status: hdr.status,
-                challenge: challenge_opt,
-            },
-        )?;
-
-    Ok(())
-}
-
 fn valid_auth_status(status: zdp::AuthenticationStatus) -> bool {
     matches!(
         status,
@@ -229,37 +166,6 @@ pub async fn handle_abandon_authentication(
         .ok_or(HandleMgmtError::LinkClosed)?
         .actor_auth
         .abandon_remote(asm, txn)
-}
-
-/// Handle a Renew Authentication request (zipline#66; NOT YET IN RFC 6)
-///
-/// Node → adapter on an Active link: carries the fresh challenge the
-/// renewed credential must bind to. Routed to the link's actor renewal
-/// state ([crate::actor_renewal]).
-pub async fn handle_renew_authentication_request(
-    asm: &Arc<Assembly>,
-    mut pkt: Packet,
-) -> HandleMgmtResult {
-    let ingress_link_id = pkt.metadata().ingress_link_id;
-
-    let Ok(hdr) = zdp::ZdpRenewAuthenticationRequestHeader::read_from_buf(&mut pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-    if usize::from(hdr.data_len.get()) < size_of::<auth::ZdpInitAuthenticationPayload>() {
-        warn!(target: ZDP, "Received Renew Authentication with unexpected payload size {}", hdr.data_len.get());
-        return Err(HandleMgmtError::BadStructure);
-    }
-    if pkt.remaining() < usize::from(hdr.data_len.get()) {
-        warn!(target: ZDP, "packet too short for renewal challenge payload");
-        return Err(HandleMgmtError::BadStructure);
-    }
-    let Ok(payload) = auth::ZdpInitAuthenticationPayload::read_from_buf(&mut pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-
-    debug!(target: ZDP, "Received Renew Authentication request for {}", asm.formatted_link_id(ingress_link_id));
-
-    crate::actor_renewal::receive_renew_request(asm, ingress_link_id, payload)
 }
 
 /// Handle a Renew Authentication response (zipline#66; NOT YET IN RFC 6)
@@ -657,32 +563,6 @@ pub async fn handle_acquire_zpr_address_request(
     Ok(())
 }
 
-/// Handle the GrantZprAddressRequest (TODO: Not yet in RFC 6)
-///
-/// This message comes from a node post verification of the authentication blob
-/// which we get in an Acquire message.
-///
-/// Routes the transaction's outcome to the independent actor controller.
-pub async fn handle_grant_zpr_address_request(
-    asm: &Arc<Assembly>,
-    txn: TxnId,
-    mut pkt: Packet,
-) -> HandleMgmtResult {
-    let ingress_link_id = pkt.metadata().ingress_link_id;
-
-    let (status, addresses) = match parse_grant_zpr_address_request(&mut pkt)? {
-        Ok(addresses) => (zdp::AuthenticationStatus::Success, addresses),
-        Err(status) => (status, Vec::new()),
-    };
-    asm.peer_table
-        .get(ingress_link_id)
-        .ok_or(HandleMgmtError::LinkClosed)?
-        .actor_auth
-        .receive_grant(txn, status, addresses)?;
-
-    Ok(())
-}
-
 /// Returns tuple of (actor_addresses, blob)
 /// The addresses are left the address requested by the adapter. This is left over from
 /// the older register-actor-address.  Until we are actually assigning addresses we
@@ -771,73 +651,6 @@ fn parse_acquire_zpr_address_request(
         return Err(HandleMgmtError::BadStructure);
     }
     Ok((actor_addresses, blob))
-}
-
-/// The grant is a message from a node to an adapter (future: or to a joining node).
-/// In includes the address (or addresses) we have been assigned to use.
-fn parse_grant_zpr_address_request(
-    pkt: &mut Packet,
-) -> Result<Result<Vec<IpAddress>, zdp::AuthenticationStatus>, HandleMgmtError> {
-    let Ok(hdr) = zdp::ZdpGrantZprAddressHeader::read_from_buf(pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-
-    // In memmory:
-    //     header
-    //     actor addresses (optional)
-
-    if !valid_auth_status(hdr.status_code) {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    if hdr.status_code != zdp::AuthenticationStatus::Success {
-        if hdr.addr_count != 0 || pkt.remaining() != 0 {
-            return Err(HandleMgmtError::BadStructure);
-        }
-        warn!(target: ZDP, "Received Grant Zpr Address Request with non-success status code {:?}", hdr.status_code);
-        return Ok(Err(hdr.status_code));
-    }
-    if hdr.addr_count != 1 {
-        return Err(HandleMgmtError::BadStructure);
-    }
-
-    let mut actor_addresses = Vec::new();
-    let bytes_needed = match hdr.ip_version {
-        L3Type::Ipv4 => 4 * hdr.addr_count as usize,
-        L3Type::Ipv6 => 16 * hdr.addr_count as usize,
-        _ => {
-            warn!(target: ZDP, "invalid ip_version field");
-            return Err(HandleMgmtError::BadStructure);
-        }
-    };
-    if pkt.remaining() < bytes_needed {
-        warn!(target: ZDP, "packet too short for addresses");
-        return Err(HandleMgmtError::BadStructure);
-    }
-    for _ in 0..hdr.addr_count {
-        let addr: IpAddress;
-        match hdr.ip_version {
-            L3Type::Ipv4 => {
-                let Ok(addr_bytes) = <[u8; 4]>::read_from_buf(pkt) else {
-                    return Err(HandleMgmtError::BadStructure);
-                };
-                addr = addr_bytes.into();
-            }
-            L3Type::Ipv6 => {
-                let Ok(addr_bytes) = <[u8; 16]>::read_from_buf(pkt) else {
-                    return Err(HandleMgmtError::BadStructure);
-                };
-                addr = addr_bytes.into();
-            }
-            _ => {
-                return Err(HandleMgmtError::BadStructure);
-            }
-        }
-        actor_addresses.push(addr);
-    }
-    if pkt.remaining() != 0 {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    Ok(Ok(actor_addresses))
 }
 
 /// handle a Bind Actor Address Request (RFC 6.5 § 6.3.11)
@@ -1180,7 +993,7 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
             );
             return Err(HandleMgmtError::MessageNotPermitted);
         }
-        (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
+        (LinkType::Internal, DOCK_LINK_ID) => {
             // We are the adapter
             debug!(
                 target: ZDP,
@@ -1232,7 +1045,7 @@ pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> Ha
     };
 
     match (link_type, ingress_link_id.get()) {
-        (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
+        (LinkType::Internal, DOCK_LINK_ID) => {
             // We are the adapter: our node withdrew a stream id we send with.
             let stream_id = pkt.metadata().ingress_stream_id;
             debug!(
@@ -1493,13 +1306,12 @@ mod test {
     }
 
     /// A ~3 KB blob (JWT plus a self-signed blob in a JSON array) must fit
-    /// through a management packet built the way
-    /// send_acquire_zpr_address_request builds it, and parse back intact.
+    /// through an AcquireZprAddress management packet and parse back
+    /// intact.
     #[test]
     fn test_acquire_zpr_address_request_3kb_blob_roundtrip() {
         let blob = "A".repeat(3 * 1024);
 
-        // Build exactly like requests::send_acquire_zpr_address_request.
         let mut req = core::new_heap_packet();
         let hdr = zdp::ZdpAcquireZprAddressHeader {
             blob_len: (blob.len() as u16).into(),
@@ -1514,34 +1326,26 @@ mod test {
         assert_eq!(parsed_blob, blob);
     }
 
-    /// A StreamIdWithdrawal received by the adapter (over its node link)
-    /// must remove the ELT entry whose tether id matches the withdrawn
-    /// stream id, so the next outbound packet misses the ELT and triggers a
-    /// fresh visa request instead of sending on the revoked stream
-    /// (zipline#21).
-    #[tokio::test]
+    /// A StreamIdWithdrawal received by the Zode's own actor (on the dock
+    /// side of its internal link pair) must remove the ELT entry whose
+    /// tether id matches the withdrawn stream id, so the next outbound
+    /// packet misses the ELT and triggers a fresh visa request instead of
+    /// sending on the revoked stream (zipline#21).
+    #[tokio::test(flavor = "local")]
     async fn test_handle_stream_id_withdrawal_removes_elt_entry_by_tether_id() {
         use crate::adapter_tables::EltPep;
         use crate::defs::FiveTuple;
         use crate::mgmt::txn_mgr::TxnMgr;
-        use crate::peer_table::test::create_dummy_peer_state;
-        use std::net::{IpAddr, Ipv4Addr};
-        use zpr::packet_info::{CompressionMode, SubstrateAddr};
-        use zpr_utils::net_defs;
+        use zpr::packet_info::CompressionMode;
 
         let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
 
-        // A peer that looks like our node (adapter -> node link).
-        let entry = asm.peer_table.vacant_entry().unwrap();
-        let key = entry.key();
-        let link_id = entry
-            .insert(create_dummy_peer_state(
-                key,
-                LinkType::AdapterToNode,
-                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
-                net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
-            ))
-            .get();
+        // The internal pair: the local actor's node side, then its dock side.
+        let (_local_actor, dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending());
+        assert_eq!(dock.get(), DOCK_LINK_ID);
+        let link_id = dock.get();
 
         // An Active ELT entry bound to tether id 42.
         let five_tuple = FiveTuple {
@@ -1734,46 +1538,6 @@ mod tests {
     use super::*;
     use zpr_ext::zerocopy::IntoBytesExt;
 
-    #[test]
-    fn authentication_evidence_is_bounded_by_actual_packet_capacity() {
-        use super::super::{core, requests};
-        use std::net::IpAddr;
-        for addresses in [
-            Vec::new(),
-            vec!["127.0.0.1".parse::<IpAddr>().unwrap()],
-            vec!["::1".parse::<IpAddr>().unwrap()],
-        ] {
-            let address_len = addresses
-                .first()
-                .map_or(0, |address| if address.is_ipv4() { 4 } else { 16 });
-            let max_blob = core::new_heap_packet().remaining_mut()
-                - size_of::<zdp::ZdpAcquireZprAddressHeader>()
-                - address_len;
-            let blob = vec![b'A'; max_blob];
-            assert!(requests::validate_acquire_zpr_address_request(&addresses, &blob).is_ok());
-            assert!(
-                requests::validate_acquire_zpr_address_request(
-                    &addresses,
-                    &vec![b'A'; max_blob + 1]
-                )
-                .is_err()
-            );
-            let asm = crate::assembly::test::create_assembly(
-                crate::assembly::test::TestAssemblyBuilder::new(),
-            );
-            requests::send_acquire_zpr_address_request(&asm, 3, 42, &addresses, Some(&blob))
-                .enqueue();
-        }
-        assert!(requests::validate_acquire_zpr_address_request(&[], &[]).is_err());
-        assert!(
-            requests::validate_acquire_zpr_address_request(
-                &["::1".parse().unwrap(); 2],
-                b"evidence"
-            )
-            .is_err()
-        );
-    }
-
     fn acquire(count: u8, blob: &[u8], addresses: &[u8]) -> Packet {
         let mut pkt = super::super::core::new_heap_packet();
         zdp::ZdpAcquireZprAddressHeader {
@@ -1784,19 +1548,6 @@ mod tests {
         .write_to_buf(&mut pkt)
         .unwrap();
         pkt.put_slice(blob);
-        pkt.put_slice(addresses);
-        pkt
-    }
-
-    fn grant(status: zdp::AuthenticationStatus, count: u8, addresses: &[u8]) -> Packet {
-        let mut pkt = super::super::core::new_heap_packet();
-        zdp::ZdpGrantZprAddressHeader {
-            status_code: status,
-            ip_version: L3Type::Ipv6,
-            addr_count: count,
-        }
-        .write_to_buf(&mut pkt)
-        .unwrap();
         pkt.put_slice(addresses);
         pkt
     }
@@ -1813,34 +1564,6 @@ mod tests {
             acquire(0, b"evidence", &[1]),
         ] {
             assert!(parse_acquire_zpr_address_request(&mut invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn grant_requires_exact_status_and_address_shape() {
-        use zdp::AuthenticationStatus as Status;
-        assert!(
-            parse_grant_zpr_address_request(&mut grant(Status::Success, 1, &[1; 16]))
-                .unwrap()
-                .is_ok()
-        );
-        for status in [Status::Rejected, Status::Retryable, Status::PolicyDenied] {
-            assert_eq!(
-                parse_grant_zpr_address_request(&mut grant(status, 0, &[]))
-                    .unwrap()
-                    .unwrap_err(),
-                status
-            );
-            assert!(parse_grant_zpr_address_request(&mut grant(status, 1, &[1; 16])).is_err());
-        }
-        for mut invalid in [
-            grant(Status::Success, 0, &[]),
-            grant(Status::Success, 2, &[1; 32]),
-            grant(Status::Success, 1, &[1; 15]),
-            grant(Status::Success, 1, &[1; 17]),
-            grant(Status(255), 0, &[]),
-        ] {
-            assert!(parse_grant_zpr_address_request(&mut invalid).is_err());
         }
     }
 

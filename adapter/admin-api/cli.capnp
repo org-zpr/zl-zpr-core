@@ -1,10 +1,11 @@
 @0xdd33f90089b3556f;
 
-# The explicit interface ID changed when getNodeInfo was removed and the
-# later ordinals renumbered (zl-zipline#234): ph and ph-cli ship together
+# The explicit interface ID changes whenever methods are removed and the
+# later ordinals renumbered (zl-zipline#234: getNodeInfo, then
+# configureLink and startLink's authAgent): ph and ph-cli ship together
 # with no compatibility, and a new ID makes a mismatched client fail at the
 # call instead of reaching the method that now holds its old ordinal.
-interface CmdLineInter @0x9fbc8d516b6d2e66 {
+interface CmdLineInter @0xb4710198e6a4bf99 {
     echo                 @0 () -> ();
     resetCounters        @1 () -> ();
     counters             @2 () -> (counts: Counters);
@@ -16,18 +17,17 @@ interface CmdLineInter @0x9fbc8d516b6d2e66 {
     perfSample           @8 (duration_secs: UInt64, frequency_per_sec: UInt64) -> (result: Text); # Currently unsupported in PH
     showLinkSummary      @9 () -> (summary: List(Text));
     showLink             @10 (id: UInt32) -> (result: Text);
-    configureLink        @11 (id: UInt32) -> (); # Currently unsupported in PH
-    startLink            @12 (id: UInt32, authAgent: AuthAgent) -> (result: SuccessOrError); # authAgent is optional (null): a link started without one is device-only
-    stopLink             @13 (id: UInt32) -> (result: SuccessOrError);
-    resetLink            @14 (id: UInt32) -> ();
-    changeLogging        @15 (logs: List(Log)) -> (result: LogsApplied);
-    getTunInfo           @16 () -> (result: SuccessOrError, info: TunInfo); # zipline#202: `ph-cli tun`
+    startLink            @11 (id: UInt32) -> (result: SuccessOrError);
+    stopLink             @12 (id: UInt32) -> (result: SuccessOrError);
+    resetLink            @13 (id: UInt32) -> ();
+    changeLogging        @14 (logs: List(Log)) -> (result: LogsApplied);
+    getTunInfo           @15 () -> (result: SuccessOrError, info: TunInfo); # zipline#202: `ph-cli tun`
     # zl-zipline#233: a Zode's own login. `login` registers authAgent for
     # this connection and returns when the login finishes; its error text is
     # the AuthFailureReason Debug spelling.
-    login                @17 (authAgent: AuthAgent) -> (result: SuccessOrError);
-    logout               @18 () -> (result: SuccessOrError);
-    showLogin            @19 () -> (result: Text);
+    login                @16 (authAgent: AuthAgent) -> (result: SuccessOrError);
+    logout               @17 () -> (result: SuccessOrError);
+    showLogin            @18 () -> (result: Text);
 }
 
 # The TUN interface ph opened (zipline#202). `zprAddrs` lists only the

@@ -54,7 +54,6 @@ pub const VERSION: &'static str = build_info::BUILD_VERSION;
 /// visible queue becoming full.
 
 pub struct Assembly {
-    pub actor_rejected: std::sync::atomic::AtomicBool,
     pub topology_config: config::TopologyConfig,
 
     pub mgmt_substrate_egress: MgmtSubstrateEgress,
@@ -130,21 +129,6 @@ pub struct Assembly {
     /// If there is a static ZPR address present in the configuration it is set here in main.
     /// Various get_ and set_ functions are defined for this below.
     pub config: rcu::RcuBox<config::Config>,
-    /// The operator-configured ZPR address demand as it stood at startup
-    /// (`--zpr-addr` / `zpr_addr`), frozen at construction (zipline#83).
-    /// Empty means "accept whatever the fabric assigns". This is what the
-    /// granted-address mismatch check compares against. (Since #1410 an
-    /// adapter's granted address lives on its actor, not in
-    /// `config.zpr_addr`; the frozen copy keeps the check independent of
-    /// any later config change.)
-    pub configured_zpr_addr_demand: Vec<IpAddr>,
-    /// A fatal, unrecoverable error signalled from a worker (zipline#83:
-    /// the granted-ZPR-address mismatch). Set via
-    /// [`Self::signal_fatal_error`]; main watches [`Self::fatal_notify`] and
-    /// exits non-zero with this message on stderr.
-    pub fatal_error: Mutex<Option<String>>,
-    /// Wakes main's fatal-error watcher (see [`Self::signal_fatal_error`]).
-    pub fatal_notify: tokio::sync::Notify,
     pub logging: Mutex<HashMap<String, String>>,
     pub reload_handle:
         reload::Handle<filter::Filtered<fmt::Layer<Registry>, Targets, Registry>, Registry>,
@@ -244,26 +228,6 @@ impl Assembly {
     /// Get a copy of the local ZPR addresses: the configured `zpr_addr`.
     pub fn get_local_zpr_addrs_std(&self) -> Vec<IpAddr> {
         self.config.get().zpr_addr.clone()
-    }
-
-    /// Record `msg` as a fatal, unrecoverable error and wake main's watcher
-    /// (see main.rs): the process exits non-zero with the message on stderr
-    /// (zipline#83). The first message wins — a later signal keeps the
-    /// original text but still notifies, so main wakes regardless of
-    /// ordering.
-    pub fn signal_fatal_error(&self, msg: String) {
-        {
-            let mut fatal = self.fatal_error.lock().unwrap();
-            if fatal.is_none() {
-                *fatal = Some(msg);
-            }
-        }
-        self.fatal_notify.notify_one();
-    }
-
-    /// The recorded fatal error, if any (see [`Self::signal_fatal_error`]).
-    pub fn get_fatal_error(&self) -> Option<String> {
-        self.fatal_error.lock().unwrap().clone()
     }
 
     /// Node only: the "dock address" is the first local ZPR address.
@@ -539,37 +503,20 @@ impl Assembly {
         }
     }
 
-    /// Add a tether to the peer table.
-    ///
-    /// `auto_start` controls whether the link starts (fires
-    /// `LinkEvent::Start`, Inactive -> Keying) immediately. Adapters started
-    /// with `--auto-connect=false` pass `false` (zipline#28): the peer is
-    /// still created — so ph-cli has a link to target — but it idles in
-    /// Inactive until a `startLink` RPC wakes it. Everything else passes
-    /// `true`, today's behaviour.
+    /// Add the node side of an adapter dock (a `NodeToAdapter` tether) to
+    /// the peer table and start it, which begins keying.
     pub fn start_tether(
         self: &Arc<Self>,
         adapter_addr: &SubstrateAddr,
         interface_addr: &ScopedIpAddr,
-        link_type: LinkType,
-        auto_start: bool,
     ) -> Result<NonZero<LinkId>, PeerInsertError> {
-        assert!(matches!(
-            link_type,
-            LinkType::NodeToAdapter | LinkType::AdapterToNode
-        ));
         debug!(target: PEER_MGMT, "Starting tether with {adapter_addr} connected to {interface_addr}");
-        let peer_id = self.add_peer(link_type, adapter_addr, interface_addr)?;
+        let peer_id = self.add_peer(LinkType::NodeToAdapter, adapter_addr, interface_addr)?;
 
         let Some(peer) = self.peer_table.get(peer_id.get()) else {
             // Peer is gone already
             return Ok(peer_id);
         };
-
-        if !auto_start {
-            info!(target: PEER_MGMT, "Tether with {adapter_addr} created idle (auto-connect off).  Assigned ID {}", self.formatted_link_id(peer_id.get()));
-            return Ok(peer_id);
-        }
 
         if let Err(e) = peer
             .link_state_machine
@@ -848,16 +795,6 @@ pub mod test {
         fn has_address(&self, _addr: IpAddr) -> std::io::Result<bool> {
             Ok(true)
         }
-        fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn route_owner_conflict(
-            &self,
-            _dest: IpAddr,
-            _prefix_len: u8,
-        ) -> std::io::Result<Option<String>> {
-            Ok(None)
-        }
     }
 
     /// A `TunCtl` which reports exactly the addresses it was constructed with,
@@ -888,98 +825,13 @@ pub mod test {
         fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
             Ok(self.addresses.contains(&addr))
         }
-        fn add_route(&self, _dest: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
-            Ok(())
-        }
-        fn route_owner_conflict(
-            &self,
-            _dest: IpAddr,
-            _prefix_len: u8,
-        ) -> std::io::Result<Option<String>> {
-            Ok(None)
-        }
     }
 
-    /// A `TunCtl` recording every `add_route` call, so tests can assert the
-    /// link-activation route install (zipline#88). With `fail_routes` set,
-    /// `add_route` fails instead, modelling a TUN whose routing table cannot
-    /// be updated — the fail-fast/warn-and-continue split's test double.
-    /// With `conflict` set, `route_owner_conflict` reports that interface
-    /// as the live owner of the queried route (zipline#101). With
-    /// `late_conflict` set, only probes after the first report it — the
-    /// concurrent-activation race, where the other adapter's carrier-up
-    /// lands between our pre-install probe and the post-carrier re-check.
-    /// `carriers` logs every `set_carrier` call so tests can assert an
-    /// adapter that backed off did not leave its carrier up. `addresses`
-    /// is the set of addresses on the TUN: `add_address` adds to it,
-    /// `clear_address` removes from it and `has_address` reports it, so
-    /// tests can see what an activation left behind (zipline#157).
+    /// A `TunCtl` that counts `teardown` calls, so a test can assert that
+    /// graceful shutdown tears the TUN down (zipline#130).
     #[cfg(test)]
     pub struct RecordingTunCtl {
-        pub routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
-        pub fail_routes: bool,
-        /// With this set, `add_address` fails — modelling a host where the
-        /// granted ZPR address cannot be set on the TUN (e.g. EPERM,
-        /// zipline#157).
-        pub fail_addresses: bool,
-        pub conflict: Option<String>,
-        pub late_conflict: Option<String>,
-        pub probes: Arc<std::sync::atomic::AtomicUsize>,
-        pub carriers: Arc<std::sync::Mutex<Vec<bool>>>,
         pub teardowns: Arc<std::sync::atomic::AtomicUsize>,
-        pub addresses: Arc<std::sync::Mutex<Vec<IpAddr>>>,
-    }
-
-    #[cfg(test)]
-    impl RecordingTunCtl {
-        /// A recording instance plus the shared log the test asserts on.
-        pub fn new(fail_routes: bool) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
-            let routes = Arc::new(std::sync::Mutex::new(Vec::new()));
-            (
-                Self {
-                    routes: routes.clone(),
-                    fail_routes,
-                    fail_addresses: false,
-                    conflict: None,
-                    late_conflict: None,
-                    probes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                    carriers: Arc::new(std::sync::Mutex::new(Vec::new())),
-                    teardowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                    addresses: Arc::new(std::sync::Mutex::new(Vec::new())),
-                },
-                routes,
-            )
-        }
-
-        /// A recording instance whose `add_address` fails — the zipline#157
-        /// scenario: the granted ZPR address cannot be set on the TUN
-        /// (e.g. EPERM), a local failure that will not clear on reconnect.
-        pub fn with_failing_addresses() -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
-            let (mut tun_ctl, routes) = Self::new(false);
-            tun_ctl.fail_addresses = true;
-            (tun_ctl, routes)
-        }
-
-        /// A recording instance whose `route_owner_conflict` names
-        /// `owner_if` as the conflicting live owner (zipline#101).
-        pub fn with_conflict(owner_if: &str) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
-            let (mut tun_ctl, routes) = Self::new(false);
-            tun_ctl.conflict = Some(owner_if.to_string());
-            (tun_ctl, routes)
-        }
-
-        /// A recording instance whose `route_owner_conflict` reports no
-        /// conflict on the first probe and names `owner_if` on every later
-        /// one — the zipline#101 concurrent-activation race: the other
-        /// adapter's route was `linkdown` (filtered) at the pre-install
-        /// probe and its carrier came up before ours did.
-        pub fn with_late_conflict(
-            owner_if: &str,
-        ) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
-            let (mut tun_ctl, routes) = Self::new(false);
-            tun_ctl.late_conflict = Some(owner_if.to_string());
-            (tun_ctl, routes)
-        }
     }
 
     #[cfg(test)]
@@ -987,22 +839,12 @@ pub mod test {
         fn name(&self) -> String {
             "tun-recording".to_string()
         }
-        fn set_carrier(&self, carrier: bool) -> std::io::Result<()> {
-            self.carriers.lock().unwrap().push(carrier);
+        fn set_carrier(&self, _carrier: bool) -> std::io::Result<()> {
             Ok(())
         }
-        fn add_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
-            if self.fail_addresses {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "RecordingTunCtl: add_address deliberately failing (EPERM)",
-                ));
-            }
-            self.addresses.lock().unwrap().push(addr);
+        fn add_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
-        /// Always succeeds: `fail_addresses` models the *granted* ZPR
-        /// address failing (zipline#157), not the AAA installed at Hello.
         fn add_authentication_address(
             &self,
             _addr: IpAddr,
@@ -1010,40 +852,11 @@ pub mod test {
         ) -> std::io::Result<()> {
             Ok(())
         }
-        fn clear_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
-            self.addresses.lock().unwrap().retain(|a| *a != addr);
+        fn clear_address(&self, _addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             Ok(())
         }
-        fn has_address(&self, addr: IpAddr) -> std::io::Result<bool> {
-            Ok(self.addresses.lock().unwrap().contains(&addr))
-        }
-        fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
-            if self.fail_routes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "RecordingTunCtl: add_route deliberately failing",
-                ));
-            }
-            self.routes.lock().unwrap().push((dest, prefix_len));
-            Ok(())
-        }
-        fn route_owner_conflict(
-            &self,
-            _dest: IpAddr,
-            _prefix_len: u8,
-        ) -> std::io::Result<Option<String>> {
-            let probe = self
-                .probes
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if let Some(conflict) = &self.conflict {
-                return Ok(Some(conflict.clone()));
-            }
-            if probe > 0 {
-                if let Some(late) = &self.late_conflict {
-                    return Ok(Some(late.clone()));
-                }
-            }
-            Ok(None)
+        fn has_address(&self, _addr: IpAddr) -> std::io::Result<bool> {
+            Ok(false)
         }
         fn teardown(&self) -> std::io::Result<()> {
             self.teardowns
@@ -1115,14 +928,13 @@ pub mod test {
 
     /// A `TunCtl` for the node self-addressing helper (zipline#159): reports
     /// exactly the addresses it was constructed with, records every
-    /// `add_address` and `add_route` call, and can be made to fail
+    /// `add_address` call, and can be made to fail
     /// `add_address` or report addresses as uninspectable, so tests can
     /// assert exactly what `ensure_local_zpr_addrs_on_tun` did.
     #[cfg(test)]
     struct SelfAddressTunCtl {
         on_tun: Vec<IpAddr>,
         added: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
-        routes: Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
         fail_add_address: bool,
         inspect_unsupported: bool,
     }
@@ -1130,28 +942,17 @@ pub mod test {
     #[cfg(test)]
     impl SelfAddressTunCtl {
         /// An instance whose device already carries `on_tun`, plus the
-        /// shared logs of `add_address` and `add_route` calls the test
-        /// asserts on.
-        #[allow(clippy::type_complexity)]
-        fn new(
-            on_tun: &[&str],
-        ) -> (
-            Self,
-            Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
-            Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>,
-        ) {
+        /// shared log of `add_address` calls the test asserts on.
+        fn new(on_tun: &[&str]) -> (Self, Arc<std::sync::Mutex<Vec<(IpAddr, u8)>>>) {
             let added = Arc::new(std::sync::Mutex::new(Vec::new()));
-            let routes = Arc::new(std::sync::Mutex::new(Vec::new()));
             (
                 Self {
                     on_tun: on_tun.iter().map(|a| a.parse().unwrap()).collect(),
                     added: added.clone(),
-                    routes: routes.clone(),
                     fail_add_address: false,
                     inspect_unsupported: false,
                 },
                 added,
-                routes,
             )
         }
     }
@@ -1190,17 +991,6 @@ pub mod test {
             }
             Ok(self.on_tun.contains(&addr))
         }
-        fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
-            self.routes.lock().unwrap().push((dest, prefix_len));
-            Ok(())
-        }
-        fn route_owner_conflict(
-            &self,
-            _dest: IpAddr,
-            _prefix_len: u8,
-        ) -> std::io::Result<Option<String>> {
-            Ok(None)
-        }
     }
 
     /// Builds a node-mode test assembly around the given `TunCtl`, with
@@ -1222,7 +1012,7 @@ pub mod test {
     /// node itself, exactly once, with the ZPR network prefix length.
     #[test]
     fn node_self_addressing_applies_missing_address() {
-        let (tun_ctl, added, _routes) = SelfAddressTunCtl::new(&[]);
+        let (tun_ctl, added) = SelfAddressTunCtl::new(&[]);
         let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
         asm.ensure_local_zpr_addrs_on_tun().unwrap();
         assert_eq!(
@@ -1239,7 +1029,7 @@ pub mod test {
     /// left untouched: the helper is idempotent.
     #[test]
     fn node_self_addressing_skips_present_address() {
-        let (tun_ctl, added, _routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
+        let (tun_ctl, added) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
         let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
         asm.ensure_local_zpr_addrs_on_tun().unwrap();
         assert!(added.lock().unwrap().is_empty());
@@ -1249,7 +1039,7 @@ pub mod test {
     /// set are applied.
     #[test]
     fn node_self_addressing_applies_only_missing_addresses() {
-        let (tun_ctl, added, _routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
+        let (tun_ctl, added) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
         let asm = assembly_with_tun_ctl(
             &["fd5a:5052:90de::1", "fd5a:5052:90de::7"],
             Box::new(tun_ctl),
@@ -1270,7 +1060,7 @@ pub mod test {
     /// remediation (PR #61 review).
     #[test]
     fn node_self_addressing_propagates_add_address_error() {
-        let (mut tun_ctl, added, _routes) = SelfAddressTunCtl::new(&[]);
+        let (mut tun_ctl, added) = SelfAddressTunCtl::new(&[]);
         tun_ctl.fail_add_address = true;
         let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
         let err = asm.ensure_local_zpr_addrs_on_tun().unwrap_err();
@@ -1286,22 +1076,11 @@ pub mod test {
     /// `local_zpr_addrs_missing_from_tun` gives it.
     #[test]
     fn node_self_addressing_skips_uninspectable_address() {
-        let (mut tun_ctl, added, _routes) = SelfAddressTunCtl::new(&[]);
+        let (mut tun_ctl, added) = SelfAddressTunCtl::new(&[]);
         tun_ctl.inspect_unsupported = true;
         let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
         asm.ensure_local_zpr_addrs_on_tun().unwrap();
         assert!(added.lock().unwrap().is_empty());
-    }
-
-    /// zl-zipline#234 (gate g167 q7): self-addressing installs no route on
-    /// any platform. The address's `ZPRNET_PREFIX_LEN` puts the visa service
-    /// on-link, so the old Windows-only visa-service /128 host route is gone.
-    #[test]
-    fn node_self_addressing_installs_no_route() {
-        let (tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);
-        let asm = assembly_with_tun_ctl(&["fd5a:5052:90de::1"], Box::new(tun_ctl));
-        asm.ensure_local_zpr_addrs_on_tun().unwrap();
-        assert!(routes.lock().unwrap().is_empty());
     }
 
     impl TestAssemblyBuilder {
@@ -1311,7 +1090,7 @@ pub mod test {
         }
     }
 
-    /// Test assembly able to key an AdapterToNode link: `process_start`
+    /// Test assembly able to key a NodeToAdapter link: `process_start`
     /// hands the link to the key manager, which needs a noise keypair and a
     /// certificate exchange.
     #[cfg(test)]
@@ -1339,7 +1118,9 @@ pub mod test {
     async fn test_shutdown_tears_down_tun() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (tun_ctl, _routes) = RecordingTunCtl::new(false);
+                let tun_ctl = RecordingTunCtl {
+                    teardowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                };
                 let teardowns = tun_ctl.teardowns.clone();
                 let mut builder = TestAssemblyBuilder::default();
                 // Node mode: shutdown_node over an empty peer table
@@ -1357,68 +1138,22 @@ pub mod test {
             .await
     }
 
-    /// `start_tether` with `auto_start = false` (zipline#28: adapter started
-    /// with `--auto-connect=false`) must create the tether peer — so ph-cli
-    /// has a link to target — but leave it Inactive: no keying, no auth
-    /// attempt. The `LinkEvent::Start` that the `startLink` RPC fires must
-    /// then wake it into Keying, exactly like a restarted link.
+    /// `start_tether` adds the node side of a dock and starts it keying
+    /// at once.
     #[tokio::test]
-    async fn test_start_tether_without_auto_start_idles_until_start_event() {
+    async fn test_start_tether_keys_immediately() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let asm = keyable_adapter_assembly();
-                // Mirror main.rs adapter startup: local actor peer first, so
-                // the tether lands at DOCK_LINK_ID.
-                assert_eq!(
-                    asm.peer_table.insert_internal_peer().get(),
-                    zpr::packet_info::LOCAL_ACTOR_LINK_ID
-                );
                 let (peer_sa, if_addr) = tether_addrs();
-                let dsid = asm
-                    .start_tether(&peer_sa, &if_addr, LinkType::AdapterToNode, false)
-                    .unwrap();
-                assert_eq!(dsid.get(), zpr::packet_info::DOCK_LINK_ID);
-
+                let dsid = asm.start_tether(&peer_sa, &if_addr).unwrap();
                 let peer = asm.peer_table.get(dsid.get()).unwrap();
                 assert_eq!(
+                    peer.link_state_machine.get_link_type(),
+                    LinkType::NodeToAdapter
+                );
+                assert_eq!(
                     peer.link_state_machine.get_state(),
-                    crate::link_state::LinkState::Inactive,
-                    "idle-mode tether must stay Inactive at startup"
-                );
-
-                // What admin_worker::start_link fires on `ph-cli connect`.
-                asm.process_link_state_event(dsid.get(), LinkEvent::Start)
-                    .unwrap();
-                assert_eq!(
-                    asm.peer_table
-                        .get(dsid.get())
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
-                    crate::link_state::LinkState::Keying,
-                    "startLink must wake the idle tether"
-                );
-            })
-            .await
-    }
-
-    /// `auto_start = true` is today's behaviour: the tether starts keying
-    /// immediately.
-    #[tokio::test]
-    async fn test_start_tether_with_auto_start_keys_immediately() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let asm = keyable_adapter_assembly();
-                let (peer_sa, if_addr) = tether_addrs();
-                let dsid = asm
-                    .start_tether(&peer_sa, &if_addr, LinkType::AdapterToNode, true)
-                    .unwrap();
-                assert_eq!(
-                    asm.peer_table
-                        .get(dsid.get())
-                        .unwrap()
-                        .link_state_machine
-                        .get_state(),
                     crate::link_state::LinkState::Keying
                 );
             })
@@ -1515,7 +1250,6 @@ pub mod test {
             let config = <config::Config as std::default::Default>::default();
             rcu::RcuBox::new(config)
         });
-        let configured_zpr_addr_demand = config.get().zpr_addr.clone();
         let logging = builder
             .logging
             .unwrap_or_else(|| Mutex::new(HashMap::default()));
@@ -1526,7 +1260,6 @@ pub mod test {
         });
 
         Assembly {
-            actor_rejected: std::sync::atomic::AtomicBool::new(false),
             topology_config,
             mgmt_substrate_egress,
             actor_output_requeue,
@@ -1558,10 +1291,7 @@ pub mod test {
             certx: builder.certx,
             system_start_time: std::time::Instant::now(),
             address_pool: std::sync::Mutex::new(None),
-            configured_zpr_addr_demand,
             config,
-            fatal_error: Mutex::new(None),
-            fatal_notify: tokio::sync::Notify::new(),
             logging,
             reload_handle,
         }

@@ -220,7 +220,6 @@ impl PeerState {
             },
 
             LinkType::NodeToAdapter => PeerType::Adapter,
-            LinkType::AdapterToNode => PeerType::Dock,
             LinkType::NodeToNode => PeerType::Node,
         }
     }

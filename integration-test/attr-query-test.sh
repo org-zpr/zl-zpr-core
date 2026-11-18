@@ -446,9 +446,10 @@ fi
 # actor loses the tag first; the sweep that revokes the visa follows.
 VS_SWEEP_REVOKED='visa sweep reason=AttributeChange .* revoked=[1-9]'
 REVOKED='Revoked visa [0-9]+'
-# The visa service refusing a visa request (vreq): what a fresh connect
-# attempt meets once the contractor visa is gone.
-EVAL_DENIED='eval denied'
+# The visa service's policy refusing a visa request (vreq): what a fresh
+# connect attempt meets once the contractor visa is gone. The only flow
+# the test starts in that window is zb's ping to Web.
+EVAL_DENIED='eval denied \(no match\): no matching policy'
 
 if [[ "$PASS" == 0 ]]; then
   SWEEPS=$(log_count vs.log "$VS_SWEEP_REVOKED")

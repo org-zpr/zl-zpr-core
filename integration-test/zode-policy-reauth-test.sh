@@ -144,7 +144,8 @@ function assert_swept() {
   wait_log_after 10 vs.log "disconnect actor at $(ere_escape "$2") for reason Admin" 0 \
     "the visa service records an Admin disconnect of $1" || return 1
   BUDGET=$(revoke_budget "$3")
-  if (( BUDGET > 0 )) && wait_for "$BUDGET" actor_absent "$2"; then
+  # wait_for counts retries, not seconds, so the clock is checked again.
+  if (( BUDGET > 0 )) && wait_for "$BUDGET" actor_absent "$2" && (( $(revoke_budget "$3") >= 0 )); then
     echo "assertion OK: the visa service no longer lists $1 as an actor"
   else
     echo "ASSERTION FAILED: the visa service still lists $1 as an actor, or its admin API failed, at the bound"

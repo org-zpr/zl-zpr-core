@@ -1,0 +1,92 @@
+# -*- mode: toml -*-
+#
+# Rejoin-after-expiry Zode netns fixture (zl-zipline#271), used by
+# zode-rejoin-test.sh. Compiles zodes-rejoin.zpl. The topology is
+# zodes-pair.zplc's: zb and zc join through the relay, which docks the
+# visa service.
+#
+# Added: the `hostnames` file trusted service, which vends zb's
+# `device.hostname` from zodes-rejoin-hostnames.json (the test copies it
+# to hostnames.json beside the visa service's config), and the UDP/53
+# service DnsZc. Every visa for DnsZc is bounded by that attribute's
+# lifetime, expiration_seconds. It is 90 s: above the visa service's 60 s
+# floor, and long enough that a test's first query, a few seconds after
+# the join, stays clear of the last 30 s of the attribute's life, in which
+# the visa service denies new visas (zl-zipline#275).
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+"zc.zpr" = "fd5a:5052::4"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[nodes.zb.substrate_addrs]
+i0 = "10.2.0.2:5000"
+
+[nodes.zc]
+provider = [ [ "device.zpr.adapter.cn", "zc" ] ]
+zpr_address = "zc.zpr"
+
+[nodes.zc.substrate_addrs]
+i0 = "10.2.0.3:5000"
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
+
+[links.relay-zc]
+peers = [ { node = "relay" }, { node = "zc" } ]
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[trusted_services.hostnames]
+api = "file"
+returns_attributes = ["device.hostname -> device.hostname{}"]
+expiration_seconds = 90
+
+[visa_service]
+dock_node = "relay"
+
+[bootstrap]
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
+"zc" = "zc-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableRelay]
+protocol = "ping"
+
+[services.PingableZb]
+protocol = "ping"
+
+[services.PingableZc]
+protocol = "ping"
+
+[protocols.dns]
+l4protocol = "UDP"
+port = 53
+
+[services.DnsZc]
+protocol = "dns"

@@ -1972,6 +1972,36 @@ pub mod tests {
         }
     }
 
+    /// zl-zipline#271: a visa past its expiry must never match a new flow.
+    ///
+    /// The visa service forgets a visa when it expires, so from then on no
+    /// revocation can reach it (link down, rejoin): a Zode that still
+    /// matches it binds every new flow under a visa its next hop can no
+    /// longer fetch ("visa N not found", Stream ID Request refused), and
+    /// never asks for a new one. On real hosts the DNS Zode kept matching
+    /// its reply visa `dns:53 -> zode:*` (120 s lifetime, from
+    /// `device.hostname`) minutes after it expired, so after the endpoint
+    /// rejoined every DNS reply was dropped.
+    #[test]
+    fn test_an_expired_visa_never_matches_a_new_flow() {
+        let mut visa_table = VisaTable::new();
+        let expired_a_minute_ago_ms = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+            - Duration::from_secs(60))
+        .as_millis() as i64;
+        let visa = make_tcp_visa(
+            5500,
+            &CLIENT.parse().unwrap(),
+            0,
+            &SERVICE.parse().unwrap(),
+            80,
+            100,
+            expired_a_minute_ago_ms,
+        );
+        visa_table.insert_visa(visa).unwrap();
+
+        assert_eq!(visa_table.match_traffic(&client_to_service()), None);
+    }
+
     // ---- J11: a newer same-five-tuple visa supersedes (zl-zipline#252) ----
 
     const CLIENT: &str = "fd5a:5052:8::1";

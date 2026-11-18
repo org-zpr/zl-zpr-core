@@ -1710,7 +1710,7 @@ pub mod test {
 
     #[allow(dead_code)] // unused by the `ph` bin, which compiles this module but not the fuzz harness
     pub fn create_assembly(builder: TestAssemblyBuilder) -> Assembly {
-        let ph_mode = builder.ph_mode.unwrap_or(PhMode::Adapter);
+        let ph_mode = builder.ph_mode.unwrap_or(PhMode::Node);
         let topology_config = builder.topology_config.unwrap_or_default();
         let mgmt_substrate_egress = builder
             .mgmt_substrate_egress

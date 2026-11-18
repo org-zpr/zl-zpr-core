@@ -46,7 +46,6 @@ launch_login_zodes user-zb || PASS=1
 
 # What the logs say beyond the shared patterns in lib/zode_funcs.sh
 # (zode_login.rs).
-POLICY_RENEWAL='Zode login: policy re-authentication answered with a renewal'
 REPLACED="Zode login: the visa service replaced this node's VS-API session, which dropped the login"
 ASK_AGENT='Zode login: asking the resident auth agent for a new login'
 
@@ -66,7 +65,7 @@ if [[ "$PASS" == 0 ]]; then
   echo "== 3. ph-cli logout"
   REVOCATIONS=$(log_count zb.log "$REVOKED")
   SWEEPS=$(log_count vs.log "$VS_SWEEP_REVOKED")
-  if zb_cli logout; then
+  if zode_cli zb logout; then
     echo "assertion OK: logout exits 0"
   else
     echo "ASSERTION FAILED: logout exited non-zero"
@@ -81,8 +80,7 @@ if [[ "$PASS" == 0 ]]; then
 
   echo "== 4. resident auth-agent; a policy install while logged in"
   LOGINS=$(log_count zb.log "$LOGGED_IN")
-  zb_cli auth-agent --no-browser > agent.out 2>&1 &
-  drive_login_url agent.out 0 || PASS=1
+  start_zode_login zb auth-agent agent.out || PASS=1
   wait_log_after 15 zb.log "$LOGGED_IN" "$LOGINS" "the agent logs zb in" || PASS=1
   assert_status 0 "Auth agent: registered" "login-status: the agent is registered" || PASS=1
   zode_ping zb "$RELAY_ZPR_ADDR" "the user flow is admitted" "$USER_FLOW_WARMUP" || PASS=1
@@ -112,7 +110,7 @@ if [[ "$PASS" == 0 ]]; then
   restart_zode_vs || PASS=1
   wait_log_after 60 zb.log "$REPLACED" 0 "zb's new VS-API session dropped the login" || PASS=1
   wait_log_after 5 zb.log "$ASK_AGENT" 0 "zb asks the resident agent for a new login (q2)" || PASS=1
-  drive_login_url agent.out 1 || PASS=1
+  drive_login_url zb agent.out 1 || PASS=1
   wait_log_after 15 zb.log "$LOGGED_IN" "$LOGINS" "zb is logged in again" || PASS=1
   assert_status 0 "State: logged in" "login-status: logged in" || PASS=1
   zode_ping zb "$RELAY_ZPR_ADDR" "the user flow is admitted again" "$USER_FLOW_WARMUP" || PASS=1

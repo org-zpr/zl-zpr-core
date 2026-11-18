@@ -772,8 +772,31 @@ function cont_vs() {
   kill -CONT "$(vs_pid)"
 }
 
-# core-tests-reauth helpers (zl-zipline#234): log a Zode's user in, for
+# Zode login helpers (core-tests-reauth and core-tests-oidc,
+# zl-zipline#234): log a Zode's user in with ph-cli and --no-browser while
+# curl in the Zode's namespace follows the authorization URL ph-cli prints,
+# for zode-login-test.sh, zode-oidc-test.sh, oidc-file-interplay-test.sh,
 # zode-policy-reauth-test.sh and attr-query-test.sh.
+
+# What ph logs (vs_worker.rs, vss_worker.rs, zode_login.rs, visa_table.rs),
+# what the visa service and the fake IdP log, and what ph-cli prints, about
+# a Zode login.
+REGISTERED='registered VSS'
+IDP_LIST='received services update with [1-9]'
+LOGGED_IN="Zode login: logged in with $(ere_escape "$IDP_ISSUER")"
+LOGGED_OUT='Zode login: logged out'
+RENEWED='Zode login: renewed; expires in'
+RENEWAL_FAILED='Zode login: silent renewal failed'
+EXPIRED='Zode login: expired without a renewal'
+POLICY_RENEWAL='Zode login: policy re-authentication answered with a renewal'
+REVOKED='Revoked visa [0-9]+'
+# The visa service's re-check after an attribute change (its visa sweep),
+# and one that revokes a visa.
+VS_SWEEP='visa sweep reason=AttributeChange '
+VS_SWEEP_REVOKED="$VS_SWEEP.* revoked=[1-9]"
+# A request to the fake IdP's authorization endpoint (an interactive login).
+AUTH_REQUEST='"GET /auth'
+URL_LINE='Open this URL to continue: '
 
 # Run ph-cli against Zode NAME ($1) in its namespace, trusting the fake
 # IdP (whose certificate the test CA signs); the other arguments go to
@@ -785,32 +808,37 @@ function zode_cli() {
     "$PH_DEBUG_BIN" -p "$NAME.sock" "$@"
 }
 
-# Start `ph-cli $2 --no-browser` on Zode $1 in the background, writing its
-# output to file $3, and drive the login it starts: wait for the
-# authorization URL ph-cli prints and GET it with curl in the Zode's
-# namespace, so the fake IdP redirects to ph-cli's loopback callback. $2
-# is `connect` (exits once logged in) or `auth-agent` (stays resident, to
-# answer silent renewals). Sets LOGIN_PID to ph-cli's PID. Returns non-zero
-# if no URL appears within 60 s.
-function start_zode_login() {
-  local NAME=$1 COMMAND=$2 OUT=$3 URL=""
-  zode_cli "$NAME" "$COMMAND" --no-browser > "$OUT" 2>&1 &
-  LOGIN_PID=$!
-  for _ in $(seq 1 60)
-  do
-    URL=$(sed -n 's/.*Open this URL to continue: //p' "$OUT" | head -n 1)
-    if [ -n "$URL" ] || ! kill -0 "$LOGIN_PID" 2> /dev/null; then
-      break
-    fi
-    sleep 1
-  done
-  if [ -z "$URL" ]; then
-    echo "ASSERTION FAILED: ph-cli $COMMAND on $NAME printed no authorization URL:"
+# Succeed when ph-cli output file $1 holds more than $2 authorization URLs.
+function url_count_above() {
+  (( $(grep -cF -- "$URL_LINE" "$1" || true) > $2 ))
+}
+
+# Wait up to 60 s for ph-cli output file $2 to print an authorization URL
+# beyond the first $3, and GET the newest one with curl in Zode $1's
+# namespace, so the fake IdP redirects to ph-cli's loopback callback.
+# Returns non-zero if no new URL appears.
+function drive_login_url() {
+  local NAME=$1 OUT=$2 SEEN=$3 URL
+  if ! wait_for 60 url_count_above "$OUT" "$SEEN"; then
+    echo "ASSERTION FAILED: ph-cli on $NAME printed no new authorization URL:"
     cat "$OUT"
     return 1
   fi
+  URL=$(sed -n "s/.*$URL_LINE//p" "$OUT" | tail -n 1)
   in_ns "zpr-$NAME" curl --silent --show-error --location --cacert ca.crt \
     --output /dev/null "$URL" || true
+}
+
+# Start `ph-cli $2 --no-browser` on Zode $1 in the background, writing its
+# output to file $3, and drive the login it starts ([drive_login_url]). $2
+# is `connect` (exits once logged in) or `auth-agent` (stays resident, to
+# answer silent renewals; kill_zode_helpers stops it). Sets LOGIN_PID to
+# ph-cli's PID. Returns non-zero if no authorization URL appears.
+function start_zode_login() {
+  local NAME=$1 COMMAND=$2 OUT=$3
+  zode_cli "$NAME" "$COMMAND" --no-browser > "$OUT" 2>&1 &
+  LOGIN_PID=$!
+  drive_login_url "$NAME" "$OUT" 0
 }
 
 # Print the verdict for $1 (0 = pass) and exit with it.
@@ -827,23 +855,7 @@ function zode_report() {
 #
 # For the tests where a user logs in on zb (zode-login-test.sh,
 # zode-oidc-test.sh, oidc-file-interplay-test.sh): the relay with the visa
-# service and zb, a fake IdP in each of their namespaces, and ph-cli
-# driving the login with --no-browser while curl in zpr-zb follows the
-# authorization URL it prints.
-
-# What ph logs (vs_worker.rs, vss_worker.rs, zode_login.rs, visa_table.rs)
-# and the visa service logs, and what ph-cli prints, about a Zode login.
-REGISTERED='registered VSS'
-IDP_LIST='received services update with [1-9]'
-LOGGED_IN="Zode login: logged in with $(ere_escape "$IDP_ISSUER")"
-LOGGED_OUT='Zode login: logged out'
-RENEWED='Zode login: renewed; expires in'
-RENEWAL_FAILED='Zode login: silent renewal failed'
-EXPIRED='Zode login: expired without a renewal'
-REVOKED='Revoked visa [0-9]+'
-# The visa service's re-check after an attribute change (its visa sweep).
-VS_SWEEP_REVOKED='visa sweep reason=AttributeChange .* revoked=[1-9]'
-URL_LINE='Open this URL to continue: '
+# service and zb, and a fake IdP in each of their namespaces.
 
 # zode_ping's warm-up for the user flow right after a login: the first
 # echoes wait for the visa request that the login now lets through.
@@ -867,15 +879,9 @@ function launch_login_zodes() {
   wait_log_after 30 zb.log "$IDP_LIST" 0 "zb has the identity-provider list"
 }
 
-# Run ph-cli against zb, in zb's namespace, trusting the fake IdP.
-function zb_cli() {
-  in_ns zpr-zb env -u BROWSER SSL_CERT_FILE="$PWD/ca.crt" \
-    "$PH_DEBUG_BIN" -p zb.sock "$@"
-}
-
 # Succeed when `ph-cli login-status` on zb has the line $1.
 function zb_status_is() {
-  zb_cli login-status 2> /dev/null | grep -qxF -- "$1"
+  zode_cli zb login-status 2> /dev/null | grep -qxF -- "$1"
 }
 
 # Wait up to $1 seconds for `ph-cli login-status` on zb to have the line
@@ -885,41 +891,19 @@ function assert_status() {
     echo "assertion OK: $3"
   else
     echo "ASSERTION FAILED: $3 (no line '$2' in login-status):"
-    zb_cli login-status || true
+    zode_cli zb login-status || true
     return 1
   fi
-}
-
-# Succeed when ph-cli output file $1 holds more than $2 authorization URLs.
-function url_count_above() {
-  (( $(grep -cF -- "$URL_LINE" "$1" || true) > $2 ))
-}
-
-# Wait for ph-cli output file $1 to print an authorization URL beyond the
-# first $2, and drive it with curl in zpr-zb: the fake IdP redirects to
-# ph-cli's loopback callback.
-function drive_login_url() {
-  local URL
-  if ! wait_for 30 url_count_above "$1" "$2"; then
-    echo "ASSERTION FAILED: ph-cli printed no new authorization URL:"
-    cat "$1"
-    return 1
-  fi
-  URL=$(sed -n "s/.*$URL_LINE//p" "$1" | tail -n 1)
-  in_ns zpr-zb curl --silent --show-error --location --cacert ca.crt \
-    --output /dev/null "$URL" || true
 }
 
 # Log a user in on zb with `ph-cli connect` (no resident agent): drive the
 # authorization URL, and assert that connect exits 0 and that zb logs the
 # login. ph-cli's output goes to connect.out.
 function zb_connect() {
-  local CONNECT_PID LOGINS
+  local LOGINS
   LOGINS=$(log_count zb.log "$LOGGED_IN")
-  zb_cli connect --no-browser > connect.out 2>&1 &
-  CONNECT_PID=$!
-  drive_login_url connect.out 0 || return 1
-  if wait "$CONNECT_PID"; then
+  start_zode_login zb connect connect.out || return 1
+  if wait "$LOGIN_PID"; then
     echo "assertion OK: connect exits 0"
   else
     echo "ASSERTION FAILED: connect exited non-zero:"

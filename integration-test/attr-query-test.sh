@@ -407,12 +407,10 @@ if [[ "$PASS" == 0 ]]; then
   plumbing_test "connect path" || PASS=1
 fi
 
-# The visa service's re-check after an attribute change (its visa sweep)
-# revoking a visa, and zb dropping it (as in zode-login-test.sh). The
-# actor loses the tag first; the sweep that revokes the visa follows.
-VS_SWEEP='visa sweep reason=AttributeChange '
-VS_SWEEP_REVOKED="$VS_SWEEP.* revoked=[1-9]"
-REVOKED='Revoked visa [0-9]+'
+# The visa service's re-check after an attribute change (VS_SWEEP)
+# revoking a visa (VS_SWEEP_REVOKED), and zb dropping it (REVOKED), as in
+# zode-login-test.sh; the patterns are in lib/zode_funcs.sh. The actor
+# loses the tag first; the sweep that revokes the visa follows.
 
 #
 # Leg 2: untargeted notify with UNCHANGED data — reconcile must converge

@@ -58,8 +58,6 @@ launch_login_zodes user-zb || PASS=1
 # failed one (connection_control.rs).
 JWKS_FETCH='"GET /jwks'
 JWKS_FETCH_FAILED='JWKS refresh after validation failure failed'
-# A request to the IdP's authorization endpoint (an interactive login).
-AUTH_REQUEST='"GET /auth'
 # The IdP's refusal of a refresh grant: the login's token-endpoint request
 # answers 200, so a 400 is the revoked grant.
 REFRESH_REFUSED='"POST /token[^"]*" 400'
@@ -76,7 +74,7 @@ if [[ "$PASS" == 0 ]]; then
   # A login with the first key needs no fetch: the seed JWKS has it.
   zb_connect || PASS=1
   assert_no_log idp-relay.log "$JWKS_FETCH" "the visa service checks the first key against its seed JWKS, with no fetch" || PASS=1
-  if zb_cli logout; then
+  if zode_cli zb logout; then
     echo "assertion OK: logout exits 0"
   else
     echo "ASSERTION FAILED: logout exited non-zero"
@@ -90,7 +88,7 @@ if [[ "$PASS" == 0 ]]; then
   assert_status 0 "State: logged in" "login-status: logged in with the rotated key" || PASS=1
   assert_zb_actor "the visa service's actor of zb carries the user's subject" user.oidc-subject '["user-zb"]' || PASS=1
   zode_ping zb "$RELAY_ZPR_ADDR" "the user flow is admitted" "$USER_FLOW_WARMUP" || PASS=1
-  if zb_cli logout; then
+  if zode_cli zb logout; then
     echo "assertion OK: logout exits 0"
   else
     echo "ASSERTION FAILED: logout exited non-zero"
@@ -101,8 +99,7 @@ fi
 if [[ "$PASS" == 0 ]]; then
   echo "== 2. the IdP revokes the refresh grant"
   LOGINS=$(log_count zb.log "$LOGGED_IN")
-  zb_cli auth-agent --no-browser > agent.out 2>&1 &
-  drive_login_url agent.out 0 || PASS=1
+  start_zode_login zb auth-agent agent.out || PASS=1
   wait_log_after 15 zb.log "$LOGGED_IN" "$LOGINS" "the agent logs zb in" || PASS=1
   assert_zb_actor "the visa service's actor of zb carries the user's subject" user.oidc-subject '["user-zb"]' || PASS=1
   # The grant works before it is revoked: the IdP refuses an unknown

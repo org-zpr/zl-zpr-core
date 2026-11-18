@@ -30,7 +30,7 @@ const CAPTURE_SUBCOMMANDS: &[&str] = &[
     "sequence",
 ];
 
-const LINK_SUBCOMMANDS: &[&str] = &["show", "configure", "start", "stop", "reset"];
+const LINK_SUBCOMMANDS: &[&str] = &["show", "start", "stop", "reset"];
 
 // Implement the Completer trait for RustyHelper
 impl rustyline::completion::Completer for RustyHelper {
@@ -166,10 +166,9 @@ fn get_command_parameter_info(command: &str) -> &str {
         "flush-file" => " Flush any outstanding packets to the capture file",
         "sequence" => " Create a temporary packet capture",
         "show" => " Show a link's status",
-        "configure" => " Configure a link",
         "start" => " Start a link",
         "stop" => " Stop a link",
-        "reset" => " Reset a link. It will require a configure before starting again",
+        "reset" => " Reset a link",
         "help" => " Display command help information",
         _ => "",
     }

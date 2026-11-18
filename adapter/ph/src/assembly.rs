@@ -430,13 +430,13 @@ impl Assembly {
     /// Node use only: adapter addressing belongs to link activation
     /// (`link_state.rs`), which this deliberately does not touch (N2).
     pub fn ensure_local_zpr_addrs_on_tun(&self) -> Result<(), SelfAddressError> {
-        // On Windows the visa-service host route is required: `netsh
-        // interface ipv6 add address` takes no prefix length (see
-        // `sys/windows/zprtun.rs::add_address`), so the address is installed
-        // as a /128 and never makes the ZPR internal network on-link. On
-        // Linux and macOS `add_address` applies `ZPRNET_PREFIX_LEN`, which
+        // On every platform `add_address` applies `ZPRNET_PREFIX_LEN`, which
         // puts the whole internal network — the visa service included —
-        // on-link, so no route is needed and none is installed.
+        // on-link. Windows also installs the visa-service host route. It
+        // dates from when the Windows `add_address` dropped the prefix
+        // (zl-zipline#272), and it still covers an address configured by
+        // hand with a longer prefix, which this function leaves alone. Linux
+        // and macOS have never installed it. #234 decides whether it stays.
         self.ensure_local_zpr_addrs_on_tun_impl(cfg!(windows))
     }
 
@@ -1460,9 +1460,9 @@ pub mod test {
         assert!(added.lock().unwrap().is_empty());
     }
 
-    /// zipline#159: where the platform needs it (Windows, whose
-    /// `netsh add address` ignores the prefix length), a /128 host route to
-    /// the visa service's well-known address is installed via the TUN.
+    /// zipline#159: on Windows, a /128 host route to the visa service's
+    /// well-known address is installed via the TUN (kept for addresses
+    /// configured by hand; see `ensure_local_zpr_addrs_on_tun`).
     #[test]
     fn node_self_addressing_installs_vs_host_route_where_needed() {
         let (tun_ctl, _added, routes) = SelfAddressTunCtl::new(&["fd5a:5052:90de::1"]);

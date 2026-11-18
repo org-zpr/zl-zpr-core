@@ -58,8 +58,10 @@
 # (unlike vs-admin), and the admin URL names the VS by IP literal.
 set -euo pipefail
 
-# vss_rpc=DEBUG: zb logs the identity-provider list it gets over VSS.
-DEBUG_TARGETS=${DEBUG_TARGETS:-all=INFO vss_rpc=DEBUG}
+# vss_rpc=DEBUG, appended to any DEBUG_TARGETS given: the Zodes log the
+# identity-provider list they get over VSS at debug level, and the test
+# waits for it.
+DEBUG_TARGETS="${DEBUG_TARGETS:-all=INFO} vss_rpc=DEBUG"
 
 # 1 = skip the notify posts (the negative leg; see header). Default 0.
 SKIP_NOTIFY=${SKIP_NOTIFY:-0}
@@ -444,6 +446,9 @@ fi
 # actor loses the tag first; the sweep that revokes the visa follows.
 VS_SWEEP_REVOKED='visa sweep reason=AttributeChange .* revoked=[1-9]'
 REVOKED='Revoked visa [0-9]+'
+# The visa service refusing a visa request (vreq): what a fresh connect
+# attempt meets once the contractor visa is gone.
+EVAL_DENIED='eval denied'
 
 if [[ "$PASS" == 0 ]]; then
   SWEEPS=$(log_count vs.log "$VS_SWEEP_REVOKED")
@@ -471,11 +476,14 @@ fi
 
 if [[ "$PASS" == 0 ]]; then
   # Once the sweep has revoked the contractor visa and zb has dropped it, a
-  # fresh connect attempt is DENIED, and revoking that visa must not take
-  # the fabric down.
+  # fresh connect attempt is DENIED: zb must ask for a new visa, which the
+  # visa service refuses, and no echo is answered. Revoking that visa must
+  # not take the fabric down.
   wait_log_after 30 vs.log "$VS_SWEEP_REVOKED" "$SWEEPS" "the visa service's sweep revokes the contractor visa" || PASS=1
   wait_log_after 10 zb.log "$REVOKED" "$REVOCATIONS" "zb drops the revoked visa" || PASS=1
-  zode_no_ping zb "$ZC_ZPR_ADDR" "a fresh zb -> Web connect is denied (revocation)" || PASS=1
+  DENIALS=$(log_count vs.log "$EVAL_DENIED")
+  zode_no_ping zb "$ZC_ZPR_ADDR" "a fresh zb -> Web connect is not answered (revocation)" || PASS=1
+  wait_log_after 5 vs.log "$EVAL_DENIED" "$DENIALS" "the visa service denies zb's new visa request for Web (revocation)" || PASS=1
   plumbing_test "after the revocation" || PASS=1
 fi
 

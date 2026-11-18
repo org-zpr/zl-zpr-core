@@ -51,8 +51,10 @@
 #
 set -euo pipefail
 
-# vss_rpc=DEBUG: the Zodes log the identity-provider list they get over VSS.
-DEBUG_TARGETS=${DEBUG_TARGETS:-all=INFO vss_rpc=DEBUG}
+# vss_rpc=DEBUG, appended to any DEBUG_TARGETS given: the Zodes log the
+# identity-provider list they get over VSS at debug level, and the test
+# waits for it.
+DEBUG_TARGETS="${DEBUG_TARGETS:-all=INFO} vss_rpc=DEBUG"
 
 source "$(dirname "$0")/lib/common_funcs.sh"
 source "$(dirname "$0")/lib/zode_funcs.sh"
@@ -114,9 +116,20 @@ function revoke_budget() {
   echo $(( $1 + REAUTH_DEADLINE + SWEEP_PERIOD + REVOKE_SLACK - SECONDS ))
 }
 
+# Succeed when the visa service's admin API lists no actor at ZPR address
+# $1. A failed query fails, so an unreachable API never reads as "gone".
+function actor_absent() {
+  local ACTORS
+  ACTORS=$(in_ns zpr-relay \
+    "$VS_ADMIN_BIN" --svc-url "$ADMIN_URL" --ca-cert ca.crt \
+    --api-key-file vs-admin.key --format compact actors) || return 1
+  jq -e --arg addr "$1" 'all(.[]; .zpr_addr != $addr)' > /dev/null <<< "$ACTORS"
+}
+
 # Wait for the sweep to disconnect Zode $1 (its ZPR address $2) within the
-# bound for the install made at $3: the sweep's log line and the visa
-# service's Admin disconnect of it.
+# bound for the install made at $3: the sweep's log line, the visa
+# service's Admin disconnect of it, and, as the proof that the teardown
+# completed, its actor gone from the admin API.
 function assert_swept() {
   local BUDGET
   BUDGET=$(revoke_budget "$3")
@@ -129,12 +142,24 @@ function assert_swept() {
     "the sweep disconnects $1 within the bound" || return 1
   echo "(found $(( SECONDS - $3 ))s after the install; the bound is $((REAUTH_DEADLINE + SWEEP_PERIOD + REVOKE_SLACK))s)"
   wait_log_after 10 vs.log "disconnect actor at $(ere_escape "$2") for reason Admin" 0 \
-    "the visa service records an Admin disconnect of $1"
+    "the visa service records an Admin disconnect of $1" || return 1
+  BUDGET=$(revoke_budget "$3")
+  if (( BUDGET > 0 )) && wait_for "$BUDGET" actor_absent "$2"; then
+    echo "assertion OK: the visa service no longer lists $1 as an actor"
+  else
+    echo "ASSERTION FAILED: the visa service still lists $1 as an actor, or its admin API failed, at the bound"
+    return 1
+  fi
 }
 
 enter_test_namespace "$@"
 
 zode_begin
+
+if ! command -v jq > /dev/null; then
+  echo "jq is required for the admin-API assertions"
+  exit 1
+fi
 
 for P in "$POLICY_NO_ZB_BIN" "$POLICY_NO_ZC_BIN"
 do

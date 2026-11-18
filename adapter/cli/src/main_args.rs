@@ -123,7 +123,7 @@ pub enum Commands {
     /// and replaces a live agent with one that is about to exit.
     #[command(verbatim_doc_comment)]
     Connect {
-        /// Link id to connect (ph adapter); omit it on a Zode to log in
+        /// Id of an adapter-side link to connect; omit it to log this Zode in
         id: Option<u32>,
         /// Print authentication URLs instead of opening a browser
         #[arg(long)]
@@ -151,8 +151,8 @@ pub enum Commands {
     /// browser: a root process cannot usefully open one.
     #[command(verbatim_doc_comment)]
     AuthAgent {
-        /// Link id to serve as authentication agent for (ph adapter); omit
-        /// it on a Zode to log in
+        /// Id of an adapter-side link to serve as authentication agent for;
+        /// omit it to log this Zode in
         id: Option<u32>,
         /// Print authentication URLs instead of opening a browser
         #[arg(long)]

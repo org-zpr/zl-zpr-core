@@ -320,6 +320,11 @@ impl Config {
             config.set_from_node(&config_file.node)?;
         }
         config.set_from_common(common)?;
+        // Validate only the control_group that won, so an invalid name in
+        // the file that a valid --control-group overrides is no error.
+        if let Some(group) = &config.control_group {
+            validate_control_group(group)?;
+        }
         if let Some(pkey_file) = auth_private_key {
             config.auth_private_key = Some(path::absolute(pkey_file).or_else(|e| {
                 Err(ArgsError::PathError(format!(
@@ -551,7 +556,9 @@ impl Config {
             self.control_path_derived = false;
         }
         if let Some(group) = &config.control_group {
-            self.control_group = Some(validate_control_group(group)?);
+            // Validated in new_for_node once the command line has had its
+            // say: an invalid name that a flag overrides is no error.
+            self.control_group = Some(group.clone());
         }
         if let Some(self_addr) = &config.self_addr {
             self.self_addr = *self_addr;
@@ -654,7 +661,8 @@ impl Config {
             self.control_path_derived = false;
         }
         if let Some(group) = &common.control_group {
-            self.control_group = Some(validate_control_group(group)?);
+            // Validated in new_for_node, with the file's value.
+            self.control_group = Some(group.clone());
         }
         if let Some(self_addr) = &common.self_addr {
             self.self_addr = *self_addr;

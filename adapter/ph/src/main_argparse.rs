@@ -33,7 +33,6 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<Config, ArgsErro
     let Command::Zode {
         config_file,
         auth_private_key,
-        advertised_substrate_addr,
         forwarding,
         initial_link,
         relay,
@@ -55,9 +54,6 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<Config, ArgsErro
     };
     let mut config = Config::new_for_node(config_file, auth_private_key, &common)?;
     // Command line overrides the config file.
-    if let Some(advertised) = advertised_substrate_addr {
-        config.set_advertised_substrate_addr(&advertised)?;
-    }
     // An omitted flag preserves the config file value (or the
     // default, false).
     if let Some(forwarding) = forwarding {
@@ -323,144 +319,23 @@ mod test {
         assert!(config.logging.is_empty());
     }
 
-    // CLI --advertised-substrate-addr sets the advertised address with no config file.
+    /// zl-zipline#264: a Zode never reports its own substrate address, so
+    /// `--advertised-substrate-addr` is gone: clap refuses it as unknown.
     #[test]
     #[parallel(env)]
-    fn test_main_args_argparse_node_advertised_addr_cli_only() {
-        let ca_file = TempFile::touch();
-        let ca_file_fname = String::from(ca_file.get_path().to_str().unwrap());
-        let cert_file = TempFile::touch();
-        let cert_file_fname = String::from(cert_file.get_path().to_str().unwrap());
-        let pk_file = TempFile::touch();
-        let pk_file_fname = String::from(pk_file.get_path().to_str().unwrap());
-        let control_sock = portable_tmp_paths("/tmp/control.sock");
-
-        let args = vec![
-            "ph",
-            "zode",
-            "--ca-file",
-            &ca_file_fname,
-            "--certificate-file",
-            &cert_file_fname,
-            "--private-key-file",
-            &pk_file_fname,
-            "--control-path",
-            &control_sock,
-            "--zpr-addr",
-            "fd5a:5052::2",
-            "--initial-link",
-            "relay.zpr@10.0.0.9:5000",
-            "--self-addr",
-            "0.0.0.0:12345",
-            "--advertised-substrate-addr",
-            "203.0.113.7:12345",
-        ];
-
-        let config = argparse(Some(args)).unwrap();
-
-        // The bind address stays wildcard; only the advertised address is concrete.
-        assert_eq!(
-            config.self_addr,
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 12345)
-        );
-        assert_eq!(
-            config.advertised_substrate_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
-                12345
-            ))
-        );
-    }
-
-    // CLI --advertised-substrate-addr wins over [node] advertised_substrate_addr.
-    #[test]
-    #[parallel(env)]
-    fn test_main_args_argparse_node_advertised_addr_cli_overrides_config() {
-        let mut tomltxt = r#"
-        [global]
-        ca_file = '$CAFILE'
-        certificate_file = '$CERTFILE'
-        private_key_file = '$PKFILE'
-        control_path = "/tmp/control.sock"
-        self_addr = "0.0.0.0:12345"
-        zpr_addr = [ "fd5a:5052::2" ]
-
-        [node]
-        advertised_substrate_addr = "203.0.113.7:6000"
-        initial_link = { addr = "10.0.0.9:5000", cn = "relay.zpr" }
-        "#;
-
-        let ca_file = TempFile::touch();
-        let cert_file = TempFile::touch();
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt
-            .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
-            .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
-            .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-
-        let args = vec![
+    fn test_main_args_argparse_refuses_advertised_substrate_addr() {
+        let (cfg, _keys) = node_config_file("");
+        let path = cfg.get_path().to_str().unwrap();
+        let err = Control::try_parse_from(vec![
             "ph",
             "zode",
             "-c",
-            tmpfile.get_path().to_str().unwrap(),
+            path,
             "--advertised-substrate-addr",
-            "198.51.100.9:7000",
-        ];
-
-        let config = argparse(Some(args)).unwrap();
-
-        assert_eq!(
-            config.advertised_substrate_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9)),
-                7000
-            ))
-        );
-    }
-
-    // The CLI value goes through the same validation as the config-file value:
-    // an unspecified IP is rejected because peers cannot dial it.
-    #[test]
-    #[parallel(env)]
-    fn test_main_args_argparse_node_advertised_addr_cli_rejects_unspecified() {
-        let ca_file = TempFile::touch();
-        let ca_file_fname = String::from(ca_file.get_path().to_str().unwrap());
-        let cert_file = TempFile::touch();
-        let cert_file_fname = String::from(cert_file.get_path().to_str().unwrap());
-        let pk_file = TempFile::touch();
-        let pk_file_fname = String::from(pk_file.get_path().to_str().unwrap());
-        let control_sock = portable_tmp_paths("/tmp/control.sock");
-
-        let args = vec![
-            "ph",
-            "zode",
-            "--ca-file",
-            &ca_file_fname,
-            "--certificate-file",
-            &cert_file_fname,
-            "--private-key-file",
-            &pk_file_fname,
-            "--control-path",
-            &control_sock,
-            "--zpr-addr",
-            "fd5a:5052::2",
-            "--advertised-substrate-addr",
-            "0.0.0.0:12345",
-        ];
-
-        match argparse(Some(args)) {
-            Err(ArgsError::ParseError(msg)) => {
-                assert!(
-                    msg.contains("unspecified"),
-                    "expected 'unspecified' in error, got: {msg}"
-                );
-            }
-            other => panic!("expected ParseError, got: {:?}", other),
-        }
+            "203.0.113.7:12345",
+        ])
+        .expect_err("--advertised-substrate-addr must be refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     // CLI --forwarding wins over [node] forwarding in either direction, and an

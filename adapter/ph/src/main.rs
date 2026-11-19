@@ -376,9 +376,6 @@ fn main() -> ExitCode {
     // instantiate (but don't launch yet) the Visa Service connection manager
     //
 
-    // Filled in once the assembly exists; see the substrate address source below.
-    let report_asm: Arc<std::sync::OnceLock<std::sync::Weak<Assembly>>> = Arc::default();
-
     let vsconn = {
         // config parsing ensures that certificate_file is set.
         let node_name = config
@@ -397,39 +394,11 @@ fn main() -> ExitCode {
         let auth_private_key = zpr_utils::rsa_sign::load_rsa_key(auth_key_pem.as_bytes())
             .unwrap_or_else(|e| panic!("failed to parse auth_private_key {auth_key_path:?}: {e}"));
 
-        // The substrate address reported on each connect and open
-        // (zl-zipline#230): see ReportedSubstrateAddr for the rules. A
-        // wildcard self_addr with no initial link has none, and that is a
-        // configuration error, not a panic.
-        let reported_substrate = match config::ReportedSubstrateAddr::for_config(&config) {
-            Ok(rule) => rule,
-            Err(err) => {
-                error!(target: STARTUP, "{err}");
-                return ExitCode::FAILURE;
-            }
-        };
-        info!(
-            target: STARTUP,
-            "reporting substrate address {reported_substrate} to the visa service"
-        );
-        // The initial-link rule reads the assembly, which is built after the
-        // VSConn (it holds the VSConn's handle): the source gets the
-        // assembly through this cell once it exists.
-        let report_asm = report_asm.clone();
-        let substrate_addr_source: libnode::vsconn::SubstrateAddrSource = Box::new(move || {
-            let asm = report_asm
-                .get()
-                .and_then(std::sync::Weak::upgrade)
-                .ok_or_else(|| std::io::Error::other("the node is not set up yet"))?;
-            reported_substrate.resolve(&asm)
-        });
-
         libnode::vsconn::VSConn::new(
             topology_config.vs_queue_size,
             SocketAddr::new(VISA_SERVICE_ADDR, VISA_SERVICE_PORT),
             node_name,
             auth_private_key,
-            substrate_addr_source,
             // The VS-API connection leaves from the node's own address
             // (zl-zipline#229): on a relay that hosts the visa service the
             // kernel would otherwise pick vs.zpr as the source.
@@ -481,10 +450,6 @@ fn main() -> ExitCode {
         logging: Mutex::new(logging_map),
         reload_handle,
     });
-    // The reported substrate address source reads the assembly from here on.
-    report_asm
-        .set(Arc::downgrade(&asm))
-        .expect("the assembly is set up once");
 
     //
     // create a Tokio "local set" to schedule all our management workers on

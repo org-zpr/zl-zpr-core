@@ -162,12 +162,6 @@ pub struct Config {
     /// peers dial.
     pub self_addr: SocketAddr,
 
-    /// Node only, optional - the substrate address this node advertises to the visa
-    /// service (the address peers dial). Needed when it differs from the bind address,
-    /// e.g. behind NAT, and for a relay with a wildcard `self_addr`; see
-    /// [ReportedSubstrateAddr]. Resolved from the config-file string at parse time.
-    pub advertised_substrate_addr: Option<SocketAddr>,
-
     /// Path to a PEM file containing the Certificate Authority certificate.
     /// Optional and if present is used by the link management system to verify passed noise certificates.
     pub ca_file: Option<PathBuf>,
@@ -602,9 +596,6 @@ impl Config {
     // of TOML config.
     fn set_from_node(&mut self, config: &Option<NodeConfigSection>) -> Result<(), ArgsError> {
         if let Some(config) = config {
-            if let Some(advertised) = &config.advertised_substrate_addr {
-                self.advertised_substrate_addr = Some(resolve_advertised_addr(advertised)?);
-            }
             if let Some(forwarding) = config.forwarding {
                 self.forwarding = forwarding;
             }
@@ -615,13 +606,6 @@ impl Config {
                 self.relay = relay;
             }
         }
-        Ok(())
-    }
-
-    /// Set the advertised substrate address from a command-line string,
-    /// applying the same resolution/validation as the config-file path.
-    pub fn set_advertised_substrate_addr(&mut self, addr_str: &str) -> Result<(), ArgsError> {
-        self.advertised_substrate_addr = Some(resolve_advertised_addr(addr_str)?);
         Ok(())
     }
 
@@ -723,7 +707,6 @@ impl Default for Config {
             certificate_file: None,
             private_key_file: None,
             private_key_data: None,
-            advertised_substrate_addr: None,
             auth_private_key: None,
             tun_if: None,
             logging: Vec::new(),
@@ -762,10 +745,6 @@ pub struct NodeConfig {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfigSection {
-    /// The substrate address this node advertises to the visa service, as a
-    /// literal `"IP:port"` string (IPv6 in square-bracket notation).
-    pub advertised_substrate_addr: Option<String>,
-
     /// Whether this node accepts forward-only visas, i.e. carries other
     /// nodes' traffic (zl-zipline#219). Default false. A relay sets it.
     pub forwarding: Option<bool>,
@@ -946,14 +925,6 @@ fn check_file_exists(desc: &str, path: &Path) -> Result<(), ArgsError> {
     }
 }
 
-/// Parse an `advertised_substrate_addr` config string to a concrete [SocketAddr].
-/// Hostnames are deliberately not accepted: substrate claims are always for a
-/// specific IP address and adapters dial nodes by IP, so the advertised value
-/// must be the concrete address itself. See [resolve_dialable_addr].
-fn resolve_advertised_addr(addr_str: &str) -> Result<SocketAddr, ArgsError> {
-    resolve_dialable_addr("advertised_substrate_addr", addr_str)
-}
-
 /// Parse a substrate address that someone dials: a literal `IP:port`, IPv6 in
 /// square-bracket notation, e.g. `"[2001:db8::1]:5000"`. Unspecified IPs (e.g.
 /// `0.0.0.0`) and port 0 are rejected because nobody can dial them. `key`
@@ -978,88 +949,6 @@ fn resolve_dialable_addr(key: &str, addr_str: &str) -> Result<SocketAddr, ArgsEr
     Ok(resolved)
 }
 
-/// The rule that gives the substrate address a node reports to the visa
-/// service on each `connect` and `open` (zl-zipline#230, gate g114 q4 and
-/// q5). Picked once at startup by [ReportedSubstrateAddr::for_config]; the
-/// address itself is read at each call by [ReportedSubstrateAddr::resolve].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReportedSubstrateAddr {
-    /// `advertised_substrate_addr` is set: always that address (a server
-    /// behind a port forward, say).
-    Advertised(SocketAddr),
-    /// `self_addr` is concrete: always that address, the one the substrate
-    /// sockets are bound to. It does not follow a network change.
-    SelfAddr(SocketAddr),
-    /// A Zode with a wildcard `self_addr` and an initial link: the local
-    /// address of the initial link's connection at the time, with
-    /// `self_addr`'s port. A laptop Zode reports its new address on the
-    /// rejoin after a network change, because every `connect` and `open`
-    /// follows a join over that link.
-    InitialLink {
-        /// `self_addr`'s port, which every substrate socket is bound to.
-        port: u16,
-    },
-}
-
-impl ReportedSubstrateAddr {
-    /// Pick the rule for a node's `config`, in this order:
-    ///
-    /// 1. `advertised_substrate_addr`, if set;
-    /// 2. a concrete `self_addr`;
-    /// 3. a wildcard `self_addr` with an initial link: that link's local
-    ///    address, read at each call;
-    /// 4. a wildcard `self_addr` with no initial link (a relay): an error.
-    ///    A wildcard covers every local address, and only the operator can
-    ///    say which one peers should dial.
-    ///
-    /// Call it once `self_addr`'s port is final (an OS-assigned port is
-    /// written back at startup).
-    pub fn for_config(config: &Config) -> Result<Self, String> {
-        if let Some(advertised) = config.advertised_substrate_addr {
-            return Ok(Self::Advertised(advertised));
-        }
-        if !config.self_addr.ip().is_unspecified() {
-            return Ok(Self::SelfAddr(config.self_addr));
-        }
-        if config.initial_link.is_some() {
-            return Ok(Self::InitialLink {
-                port: config.self_addr.port(),
-            });
-        }
-        Err(format!(
-            "cannot determine a substrate address to report: self_addr {} has an \
-             unspecified IP and there is no initial link; set \
-             advertised_substrate_addr in the [node] config section",
-            config.self_addr
-        ))
-    }
-
-    /// The substrate address to report now, for `asm`'s node. Only
-    /// [ReportedSubstrateAddr::InitialLink] reads anything: it fails when the
-    /// initial link has no connection.
-    pub fn resolve(&self, asm: &crate::assembly::Assembly) -> std::io::Result<SocketAddr> {
-        match *self {
-            Self::Advertised(addr) | Self::SelfAddr(addr) => Ok(addr),
-            Self::InitialLink { port } => crate::zode_links::initial_link_local_addr(asm, port),
-        }
-    }
-}
-
-impl std::fmt::Display for ReportedSubstrateAddr {
-    /// Names the rule, for the startup log.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Advertised(addr) => write!(f, "{addr} (advertised_substrate_addr)"),
-            Self::SelfAddr(addr) => write!(f, "{addr} (self_addr)"),
-            Self::InitialLink { port } => write!(
-                f,
-                "the initial link's local address at each connect/open, port {port} \
-                 (wildcard self_addr)"
-            ),
-        }
-    }
-}
-
 /// Parse the `certificate_file` (a noise certificate) and return the CN value found within.
 ///
 /// TODO: This has nothing to do with noise.  And nothing to do with km_cert_exchange.  Move to a pki util file.
@@ -1077,88 +966,17 @@ mod test {
     #[cfg(unix)]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// zl-zipline#230 gap 2: the four rules for the reported substrate
-    /// address, in order. A wildcard joiner no longer fails at startup; a
-    /// wildcard relay still does.
+    /// zl-zipline#264: a Zode never reports its own substrate address, so
+    /// `advertised_substrate_addr` is gone. A config that still sets it is
+    /// refused as unknown, not ignored.
     #[test]
-    fn reported_substrate_addr_rules() {
-        let wildcard: SocketAddr = "0.0.0.0:5000".parse().unwrap();
-        let concrete: SocketAddr = "192.0.2.10:5000".parse().unwrap();
-        let advertised: SocketAddr = "203.0.113.7:6000".parse().unwrap();
-        let initial_link = Some(InitialLink::parse_cli("relay@192.0.2.1:5000").unwrap());
-        let config =
-            |self_addr, advertised_substrate_addr, initial_link: Option<InitialLink>| Config {
-                self_addr,
-                advertised_substrate_addr,
-                initial_link,
-                ..Config::default()
-            };
-
-        // 1. advertised_substrate_addr wins, even over a concrete self_addr.
-        assert_eq!(
-            ReportedSubstrateAddr::for_config(&config(
-                concrete,
-                Some(advertised),
-                initial_link.clone()
-            )),
-            Ok(ReportedSubstrateAddr::Advertised(advertised))
-        );
-        // 2. A concrete self_addr, with or without an initial link.
-        assert_eq!(
-            ReportedSubstrateAddr::for_config(&config(concrete, None, initial_link.clone())),
-            Ok(ReportedSubstrateAddr::SelfAddr(concrete))
-        );
-        // 3. A wildcard joiner: its initial link, with self_addr's port.
-        assert_eq!(
-            ReportedSubstrateAddr::for_config(&config(wildcard, None, initial_link)),
-            Ok(ReportedSubstrateAddr::InitialLink { port: 5000 })
-        );
-        // 4. A wildcard relay: no address to report.
-        let err = ReportedSubstrateAddr::for_config(&config(wildcard, None, None)).unwrap_err();
+    fn test_node_config_refuses_advertised_substrate_addr() {
+        let err = config_from_node_section("advertised_substrate_addr = \"203.0.113.7:6000\"")
+            .unwrap_err();
         assert!(
-            err.contains("advertised_substrate_addr"),
-            "names the fix: {err}"
+            err.to_string().contains("advertised_substrate_addr"),
+            "the error names the refused key: {err}"
         );
-    }
-
-    #[test]
-    fn test_deserialize_node_config_section() {
-        let toml_str = r#"
-            advertised_substrate_addr = "203.0.113.7:5000"
-            "#;
-        let config: NodeConfigSection = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            config.advertised_substrate_addr.as_deref(),
-            Some("203.0.113.7:5000")
-        );
-    }
-
-    #[test]
-    fn test_node_config_advertised_substrate_addr() {
-        let toml_str = r#"
-            [global]
-            self_addr = "10.0.0.1:5000"
-
-            [node]
-            advertised_substrate_addr = "203.0.113.7:6000"
-            "#;
-        let file_config: NodeConfig = toml::from_str(toml_str).unwrap();
-        let mut config = Config::default();
-        config.set_from_node(&file_config.node).unwrap();
-        assert_eq!(
-            config.advertised_substrate_addr,
-            Some("203.0.113.7:6000".parse().unwrap())
-        );
-
-        // Without a [node] section the option stays unset.
-        let toml_str = r#"
-            [global]
-            self_addr = "10.0.0.1:5000"
-            "#;
-        let file_config: NodeConfig = toml::from_str(toml_str).unwrap();
-        let mut config = Config::default();
-        config.set_from_node(&file_config.node).unwrap();
-        assert_eq!(config.advertised_substrate_addr, None);
     }
 
     /// `auth_renewal_lead_seconds` configured the renewal of docked
@@ -1416,37 +1234,40 @@ mod test {
         assert!(check(false, vec![own, v4]).is_ok());
     }
 
+    /// A substrate address someone dials (the initial link's) must be a
+    /// literal, concrete IP:port.
     #[test]
-    fn test_resolve_advertised_addr() {
+    fn test_resolve_dialable_addr() {
+        let resolve_dialable = |addr: &str| resolve_dialable_addr("addr", addr);
         // Plain IP:port passes through.
         assert_eq!(
-            resolve_advertised_addr("203.0.113.7:5000").unwrap(),
+            resolve_dialable("203.0.113.7:5000").unwrap(),
             "203.0.113.7:5000".parse::<SocketAddr>().unwrap()
         );
         // V6 in square-bracket notation passes through.
         assert_eq!(
-            resolve_advertised_addr("[2001:db8::7]:5000").unwrap(),
+            resolve_dialable("[2001:db8::7]:5000").unwrap(),
             "[2001:db8::7]:5000".parse::<SocketAddr>().unwrap()
         );
         // V6 with a scope-free full form.
         assert_eq!(
-            resolve_advertised_addr("[2001:db8:0:0:0:0:0:9]:6000").unwrap(),
+            resolve_dialable("[2001:db8:0:0:0:0:0:9]:6000").unwrap(),
             "[2001:db8::9]:6000".parse::<SocketAddr>().unwrap()
         );
         // V6 without brackets rejected.
-        assert!(resolve_advertised_addr("2001:db8::7:5000").is_err());
+        assert!(resolve_dialable("2001:db8::7:5000").is_err());
         // Hostnames rejected: the claim is always for a specific IP address.
-        assert!(resolve_advertised_addr("localhost:5000").is_err());
-        assert!(resolve_advertised_addr("node1.example.com:5000").is_err());
+        assert!(resolve_dialable("localhost:5000").is_err());
+        assert!(resolve_dialable("node1.example.com:5000").is_err());
         // Unspecified IP rejected.
-        assert!(resolve_advertised_addr("0.0.0.0:5000").is_err());
-        assert!(resolve_advertised_addr("[::]:5000").is_err());
+        assert!(resolve_dialable("0.0.0.0:5000").is_err());
+        assert!(resolve_dialable("[::]:5000").is_err());
         // Port 0 rejected (V4 and V6).
-        assert!(resolve_advertised_addr("203.0.113.7:0").is_err());
-        assert!(resolve_advertised_addr("[2001:db8::7]:0").is_err());
+        assert!(resolve_dialable("203.0.113.7:0").is_err());
+        assert!(resolve_dialable("[2001:db8::7]:0").is_err());
         // Garbage rejected.
-        assert!(resolve_advertised_addr("not an address").is_err());
-        assert!(resolve_advertised_addr("203.0.113.7").is_err());
+        assert!(resolve_dialable("not an address").is_err());
+        assert!(resolve_dialable("203.0.113.7").is_err());
     }
 
     /// With a resolved owner and a derived (default) socket path, the

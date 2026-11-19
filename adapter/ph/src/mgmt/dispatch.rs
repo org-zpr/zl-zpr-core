@@ -792,6 +792,54 @@ mod test {
             .await
     }
 
+    /// zl-zipline#264 "No roaming": a link's peer substrate address is the
+    /// one it keyed with. A handshake from another source address, even one
+    /// for the same peer, does not move the established link there: it
+    /// starts a link of its own at the new address, which has to key and
+    /// pass its own CN check, and the established link keeps its address.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_packet_from_another_address_never_moves_a_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                let (sa, iface) = {
+                    let peer = asm.peer_table.get(old).unwrap();
+                    (peer.substrate_addr, peer.interface_addr)
+                };
+                let moved = SubstrateAddr::new(sa.ip(), sa.port() + 1);
+
+                let (zode_msg0, adapter_msg0) = first_messages();
+                deliver_km_from(&asm, moved, iface, &adapter_msg0);
+                assert!(
+                    asm.peer_table.lookup_peer(&moved, &iface).is_none(),
+                    "an unmarked message from the new address opens nothing"
+                );
+                deliver_km_from(&asm, moved, iface, &zode_msg0);
+                let new = asm
+                    .peer_table
+                    .lookup_peer(&moved, &iface)
+                    .expect("the new address gets a link of its own")
+                    .get();
+                assert_ne!(new, old);
+                assert_eq!(
+                    asm.peer_table
+                        .get(new)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    crate::link_state::LinkState::Keying
+                );
+
+                assert_eq!(asm.peer_table.get(old).unwrap().substrate_addr, sa);
+                assert_eq!(
+                    asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
+                    Some(old),
+                    "the established link still owns its address"
+                );
+            })
+            .await
+    }
+
     /// An unmarked key-management message on an established Zode link
     /// opens no new handshake.
     #[tokio::test(start_paused = true)]

@@ -311,7 +311,6 @@ pub async fn start_vsconn(
         NODE_CN.to_string(),
         aws_lc_rs::signature::RsaKeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
             .expect("test RSA key"),
-        libnode::vsconn::fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()),
         // The fake visa service listens on loopback: bind the VS-API source
         // there (zl-zipline#229).
         std::net::Ipv4Addr::LOCALHOST.into(),

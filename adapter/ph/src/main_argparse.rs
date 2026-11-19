@@ -49,6 +49,12 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<Config, ArgsErro
                     e
                 )))
             })?;
+            // A flag below replaces these file values, so new_for_node
+            // must not validate them (zl-zipline#278 review).
+            nc.drop_node_values_replaced_by_flags(
+                advertised_substrate_addr.is_some(),
+                initial_link.is_some(),
+            );
             Some(nc)
         }
         None => None,

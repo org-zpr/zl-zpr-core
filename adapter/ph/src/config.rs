@@ -306,14 +306,26 @@ impl Config {
     /// defaults, and the command line applies last, so every flag that is
     /// given overrides the file's value. A list flag (`--zpr-addr`,
     /// `--logging`) replaces the file's whole list. The `ph zode` flags
-    /// for the `[node]` section are applied by the caller, after this.
+    /// for the `[node]` section are applied by the caller, after this; the
+    /// caller drops a `[node]` value that such a flag replaces before it
+    /// calls this (see [NodeConfig::drop_node_values_replaced_by_flags]).
+    ///
+    /// A file value that a given flag replaces is dropped before the file
+    /// is applied, because applying a file value also validates it: an
+    /// invalid or stale `control_group` in the file must not stop ph when
+    /// `--control-group` gives a valid one (zl-zipline#278 review).
     pub fn new_for_node(
         config_file: Option<NodeConfig>,
         auth_private_key: Option<PathBuf>,
         common: &CommonArgs,
     ) -> Result<Self, ArgsError> {
         let mut config = Config::default();
-        if let Some(config_file) = config_file {
+        if let Some(mut config_file) = config_file {
+            // --control-group replaces the file's control_group, so do not
+            // validate the file's value (zl-zipline#278 review).
+            if common.control_group.is_some() {
+                config_file.global.control_group = None;
+            }
             let base_dir = config_file.config_path.parent().unwrap();
             config.set_from_globals(&config_file.global, base_dir)?;
             config.set_from_authentication(&config_file.authentication, base_dir)?;
@@ -776,6 +788,30 @@ pub struct NodeConfig {
     pub global: GlobalConfigSection,
     pub node: Option<NodeConfigSection>,
     pub authentication: Option<AuthenticationConfigSection>,
+}
+
+impl NodeConfig {
+    /// Drop each `[node]` value that a given `ph zode` flag replaces
+    /// (zl-zipline#278 review). [Config::new_for_node] validates the
+    /// `[node]` values when it applies them, before the caller applies
+    /// these flags. Without this, an invalid `advertised_substrate_addr`
+    /// or `[node.initial_link]` in the file stops ph although the flag
+    /// gives a valid value. With no flag, the file value stays, and is
+    /// validated as before.
+    pub fn drop_node_values_replaced_by_flags(
+        &mut self,
+        advertised_substrate_addr: bool,
+        initial_link: bool,
+    ) {
+        if let Some(node) = self.node.as_mut() {
+            if advertised_substrate_addr {
+                node.advertised_substrate_addr = None;
+            }
+            if initial_link {
+                node.initial_link = None;
+            }
+        }
+    }
 }
 
 // The `[node]` section of a Zode config file.

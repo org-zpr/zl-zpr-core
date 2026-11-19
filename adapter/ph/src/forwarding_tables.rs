@@ -85,23 +85,33 @@ impl PftPep {
     }
 
     /// When the bound visa expires, in milliseconds since the UNIX epoch
-    /// ([unix_ms]). A packet on this entry at or after it is dropped.
-    pub fn expires_ms(&self) -> u64 {
-        self.expires.load(AtomicOrdering::Acquire)
+    /// ([unix_ms]), and where the stream is forwarded to: what the fast
+    /// path reads for each packet, which it drops at or after the expiry.
+    ///
+    /// A J11 rebind may run between the two loads. The expiry is loaded
+    /// first, and [PftPep::rebind] stores it last, so a reader that sees a
+    /// rebind's expiry also sees its next hop (Release/Acquire). The one
+    /// mixed pair a reader can get is the old expiry with the new next
+    /// hop: a packet the old visa still admits goes to the successor's
+    /// target, which the J11 commit checked is live. Never the reverse,
+    /// which would let a packet of an expired visa pass on its successor's
+    /// expiry.
+    pub fn target(&self) -> (u64, ForwardingEntry) {
+        let expires_ms = self.expires.load(AtomicOrdering::Acquire);
+        (expires_ms, self.next_hop())
     }
 
     /// Move this entry onto `visa_id`, which expires at `expires`,
     /// forwarding to `next_hop` (J11 commit). The only writer after
     /// [PftPep::new]; the visa table calls it under its write lock. The
-    /// expiry and the visa ID are stored before the next hop, so a reader
-    /// that loads the next hop first and sees the new one also sees the new
-    /// expiry and visa ID.
+    /// expiry is stored last, so a reader that sees the new expiry also
+    /// sees the new visa ID and next hop (see [PftPep::target]).
     pub fn rebind(&self, next_hop: ForwardingEntry, visa_id: VisaId, expires: SystemTime) {
-        self.expires
-            .store(unix_ms(expires), AtomicOrdering::Release);
         self.visa_id.store(visa_id, AtomicOrdering::Release);
         self.next_hop
             .store(pack_forwarding_entry(next_hop), AtomicOrdering::Release);
+        self.expires
+            .store(unix_ms(expires), AtomicOrdering::Release);
     }
 }
 
@@ -198,13 +208,42 @@ mod tests {
         let old_expiry = UNIX_EPOCH + Duration::from_secs(1_000);
         let new_expiry = UNIX_EPOCH + Duration::from_secs(2_000);
         let pep = PftPep::new(ForwardingEntry(3, 42), 7100, old_expiry);
-        assert_eq!(pep.expires_ms(), 1_000_000);
+        assert_eq!(pep.target().0, 1_000_000);
 
         pep.rebind(ForwardingEntry(4, 43), 7101, new_expiry);
 
         assert!(pep.next_hop() == ForwardingEntry(4, 43));
         assert_eq!(pep.visa_id(), 7101);
-        assert_eq!(pep.expires_ms(), 2_000_000);
+        assert_eq!(pep.target().0, 2_000_000);
+    }
+
+    /// Local Codex review (t320, P2): a J11 rebind races the fast path,
+    /// which must never pair the expiry of the visa a rebind moves the
+    /// stream onto with the next hop of the visa it moves it off: the old
+    /// visa may have expired, and its packets must not pass on the new
+    /// visa's expiry. A writer rebinds in a tight loop onto ever newer
+    /// targets, each expiring at its own number (in ms); a concurrent reader
+    /// must never see a next hop older than the expiry it read with it.
+    #[test]
+    fn test_a_racing_reader_never_pairs_a_new_expiry_with_an_old_next_hop() {
+        const REBINDS: u32 = 2_000_000;
+        let pep = PftPep::new(ForwardingEntry(1, 0), 0, UNIX_EPOCH);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for i in 1..=REBINDS {
+                    let expires = UNIX_EPOCH + Duration::from_millis(u64::from(i));
+                    pep.rebind(ForwardingEntry(1, i), VisaId::from(i), expires);
+                }
+            });
+            while !writer.is_finished() {
+                let (expires_ms, next_hop) = pep.target();
+                assert!(
+                    u64::from(next_hop.1) >= expires_ms,
+                    "next hop {} read with the expiry of target {expires_ms}",
+                    next_hop.1
+                );
+            }
+        });
     }
 
     /// An expiry before the UNIX epoch, which no granted visa has, counts

@@ -817,13 +817,12 @@ impl VisaTable {
     /// bindings if it did, for the caller to withdraw from their adapters:
     /// on expiry a node tears down the tethers to its adapters, so their
     /// next packet binds afresh (VISA_SERVICE.md). Zode links get no
-    /// withdrawal (F5); a Zode upstream ejects its own copy at its next
-    /// match.
+    /// withdrawal (F5): every Zode on the path stops the stream at the
+    /// same expiry, on its own clock.
     ///
-    /// Only a match calls this: no timer sweeps the table for expired
-    /// visas (operator decision, 2026-11-18; a sweep is zl-zipline#274).
-    /// So an expired visa with live streams keeps them until a new flow
-    /// matches it, or it is revoked.
+    /// A match ejects at once, so a new flow never waits for the expiry
+    /// sweep ([VisaTable::handle_expirations], zl-zipline#274), which frees
+    /// every other expired visa.
     fn eject_if_expired(
         &mut self,
         peer_table: &peer_table::PeerTable,
@@ -861,32 +860,45 @@ impl VisaTable {
         Ok(withdrawn)
     }
 
-    /// Remove every expired visa from the table.
+    /// The expiry sweep (zl-zipline#274): free the visas that have expired
+    /// at `now`, with their bindings and PFT entries, and drain their
+    /// entries from `timeout_queue`.
     ///
-    /// No production code calls this: `ph` enforces expiry only when a
-    /// flow is matched ([VisaTable::match_traffic], zl-zipline#271), and
-    /// withdraws the streams of an ejected visa from its adapters. Whether
-    /// to sweep periodically as well, and whether a sweep notifies, is
-    /// zl-zipline#274.
+    /// The sweep enforces nothing: from its expiry on the fast path drops
+    /// every packet of a visa's streams. It reclaims, and when to free a
+    /// visa depends on where its streams enter this Zode (D3, D4):
     ///
-    /// Returns the withdrawn forwarding entries. Unlike revocation
-    /// ([`Self::revoke_for_link`] via `Assembly::drop_peer`), expiry
-    /// deliberately does NOT notify peers: both ends of a flow hold the same
-    /// visa expiry and eject on their own clocks, and a peer that sends
-    /// early (clock skew) gets `UnknownStreamId` and re-requests a visa —
-    /// unlike the revocation case, where the surviving peer's binding would
-    /// otherwise never die. Callers that want to notify anyway have the
-    /// returned entries to do it with.
+    /// - No stream enters over a Zode link (this Zode is the ingress, from
+    ///   its own actor, or the visa has no stream left, such as a visa a
+    ///   J11 commit moved its streams off): freed at its expiry. The
+    ///   returned ingress entries are withdrawn from the actor, so its next
+    ///   packet binds afresh, under a new visa or not at all.
+    /// - A stream enters over a Zode link (transit, or egress from an
+    ///   upstream Zode): freed only [config::STREAM_ID_REUSE_GRACE] after
+    ///   its expiry. Until then its PFT slot stays occupied, so its stream
+    ///   ID is not handed to a new stream while the upstream may still send
+    ///   on it.
+    ///
+    /// Returns the withdrawn forwarding entries. Expiry notifies no peer
+    /// over a Zode link: every Zode on the path holds the same expiry and
+    /// stops on its own clock ([crate::assembly::Assembly::withdraw_streams]
+    /// sends only to this Zode's own actor and dock).
+    ///
+    /// The lookup table is rebuilt only if a visa was freed: this runs
+    /// every [config::VISA_EXPIRY_SWEEP_INTERVAL].
     pub fn handle_expirations(
         &mut self,
         peer_table: &peer_table::PeerTable,
+        now: SystemTime,
     ) -> Vec<ForwardingEntry> {
-        let current_time = Utc::now();
+        let now_utc = DateTime::<Utc>::from(now);
         let mut withdrawn = Vec::new();
+        let mut in_grace = Vec::new();
+        let mut freed_any = false;
         while self
             .timeout_queue
             .peek()
-            .map_or(false, |entry| entry.expiration < current_time)
+            .is_some_and(|entry| entry.expiration <= now_utc)
         {
             let timeout_entry = self.timeout_queue.pop().unwrap();
             // An entry is stale if its visa was revoked, or revoked and an
@@ -900,12 +912,42 @@ impl VisaTable {
             if held_expiry != Some(timeout_entry.expiration) {
                 continue;
             }
+            let grace_ends = timeout_entry.expiration + config::STREAM_ID_REUSE_GRACE;
+            if now_utc < grace_ends
+                && self.has_stream_from_a_zode_link(peer_table, timeout_entry.id)
+            {
+                in_grace.push(timeout_entry);
+                continue;
+            }
+            info!(target: VISA_MGMT, "visa {} has expired: ejecting it", timeout_entry.id);
             if let Ok(entries) = self.revoke_no_rebuild(peer_table, timeout_entry.id) {
                 withdrawn.extend(entries);
+                freed_any = true;
             }
         }
-        self.rebuild_lookup_table();
+        // ponytail: a visa in its grace is looked at again by every sweep
+        // until the grace ends, O(visas in their grace) per sweep; requeue
+        // it at the grace's end if that ever shows up in profiles.
+        self.timeout_queue.extend(in_grace);
+        if freed_any {
+            self.rebuild_lookup_table();
+        }
         withdrawn
+    }
+
+    /// Whether a stream bound under the visa `visa_id` enters this Zode
+    /// over a Zode link (D4): its ingress is an upstream Zode, which may
+    /// still send on the stream's ID.
+    fn has_stream_from_a_zode_link(
+        &self,
+        peer_table: &peer_table::PeerTable,
+        visa_id: VisaId,
+    ) -> bool {
+        self.bindings(visa_id).iter().any(|binding| {
+            peer_table
+                .get(binding.ingress.0)
+                .is_some_and(|peer| peer.is_zode_link())
+        })
     }
 
     /// Revoke every visa with a stream bound over `link_id`, on the ingress
@@ -1251,12 +1293,17 @@ pub mod tests {
 
     /// Add a dummy peer to the assembly's peer table and return its link ID.
     fn add_dummy_peer(asm: &Assembly, last_octet: u8) -> LinkId {
+        add_dummy_peer_of_type(asm, LinkType::Internal, last_octet)
+    }
+
+    /// [add_dummy_peer], with a link of type `link_type`.
+    fn add_dummy_peer_of_type(asm: &Assembly, link_type: LinkType, last_octet: u8) -> LinkId {
         let entry = asm.peer_table.vacant_entry().unwrap();
         let key = entry.key();
         entry
             .insert(create_dummy_peer_state(
                 key,
-                LinkType::Internal,
+                link_type,
                 SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, last_octet)), 443),
                 net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 4, last_octet)),
             ))
@@ -1363,7 +1410,7 @@ pub mod tests {
         );
 
         // Expiry.
-        visa_table.handle_expirations(&asm.peer_table);
+        visa_table.handle_expirations(&asm.peer_table, SystemTime::now());
         assert!(!visa_table.table.contains_key(&5002));
         assert_eq!(
             visa_table.match_traffic(&asm.peer_table, &full_tuple).0,
@@ -1428,14 +1475,14 @@ pub mod tests {
         builder.visa_table = Some(VisaTable::new());
         let asm = Arc::new(create_assembly(builder));
 
-        let one_second = std::time::Duration::from_secs(1);
+        let in_a_second = SystemTime::now() + Duration::from_secs(1);
         let visa1 = 12345;
         let visa2 = 67890;
         let visa3 = 234;
         let mut visa_table = asm.visa_table.write().unwrap();
         let v1 = new_vsapi_visa_tcp_default(visa1 as u64, ALREADY_EXPIRED); // An element that will timeout immediately
         let v2 = new_vsapi_visa_tcp_default(visa2 as u64, never_expires()); // An element that won't timeout
-        let v3 = new_vsapi_visa_tcp_default(visa3 as u64, (Utc::now() + one_second).into()); // An element that will time out in a second
+        let v3 = new_vsapi_visa_tcp_default(visa3 as u64, in_a_second); // An element that will time out in a second
         let _ = visa_table.insert_visa(v1);
         let _ = visa_table.insert_visa(v2);
         let _ = visa_table.insert_visa(v3); // An element that will time out in a second
@@ -1446,7 +1493,7 @@ pub mod tests {
         assert_eq!(true, visa_table.table.contains_key(&visa2));
         assert_eq!(true, visa_table.table.contains_key(&visa3));
 
-        visa_table.handle_expirations(&asm.peer_table);
+        visa_table.handle_expirations(&asm.peer_table, SystemTime::now());
 
         assert_eq!(2, visa_table.table.len());
         assert_eq!(2, visa_table.timeout_queue.len());
@@ -1454,9 +1501,7 @@ pub mod tests {
         assert_eq!(true, visa_table.table.contains_key(&visa2));
         assert_eq!(true, visa_table.table.contains_key(&visa3));
 
-        std::thread::sleep(one_second);
-
-        visa_table.handle_expirations(&asm.peer_table);
+        visa_table.handle_expirations(&asm.peer_table, in_a_second);
 
         assert_eq!(1, visa_table.table.len());
         assert_eq!(1, visa_table.timeout_queue.len());
@@ -1524,7 +1569,7 @@ pub mod tests {
 
         std::thread::sleep(one_second);
 
-        visa_table.handle_expirations(&asm.peer_table);
+        visa_table.handle_expirations(&asm.peer_table, SystemTime::now());
         assert_eq!(1, peer_state.pft.len());
 
         assert!(visa_table.revoke(&asm.peer_table, visa1).is_ok());
@@ -2038,7 +2083,7 @@ pub mod tests {
             visa_table.insert_visa(visa).unwrap();
         }
         visa_table.regrant_vs_visas(&peer_table, &addr);
-        visa_table.handle_expirations(&peer_table);
+        visa_table.handle_expirations(&peer_table, SystemTime::now());
         assert!(visa_table.contains(1) && visa_table.contains(2));
     }
 
@@ -2138,7 +2183,7 @@ pub mod tests {
         }
 
         visa_table.revoke(&asm.peer_table, 5400).unwrap();
-        visa_table.handle_expirations(&asm.peer_table);
+        visa_table.handle_expirations(&asm.peer_table, SystemTime::now());
 
         for visa_id in [5400, 5401] {
             assert!(visa_table.bindings(visa_id).is_empty());
@@ -2904,7 +2949,7 @@ pub mod tests {
             .get(link)
             .unwrap()
             .pft
-            .inspect(stream, PftPep::expires_ms)
+            .inspect(stream, |pep| pep.target().0)
     }
 
     /// zl-zipline#274 (D2): no stream is bound under a visa that has
@@ -2991,6 +3036,139 @@ pub mod tests {
 
         assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 43), 7711)));
         assert_eq!(pft_expiry(&asm, link_a, tether), Some(unix_ms(new_expiry)));
+    }
+
+    // ---- The expiry sweep (zl-zipline#274, D3 and D4) ----
+
+    /// The expiry of the held visa `visa_id`.
+    fn held_expiry(visa_table: &VisaTable, visa_id: VisaId) -> SystemTime {
+        visa_table.table[&visa_id].visa().expires
+    }
+
+    /// zl-zipline#274 (D3): at the ingress, where the stream enters from
+    /// this Zode's own actor, the sweep ejects an expired visa at its
+    /// expiry, and not a moment before. Its stream's ingress entry is
+    /// handed back to be withdrawn from the actor, so its next packet
+    /// binds afresh, and the expiry queue is drained.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_the_sweep_ejects_an_expired_ingress_visa_at_once() {
+        let (asm, link_a, _link_b, tether) = bound_old_visa(7800);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        let expires = held_expiry(&visa_table, 7800);
+
+        let withdrawn =
+            visa_table.handle_expirations(&asm.peer_table, expires - Duration::from_millis(1));
+        assert!(withdrawn.is_empty());
+        assert!(visa_table.contains(7800), "held until its expiry");
+
+        let withdrawn = visa_table.handle_expirations(&asm.peer_table, expires);
+        assert!(withdrawn == vec![ForwardingEntry(link_a, tether)]);
+        assert!(!visa_table.contains(7800));
+        assert!(pft_entry(&asm, link_a, tether).is_none());
+        assert_eq!(
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
+            None,
+            "the lookup no longer answers it"
+        );
+        assert!(visa_table.timeout_queue.is_empty());
+    }
+
+    /// zl-zipline#274 (D4): a visa with a stream entering over a Zode link
+    /// (transit, or egress from an upstream Zode) is held past its expiry
+    /// for the stream-ID reuse grace. Its PFT slot stays occupied, so the
+    /// stream ID is not handed to a new stream while the upstream may
+    /// still send on it (the fast path drops those packets). After the
+    /// grace it goes, and the queue is drained.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_the_sweep_keeps_an_expired_transit_visa_until_the_grace_passes() {
+        let mut builder = TestAssemblyBuilder::new();
+        builder.visa_table = Some(VisaTable::new());
+        let asm = Arc::new(create_assembly(builder));
+        let upstream = add_dummy_peer_of_type(&asm, LinkType::NodeToNode, 1);
+        let downstream = add_dummy_peer_of_type(&asm, LinkType::NodeToNode, 2);
+        let expires = UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        visa_table
+            .insert_visa(new_vsapi_visa_forward_only(7810, expires, next_hop_addr()))
+            .unwrap();
+        let egress = ForwardingEntry(downstream, 42);
+        let tether = asm
+            .peer_table
+            .get(upstream)
+            .unwrap()
+            .pft
+            .insert(PftPep::new(egress.clone(), 7810, expires))
+            .unwrap();
+        let ingress = ForwardingEntry(upstream, tether);
+        visa_table
+            .bind(
+                7810,
+                StreamBinding {
+                    ingress: ingress.clone(),
+                    egress,
+                },
+                before_the_expiry(),
+            )
+            .unwrap();
+
+        let in_the_grace = expires + Duration::from_secs(1);
+        assert!(
+            visa_table
+                .handle_expirations(&asm.peer_table, in_the_grace)
+                .is_empty()
+        );
+        assert!(visa_table.contains(7810), "held for the grace");
+        assert!(
+            pft_entry(&asm, upstream, tether).is_some(),
+            "the slot stays"
+        );
+        assert_eq!(visa_table.timeout_queue.len(), 1, "looked at again");
+
+        let after_the_grace = expires + config::STREAM_ID_REUSE_GRACE + Duration::from_secs(1);
+        let withdrawn = visa_table.handle_expirations(&asm.peer_table, after_the_grace);
+        assert!(withdrawn == vec![ingress]);
+        assert!(!visa_table.contains(7810));
+        assert!(pft_entry(&asm, upstream, tether).is_none());
+        assert!(visa_table.timeout_queue.is_empty());
+    }
+
+    /// zl-zipline#274 (D3): a visa a J11 commit moved its stream off has no
+    /// binding left, and the sweep ejects it at its expiry. The stream,
+    /// now under its successor, is untouched and withdraws nothing.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_the_sweep_ejects_a_superseded_visa_with_no_binding_at_expiry() {
+        let (asm, link_a, link_b, tether) = bound_old_visa(7820);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        let old_expiry = held_expiry(&visa_table, 7820);
+        let mut new_visa = tcp_visa(7821, CLIENT, 0, SERVICE, 80);
+        new_visa.expires = old_expiry + Duration::from_secs(3600);
+        visa_table.insert_visa(new_visa).unwrap();
+        visa_table
+            .commit_supersede(
+                &asm.peer_table,
+                7820,
+                7821,
+                ForwardingEntry(link_a, tether),
+                ForwardingEntry(link_b, 43),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let withdrawn = visa_table.handle_expirations(&asm.peer_table, old_expiry);
+
+        assert!(withdrawn.is_empty());
+        assert!(!visa_table.contains(7820));
+        assert!(visa_table.contains(7821));
+        assert!(pft_entry(&asm, link_a, tether) == Some((ForwardingEntry(link_b, 43), 7821)));
+        assert_eq!(
+            visa_table
+                .match_traffic(&asm.peer_table, &client_to_service())
+                .0,
+            Some(7821)
+        );
+        assert_eq!(visa_table.timeout_queue.len(), 1, "only the successor's");
     }
 
     #[test]

@@ -397,18 +397,18 @@ impl FastpathWorker {
 
             // TODO: policy enforcement
 
-            // One load: a J11 rebind may swap the entry's target at
-            // any moment, and both IDs must come from the same target.
-            let next_hop = pep.next_hop();
+            // A J11 rebind may swap the entry's target at any moment:
+            // `target` reads the expiry and the next hop so that a new
+            // expiry never comes with an old next hop, and the next hop's
+            // two IDs in one load.
+            let (expires_ms, next_hop) = pep.target();
             egress_link_id = next_hop.0;
             egress_stream_id = next_hop.1;
 
             // Visa expiry, on every packet at every hop (zl-zipline#274):
             // a stream stops when its visa does, whenever it was bound.
-            // Loaded after the next hop, so a stream a J11 rebind just
-            // moved is checked against its new visa's expiry. Dropped
-            // silently, like an unknown stream ID.
-            if self.now_ms >= pep.expires_ms() {
+            // Dropped silently, like an unknown stream ID.
+            if self.now_ms >= expires_ms {
                 drop(pep);
                 drop(ingress_peer_state);
                 self.drop_and_count(pkt, FastpathCounterType::VisaExpired);

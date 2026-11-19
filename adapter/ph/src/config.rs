@@ -104,6 +104,26 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration:
 /// timeout, 3 misses gives roughly 9-12 s of grace before teardown.
 pub const KEEP_ALIVE_MAX_MISSES: u32 = 3;
 
+/// How often, at most, the expiry sweep runs (zl-zipline#274,
+/// [crate::visa_mgmt::sweep_expired_visas_if_due]). The sweep enforces
+/// nothing: the fast path drops every packet of an expired visa on its own.
+/// It frees expired visas and their streams, and withdraws an expired
+/// stream from this Zode's own actor so its next packet binds afresh. So
+/// this is also about how long such a flow can stay stalled after its
+/// visa expired before it binds again. The sweep has no timer of its own
+/// (operator, g184 q7): it runs on the first link keep-alive tick (every
+/// [DEFAULT_KEEP_ALIVE_PERIOD]) once the interval has passed.
+pub const VISA_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long past its expiry a visa with a stream entering over a Zode link
+/// (transit, or egress from an upstream Zode) is kept, with that stream's
+/// PFT slot (zl-zipline#274, D4). The stream forwards nothing from the
+/// expiry on, but its ID is not handed to a new stream while the upstream,
+/// whose clock may lag, could still send on it.
+/// ponytail: a fixed bound on clock skew between Zodes; raise it if Zode
+/// clocks are not NTP-synced.
+pub const STREAM_ID_REUSE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Maximum length of payload to include in a Bind Request.
 ///
 /// 256 octects is more than enough to capture the longest common headers

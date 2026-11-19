@@ -195,6 +195,12 @@ impl PeerState {
         self.link_state_machine.is_internal()
     }
 
+    /// Whether this peer's link is a Zode-to-Zode link (`NodeToNode`),
+    /// rather than an internal link to this Zode's own actor or dock.
+    pub fn is_zode_link(&self) -> bool {
+        self.link_state_machine.get_link_type() == LinkType::NodeToNode
+    }
+
     /// What type of peer is this.  Accounts for well-known internal links
     /// (local actor and dock).
     pub fn peer_type(&self) -> PeerType {

@@ -83,6 +83,9 @@ pub struct Assembly {
     pub relay_named_by_topology: std::sync::atomic::AtomicBool,
 
     pub visa_table: std::sync::RwLock<visa_table::VisaTable>, // Only for nodes
+    /// When the expiry sweep last ran, or `None` before the first one
+    /// ([crate::visa_mgmt::sweep_expired_visas_if_due], zl-zipline#274).
+    pub last_visa_sweep: Mutex<Option<std::time::Instant>>,
 
     /// The links the visa service last pushed with `setTopology`. Its
     /// `peer_cn`s are the peers this Zode accepts on Zode links
@@ -366,7 +369,7 @@ impl Assembly {
         let zode_link = self
             .peer_table
             .get(link_id)
-            .is_some_and(|p| p.link_state_machine.get_link_type() == LinkType::NodeToNode);
+            .is_some_and(|p| p.is_zode_link());
         if zode_link && self.zode_links.is_up_on(link_id) {
             // F6 (zl-zipline#251): register the loss with the reporter
             // FIRST, before any revocation, so a visa request that a
@@ -439,24 +442,45 @@ impl Assembly {
     /// visa-table write lock — the send path takes the peer's `zdpr_send`
     /// mutex, which must never nest under it.
     ///
-    /// Expiry (zl-zipline#271) withdraws too: a match that ejects an expired
-    /// visa (`VisaTable::match_traffic`) hands its streams here, so the
-    /// adapter's next packet binds afresh. `VisaTable::handle_expirations`
-    /// has no production caller (a periodic sweep is zl-zipline#274).
+    /// Expiry withdraws too: a match that ejects an expired visa
+    /// (`VisaTable::match_traffic`, zl-zipline#271) and the expiry sweep
+    /// (`VisaTable::handle_expirations`, zl-zipline#274) hand their streams
+    /// here, so the actor's next packet binds afresh.
     pub(crate) fn withdraw_streams(
         &self,
         withdrawn: Vec<ForwardingEntry>,
         excluded_link: Option<LinkId>,
     ) {
         for entry in withdrawn {
-            let to_adapter = self.peer_table.get(entry.0).is_some_and(|peer| {
-                peer.link_state_machine.get_link_type() != LinkType::NodeToNode
-            });
+            let to_adapter = self
+                .peer_table
+                .get(entry.0)
+                .is_some_and(|peer| !peer.is_zode_link());
             if Some(entry.0) == excluded_link || !to_adapter {
                 continue;
             }
             mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
         }
+    }
+
+    /// Run `update` on the visa table under its write lock, then withdraw
+    /// the streams it returns from this Zode's own actor and dock
+    /// ([Assembly::withdraw_streams]) once the lock is released: the send
+    /// path must never nest under the visa-table lock (zipline#9). Returns
+    /// what `update` returns besides the streams.
+    pub(crate) fn update_visa_table_and_withdraw<T>(
+        &self,
+        update: impl FnOnce(
+            &mut visa_table::VisaTable,
+            &peer_table::PeerTable,
+        ) -> (T, Vec<ForwardingEntry>),
+    ) -> T {
+        let (result, withdrawn) = {
+            let mut visa_table = self.visa_table.write().unwrap();
+            update(&mut visa_table, &self.peer_table)
+        };
+        self.withdraw_streams(withdrawn, None);
+        result
     }
 
     /// Part of graceful shutdown (or administrative link shutdown).
@@ -1164,6 +1188,7 @@ pub mod test {
             actor_output_requeue,
             vsconn,
             visa_table,
+            last_visa_sweep: Mutex::new(None),
             topology: Default::default(),
             zode_links: Default::default(),
             zode_login: Default::default(),
@@ -1555,7 +1580,7 @@ pub mod test {
                 .bind(visa_id, binding_on(link_id, tether_id), before_the_expiry())
                 .unwrap();
 
-            visa_table.handle_expirations(&asm.peer_table);
+            visa_table.handle_expirations(&asm.peer_table, std::time::SystemTime::now());
             assert!(!visa_table.contains(visa_id));
             assert_eq!(peer.pft.len(), 0);
             drop(visa_table);

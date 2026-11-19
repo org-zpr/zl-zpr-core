@@ -1212,8 +1212,9 @@ mod test {
     /// zl-zipline#250, gate g78 q5: a Zode link never re-keys, so a ZPI 0
     /// packet arriving on an established Zode link is a new handshake from
     /// the same address and passes the fastpath (as a null packet, which
-    /// may only carry key management). On an adapter link with an SA, ZPI 0
-    /// is still refused.
+    /// may only carry key management). On any other link with an SA (an
+    /// internal link here; no other link type exists), ZPI 0 is still
+    /// refused.
     #[tokio::test(flavor = "local")]
     async fn test_zpi_0_on_established_link_passes_only_for_zode_links() {
         use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
@@ -1223,9 +1224,9 @@ mod test {
             "b.zpr",
             crate::link_state::LinkState::Active,
         );
-        let adapter = crate::peer_table::test::insert_peer_with_verified_cn(
+        let other = crate::peer_table::test::insert_peer_with_verified_cn(
             &asm,
-            crate::link_state::LinkType::NodeToAdapter,
+            crate::link_state::LinkType::Internal,
             "c.zpr",
             crate::link_state::LinkState::Active,
         );
@@ -1233,7 +1234,7 @@ mod test {
 
         assert!(decrypt(&asm, zpi, &mut null_packet_on(zode)).is_ok());
         assert!(matches!(
-            decrypt(&asm, zpi, &mut null_packet_on(adapter)),
+            decrypt(&asm, zpi, &mut null_packet_on(other)),
             Err(DecryptError::UnknownZpi)
         ));
     }

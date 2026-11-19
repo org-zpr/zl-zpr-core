@@ -50,7 +50,6 @@ pub enum LinkEvent {
     Start,
     KeyingDone,
     ReceivedHelloRequest,
-    AssignedAAA(IpAddress), // Assigned AAA address for this link
     ReceivedHelloResponse {
         status: ResponseCode,
         aaa_address: Option<IpAddress>,
@@ -86,7 +85,6 @@ pub enum LinkType {
     /// other's CA-signed certificate, the dialer says Hello, and neither end
     /// hands out an AAA address. Which end this Zode is lives in [ZodeEnd].
     NodeToNode,
-    NodeToAdapter,
 }
 
 /// Which end of a Zode (NodeToNode) link this Zode is (zl-zipline#250). Set
@@ -346,52 +344,36 @@ impl LinkStateWrapper {
         self.locked_fsm.lock().unwrap().logical_clock
     }
 
+    /// Answer the dialer's HelloRequest on a Zode link this Zode answered.
+    /// Only the answering end of a Zode link expects a HelloRequest.
     fn process_hello_request(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
         let locked_fsm = self.locked_fsm.lock().unwrap();
-        let zode_answerer = self.zode_end() == Some(&ZodeEnd::Answerer);
-        if !(self.link_type == LinkType::NodeToAdapter || zode_answerer)
-            || locked_fsm.state != LinkState::Helloing
-        {
+        if self.zode_end() != Some(&ZodeEnd::Answerer) || locked_fsm.state != LinkState::Helloing {
             return Err(LinkStateError::UnexpectedTransition(
                 locked_fsm.state,
                 "ReceivedHelloRequest",
             ));
         }
-        if zode_answerer {
-            // zl-zipline#250: a Zode link carries no AAA address, no identity
-            // providers and no bootstrap flag. The peer is known by its
-            // CN-checked certificate, and its ZPR address comes from the
-            // topology, never from Hello.
-            mgmt::requests::send_hello_success_response(asm, self.id, 0, &[], None).enqueue();
-            return self.run_active_zode(asm, locked_fsm);
-        }
-        let aaa = asm.address_pool.lock().unwrap().as_mut().map(|pool| {
+        // zl-zipline#250: a Zode link carries no AAA address, no identity
+        // providers and no bootstrap flag. The peer is known by its
+        // CN-checked certificate, and its ZPR address comes from the
+        // topology, never from Hello.
+        mgmt::requests::send_hello_success_response(asm, self.id, 0, &[], None).enqueue();
+        self.run_active_zode(asm, locked_fsm)
+    }
+
+    /// Take an AAA address for a new link from the pool the visa service
+    /// configured, or `None` when it has configured none. The caller hands
+    /// it to [Self::install_aaa] or [Self::process_assigned_aaa], so that
+    /// link cleanup gives it back.
+    // AAA kept unused in v1 (zodes plan §5.4)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn allocate_aaa(asm: &Assembly) -> Option<IpAddress> {
+        asm.address_pool.lock().unwrap().as_mut().map(|pool| {
             let aaa = pool.get_aaa_address();
             debug!(target: LINK_STATE, "allocated AAA {aaa}; {} active reservations", pool.len());
             aaa
-        });
-        if aaa.is_none() {
-            mgmt::requests::send_hello_error_response(
-                asm,
-                self.id,
-                ResponseCode::TemporarilyUnavailable,
-            )
-            .enqueue();
-            drop(locked_fsm);
-            return self.initiate_close(asm, TerminateReason::Other);
-        }
-        if let Some(aaa) = aaa {
-            self.process_assigned_aaa(asm, aaa)?;
-        }
-        mgmt::requests::send_hello_success_response(
-            asm,
-            self.id,
-            0,
-            &crate::auth_agent::advertised_oidc_idps(asm, self.id),
-            aaa,
-        )
-        .enqueue();
-        self.run_active(asm, locked_fsm)
+        })
     }
 
     fn process_hello_response(
@@ -494,7 +476,6 @@ impl LinkStateWrapper {
             LinkEvent::Start => self.process_start(asm),
             LinkEvent::KeyingDone => self.process_keying_done(asm),
             LinkEvent::ReceivedHelloRequest => self.process_hello_request(asm),
-            LinkEvent::AssignedAAA(addr) => self.process_assigned_aaa(asm, addr),
             LinkEvent::ReceivedHelloResponse {
                 status,
                 aaa_address,
@@ -520,7 +501,7 @@ impl LinkStateWrapper {
         }
     }
 
-    /// Start an inactive link/tether
+    /// Start an inactive Zode link
     /// Transitions from Inactive -> Keying
     /// Will trigger key management messages to be sent if this Zode dialed
     /// the link
@@ -583,22 +564,6 @@ impl LinkStateWrapper {
                 // Bound keying on both ends: a dialer whose peer never
                 // answers, and an answerer whose dialer went away.
                 self.set_timeout(asm, &mut locked_fsm, config::ZODE_KEYING_TIMEOUT);
-                Ok(())
-            }
-            LinkType::NodeToAdapter => {
-                km_multiplexor::add_node_link(
-                    asm,
-                    link_id,
-                    ZPIPair::new(ZPI_ENCRYPTED_HEADER_FLAG | 3, 4),
-                    asm.self_noise_keypair.clone().unwrap(),
-                    asm.certx.clone().unwrap(),
-                )
-                .unwrap();
-                // The node is the noise responder and never re-initiates,
-                // so bound how long it waits for keying to finish
-                // (zipline#173). `KeyingDone` moves the FSM to Helloing,
-                // and that state change cancels this timer.
-                self.set_timeout(asm, &mut locked_fsm, config::NODE_KEYING_TIMEOUT);
                 Ok(())
             }
             LinkType::Internal => {
@@ -707,9 +672,11 @@ impl LinkStateWrapper {
         Ok(())
     }
 
-    /// This is called when we receive an AAA address assignment.
-    /// Does not generate an error.
-    fn process_assigned_aaa(
+    /// Record `aaa_addr` as this link's AAA address, so that link cleanup
+    /// gives it back to the pool. Does not generate an error.
+    // AAA kept unused in v1 (zodes plan §5.4)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn process_assigned_aaa(
         &self,
         _asm: &Arc<Assembly>,
         aaa_addr: IpAddress,
@@ -749,18 +716,6 @@ impl LinkStateWrapper {
             (LinkType::NodeToNode, LinkState::Keying | LinkState::Helloing) => {
                 // Timeout here means we give up on the link.
                 error!(target: LINK_STATE, "{}: timed out in state {:?}", asm.formatted_link_id(self.id), locked_fsm.state);
-                locked_fsm.set_state(LinkState::Error);
-                drop(locked_fsm);
-                return self.initiate_close(asm, TerminateReason::RequestTimedOut);
-            }
-
-            (LinkType::NodeToAdapter, LinkState::Keying) => {
-                // The adapter never completed the noise handshake within
-                // NODE_KEYING_TIMEOUT (zipline#173). Drop the link: the
-                // close path removes the peer entry and stops the KM, and
-                // an adapter that is still alive will dock afresh.
-                warn!(target: LINK_STATE, "{}: keying not completed within {:?}, closing link",
-                    asm.formatted_link_id(self.id), config::NODE_KEYING_TIMEOUT);
                 locked_fsm.set_state(LinkState::Error);
                 drop(locked_fsm);
                 return self.initiate_close(asm, TerminateReason::RequestTimedOut);
@@ -970,8 +925,7 @@ impl LinkStateWrapper {
             // zl-zipline#250: a closed Zode link drops its peer entry on
             // both ends, which clears everything tied to it (ZODE_LINKS.md
             // rule 9). It never restarts itself: only its owner redials.
-            (LinkState::Closing, LinkType::NodeToAdapter | LinkType::NodeToNode)
-            | (LinkState::Resetting, _) => {
+            (LinkState::Closing, LinkType::NodeToNode) | (LinkState::Resetting, _) => {
                 // Clear whole peer out
                 drop(locked_fsm);
                 asm.drop_peer(link_id);
@@ -1201,16 +1155,6 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::task::LocalSet;
 
-    fn hello_link(link_type: LinkType) -> LinkStateWrapper {
-        let link = LinkStateWrapper::new(3, link_type);
-        {
-            let mut fsm = link.locked_fsm.lock().unwrap();
-            fsm.status = LinkStatus::Up;
-            fsm.set_state(LinkState::Helloing);
-        }
-        link
-    }
-
     #[test]
     fn readiness_tracks_all_link_states() {
         let link = LinkStateWrapper::new(3, LinkType::NodeToNode);
@@ -1244,7 +1188,9 @@ mod tests {
     }
 
     /// A `TunCtl` whose addresses live in a shared list, so a test can see
-    /// what `install_aaa` and link cleanup did to the TUN.
+    /// what `install_aaa` and link cleanup did to the TUN. An AAA goes on
+    /// the TUN only as an authentication address: a plain `add_address`
+    /// fails the test.
     struct AaaTunCtl(Arc<Mutex<Vec<std::net::IpAddr>>>);
 
     impl crate::tun_ctl::TunCtl for AaaTunCtl {
@@ -1255,15 +1201,15 @@ mod tests {
             Ok(())
         }
         fn add_address(&self, addr: std::net::IpAddr, _prefix_len: u8) -> std::io::Result<()> {
-            self.0.lock().unwrap().push(addr);
-            Ok(())
+            panic!("{addr} added as a plain address; an AAA is an authentication address");
         }
         fn add_authentication_address(
             &self,
             addr: std::net::IpAddr,
-            prefix_len: u8,
+            _prefix_len: u8,
         ) -> std::io::Result<()> {
-            self.add_address(addr, prefix_len)
+            self.0.lock().unwrap().push(addr);
+            Ok(())
         }
         fn clear_address(&self, addr: std::net::IpAddr, _prefix_len: u8) -> std::io::Result<()> {
             self.0.lock().unwrap().retain(|a| *a != addr);
@@ -1304,12 +1250,58 @@ mod tests {
         }
     }
 
+    /// AAA kept unused in v1 (zodes plan §5.4): `install_aaa` puts the AAA
+    /// on the TUN through `TunCtl::add_authentication_address`, the only
+    /// way [AaaTunCtl] accepts an address.
+    #[tokio::test(flavor = "local")]
+    async fn install_aaa_adds_an_authentication_address() {
+        let aaa_ip: std::net::IpAddr = "fd5a:5052:0:aaa::1".parse().unwrap();
+        let tun = Arc::new(Mutex::new(Vec::new()));
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            tun_ctl: Some(Box::new(AaaTunCtl(tun.clone()))),
+            ..TestAssemblyBuilder::new()
+        }));
+        let link = LinkStateWrapper::new(3, LinkType::NodeToNode);
+        link.install_aaa(&asm, aaa_ip.into()).unwrap();
+        assert_eq!(*tun.lock().unwrap(), vec![aaa_ip]);
+    }
+
+    /// AAA kept unused in v1 (zodes plan §5.4): `allocate_aaa` takes nothing
+    /// until the visa service has configured a pool. An AAA it takes and
+    /// `process_assigned_aaa` records on a link goes back to the pool when
+    /// link cleanup runs, whatever the link type: the pool holds no
+    /// reservation afterwards.
+    #[tokio::test(flavor = "local")]
+    async fn allocated_aaa_is_given_back_by_link_cleanup() {
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        assert_eq!(
+            LinkStateWrapper::allocate_aaa(&asm),
+            None,
+            "no pool, no AAA"
+        );
+
+        *asm.address_pool.lock().unwrap() = Some(
+            crate::address_pool::AddressPool::new("fd5a:5052:0:aaa::/64".parse().unwrap()).unwrap(),
+        );
+        let reservations =
+            |asm: &Assembly| asm.address_pool.lock().unwrap().as_ref().unwrap().len();
+        let aaa = LinkStateWrapper::allocate_aaa(&asm).expect("an AAA from the pool");
+        assert_eq!(reservations(&asm), 1);
+
+        let link = LinkStateWrapper::new(3, LinkType::NodeToNode);
+        link.process_assigned_aaa(&asm, aaa).unwrap();
+        link.test_set_state(LinkState::Closing);
+        let _ = link.clean_up_link_state(&asm);
+        assert_eq!(link.aaa_address(), None);
+        assert_eq!(reservations(&asm), 0, "cleanup gave the AAA back");
+    }
+
     #[tokio::test]
     async fn aaa_assignment_waits_for_cleanup_ownership() {
         use std::net::IpAddr;
 
         let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-        let link = LinkStateWrapper::new(3, LinkType::NodeToAdapter);
+        let link = LinkStateWrapper::new(3, LinkType::NodeToNode);
         let aaa = "fd5a:5052:0:aaa::1".parse::<IpAddr>().unwrap().into();
         let data = link.locked_data.lock().unwrap();
         std::thread::scope(|scope| {
@@ -1331,42 +1323,6 @@ mod tests {
             assert!(unchanged);
         });
         assert_eq!(link.aaa_address(), Some(aaa));
-    }
-
-    #[tokio::test]
-    async fn ordinary_hello_cannot_succeed_without_aaa() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                let node = hello_link(LinkType::NodeToAdapter);
-                node.process_hello_request(&asm).unwrap();
-                assert!(!node.is_ready());
-                assert_eq!(node.get_state(), LinkState::Closing);
-            })
-            .await;
-    }
-
-    /// Insert a node-side (NodeToAdapter) peer and return its link id.
-    fn add_node_peer(asm: &Arc<Assembly>) -> LinkId {
-        add_peer(asm, LinkType::NodeToAdapter, 9500)
-    }
-
-    /// Insert a peer of `link_type` whose substrate port is `base_port`
-    /// plus its link id, and return the link id.
-    fn add_peer(asm: &Arc<Assembly>, link_type: LinkType, base_port: u16) -> LinkId {
-        use crate::peer_table::test::create_dummy_peer_state;
-        use std::net::Ipv4Addr;
-        use zpr_utils::net_defs::ScopedIpAddr;
-
-        let entry = asm.peer_table.vacant_entry().unwrap();
-        let link_id = entry.key();
-        let peer = create_dummy_peer_state(
-            link_id,
-            link_type,
-            SubstrateAddr::from(([127, 0, 0, 1], base_port + link_id.get() as u16)),
-            ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
-        );
-        entry.insert(peer).get()
     }
 
     /// A test assembly whose links can be started: `process_start` hands
@@ -1956,75 +1912,6 @@ mod tests {
                     generation_before,
                     "the new session must be distinguishable from the old one"
                 );
-            })
-            .await
-    }
-
-    /// zipline#173: a node-side link whose peer never completes the noise
-    /// handshake must not sit in Keying forever. Nothing here answers the
-    /// responder, so the link can only leave Keying by timing out after
-    /// NODE_KEYING_TIMEOUT; once it does, the close path removes the peer
-    /// entry altogether.
-    #[tokio::test(start_paused = true)]
-    async fn test_node_link_stuck_in_keying_is_torn_down() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = keyable_assembly();
-                let link_id = add_node_peer(&asm);
-
-                asm.process_link_state_event(link_id, LinkEvent::Start)
-                    .unwrap();
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Keying);
-
-                // Just before the deadline the link is still waiting.
-                let one_sec = Duration::from_secs(1);
-                tokio::time::sleep(config::NODE_KEYING_TIMEOUT - one_sec).await;
-                assert_eq!(
-                    link_state_of(&asm, link_id),
-                    LinkState::Keying,
-                    "node link torn down before NODE_KEYING_TIMEOUT"
-                );
-
-                // Past the deadline plus the terminate timeout the close has
-                // completed and the peer entry is gone.
-                tokio::time::sleep(2 * one_sec + config::DEFAULT_TERMINATE_TIMEOUT).await;
-                assert!(
-                    asm.peer_table.get(link_id).is_none(),
-                    "node link that never completed keying is still in the peer table \
-                     (state {:?})",
-                    asm.peer_table
-                        .get(link_id)
-                        .map(|p| p.link_state_machine.get_state())
-                );
-            })
-            .await
-    }
-
-    /// zipline#173: the keying deadline only applies while Keying. A node
-    /// link that finishes keying in time (the FSM leaves Keying, as it does
-    /// on `KeyingDone`) must survive past NODE_KEYING_TIMEOUT.
-    #[tokio::test(start_paused = true)]
-    async fn test_node_link_keying_done_cancels_keying_timeout() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = keyable_assembly();
-                let link_id = add_node_peer(&asm);
-
-                asm.process_link_state_event(link_id, LinkEvent::Start)
-                    .unwrap();
-                asm.peer_table
-                    .get(link_id)
-                    .unwrap()
-                    .link_state_machine
-                    .test_set_state(LinkState::Helloing);
-
-                tokio::time::sleep(config::NODE_KEYING_TIMEOUT * 2).await;
-
-                let peer = asm
-                    .peer_table
-                    .get(link_id)
-                    .expect("keyed node link was torn down by the keying deadline");
-                assert_eq!(peer.link_state_machine.get_state(), LinkState::Helloing);
             })
             .await
     }

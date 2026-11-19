@@ -189,30 +189,9 @@ pub async fn launch_message_worker(
     }
 }
 
-/// Creates a new KeyManager for the link from a node to an adapter and starts its state machine.  A node link waits for a
-/// KM initiator.
-///
-/// - `link_id` is the link to the peer, in this case better be a link to an adapter.
-/// - `local_noise_key` is the local noise key for the dock (public part of this key must be shared out of band with adapters).
-///
-/// Note that the link must already have a peer_table entry.
-pub fn add_node_link(
-    asm: &Assembly,
-    link_id: LinkId,
-    recv_zpis: ZPIPair,
-    local_noise_key: NoiseKeypair,
-    certx: KmCertExchange,
-) -> Result<(), KmSetupError> {
-    let noise = match KmNoise::new(false, false, Some(local_noise_key), recv_zpis, certx) {
-        Ok(n) => n,
-        Err(e) => return Err(KmSetupError::InitializationError(e)),
-    };
-    add_noise_link(asm, link_id, noise)
-}
-
 /// Creates a new KeyManager for a link between two Zodes and starts its state machine (zl-zipline#220).
 ///
-/// Unlike the node side of a dock above, both ends verify: each requires the
+/// Both ends verify: each requires the
 /// peer to present a certificate signed by our CA whose key is the peer's
 /// Noise static key. A Zode without a CA certificate cannot start the link.
 ///

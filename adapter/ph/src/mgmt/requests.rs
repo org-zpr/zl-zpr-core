@@ -62,8 +62,10 @@ pub fn send_hello_request(
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloRequest, pkt)
 }
 
-/// AAA address is optional, but will usually be specified.  Only is not specified if this node
-/// has not established a VSS connection with the visa service yet.
+/// Send a successful HelloResponse on `link_id`. A Zode answering a Zode
+/// link passes no AAA address and no identity providers (zl-zipline#250).
+/// The `aaa_address` parameter stays: AAA kept unused in v1 (zodes plan
+/// §5.4).
 ///
 /// `oidc_idps` advertises off-net OIDC identity providers (one `OIDC_IDP` TLV
 /// each); empty when the visa service has none configured.

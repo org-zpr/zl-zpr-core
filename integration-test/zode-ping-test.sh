@@ -64,8 +64,21 @@ function assert_ph_cli_tun() {
 # Assert that Zode $1 counted no actor packet out of order. Each fastpath
 # worker reports its own counter, so `ph-cli counters` prints one line per
 # worker; this sums them.
+#
+# ph tracks out-of-order actor packets only in a debug build: the counter
+# and its tracker are `#[cfg(debug_assertions)]` (counters.rs, fastpath.rs).
+# Core CI runs a debug ph and says so with PH_DEBUG_BUILD=1; zpr-dev's netns
+# tier runs a release one. The counter is required, present and 0, when
+# PH_DEBUG_BUILD=1 or when $PH_BIN contains the counter's name, so a debug
+# ph that stops reporting it (in CI even under a new name), or a ph-cli that
+# prints it differently, fails. Otherwise $PH_BIN was built without the
+# counter, and the check is reported as not measured.
 function assert_no_actor_ooo() {
   local OUT TOTAL
+  if [[ "${PH_DEBUG_BUILD:-}" != 1 ]] && ! grep -qaF "Actor Packets Out-Of-Order" "$PH_BIN"; then
+    echo "not measured: $1 runs a ph built without the out-of-order counter (a release build)"
+    return 0
+  fi
   if ! OUT=$("$PH_DEBUG_BIN" -p "$1.sock" counters); then
     echo "ASSERTION FAILED: ph-cli counters on $1 exited non-zero"
     return 1

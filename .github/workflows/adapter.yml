@@ -269,6 +269,9 @@ jobs:
     - name: Set env
       run: |
         echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
+        # The ph under test is the debug build above; zode-ping-test.sh then
+        # requires its debug-only out-of-order counter to be present and 0.
+        echo "PH_DEBUG_BUILD=1" >> $GITHUB_ENV
 
     - name: Install valkey
       timeout-minutes: 5

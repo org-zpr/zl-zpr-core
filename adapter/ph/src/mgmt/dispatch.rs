@@ -27,12 +27,8 @@ pub fn dispatch_mgmt_packet_with_addr(
         Ok((base_hdr, _)) if base_hdr.packet_type == zdp::ZdpPacketType::KeyManagement => {
             pkt.advance(std::mem::size_of::<zdp::ZdpBaseHeader>());
 
-            // TODO: once we have multi-node, how do we know whether this is a link or a
-            // tether?
-
-            // It is possible we are processing a queue of messages and we have already set up a
-            // tether for this source.  So before trying to start a tether check if we already have one.
-
+            // It is possible we are processing a queue of messages and we
+            // have already set up a link for this source, so look it up first.
             let mut ingress_link_id = asm
                 .peer_table
                 .lookup_peer(&peer_sa, &interface_addr)
@@ -46,15 +42,17 @@ pub fn dispatch_mgmt_packet_with_addr(
             }
 
             if ingress_link_id == LINK_ID_UNKNOWN {
-                // A dialing Zode marks its first handshake message
-                // (zl-zipline#250); anything else docks as an adapter.
-                let started = match inbound_link_type(km_noise_message(pkt.body())) {
-                    LinkType::NodeToNode => {
+                // Only a Zode opens a link (zl-zipline#234), and a dialing
+                // Zode marks its first handshake message (zl-zipline#250).
+                // Anything else, an adapter's dock included, is refused.
+                let started =
+                    if crate::km_noise::starts_zode_handshake(km_noise_message(pkt.body())) {
                         asm.start_zode_link(&peer_sa, &interface_addr, ZodeEnd::Answerer)
-                    }
-                    _ => asm.start_tether(&peer_sa, &interface_addr),
-                };
-                let Some(i_link_id) = started.ok() else {
+                            .ok()
+                    } else {
+                        None
+                    };
+                let Some(i_link_id) = started else {
                     core::count_event(asm, ManagementCounterType::UnknownPeer);
                     return;
                 };
@@ -69,17 +67,6 @@ pub fn dispatch_mgmt_packet_with_addr(
             core::count_event(asm, ManagementCounterType::UnknownPeer);
             return;
         }
-    }
-}
-
-/// The link type for a new inbound link whose first key-management message
-/// is `km_msg` (zl-zipline#250): a Zode link when it opens a Zode handshake,
-/// an adapter dock otherwise.
-fn inbound_link_type(km_msg: &[u8]) -> LinkType {
-    if crate::km_noise::starts_zode_handshake(km_msg) {
-        LinkType::NodeToNode
-    } else {
-        LinkType::NodeToAdapter
     }
 }
 
@@ -447,15 +434,15 @@ mod test {
         )
     }
 
-    /// zl-zipline#250: a node creates a Zode link for an unknown peer whose
-    /// first handshake message carries the Zode marker, and an adapter
-    /// dock for anything else.
+    /// zl-zipline#250, #234: only a first handshake message that carries
+    /// the Zode marker opens a link; an adapter's unmarked handshake, and
+    /// a message that is not a handshake at all, open nothing.
     #[test]
-    fn test_inbound_link_type_from_first_handshake_message() {
+    fn test_only_a_first_zode_handshake_message_is_marked() {
         let (zode_msg0, adapter_msg0) = first_messages();
-        assert_eq!(inbound_link_type(&zode_msg0), LinkType::NodeToNode);
-        assert_eq!(inbound_link_type(&adapter_msg0), LinkType::NodeToAdapter);
-        assert_eq!(inbound_link_type(&[]), LinkType::NodeToAdapter);
+        assert!(crate::km_noise::starts_zode_handshake(&zode_msg0));
+        assert!(!crate::km_noise::starts_zode_handshake(&adapter_msg0));
+        assert!(!crate::km_noise::starts_zode_handshake(&[]));
     }
 
     /// Review round 2: with `--km-impl null` the Noise handshake goes out
@@ -467,17 +454,17 @@ mod test {
         body.extend_from_slice(&KM_ID_NULL.to_be_bytes());
         body.extend_from_slice(&(zode_msg0.len() as u16).to_be_bytes());
         body.extend_from_slice(&zode_msg0);
-        assert_eq!(
-            inbound_link_type(km_noise_message(&body)),
-            LinkType::NodeToNode
-        );
+        assert!(crate::km_noise::starts_zode_handshake(km_noise_message(
+            &body
+        )));
     }
 
-    /// zl-zipline#250: dispatching a marked first message from an unknown
-    /// address creates a NodeToNode link with this Zode as the answerer;
-    /// an unmarked one still docks an adapter.
+    /// zl-zipline#250, #234: dispatching a marked first message from an
+    /// unknown address creates a NodeToNode link with this Zode as the
+    /// answerer. An unmarked one (an adapter's dock) is refused: no link is
+    /// created and the packet is counted as from an unknown peer.
     #[tokio::test(flavor = "local")]
-    async fn test_unknown_peer_marked_handshake_creates_zode_link() {
+    async fn test_unknown_peer_marked_handshake_creates_zode_link_unmarked_is_refused() {
         let ca = crate::pki::TestCa::new("zode-ca");
         let (kp, certx) = crate::assembly::test::zode_link_keys(&ca, "relay.zpr");
         let asm = Arc::new(create_assembly(TestAssemblyBuilder {
@@ -502,7 +489,15 @@ mod test {
                 .get_link_type()
         };
         assert_eq!(link_type_at(zode_sa), LinkType::NodeToNode);
-        assert_eq!(link_type_at(adapter_sa), LinkType::NodeToAdapter);
+        assert!(
+            asm.peer_table
+                .lookup_peer(&adapter_sa, &intf_addr)
+                .is_none()
+        );
+        assert_eq!(
+            asm.counters.management[ManagementCounterType::UnknownPeer].get_count(),
+            1
+        );
         let id = asm.peer_table.lookup_peer(&zode_sa, &intf_addr).unwrap();
         assert_eq!(
             asm.peer_table
@@ -858,7 +853,7 @@ mod test {
         let (mp_outq_out, mut mp_outq_in) = tokio::sync::oneshot::channel();
         let peer_state = PeerState::new(
             peer_entry.key(),
-            LinkType::NodeToAdapter,
+            LinkType::NodeToNode,
             peer_sa,
             intf_addr,
             move |q| {

@@ -106,6 +106,7 @@ pub enum FastpathCounterType {
     OtherError,
 
     TtlExpired,
+    VisaExpired, // the stream's visa has expired (zl-zipline#274)
 
     #[cfg(debug_assertions)]
     ActorPacketsOutOfOrder,
@@ -204,6 +205,7 @@ impl FastpathCounterType {
             Self::OtherError => "Fastpath Other Error",
 
             Self::TtlExpired => "TTL Reached 0",
+            Self::VisaExpired => "Visa Expired",
 
             #[cfg(debug_assertions)]
             Self::ActorPacketsOutOfOrder => "Actor Packets Out-Of-Order",

@@ -1208,10 +1208,12 @@ pub mod test {
         use crate::peer_table::test::create_dummy_peer_state;
         use crate::visa_table::VisaTable;
         use crate::visa_table::tests::{
-            ALREADY_EXPIRED, binding_on, never_expires, new_vsapi_visa_tcp_default,
+            ALREADY_EXPIRED, before_the_expiry, binding_on, never_expires,
+            new_vsapi_visa_tcp_default,
         };
         use crate::zdp;
         use std::net::Ipv4Addr;
+        use std::time::SystemTime;
         use zpr_utils::net_defs;
 
         /// Build a Node-mode assembly whose mgmt substrate egress queue we
@@ -1278,12 +1280,16 @@ pub mod test {
                 .get(link)
                 .unwrap()
                 .pft
-                .insert(PftPep::new(ForwardingEntry(link, 1), VISA_ID))
+                .insert(PftPep::new(
+                    ForwardingEntry(link, 1),
+                    VISA_ID,
+                    never_expires(),
+                ))
                 .unwrap();
             asm.visa_table
                 .write()
                 .unwrap()
-                .bind(VISA_ID, binding_on(link, tether))
+                .bind(VISA_ID, binding_on(link, tether), SystemTime::now())
                 .unwrap();
             tether
         }
@@ -1539,10 +1545,14 @@ pub mod test {
             let peer = asm.peer_table.get(link_id).unwrap();
             let tether_id = peer
                 .pft
-                .insert(PftPep::new(ForwardingEntry(link_id, 1), visa_id))
+                .insert(PftPep::new(
+                    ForwardingEntry(link_id, 1),
+                    visa_id,
+                    never_expires(),
+                ))
                 .unwrap();
             visa_table
-                .bind(visa_id, binding_on(link_id, tether_id))
+                .bind(visa_id, binding_on(link_id, tether_id), before_the_expiry())
                 .unwrap();
 
             visa_table.handle_expirations(&asm.peer_table);

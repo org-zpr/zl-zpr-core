@@ -15,10 +15,11 @@ use crate::forwarding_tables;
 use crate::peer_table::PeerType;
 use crate::prelude::*;
 use crate::visa_mgmt;
-use crate::visa_table::{StreamBinding, Visa, VisaTable, VisaTableError};
+use crate::visa_table::{StreamBinding, VisaTable, VisaTableError};
 
 use dashmap::DashMap;
 use std::num::NonZero;
+use std::time::SystemTime;
 use zpr::vsapi_types::{CommFlag, PacketDesc, VisaRequest, VsapiFiveTuple, vsapi_ip_number};
 use zpr_utils::net_defs::IpAddress;
 
@@ -388,7 +389,7 @@ pub fn request_stream(
         .read()
         .unwrap()
         .get(visa_id)
-        .map(Visa::has_expired);
+        .map(|visa| visa.has_expired_at(SystemTime::now()));
     match held_visa_expired {
         // Visa found.
         Some(false) => return requested_visa_granted(asm, ingress_link_id, txn_id, visa_id),
@@ -844,8 +845,14 @@ fn rebind_granted(
     new_egress: ForwardingEntry,
 ) {
     let mut visa_table = asm.visa_table.write().unwrap();
-    let committed =
-        visa_table.commit_supersede(&asm.peer_table, old, new, ingress.clone(), new_egress);
+    let committed = visa_table.commit_supersede(
+        &asm.peer_table,
+        old,
+        new,
+        ingress.clone(),
+        new_egress,
+        SystemTime::now(),
+    );
     // Read under the same lock as the refusal, so the two agree.
     let newer = visa_table.successor_of(old);
     drop(visa_table);
@@ -956,11 +963,21 @@ fn requested_tether_granted(
                     ingress: ForwardingEntry(ingress_link_id.get(), ingress_tether_entry.key()),
                     egress: ForwardingEntry(egress_link_id.get(), egress_tether_id),
                 };
-                match visa_table.bind(visa_id, binding.clone()) {
+                // A visa that has expired since the request came in binds
+                // nothing (zl-zipline#274).
+                match visa_table.bind(visa_id, binding.clone(), SystemTime::now()) {
                     Err(_) => Err("policy error"),
                     Ok(successor) => {
-                        let ingress_tether_id = ingress_tether_entry
-                            .insert(forwarding_tables::PftPep::new(binding.egress, visa_id));
+                        // The entry carries the visa's expiry, which the
+                        // fast path checks on every packet.
+                        let expires = visa_table
+                            .get(visa_id)
+                            .expect("a bound visa is held")
+                            .visa()
+                            .expires;
+                        let ingress_tether_id = ingress_tether_entry.insert(
+                            forwarding_tables::PftPep::new(binding.egress, visa_id, expires),
+                        );
                         Ok((ingress_tether_id, tc, peer_a2a_dh_pubkey, successor))
                     }
                 }
@@ -2011,6 +2028,7 @@ mod tests {
             .insert(forwarding_tables::PftPep::new(
                 ForwardingEntry(zode_link, 42),
                 own_visa,
+                never_expires(),
             ))
             .unwrap();
         visa_table
@@ -2020,6 +2038,7 @@ mod tests {
                     ingress: ForwardingEntry(actor, actor_stream),
                     egress: ForwardingEntry(zode_link, 42),
                 },
+                SystemTime::now(),
             )
             .unwrap();
         drop(visa_table);
@@ -3068,6 +3087,7 @@ mod tests {
                     .insert(forwarding_tables::PftPep::new(
                         ForwardingEntry(zode_link, 42),
                         expired,
+                        never_expires(),
                     ))
                     .unwrap();
                 visa_table
@@ -3077,6 +3097,7 @@ mod tests {
                             ingress: ForwardingEntry(actor, live_stream),
                             egress: ForwardingEntry(zode_link, 42),
                         },
+                        crate::visa_table::tests::before_the_expiry(),
                     )
                     .unwrap();
                 drop(visa_table);
@@ -3139,6 +3160,7 @@ mod tests {
                     .insert(forwarding_tables::PftPep::new(
                         ForwardingEntry(link_b, 42),
                         expired,
+                        never_expires(),
                     ))
                     .unwrap();
                 visa_table
@@ -3148,6 +3170,7 @@ mod tests {
                             ingress: ForwardingEntry(link_a.get(), live_stream),
                             egress: ForwardingEntry(link_b, 42),
                         },
+                        crate::visa_table::tests::before_the_expiry(),
                     )
                     .unwrap();
                 drop(visa_table);
@@ -3169,5 +3192,58 @@ mod tests {
                 );
             })
             .await
+    }
+
+    // ---- Visa expiry on every use (zl-zipline#274) ----
+
+    /// zl-zipline#274 (D2): the visa a Stream ID Request named was live
+    /// when the request came in, and has expired by the time the next hop
+    /// grants its stream. The grant is not installed: the requestor gets
+    /// the policy-error refusal, and no PFT entry or binding is left. The
+    /// same holds for a visa fetched by ID meanwhile, which is bound
+    /// through the same path.
+    #[tokio::test]
+    async fn test_a_stream_id_grant_for_an_expired_visa_is_rejected() {
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+        try_recv_packet(&mut egress_rx).expect("a StreamIdRequest to the next hop");
+
+        // While the next-hop bind is outstanding, the visa's lifetime runs
+        // out. A held visa is never edited, so the table is given what it
+        // holds from then on: the same visa, expired.
+        {
+            let mut visa_table = asm.visa_table.write().unwrap();
+            visa_table.revoke(&asm.peer_table, VISA_ID).unwrap();
+            visa_table
+                .insert_visa(new_vsapi_visa_forward_only_from(
+                    VISA_ID,
+                    crate::visa_table::tests::ALREADY_EXPIRED,
+                    Some(prev_hop()),
+                    next_hop(),
+                ))
+                .unwrap();
+        }
+
+        let egress_txn = asm
+            .peer_table
+            .get(link_b)
+            .unwrap()
+            .node_state
+            .awaiting_next_hop_bind_table
+            .iter()
+            .next()
+            .expect("the next-hop bind is outstanding")
+            .key()
+            .clone();
+        install_tether(&asm, NonZero::new(link_b).unwrap(), &egress_txn, 42).unwrap();
+
+        assert_only_stream_id_error_response(&mut egress_rx, link_a);
+        assert_eq!(
+            asm.peer_table.get(link_a).unwrap().pft.len(),
+            0,
+            "no PFT entry"
+        );
+        assert!(asm.visa_table.read().unwrap().bindings(VISA_ID).is_empty());
+        assert!(no_bind_state(&asm, link_a));
     }
 }

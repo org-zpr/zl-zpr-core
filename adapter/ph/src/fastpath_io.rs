@@ -834,6 +834,39 @@ mod tests {
 
     // ---- zl-zipline#270: a send the host refuses ----
 
+    /// zl-zipline#270: the drop warning names the cause. A refused send
+    /// points at the host (a firewall rule); a network-change drop keeps the
+    /// #230 wording about a vanished local address. Both name the source,
+    /// the destination and the error.
+    #[test]
+    fn send_drop_message_names_the_cause() {
+        use super::send_drop_message;
+
+        let src: zpr_utils::net_defs::ScopedIpAddr =
+            std::net::IpAddr::from(std::net::Ipv4Addr::new(192, 0, 2, 1)).into();
+        let dst: std::net::SocketAddr = "198.51.100.7:4433".parse().unwrap();
+        let err = Error::from(ErrorKind::PermissionDenied);
+
+        let refused = send_drop_message(SendDropCause::Refused, &src, &dst, &err);
+        assert_eq!(
+            refused,
+            format!(
+                "dropping substrate send from 192.0.2.1 to 198.51.100.7:4433: {err} \
+                 (refused by the host, for example by a firewall rule)"
+            )
+        );
+
+        let changed = send_drop_message(SendDropCause::NetworkChange, &src, &dst, &err);
+        assert_eq!(
+            changed,
+            format!(
+                "dropping substrate send from 192.0.2.1 to 198.51.100.7:4433: {err} \
+                 (the local address may be gone after a network change; \
+                 the link's keep-alive will close it)"
+            )
+        );
+    }
+
     /// The destination of a send the host refuses without any firewall
     /// setup: the IPv4 limited broadcast address, which a socket without
     /// `SO_BROADCAST` may not send to (Linux and macOS: `EACCES`; Windows:

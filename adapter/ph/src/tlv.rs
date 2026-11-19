@@ -26,7 +26,10 @@ impl DataType {
 
     pub const POLICY_ID: TlvType = 1;
     pub const VERSION: TlvType = 2;
-    pub const AAA: TlvType = 3; // Actor Authentication Address - temporary address actor may use for authentication
+    /// Actor Authentication Address: a temporary address an actor may use
+    /// for authentication. AAA kept unused in v1 (zodes plan §5.4): never
+    /// sent on a Zode link, and refused when a Zode link carries it.
+    pub const AAA: TlvType = 3;
     // TlvType 4 was ASA (Authentication Service SocketAddress), removed with
     // the legacy BAS/OAuthRsa client (zipline#15); unknown TLVs are skipped by
     // the parser, so older peers that still send it remain compatible.

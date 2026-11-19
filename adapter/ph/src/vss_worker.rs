@@ -317,6 +317,45 @@ mod tests {
     use tokio::task::LocalSet;
     use zpr_utils::net_defs::IpAddress;
 
+    /// An `AAA_PREFIX` configuration parameter.
+    fn aaa_prefix(value: &str) -> Param {
+        Param {
+            name: pname::AAA_PREFIX.to_string(),
+            value: ParamValue::StrParam(value.to_string()),
+        }
+    }
+
+    /// AAA kept unused in v1 (zodes plan §5.4): the visa service still
+    /// pushes `Configure([AAA_PREFIX])`, and the Zode fills its AAA pool
+    /// from it. A prefix that does not parse, or is longer than /88, is
+    /// refused and leaves the pool as it was; so is a second AAA_PREFIX.
+    #[test]
+    fn test_configure_aaa_prefix_fills_the_pool_and_refuses_a_bad_one() {
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        assert!(asm.address_pool.lock().unwrap().is_none());
+
+        let good = "fd5a:5052:0:aaa::/64";
+        process_configuration(&asm, vec![aaa_prefix(good)]).unwrap();
+        let prefix = |asm: &Assembly| {
+            asm.address_pool
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|pool| pool.get_prefix())
+        };
+        assert_eq!(prefix(&asm).as_deref(), Some(good));
+
+        for bad in [
+            vec![aaa_prefix("not a prefix")],
+            vec![aaa_prefix("fd5a:5052:0:aaa::/96")],
+            vec![aaa_prefix(good), aaa_prefix(good)],
+        ] {
+            let err = process_configuration(&asm, bad).unwrap_err();
+            assert_eq!(err.code, ErrorCode::ParamError);
+            assert_eq!(prefix(&asm).as_deref(), Some(good), "the pool is unchanged");
+        }
+    }
+
     /// With `forwarding` off, a pushed forward-only visa is refused and
     /// dropped, but the op is still acked so the visa service's push queue
     /// keeps flowing; the next op in the batch is processed

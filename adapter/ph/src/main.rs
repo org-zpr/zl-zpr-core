@@ -92,9 +92,15 @@ use queues::*;
 use sys::ZprTun;
 use tun_ctl::TunCtl;
 
-use zpr::addrs::{DEFAULT_TETHER_PORT, VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPRNET_PREFIX_LEN};
+use zpr::addrs::{VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPRNET_PREFIX_LEN};
+
 use zpr::packet_info::{DOCK_LINK_ID, LOCAL_ACTOR_LINK_ID};
 use zpr::vsapi_types::AuthServicesList;
+
+/// The UDP port a Zode listens on for its links when `--self-addr` names
+/// none. zl-zpr-common still calls it the tether port, from when adapters
+/// tethered to nodes; there are no tethers any more (zl-zipline#234).
+const DEFAULT_LINK_PORT: u16 = zpr::addrs::DEFAULT_TETHER_PORT;
 
 fn main() -> ExitCode {
     let system_start_time = std::time::Instant::now();
@@ -297,8 +303,8 @@ fn main() -> ExitCode {
     //
 
     if config.self_addr.port() == 0 {
-        config.self_addr.set_port(DEFAULT_TETHER_PORT);
-        info!(target: STARTUP, "listening on default tether port {}", config.self_addr.port());
+        config.self_addr.set_port(DEFAULT_LINK_PORT);
+        info!(target: STARTUP, "listening on default link port {}", config.self_addr.port());
     }
 
     let mut substrate_sockets: Vec<std::net::UdpSocket> = Vec::new();

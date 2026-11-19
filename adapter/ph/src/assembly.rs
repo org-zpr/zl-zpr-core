@@ -180,16 +180,17 @@ impl Assembly {
         join_set.join_all().await;
     }
 
-    /// Disconnect all non-internal peers.
-    /// Used in a node context when (for example) we loose all state with the visa service.
+    /// Reset every peer link (every non-internal peer), except the one
+    /// carrying the VS-API session. Used when (for example) this Zode loses
+    /// all state with the visa service.
     ///
-    /// Zode links are reset too, except the one carrying the VS-API session
+    /// The exception is the link carrying the VS-API session
     /// being reset: a joiner's initial link, the link its bootstrap visas
     /// were handed off on (zl-zipline#252, R16). On a relay this ends every
     /// join riding on it, so each joiner redials and gets a fresh hand-off.
     ///
-    /// Does not remove visas related to the adapter/peer.
-    pub async fn disconnect_adapters(self: &Arc<Self>) {
+    /// Does not remove visas related to the peers.
+    pub async fn reset_peer_links(self: &Arc<Self>) {
         let mut join_set = tokio::task::JoinSet::new();
         let session_link = *self.bootstrap_handoff.borrow();
         self.peer_table.for_each(|(peer_id, peer)| {
@@ -470,37 +471,6 @@ impl Assembly {
         }
     }
 
-    /// Add the node side of an adapter dock (a `NodeToAdapter` tether) to
-    /// the peer table and start it, which begins keying.
-    pub fn start_tether(
-        self: &Arc<Self>,
-        adapter_addr: &SubstrateAddr,
-        interface_addr: &ScopedIpAddr,
-    ) -> Result<NonZero<LinkId>, PeerInsertError> {
-        debug!(target: PEER_MGMT, "Starting tether with {adapter_addr} connected to {interface_addr}");
-        let peer_id = self.add_peer(LinkType::NodeToAdapter, adapter_addr, interface_addr)?;
-
-        let Some(peer) = self.peer_table.get(peer_id.get()) else {
-            // Peer is gone already
-            return Ok(peer_id);
-        };
-
-        if let Err(e) = peer
-            .link_state_machine
-            .process_event(self, LinkEvent::Start)
-        {
-            error!(target: PEER_MGMT, "{} failed to start with error {e}.  Resetting", self.formatted_link_id(peer_id.get()));
-            peer.link_state_machine
-                .process_event(self, LinkEvent::Error)
-                .expect("This shouldn't error!");
-            return Err(PeerInsertError::FailedToStart(e.to_string()));
-        } else {
-            info!(target: PEER_MGMT, "Successfully started tether with {adapter_addr}.  Assigned ID {}", self.formatted_link_id(peer_id.get()));
-        }
-
-        return Ok(peer_id);
-    }
-
     /// Add a Zode-to-Zode link to `peer` and start it (zl-zipline#250).
     /// `end` says whether this Zode dialed it, and for which CN, or answers
     /// a peer's dial. A link that fails to start leaves no peer entry.
@@ -569,8 +539,9 @@ impl Assembly {
     /// Find the link toward ZPR address `addr`, the next hop of a visa:
     ///
     /// 1. one of this ph's own addresses: the local actor link;
-    /// 2. an adapter link (any link but a Zode link) whose authenticated
-    ///    actor addresses or AAA address include `addr`;
+    /// 2. an internal link to this Zode's own actor (any link but a Zode
+    ///    link) whose authenticated actor addresses or AAA address include
+    ///    `addr`;
     /// 3. a Zode link (F1, zl-zipline#251): see [Assembly::find_zode_egress_link].
     ///
     /// `None` if nothing matches. The caller then refuses the bind
@@ -595,8 +566,10 @@ impl Assembly {
             return Some(NonZero::new(LOCAL_ACTOR_LINK_ID).unwrap());
         }
 
-        // Adapter links (and the internal links) own the actor addresses
-        // they authenticated. Zode links are left out here: see above.
+        // The internal links to this Zode's own actor own the actor
+        // addresses they authenticated, and a link owns the AAA address it
+        // was given (AAA kept unused in v1 (zodes plan §5.4)). Zode links
+        // are left out here: see above.
         let adapter = self
             .peer_table
             .find(|(_id, peer)| {
@@ -1057,25 +1030,6 @@ pub mod test {
         }
     }
 
-    /// Test assembly able to key a NodeToAdapter link: `process_start`
-    /// hands the link to the key manager, which needs a noise keypair and a
-    /// certificate exchange.
-    #[cfg(test)]
-    fn keyable_adapter_assembly() -> Arc<Assembly> {
-        let mut builder = TestAssemblyBuilder::new();
-        builder.self_noise_keypair = Some(crate::km_noise::NoiseKeypair::generate());
-        builder.certx = Some(crate::km_cert_exchange::KmCertExchange::new(None, None));
-        Arc::new(create_assembly(builder))
-    }
-
-    #[cfg(test)]
-    fn tether_addrs() -> (SubstrateAddr, ScopedIpAddr) {
-        (
-            SubstrateAddr::from(([127, 0, 0, 1], 9000)),
-            ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2).into()),
-        )
-    }
-
     /// Graceful shutdown must tear the TUN device down after the peers are
     /// dropped (zipline#130, PR #51 review): the signal path ends in
     /// `process::exit(0)`, which skips destructors, so on Windows an
@@ -1100,28 +1054,6 @@ pub mod test {
                     teardowns.load(std::sync::atomic::Ordering::SeqCst),
                     1,
                     "graceful shutdown must call TunCtl::teardown exactly once"
-                );
-            })
-            .await
-    }
-
-    /// `start_tether` adds the node side of a dock and starts it keying
-    /// at once.
-    #[tokio::test]
-    async fn test_start_tether_keys_immediately() {
-        tokio::task::LocalSet::new()
-            .run_until(async {
-                let asm = keyable_adapter_assembly();
-                let (peer_sa, if_addr) = tether_addrs();
-                let dsid = asm.start_tether(&peer_sa, &if_addr).unwrap();
-                let peer = asm.peer_table.get(dsid.get()).unwrap();
-                assert_eq!(
-                    peer.link_state_machine.get_link_type(),
-                    LinkType::NodeToAdapter
-                );
-                assert_eq!(
-                    peer.link_state_machine.get_state(),
-                    crate::link_state::LinkState::Keying
                 );
             })
             .await
@@ -1369,13 +1301,13 @@ pub mod test {
             got
         }
 
-        /// F5 (zl-zipline#251): a revocation of a visa bound adapter -> Zode
-        /// link sends exactly one withdrawal, to the adapter, and none on the
-        /// Zode link.
+        /// F5 (zl-zipline#251): a revocation of a visa bound from this Zode's
+        /// own actor (an internal link) to a Zode link sends exactly one
+        /// withdrawal, to the actor, and none on the Zode link.
         #[tokio::test]
         async fn test_revocation_sends_no_withdrawal_on_zode_link() {
             let (asm, mut egress_rx, bound) =
-                setup_visa_on_links(&[LinkType::NodeToAdapter, LinkType::NodeToNode]);
+                setup_visa_on_links(&[LinkType::Internal, LinkType::NodeToNode]);
 
             crate::visa_mgmt::handle_revocation(&asm, 3000).unwrap();
 
@@ -1383,12 +1315,12 @@ pub mod test {
         }
 
         /// F5 (zl-zipline#251): dropping another link that holds the same
-        /// visa sends exactly one withdrawal, to the adapter, and none on the
-        /// surviving Zode link.
+        /// visa sends exactly one withdrawal, to this Zode's own actor (an
+        /// internal link), and none on the surviving Zode link.
         #[tokio::test]
         async fn test_drop_peer_sends_no_withdrawal_on_zode_link() {
             let (asm, mut egress_rx, bound) = setup_visa_on_links(&[
-                LinkType::NodeToAdapter,
+                LinkType::Internal,
                 LinkType::NodeToNode,
                 LinkType::NodeToNode,
             ]);
@@ -1563,14 +1495,14 @@ pub mod test {
         /// ends each join riding on it, so a joiner whose relay copies the
         /// reset purges redials and gets a fresh hand-off (hosted review).
         #[tokio::test(flavor = "local")]
-        async fn test_disconnect_adapters_keeps_only_the_session_link() {
+        async fn test_reset_peer_links_keeps_only_the_session_link() {
             // A node whose egress queue is drained, so a reset can send.
             let (asm, _egress) =
                 crate::zode_links::tests::driven_zode("fd5a:5052:8::1", "b.zpr", None);
             let session = insert_up_zode_link(&asm, "relay.zpr", ZODE_ADDR.parse().unwrap());
             let other = insert_up_zode_link(&asm, "c.zpr", "fd5a:5052:8::98".parse().unwrap());
             asm.bootstrap_handoff.send_replace(Some(session));
-            asm.disconnect_adapters().await;
+            asm.reset_peer_links().await;
             let state = |link| {
                 asm.peer_table
                     .get(link)
@@ -1661,14 +1593,14 @@ pub mod test {
             assert_eq!(asm.find_egress_link(zode_addr()), None);
         }
 
-        /// Adapter links still resolve by their authenticated actor
-        /// addresses.
+        /// Actor links (the internal link to this Zode's own actor) still
+        /// resolve by their authenticated actor addresses.
         #[tokio::test]
-        async fn test_adapter_link_resolves_by_actor_address() {
+        async fn test_actor_link_resolves_by_actor_address() {
             let asm = node();
             let link = crate::peer_table::test::insert_peer_with_verified_cn(
                 &asm,
-                LinkType::NodeToAdapter,
+                LinkType::Internal,
                 "adapter",
                 LinkState::Active,
             );

@@ -807,16 +807,14 @@ mod tests {
 
     #[test]
     fn test_check_refuses_a_link_that_is_not_a_zode_link() {
-        for link_type in [LinkType::NodeToAdapter, LinkType::Internal] {
-            let ctx = HandoffContext {
-                link_type,
-                ..good_ctx()
-            };
-            assert_eq!(
-                check_handoff(&ctx, vec![forward(), reverse()]),
-                Err(HandoffError::NotZodeLink)
-            );
-        }
+        let ctx = HandoffContext {
+            link_type: LinkType::Internal,
+            ..good_ctx()
+        };
+        assert_eq!(
+            check_handoff(&ctx, vec![forward(), reverse()]),
+            Err(HandoffError::NotZodeLink)
+        );
     }
 
     /// Never inside Hello: any state but Active is refused.

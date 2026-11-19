@@ -62,7 +62,7 @@ pub struct CommonArgs {
 
     /// Substrate address the Zode's link sockets bind to: the address peers dial.
     /// The default binds every IPv4 interface (0.0.0.0); port 0, the default,
-    /// becomes the default tether port
+    /// becomes the default link port, 5000
     #[arg(short = 'a', long, value_name = "ADDR:PORT", value_parser = parse_socket_addr_or_scoped_ip_addr)]
     pub self_addr: Option<SocketAddr>,
 

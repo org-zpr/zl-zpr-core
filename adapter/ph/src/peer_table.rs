@@ -205,7 +205,6 @@ impl PeerState {
                 _ => PeerType::Unknown,
             },
 
-            LinkType::NodeToAdapter => PeerType::Adapter,
             LinkType::NodeToNode => PeerType::Node,
         }
     }
@@ -244,16 +243,6 @@ impl PeerTable {
             peer_slab_reader,
             sa_to_link: DashMap::with_capacity(PEER_TABLE_SIZE),
         }
-    }
-
-    /// Adds a "dummy" peer with the expected link ID for referencing internal links.
-    ///
-    /// Panics if there is no room in the table.  (This is intended to only be invoked
-    /// at startup, before dynamic entries have been added.)
-    pub fn insert_internal_peer(&self) -> NonZero<LinkId> {
-        let entry = self.vacant_entry().unwrap();
-        let peer = PeerState::new_internal_peer(entry.key(), None, |_| std::future::pending());
-        entry.insert(peer)
     }
 
     pub fn insert_internal_peer_pair<Worker>(

@@ -744,7 +744,7 @@ pub async fn handle_bind_egress_stream_response(
 ///
 /// - from a Zode, by F5 (zl-zipline#251): Zode links carry no teardown
 ///   messages. A refusal closes the link (gate g88 q2).
-/// - from an adapter or the local actor (gate g88 q3): no core component
+/// - from the local actor (gate g88 q3): no core component
 ///   sends it, and F4 lists the only causes of teardown (expiry, a visa
 ///   service revocation, a lost link).
 pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
@@ -762,12 +762,12 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
     };
 
     match (link_type, ingress_link_id.get()) {
-        (LinkType::NodeToAdapter, _) | (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
-            // We are the node; an adapter (or the local actor) does not
-            // unbind streams with us.
+        (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
+            // We are the node; the local actor does not unbind streams
+            // with us.
             warn!(
                 target: ZDP,
-                "{}: refusing UnbindEgressStreamIndication from an adapter or the local actor: F4 lists the only teardown causes",
+                "{}: refusing UnbindEgressStreamIndication from the local actor: F4 lists the only teardown causes",
                 asm.formatted_link_id(ingress_link_id.get())
             );
             return Err(HandleMgmtError::MessageNotPermitted);
@@ -850,8 +850,9 @@ pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> Ha
                 }
             }
         }
-        (LinkType::NodeToAdapter, _) | (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
-            // We are the node; adapters do not withdraw stream ids from us.
+        (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
+            // We are the node; the local actor does not withdraw stream
+            // ids from us.
             debug!(
                 target: ZDP,
                 "{}: adapter -> node not permitted",
@@ -941,6 +942,52 @@ mod test {
             } => {
                 assert_eq!(status, zdp::ResponseCode::Success);
                 assert_eq!(oidc_idps, Some(vec![idp]));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// AAA kept unused in v1 (zodes plan §5.4): the AAA TLV round-trips. A
+    /// HelloResponse that `send_hello_success_response` sends with an AAA
+    /// address decodes, on a link that is not a Zode link (a Zode link
+    /// refuses the TLV), to a ReceivedHelloResponse carrying that address.
+    #[tokio::test(flavor = "local")]
+    async fn test_hello_response_aaa_round_trips() {
+        use zerocopy::FromBytes;
+        let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        let aaa: IpAddress = "fd5a:5052:0:aaa::1"
+            .parse::<std::net::IpAddr>()
+            .unwrap()
+            .into();
+
+        crate::mgmt::requests::send_hello_success_response(&asm, link_id, 0, &[], Some(aaa))
+            .enqueue();
+        let buf = vec![0u8; crate::config::PACKET_BUFFER_SIZE].into_boxed_slice();
+        let sent = egress_rx.try_recv(buf).expect("a HelloResponse");
+        let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(sent.body()).unwrap();
+        assert_eq!(base_hdr.packet_type, zdp::ZdpPacketType::HelloResponse);
+        let (_mgmt_hdr, body) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+        let mut pkt = core::new_heap_packet();
+        pkt.put_slice(body);
+
+        // Link 99 does not exist, so it is not a Zode link.
+        match parse_hello_response(&asm, 99, &mut pkt).unwrap() {
+            LinkEvent::ReceivedHelloResponse {
+                status,
+                aaa_address,
+                ..
+            } => {
+                assert_eq!(status, zdp::ResponseCode::Success);
+                assert_eq!(aaa_address, Some(aaa));
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1138,8 +1185,8 @@ mod test {
 
 /// F5 (zl-zipline#251): Zode links carry no teardown messages. A Stream ID
 /// Withdrawal (type 5) or an Unbind Egress Stream Indication (type 13)
-/// arriving on one is refused, which closes the link; a type 13 from an
-/// adapter or the local actor is refused too (gate g88 q3).
+/// arriving on one is refused, which closes the link; a type 13 from the
+/// local actor is refused too (gate g88 q3).
 #[cfg(test)]
 mod teardown_test {
     use super::*;
@@ -1252,34 +1299,16 @@ mod teardown_test {
         }
     }
 
-    /// Gate g88 q3: a node refuses an Unbind Egress Stream Indication from
-    /// an adapter, as it refuses a withdrawal from one. No core component
-    /// sends it, and F4 lists the only causes of teardown. The adapter's
-    /// forwarding entry is untouched.
-    #[tokio::test]
-    async fn test_unbind_indication_from_adapter_is_refused() {
-        let (asm, _egress_rx) = node();
-        let adapter = crate::peer_table::test::insert_peer_with_verified_cn(
-            &asm,
-            LinkType::NodeToAdapter,
-            "adapter",
-            LinkState::Active,
-        );
-        let stream = bind_stream(&asm, adapter);
-
-        assert!(matches!(
-            handle_unbind_indication(&asm, arriving(adapter, stream)).await,
-            Err(HandleMgmtError::MessageNotPermitted)
-        ));
-        assert_eq!(asm.peer_table.get(adapter).unwrap().pft.len(), 1);
-    }
-
-    /// Gate g88 q3: the same refusal for an Unbind Egress Stream Indication
-    /// on the local actor link.
+    /// Gate g88 q3: a node refuses an Unbind Egress Stream Indication on
+    /// the local actor link. No core component sends it, and F4 lists the
+    /// only causes of teardown. The actor's forwarding entry is untouched.
     #[tokio::test(flavor = "local")]
     async fn test_unbind_indication_from_local_actor_is_refused() {
         let (asm, _egress_rx) = node();
-        let local_actor = asm.peer_table.insert_internal_peer().get();
+        let (local_actor, _dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending());
+        let local_actor = local_actor.get();
         assert_eq!(local_actor, zpr::packet_info::LOCAL_ACTOR_LINK_ID);
         let stream = bind_stream(&asm, local_actor);
 

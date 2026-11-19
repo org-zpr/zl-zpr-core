@@ -63,17 +63,9 @@ pub struct OidcCredentialRequest {
 /// Handle to the AuthAgent registered for a link via startLink.
 pub type AuthAgentHandle = tokio::sync::mpsc::UnboundedSender<OidcCredentialRequest>;
 
-/// Node side: the OIDC identity providers to advertise in HelloResponse
-/// (zipline#12) — one [auth::OidcIdpInfo] per auth service the visa service
-/// lists with `stype == OidcAuthentication` that carries a client config.
-pub fn advertised_oidc_idps(asm: &Assembly, link_id: LinkId) -> Vec<auth::OidcIdpInfo> {
-    oidc_idps(asm, &asm.formatted_link_id(link_id).to_string())
-}
-
-/// Node side: one [auth::OidcIdpInfo] per auth service the visa service
-/// lists with `stype == OidcAuthentication` that carries a client config.
-/// `context` names what they are for in the log: a link, or a Zode's own
-/// login (zl-zipline#233).
+/// One [auth::OidcIdpInfo] per auth service the visa service lists with
+/// `stype == OidcAuthentication` that carries a client config. `context`
+/// names what they are for in the log: a Zode's own login (zl-zipline#233).
 pub fn oidc_idps(asm: &Assembly, context: &str) -> Vec<auth::OidcIdpInfo> {
     use zpr::vsapi_types::ServiceT;
 

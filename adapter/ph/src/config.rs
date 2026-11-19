@@ -49,19 +49,6 @@ pub const DEFAULT_ZDPR_RETRY_LIMIT: u8 = 3;
 
 pub const DEFAULT_TERMINATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Node side only: how long a node-to-adapter link may stay in `Keying`
-/// before the node gives up on it and tears it down (zipline#173).
-///
-/// The node is the noise responder, so it has nothing to retry on its own:
-/// a peer that vanished mid-handshake (NAT rebinding, crashed adapter,
-/// garbage first packet) would otherwise leave a link and peer-table entry
-/// behind for the life of the process. A real handshake completes in well
-/// under a second; 60 s is four noise `HANDSHAKE_TIMEOUT`s (15 s, in
-/// `km_noise.rs`), so a live initiator gets several attempts first. If the
-/// adapter docks again after the teardown, the node simply allocates a
-/// fresh link for it.
-pub const NODE_KEYING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// How long either end of a Zode link may stay in `Keying` before it closes
 /// the link (zl-zipline#250). A real handshake takes one round trip.
 ///

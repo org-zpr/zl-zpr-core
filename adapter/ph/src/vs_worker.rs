@@ -97,8 +97,8 @@ pub async fn launch(
                                     && state == StateFlag::HasState) =>
                         {
                             state = StateFlag::NoState;
-                            info!(target: STARTUP, "visa service refused a reconnect ({:?}); clearing adapters and visas, connecting as reset", err.code);
-                            asm.disconnect_adapters().await;
+                            info!(target: STARTUP, "visa service refused a reconnect ({:?}); resetting peer links and clearing visas, connecting as reset", err.code);
+                            asm.reset_peer_links().await;
                             // A reset declares no state: keep only the
                             // visas that carry the VS-API session itself.
                             let withdrawn = asm

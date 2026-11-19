@@ -164,7 +164,9 @@ pub fn bind_actor_address(
         return;
     };
 
-    // Ensure this adapter actually owns this source address.
+    // Ensure the requesting actor owns this source address: one of its
+    // authenticated addresses, or the link's AAA address (AAA kept unused
+    // in v1 (zodes plan §5.4)).
 
     if !peer_state.actor_auth.owns_address(&five_tuple.src_address)
         && peer_state.link_state_machine.aaa_address() != Some(five_tuple.src_address)
@@ -1443,7 +1445,7 @@ mod tests {
     /// [node_with_visa], with a VS-API handle whose session is gone: every
     /// visa request fails at once with `ConnClosed`, so a bind that needs
     /// one is refused upstream, which shows when the request was made.
-    fn node_with_visa_and_no_vs_session() -> (Arc<Assembly>, EgressRx) {
+    fn node_with_visa_and_no_vs_session() -> (Arc<Assembly>, EgressRx, HairpinRx) {
         let key = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
         let vsconn = libnode::vsconn::VSConn::new(
             4,
@@ -1453,8 +1455,7 @@ mod tests {
             libnode::vsconn::fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()),
             std::net::Ipv4Addr::LOCALHOST.into(),
         );
-        let (asm, egress_rx, _hairpin_rx) = node_assembly(Some(vsconn.handle()));
-        (asm, egress_rx)
+        node_assembly(Some(vsconn.handle()))
     }
 
     /// The assembly behind [node_with_visa_and_hairpin], with VS-API handle
@@ -1498,38 +1499,51 @@ mod tests {
         asm.counters.management[ManagementCounterType::StreamIdRequestRejected].get_count()
     }
 
-    /// Build a middle node ([node_with_visa]) with an upstream peer of type
-    /// `upstream` on link A and a downstream peer of type `downstream` on
-    /// link B that `find_egress_link` resolves [NEXT_HOP] to. A Zode is
-    /// reached the way F1 says (zl-zipline#251): an up Zode link whose CN
-    /// has its address in the topology. An upstream Zode is at [PREV_HOP],
-    /// so it is the visa's previous hop (gap 7, zl-zipline#253); a
-    /// downstream Zode is at [NEXT_HOP]. A downstream adapter owns
-    /// [NEXT_HOP] as an actor address.
+    /// Build a middle node ([node_with_visa]) with an up Zode link A to the
+    /// Zode at [PREV_HOP], the visa's previous hop (gap 7, zl-zipline#253),
+    /// and an up Zode link B to the Zode at [NEXT_HOP]. Each Zode is reached
+    /// the way F1 says (zl-zipline#251): an up Zode link whose CN has its
+    /// address in the topology.
     ///
     /// Returns (asm, egress queue receiver, link A, link B).
-    fn middle_node(
-        upstream: LinkType,
-        downstream: LinkType,
-    ) -> (Arc<Assembly>, EgressRx, LinkId, LinkId) {
+    fn middle_node() -> (Arc<Assembly>, EgressRx, LinkId, LinkId) {
         let (asm, egress_rx) = node_with_visa();
-        let link_a = if upstream == LinkType::NodeToNode {
-            insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop())
+        let link_a = insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop());
+        let link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
+        (asm, egress_rx, link_a, link_b)
+    }
+
+    /// A middle node ([node_with_visa_and_hairpin]) between this Zode's own
+    /// actor, on the local actor link of the internal pair, and another
+    /// Zode. If `actor_upstream`, link A is the local actor link and link B
+    /// an up Zode link to the Zode at [NEXT_HOP]. Otherwise link A is an up
+    /// Zode link to the Zode at [PREV_HOP] and link B the local actor link,
+    /// which owns [NEXT_HOP] as an actor address. What is sent to the local
+    /// actor arrives on the hairpin. Needs a `LocalSet`: the internal pair
+    /// spawns its workers.
+    ///
+    /// Returns (asm, egress queue receiver, hairpin receiver, link A, link B).
+    fn actor_middle_node(
+        actor_upstream: bool,
+    ) -> (Arc<Assembly>, EgressRx, HairpinRx, LinkId, LinkId) {
+        let (asm, egress_rx, hairpin_rx) = node_with_visa_and_hairpin();
+        let (local_actor, _dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+        let local_actor = local_actor.get();
+        let (link_a, link_b) = if actor_upstream {
+            let zode_link = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
+            (local_actor, zode_link)
         } else {
-            add_peer(&asm, upstream, 1)
-        };
-        let link_b = if downstream == LinkType::NodeToNode {
-            insert_up_zode_link(&asm, "next-hop.zpr", next_hop())
-        } else {
-            let link_b = add_peer(&asm, downstream, 2);
             asm.peer_table
-                .get(link_b)
+                .get(local_actor)
                 .unwrap()
                 .actor_auth
                 .test_set_addresses(vec![IpAddress::new_from_std(&next_hop())]);
-            link_b
+            let zode_link = insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop());
+            (zode_link, local_actor)
         };
-        (asm, egress_rx, link_a, link_b)
+        (asm, egress_rx, hairpin_rx, link_a, link_b)
     }
 
     /// Add a dummy peer of the given link type and return its link ID.
@@ -1586,8 +1600,7 @@ mod tests {
     /// Revoking the visa then removes that entry.
     #[tokio::test]
     async fn test_middle_node_binds_forward_only_visa_between_node_links() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         let upstream_txn: TxnId = 7;
 
         request_stream(&asm, NonZero::new(link_a).unwrap(), upstream_txn, VISA_ID);
@@ -1649,13 +1662,13 @@ mod tests {
         assert!(!asm.visa_table.read().unwrap().contains(VISA_ID));
     }
 
-    /// A forward-only visa has no traffic classifier, so it cannot bind to an
-    /// adapter. The bind is refused with an error response upstream instead
-    /// of a panic, and nothing is sent to the adapter.
-    #[tokio::test]
-    async fn test_forward_only_visa_toward_adapter_is_refused() {
-        let (asm, mut egress_rx, link_a, _link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToAdapter);
+    /// A forward-only visa has no traffic classifier, so it cannot bind to
+    /// the local actor, which binds by one. The bind is refused with an
+    /// error response upstream instead of a panic, and nothing is sent to
+    /// the local actor.
+    #[tokio::test(flavor = "local")]
+    async fn test_forward_only_visa_toward_the_local_actor_is_refused() {
+        let (asm, mut egress_rx, mut hairpin_rx, link_a, _link_b) = actor_middle_node(false);
 
         request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
 
@@ -1665,26 +1678,27 @@ mod tests {
         assert_eq!(rsp.packet_type, zdp::ZdpPacketType::StreamIdResponse);
         let (rsp_hdr, _) = zdp::ZdpStreamIdResponseHeader::ref_from_prefix(&rsp.payload).unwrap();
         assert_ne!(rsp_hdr.status_code, zdp::ResponseCode::Success);
+        assert!(try_recv_packet(&mut egress_rx).is_none());
         assert!(
-            try_recv_packet(&mut egress_rx).is_none(),
-            "nothing goes to the adapter"
+            hairpin_rx.try_recv().is_err(),
+            "nothing goes to the local actor"
         );
         assert_eq!(rejected(&asm), 1);
     }
 
-    /// An adapter cannot bind a forward-only visa either: it binds by traffic
-    /// classifier. The bind must be refused BEFORE a stream is requested from
-    /// the next hop, or the stream the next hop grants is never released
-    /// (Codex review on zl-zpr-core#100).
-    #[tokio::test]
-    async fn test_forward_only_visa_from_adapter_is_refused_before_next_hop_bind() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToAdapter, LinkType::NodeToNode);
+    /// The local actor cannot bind a forward-only visa either: it binds by
+    /// traffic classifier. The bind must be refused BEFORE a stream is
+    /// requested from the next hop, or the stream the next hop grants is
+    /// never released (Codex review on zl-zpr-core#100).
+    #[tokio::test(flavor = "local")]
+    async fn test_forward_only_visa_from_the_local_actor_is_refused_before_next_hop_bind() {
+        let (asm, mut egress_rx, mut hairpin_rx, link_a, link_b) = actor_middle_node(true);
 
         requested_visa_granted(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
 
-        let pkt = try_recv_packet(&mut egress_rx).expect("an error response to the adapter");
-        assert_eq!(pkt.metadata().egress_link_id, link_a);
+        let pkt = hairpin_rx
+            .try_recv()
+            .expect("an error response to the local actor");
         let (base_hdr, _) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
         assert_eq!(
             base_hdr.packet_type,
@@ -1705,7 +1719,7 @@ mod tests {
         assert_eq!(
             rejected(&asm),
             0,
-            "an adapter's bind is no Stream ID Request"
+            "the local actor's bind is no Stream ID Request"
         );
     }
 
@@ -1764,8 +1778,7 @@ mod tests {
     /// gone.
     #[tokio::test]
     async fn test_bind_is_refused_when_egress_transaction_ids_run_out() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         let txn_mgr = asm.peer_table.get(link_b).unwrap().txn_mgr.clone();
         let open: Vec<_> = std::iter::from_fn(|| txn_mgr.try_open()).collect();
         assert_eq!(open.len(), usize::from(TxnId::MAX) + 1);
@@ -1918,8 +1931,7 @@ mod tests {
     /// at B. Nothing is sent on A: it is a Zode link (F5).
     #[tokio::test]
     async fn test_losing_the_egress_link_revokes_the_visa() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         bind_a_to_b(&asm, &mut egress_rx, link_a, link_b);
 
         asm.drop_peer(link_b);
@@ -1936,8 +1948,7 @@ mod tests {
     /// sends nothing on B.
     #[tokio::test]
     async fn test_losing_the_ingress_link_revokes_the_visa() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         bind_a_to_b(&asm, &mut egress_rx, link_a, link_b);
 
         asm.drop_peer(link_a);
@@ -1956,8 +1967,7 @@ mod tests {
     /// directly instead.)
     #[tokio::test]
     async fn test_no_forwarding_entry_or_binding_refers_to_a_lost_link() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         bind_a_to_b(&asm, &mut egress_rx, link_a, link_b);
 
         asm.drop_peer(link_b);
@@ -1972,31 +1982,30 @@ mod tests {
         );
     }
 
-    /// F3 at the flow's first Zode (zl-zipline#251): an adapter's flow bound
-    /// out a Zode link. Losing the Zode link revokes the visa, so the
-    /// adapter's next packet matches no visa and asks for one (F6), and the
-    /// adapter gets exactly one withdrawal for its stream.
-    #[tokio::test]
-    async fn test_losing_the_zode_link_at_the_first_zode_withdraws_from_the_adapter() {
+    /// F3 at the flow's first Zode (zl-zipline#251): the local actor's flow
+    /// bound out a Zode link. Losing the Zode link revokes the visa, so the
+    /// actor's next packet matches no visa and asks for one (F6), and the
+    /// actor gets exactly one withdrawal for its stream.
+    #[tokio::test(flavor = "local")]
+    async fn test_losing_the_zode_link_at_the_first_zode_withdraws_from_the_local_actor() {
         use crate::visa_table::tests::new_vsapi_visa_tcp_default;
 
-        let (asm, mut egress_rx, adapter, zode_link) =
-            middle_node(LinkType::NodeToAdapter, LinkType::NodeToNode);
+        let (asm, mut egress_rx, mut hairpin_rx, actor, zode_link) = actor_middle_node(true);
         let own_visa: VisaId = VISA_ID + 1;
         let mut visa = new_vsapi_visa_tcp_default(own_visa, never_expires());
         visa.fwd_pep = Some(zpr::vsapi_types::FwdPep {
             next_hop: next_hop(),
             style: zpr::vsapi_types::FwdPepStyle::OneWay,
         });
-        // The adapter's stream bound out the Zode link, as a completed bind
+        // The actor's stream bound out the Zode link, as a completed bind
         // leaves it (the bind itself is covered above). Set up directly: a
-        // bind response would sit unacknowledged in the adapter's reliable
+        // bind response would sit unacknowledged in the actor's reliable
         // send window and hold the withdrawal back.
         let mut visa_table = asm.visa_table.write().unwrap();
         visa_table.insert_visa(visa).unwrap();
-        let adapter_stream = asm
+        let actor_stream = asm
             .peer_table
-            .get(adapter)
+            .get(actor)
             .unwrap()
             .pft
             .insert(forwarding_tables::PftPep::new(
@@ -2008,7 +2017,7 @@ mod tests {
             .bind(
                 own_visa,
                 StreamBinding {
-                    ingress: ForwardingEntry(adapter, adapter_stream),
+                    ingress: ForwardingEntry(actor, actor_stream),
                     egress: ForwardingEntry(zode_link, 42),
                 },
             )
@@ -2018,15 +2027,14 @@ mod tests {
         asm.drop_peer(zode_link);
 
         assert!(!asm.visa_table.read().unwrap().contains(own_visa));
-        let pkt = try_recv_packet(&mut egress_rx).expect("a withdrawal to the adapter");
-        assert_eq!(pkt.metadata().egress_link_id, adapter);
+        let pkt = hairpin_rx
+            .try_recv()
+            .expect("a withdrawal to the local actor");
         let msg = decode_per_flow(&pkt);
         assert_eq!(msg.0, zdp::ZdpPacketType::StreamIdWithdrawal);
-        assert_eq!(msg.1, adapter_stream);
-        assert!(
-            try_recv_packet(&mut egress_rx).is_none(),
-            "exactly one withdrawal"
-        );
+        assert_eq!(msg.1, actor_stream);
+        assert!(hairpin_rx.try_recv().is_err(), "exactly one withdrawal");
+        assert!(try_recv_packet(&mut egress_rx).is_none());
     }
 
     /// The type and per-flow stream ID of a per-flow management packet
@@ -2043,8 +2051,7 @@ mod tests {
     /// no bind state is left on A.
     #[tokio::test]
     async fn test_losing_the_next_hop_link_refuses_the_pending_bind() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
         assert!(
             try_recv_packet(&mut egress_rx).is_some(),
@@ -2068,7 +2075,7 @@ mod tests {
     async fn test_losing_the_next_hop_link_revokes_the_pending_binds_visa() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
+                let (asm, mut egress_rx, _hairpin_rx) = node_with_visa_and_no_vs_session();
                 let link_a =
                     NonZero::new(insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop())).unwrap();
                 let link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
@@ -2102,8 +2109,7 @@ mod tests {
     /// left on B.
     #[tokio::test]
     async fn test_late_grant_for_a_lost_requestor_is_ignored() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
         assert!(
             try_recv_packet(&mut egress_rx).is_some(),
@@ -2134,8 +2140,7 @@ mod tests {
     /// then ignored.
     #[tokio::test]
     async fn test_reused_transaction_id_of_a_pending_bind_does_not_panic() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         // A second visa names A's topology address as both its previous
         // and its next hop: a bind of it from A passes the previous-hop
         // guard (gap 7) and loops back to A.
@@ -2182,7 +2187,7 @@ mod tests {
     async fn test_visa_request_after_a_zode_link_loss_waits_for_the_down_report() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
+                let (asm, mut egress_rx, _hairpin_rx) = node_with_visa_and_no_vs_session();
                 let link_a = add_peer(&asm, LinkType::NodeToNode, 1);
                 let link_b = insert_up_zode_link(&asm, "b.zpr", next_hop());
 
@@ -2239,7 +2244,7 @@ mod tests {
     async fn test_visa_result_for_a_lost_requestor_is_dropped() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
+                let (asm, mut egress_rx, _hairpin_rx) = node_with_visa_and_no_vs_session();
                 let link_a = add_peer(&asm, LinkType::NodeToNode, 1);
                 request_stream(&asm, NonZero::new(link_a).unwrap(), 7, UNKNOWN_VISA);
 
@@ -2324,8 +2329,7 @@ mod tests {
     /// address) is refused.
     #[tokio::test]
     async fn test_a_request_from_a_zode_that_is_not_the_previous_hop_is_refused() {
-        let (asm, mut egress_rx, _link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, _link_a, link_b) = middle_node();
         let other = insert_up_zode_link(&asm, "other.zpr", "fd5a:5052:8::22".parse().unwrap());
 
         request_stream(&asm, NonZero::new(other).unwrap(), 7, VISA_ID);
@@ -2353,8 +2357,7 @@ mod tests {
     /// not edited.
     #[tokio::test]
     async fn test_a_request_for_a_visa_with_no_previous_hop_is_refused() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         let no_prev_hop: VisaId = VISA_ID + 4;
         asm.visa_table
             .write()
@@ -2376,8 +2379,7 @@ mod tests {
     /// connection is refused, though its verified CN is still right.
     #[tokio::test]
     async fn test_a_request_on_a_replaced_connection_is_refused() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         let replacement = crate::peer_table::test::insert_zode_peer_with_verified_cn(
             &asm,
             "prev-hop.zpr",
@@ -2400,8 +2402,7 @@ mod tests {
     /// nothing is counted.
     #[tokio::test]
     async fn test_a_request_from_the_previous_hop_is_bound() {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
 
         request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
 
@@ -2419,8 +2420,7 @@ mod tests {
     /// that `prev_hop` (or its absence) when it fails.
     #[tokio::test]
     async fn test_check_prev_hop_reports_the_visas_previous_hop() {
-        let (asm, _egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, _egress_rx, link_a, link_b) = middle_node();
         let link_a = NonZero::new(link_a).unwrap();
         let link_b = NonZero::new(link_b).unwrap();
         assert_eq!(check_prev_hop(&asm, VISA_ID, link_a), Ok(()));
@@ -2769,8 +2769,7 @@ mod tests {
     ///
     /// Returns (asm, egress queue, link A, link B, A's stream).
     fn middle_node_with_successor() -> (Arc<Assembly>, EgressRx, LinkId, LinkId, StreamId) {
-        let (asm, mut egress_rx, link_a, link_b) =
-            middle_node(LinkType::NodeToNode, LinkType::NodeToNode);
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
         widen_zdpr_window(&asm, link_a);
         widen_zdpr_window(&asm, link_b);
         visa_mgmt::insert_visa(&asm, transit_visa(OLD_VISA)).unwrap();
@@ -3033,18 +3032,20 @@ mod tests {
     /// can no longer fetch (the visa service forgets a visa at expiry), so
     /// every new flow would be refused, for good.
     ///
-    /// The adapter's live stream under the expired visa is withdrawn, so
-    /// its next packet binds afresh (VISA_SERVICE.md: on expiry a node
-    /// tears down the tethers to its adapters).
+    /// The local actor's live stream under the expired visa is withdrawn,
+    /// so its next packet binds afresh.
     #[tokio::test]
     async fn test_a_bind_matching_an_expired_visa_asks_for_a_new_visa() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
-                let adapter = add_peer(&asm, LinkType::NodeToAdapter, 1);
+                let (asm, _egress_rx, mut hairpin_rx) = node_with_visa_and_no_vs_session();
+                let (actor, _dock) = asm
+                    .peer_table
+                    .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+                let actor = actor.get();
                 let zode_link = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
                 asm.peer_table
-                    .get(adapter)
+                    .get(actor)
                     .unwrap()
                     .actor_auth
                     .test_set_addresses(vec![IpAddress::new_from_std(
@@ -3058,10 +3059,10 @@ mod tests {
                         crate::visa_table::tests::ALREADY_EXPIRED,
                     ))
                     .unwrap();
-                // A stream the adapter bound under the visa before it expired.
+                // A stream the actor bound under the visa before it expired.
                 let live_stream = asm
                     .peer_table
-                    .get(adapter)
+                    .get(actor)
                     .unwrap()
                     .pft
                     .insert(forwarding_tables::PftPep::new(
@@ -3073,7 +3074,7 @@ mod tests {
                     .bind(
                         expired,
                         StreamBinding {
-                            ingress: ForwardingEntry(adapter, live_stream),
+                            ingress: ForwardingEntry(actor, live_stream),
                             egress: ForwardingEntry(zode_link, 42),
                         },
                     )
@@ -3083,7 +3084,7 @@ mod tests {
 
                 bind_actor_address(
                     &asm,
-                    NonZero::new(adapter).unwrap(),
+                    NonZero::new(actor).unwrap(),
                     7,
                     L3Type::Ipv6,
                     &client_syn(),
@@ -3094,8 +3095,9 @@ mod tests {
                     !asm.visa_table.read().unwrap().contains(expired),
                     "the expired visa is ejected"
                 );
-                let pkt = try_recv_packet(&mut egress_rx).expect("a withdrawal to the adapter");
-                assert_eq!(pkt.metadata().egress_link_id, adapter);
+                let pkt = hairpin_rx
+                    .try_recv()
+                    .expect("a withdrawal to the local actor");
                 assert!(
                     decode_per_flow(&pkt) == (zdp::ZdpPacketType::StreamIdWithdrawal, live_stream)
                 );
@@ -3114,7 +3116,7 @@ mod tests {
     async fn test_a_stream_request_for_an_expired_visa_is_refused() {
         tokio::task::LocalSet::new()
             .run_until(async {
-                let (asm, mut egress_rx) = node_with_visa_and_no_vs_session();
+                let (asm, mut egress_rx, _hairpin_rx) = node_with_visa_and_no_vs_session();
                 let link_a =
                     NonZero::new(insert_up_zode_link(&asm, "prev-hop.zpr", prev_hop())).unwrap();
                 let link_b = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());

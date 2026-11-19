@@ -657,45 +657,76 @@ mod tests {
 
     // ---- zl-zipline#230 gap 1: send errors after a network change ----
 
-    use super::{is_network_change_send_error, send_substrate_egress_queue};
+    use super::{SendDropCause, classify_send_error, send_substrate_egress_queue};
 
-    /// The classifier accepts exactly the errors a vanished source address
-    /// or a changed network causes, `InvalidInput` only for a send that
-    /// named its source (the Linux IPv6 `EINVAL`), and nothing else.
-    #[test]
-    fn network_change_send_errors_are_classified() {
-        for kind in [
-            ErrorKind::NetworkUnreachable,
-            ErrorKind::HostUnreachable,
-            ErrorKind::NetworkDown,
-            ErrorKind::AddrNotAvailable,
-        ] {
-            let err = Error::from(kind);
-            assert!(
-                is_network_change_send_error(&err, true),
-                "{kind:?} with a source"
-            );
-            assert!(
-                is_network_change_send_error(&err, false),
-                "{kind:?} without a source"
-            );
+    /// The raw OS error codes with which the host refuses a send: `EPERM`
+    /// (a netfilter or LSM verdict) and `EACCES` (for example, a broadcast
+    /// without `SO_BROADCAST`) on Unix, `WSAEACCES` on Windows.
+    fn refused_send_os_errors() -> Vec<i32> {
+        #[cfg(unix)]
+        {
+            vec![libc::EPERM, libc::EACCES]
         }
+        #[cfg(windows)]
+        {
+            vec![windows_sys::Win32::Networking::WinSock::WSAEACCES]
+        }
+    }
+
+    /// The classifier maps exactly the errors a vanished source address or a
+    /// changed network causes to `NetworkChange` (zl-zipline#230), with
+    /// `InvalidInput` only for a send that named its source (the Linux IPv6
+    /// `EINVAL`); a send the host refuses (`PermissionDenied`: `EPERM`,
+    /// `EACCES`) to `Refused` (zl-zipline#270); and nothing else.
+    #[test]
+    fn send_errors_are_classified() {
+        for had_source in [true, false] {
+            for kind in [
+                ErrorKind::NetworkUnreachable,
+                ErrorKind::HostUnreachable,
+                ErrorKind::NetworkDown,
+                ErrorKind::AddrNotAvailable,
+            ] {
+                assert_eq!(
+                    classify_send_error(&Error::from(kind), had_source),
+                    Some(SendDropCause::NetworkChange),
+                    "{kind:?}, source {had_source}"
+                );
+            }
+
+            assert_eq!(
+                classify_send_error(&Error::from(ErrorKind::PermissionDenied), had_source),
+                Some(SendDropCause::Refused),
+                "PermissionDenied, source {had_source}"
+            );
+            for code in refused_send_os_errors() {
+                let err = Error::from_raw_os_error(code);
+                assert_eq!(
+                    classify_send_error(&err, had_source),
+                    Some(SendDropCause::Refused),
+                    "os error {code} ({err}), source {had_source}"
+                );
+            }
+
+            for kind in [ErrorKind::BrokenPipe, ErrorKind::Other] {
+                assert_eq!(
+                    classify_send_error(&Error::from(kind), had_source),
+                    None,
+                    "{kind:?} must stay fatal, source {had_source}"
+                );
+            }
+        }
+
         let einval = Error::from(ErrorKind::InvalidInput);
-        assert!(is_network_change_send_error(&einval, true));
-        assert!(
-            !is_network_change_send_error(&einval, false),
+        assert_eq!(
+            classify_send_error(&einval, true),
+            Some(SendDropCause::NetworkChange)
+        );
+        assert_eq!(
+            classify_send_error(&einval, false),
+            None,
             "EINVAL without a source is a malformed send, not a network change"
         );
-        for kind in [
-            ErrorKind::PermissionDenied,
-            ErrorKind::BrokenPipe,
-            ErrorKind::Other,
-        ] {
-            assert!(
-                !is_network_change_send_error(&Error::from(kind), true),
-                "{kind:?} must stay fatal"
-            );
-        }
     }
 
     /// A wildcard-bound socket, a receiver it can reach, and a source
@@ -761,10 +792,11 @@ mod tests {
             for v6 in [false, true] {
                 let (sender, receiver, gone) = vanished_source_setup(v6);
                 let err = first_send_error(name, &sender, receiver.local_addr().unwrap(), gone);
-                assert!(
-                    is_network_change_send_error(&err, true),
+                assert_eq!(
+                    classify_send_error(&err, true),
+                    Some(SendDropCause::NetworkChange),
                     "engine {name}: a send from {gone} failed with {err} ({:?}, errno {:?}), \
-                     which the classifier does not accept",
+                     which the classifier does not accept as a network change",
                     err.kind(),
                     err.raw_os_error()
                 );

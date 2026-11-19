@@ -167,7 +167,7 @@ impl Visa {
 
     /// Whether this visa's lifetime has run out at `now`, by this Zode's
     /// clock: from its expiry instant on, as on the fast path
-    /// ([crate::forwarding_tables::PftPep::expires_ms]).
+    /// ([crate::forwarding_tables::PftPep::target]).
     pub fn has_expired_at(&self, now: SystemTime) -> bool {
         self.visa.expires <= now
     }

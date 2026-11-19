@@ -88,7 +88,8 @@ pub struct CommonArgs {
 
     /// ZPR address (no port) of the Zode, an address of its TUN. Repeatable. The
     /// first is the Zode's own address and must be IPv6; a relay adds
-    /// fd5a:5052::1 (vs.zpr) after it, and no other Zode lists it.
+    /// fd5a:5052::1 (vs.zpr) after it, and no other Zode lists it. Replaces
+    /// the config file's whole zpr_addr list.
     #[arg(long, short = 'z')]
     pub zpr_addr: Option<Vec<IpAddr>>,
 
@@ -107,12 +108,18 @@ pub struct CommonArgs {
     /// to the DEBUG level, except zdp and link_state, which would be set to TRACE
     /// When setting the target 'all' you can also omit the target. i.e.
     /// --logging all=DEBUG zdp=TRACE is the same as --logging DEBUG zdp=TRACE
+    /// Any --logging replaces the config file's whole logging list: the
+    /// file's pairs are not merged with the command line's pairs.
     #[arg(long, short = 'l', value_delimiter = ' ', num_args = 1.., value_parser = parse_key_val, verbatim_doc_comment)]
     pub logging: Vec<(String, String)>,
 
-    /// Which packet I/O engine to use
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(std::iter::once(batch_io::AUTO_ENGINE_NAME).chain(batch_io::engine_names())), default_value_t = batch_io::AUTO_ENGINE_NAME.to_owned())]
-    pub io_engine: String,
+    /// Which packet I/O engine to use. Default: auto, unless the config
+    /// file sets io_engine
+    // No clap default: `None` lets a file's `io_engine` stand when the flag
+    // is absent (zl-zipline#278). [crate::config::Config::default] holds
+    // the `auto` default.
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(std::iter::once(batch_io::AUTO_ENGINE_NAME).chain(batch_io::engine_names())))]
+    pub io_engine: Option<String>,
 
     /// Current supported implementations: noise (default), null
     #[arg(long, default_value = "noise")]
@@ -148,6 +155,8 @@ pub enum Command {
         config_file: Option<PathBuf>,
 
         /// RSA private key used for authentication with the visa service.
+        /// Overrides `auth_private_key` in the `[authentication]` section of
+        /// the config file.
         #[arg(long, value_name = "PATH")]
         auth_private_key: Option<PathBuf>,
 

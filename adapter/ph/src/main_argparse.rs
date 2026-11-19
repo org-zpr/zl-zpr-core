@@ -48,6 +48,9 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<Config, ArgsErro
                     e
                 )))
             })?;
+            // A flag below replaces this file value, so new_for_node
+            // must not validate it (zl-zipline#278 review).
+            nc.drop_node_values_replaced_by_flags(initial_link.is_some());
             Some(nc)
         }
         None => None,
@@ -575,9 +578,8 @@ mod test {
 
     /// zl-zipline#229 (gate g117 q2): the relay config contract, with
     /// `relay` from the `[node]` section or from `--relay`, and the
-    /// addresses from the config file or from `--zpr-addr`. A node applies
-    /// `--zpr-addr` before the file's `zpr_addr`, so the command line's
-    /// addresses come first.
+    /// addresses from the config file or from `--zpr-addr`. `--zpr-addr`
+    /// replaces the file's `zpr_addr` list (zl-zipline#278).
     #[test]
     #[parallel(env)]
     fn test_main_args_argparse_relay_lists_visa_service_addr() {
@@ -629,14 +631,18 @@ mod test {
             )
             .is_err()
         );
-        // The command line's addresses come before the file's.
+        // The command line's addresses replace the file's, so `-z vs.zpr`
+        // alone makes vs.zpr the relay's own address, which is refused.
         assert!(parse_file(r#"["fd5a:5052::2"]"#, "relay = true", &["-z", vs]).is_err());
 
         // A node that is not a relay never lists vs.zpr, nor any duplicate.
         assert!(parse_file(r#"["fd5a:5052::2"]"#, DIAL, &[]).is_ok());
         assert!(parse_file(r#"["fd5a:5052::2", "fd5a:5052::1"]"#, DIAL, &[]).is_err());
         assert!(parse_file(none, DIAL, &["-z", "fd5a:5052::2", "-z", vs]).is_err());
-        assert!(parse_file(r#"["fd5a:5052::2"]"#, DIAL, &["-z", "fd5a:5052::2"]).is_err());
+        assert!(parse_file(none, DIAL, &["-z", "fd5a:5052::2", "-z", "fd5a:5052::2"]).is_err());
+        // The file's list and the command line's list never combine
+        // (zl-zipline#278), so the same address in both is no duplicate.
+        assert!(parse_file(r#"["fd5a:5052::2"]"#, DIAL, &["-z", "fd5a:5052::2"]).is_ok());
     }
 
     #[test]
@@ -688,13 +694,210 @@ mod test {
     /// `global_extra` verbatim, with `extra_args` appended to the command
     /// line (zipline#154 `control_group` tests).
     fn argparse_zode_with(global_extra: &str, extra_args: &[&str]) -> Result<Config, ArgsError> {
-        let (tmpfile, _keys) = node_config_file_global(
+        argparse_zode_full(global_extra, "", extra_args).0
+    }
+
+    /// The `[node]` section text of a Zode that dials `relay.zpr` over its
+    /// initial link, for the [argparse_zode_full] fixtures.
+    const INITIAL_LINK_TABLE: &str =
+        "[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"relay.zpr\"";
+
+    /// The general form of [argparse_zode_with] (zl-zipline#278): parse a
+    /// minimal valid Zode config whose `[global]` section carries
+    /// `global_extra` verbatim and whose node section is followed by
+    /// `trailing_sections` verbatim (e.g. an `[authentication]` table),
+    /// with `extra_args` appended to the command line. Returns the parse
+    /// result and the guards of the file's `ca_file`, `certificate_file`
+    /// and `private_key_file`, in that order, so a test can compare paths.
+    fn argparse_zode_full(
+        global_extra: &str,
+        trailing_sections: &str,
+        extra_args: &[&str],
+    ) -> (Result<Config, ArgsError>, [TempFile; 3]) {
+        let (tmpfile, keys) = node_config_file_global(
             global_extra,
-            "[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"relay.zpr\"",
+            &format!("{INITIAL_LINK_TABLE}\n\n{trailing_sections}"),
         );
         let mut args = vec!["ph", "zode", "-c", tmpfile.get_path().to_str().unwrap()];
         args.extend_from_slice(extra_args);
-        argparse(Some(args))
+        (argparse(Some(args)), keys)
+    }
+
+    /// The `[global]` keys the zl-zipline#278 file-versus-flag tests set
+    /// in the file, beyond the ones [node_config_file_with] always writes
+    /// (`control_path = "/tmp/control.sock"`, `self_addr =
+    /// "10.0.0.1:12345"`, `zpr_addr = ["fd5a:5052::2"]` and the three key
+    /// files).
+    fn file_only_global_extra() -> String {
+        format!(
+            "tun_if = \"tun-file\"\nio_engine = \"{}\"\nlogging = [ [\"all\", \"INFO\"], [\"zdp\", \"DEBUG\"] ]",
+            file_io_engine()
+        )
+    }
+
+    /// An `io_engine` name the file can set that is not the command line's
+    /// `auto`: the first real engine this platform has.
+    fn file_io_engine() -> &'static str {
+        crate::batch_io::engine_names()
+            .next()
+            .expect("every platform has a packet I/O engine")
+    }
+
+    /// The `[authentication]` table the zl-zipline#278 tests put in the file.
+    const FILE_AUTH_SECTION: &str =
+        "[authentication]\nauth_private_key = \"/tmp/zl278-file-auth.pem\"";
+
+    /// zl-zipline#278: with no flags, every `[global]` value the file sets
+    /// survives, and so does `[authentication] auth_private_key`. In
+    /// particular a flag's default must not beat the file (`io_engine`).
+    #[test]
+    #[parallel(env)]
+    fn test_file_values_survive_without_flags() {
+        let (config, keys) = argparse_zode_full(&file_only_global_extra(), FILE_AUTH_SECTION, &[]);
+        let config = config.expect("a valid file-only Zode config");
+        assert_eq!(
+            config.control_path,
+            PathBuf::from(portable_tmp_paths("/tmp/control.sock"))
+        );
+        assert_eq!(
+            config.self_addr,
+            "10.0.0.1:12345".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(config.ca_file, Some(keys[0].get_path().into()));
+        assert_eq!(config.certificate_file, Some(keys[1].get_path().into()));
+        assert_eq!(
+            config.noise_private_key_source(),
+            format!("file://{}", keys[2].get_path().display())
+        );
+        assert_eq!(config.tun_if.as_deref(), Some("tun-file"));
+        assert_eq!(config.batch_io_engine, file_io_engine());
+        let expected_addrs: Vec<IpAddr> = vec!["fd5a:5052::2".parse().unwrap()];
+        assert_eq!(config.zpr_addr, expected_addrs);
+        let expected_logging = vec![
+            ("all".to_string(), "INFO".to_string()),
+            ("zdp".to_string(), "DEBUG".to_string()),
+        ];
+        assert_eq!(config.logging, expected_logging);
+        assert_eq!(
+            config.auth_private_key,
+            Some(PathBuf::from(portable_tmp_paths(
+                "/tmp/zl278-file-auth.pem"
+            )))
+        );
+    }
+
+    /// zl-zipline#278: `--control-path` overrides `control_path` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_control_path() {
+        let flag = portable_tmp_paths("/tmp/zl278-flag-control.sock");
+        let config = argparse_zode_with("", &["--control-path", &flag]).unwrap();
+        assert_eq!(config.control_path, path::absolute(&flag).unwrap());
+    }
+
+    /// zl-zipline#278: `--self-addr` overrides `self_addr` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_self_addr() {
+        let config = argparse_zode_with("", &["--self-addr", "10.0.0.2:23456"]).unwrap();
+        assert_eq!(
+            config.self_addr,
+            "10.0.0.2:23456".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    /// zl-zipline#278: `--ca-file` overrides `ca_file` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_ca_file() {
+        let flag_file = TempFile::touch();
+        let flag = flag_file.get_path().to_str().unwrap();
+        let config = argparse_zode_with("", &["--ca-file", flag]).unwrap();
+        assert_eq!(config.ca_file, Some(path::absolute(flag).unwrap()));
+    }
+
+    /// zl-zipline#278: `--certificate-file` overrides `certificate_file` in
+    /// the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_certificate_file() {
+        let flag_file = TempFile::touch();
+        let flag = flag_file.get_path().to_str().unwrap();
+        let config = argparse_zode_with("", &["--certificate-file", flag]).unwrap();
+        assert_eq!(config.certificate_file, Some(path::absolute(flag).unwrap()));
+    }
+
+    /// zl-zipline#278: `-k` overrides `private_key_file` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_private_key_file() {
+        let flag_file = TempFile::touch();
+        let flag = flag_file.get_path().to_str().unwrap();
+        let config = argparse_zode_with("", &["-k", flag]).unwrap();
+        assert_eq!(
+            config.noise_private_key_source(),
+            format!("file://{}", path::absolute(flag).unwrap().display())
+        );
+    }
+
+    /// zl-zipline#278: `--tun-if` overrides `tun_if` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_tun_if() {
+        let config =
+            argparse_zode_with(r#"tun_if = "tun-file""#, &["--tun-if", "tun-flag"]).unwrap();
+        assert_eq!(config.tun_if.as_deref(), Some("tun-flag"));
+    }
+
+    /// zl-zipline#278: `--io-engine` overrides `io_engine` in the file,
+    /// even when the flag names the default, `auto`.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_io_engine() {
+        let line = format!("io_engine = \"{}\"", file_io_engine());
+        let config = argparse_zode_with(&line, &["--io-engine", "auto"]).unwrap();
+        assert_eq!(config.batch_io_engine, "auto");
+    }
+
+    /// zl-zipline#278 Q1: `--zpr-addr` replaces the file's `zpr_addr`
+    /// list; it does not add to it.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_replaces_file_zpr_addr() {
+        let config = argparse_zode_with("", &["--zpr-addr", "fd5a:5052::3"]).unwrap();
+        let expected: Vec<IpAddr> = vec!["fd5a:5052::3".parse().unwrap()];
+        assert_eq!(config.zpr_addr, expected);
+    }
+
+    /// zl-zipline#278 Q2 (operator's answer): any `--logging` replaces the
+    /// file's whole `logging` list. There is no merge per target, so the
+    /// file's `all=INFO` is gone too.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_replaces_file_logging() {
+        let config = argparse_zode_with(
+            r#"logging = [ ["all", "INFO"], ["zdp", "DEBUG"] ]"#,
+            &["--logging", "zdp=TRACE"],
+        )
+        .unwrap();
+        assert_eq!(
+            config.logging,
+            vec![("zdp".to_string(), "TRACE".to_string())]
+        );
+    }
+
+    /// zl-zipline#278 Q3: `--auth-private-key` overrides `auth_private_key`
+    /// in the file's `[authentication]` section.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_auth_private_key() {
+        let flag = portable_tmp_paths("/tmp/zl278-flag-auth.pem");
+        let (config, _keys) =
+            argparse_zode_full("", FILE_AUTH_SECTION, &["--auth-private-key", &flag]);
+        assert_eq!(
+            config.unwrap().auth_private_key,
+            Some(path::absolute(&flag).unwrap())
+        );
     }
 
     /// zipline#154: `control_group` in `[global]` is parsed into the config.
@@ -715,6 +918,21 @@ mod test {
             &["--control-group", "from-flag"],
         )
         .unwrap();
+        assert_eq!(config.control_group.as_deref(), Some("from-flag"));
+    }
+
+    /// zl-zipline#278 (review on core#141): a valid `--control-group`
+    /// overrides an invalid `control_group` in the file. Only the value
+    /// that wins is validated, so the file's bad name does not stop the
+    /// Zode.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_flag_overrides_invalid_file_value() {
+        let config = argparse_zode_with(
+            r#"control_group = "bad,name""#,
+            &["--control-group", "from-flag"],
+        )
+        .expect("the flag's valid name wins over the file's invalid name");
         assert_eq!(config.control_group.as_deref(), Some("from-flag"));
     }
 
@@ -768,6 +986,37 @@ mod test {
         ] {
             let config = argparse_zode_with("", &["--control-group", good]).unwrap();
             assert_eq!(config.control_group.as_deref(), Some(good));
+        }
+    }
+
+    /// zl-zipline#278 review: a valid `--initial-link` replaces an invalid
+    /// `[node.initial_link]` in the file, so the file's value is never
+    /// checked. With no flag, the invalid file value is still refused.
+    #[test]
+    #[parallel(env)]
+    fn test_initial_link_flag_bypasses_invalid_file_value() {
+        for bad in [
+            "[node.initial_link]\naddr = \"0.0.0.0:5000\"\ncn = \"relay.zpr\"",
+            "[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"\"",
+        ] {
+            let (cfg, _keys) = node_config_file(bad);
+            let path = cfg.get_path().to_str().unwrap();
+            let config = argparse(Some(vec![
+                "ph",
+                "zode",
+                "-c",
+                path,
+                "--initial-link",
+                "cli.zpr@10.0.0.7:6000",
+            ]))
+            .unwrap_or_else(|e| panic!("--initial-link must replace {bad:?}: {e}"));
+            let link = config.initial_link.unwrap();
+            assert_eq!(link.cn, "cli.zpr");
+            assert_eq!(link.addr, "10.0.0.7:6000".parse::<SocketAddr>().unwrap());
+
+            let err = argparse(Some(vec!["ph", "zode", "-c", path]))
+                .expect_err("an invalid file initial_link with no flag");
+            assert!(err.to_string().contains("initial_link"), "{bad:?}: {err}");
         }
     }
 

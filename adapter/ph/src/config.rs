@@ -294,13 +294,39 @@ impl Config {
 
     /// Create the [Config] struct from an optional configuration file, the
     /// optional `--auth-private-key` and the "common" command line arguments.
-    /// Command line arguments win over the configuration file.
+    ///
+    /// Command line arguments win over the configuration file
+    /// (zl-zipline#278): the file's sections apply first, onto the
+    /// defaults, and the command line applies last, so every flag that is
+    /// given overrides the file's value. A list flag (`--zpr-addr`,
+    /// `--logging`) replaces the file's whole list. The `ph zode` flags
+    /// for the `[node]` section are applied by the caller, after this; the
+    /// caller drops a `[node]` value that such a flag replaces before it
+    /// calls this (see [NodeConfig::drop_node_values_replaced_by_flags]).
+    ///
+    /// A file value that a given flag replaces must not be validated: an
+    /// invalid or stale value in the file must not stop ph when the flag
+    /// gives a valid one (zl-zipline#278 review). `control_group` is
+    /// stored raw by both sources and validated once below, after the
+    /// command line applies.
     pub fn new_for_node(
         config_file: Option<NodeConfig>,
         auth_private_key: Option<PathBuf>,
         common: &CommonArgs,
     ) -> Result<Self, ArgsError> {
         let mut config = Config::default();
+        if let Some(config_file) = config_file {
+            let base_dir = config_file.config_path.parent().unwrap();
+            config.set_from_globals(&config_file.global, base_dir)?;
+            config.set_from_authentication(&config_file.authentication, base_dir)?;
+            config.set_from_node(&config_file.node)?;
+        }
+        config.set_from_common(common)?;
+        // Validate only the control_group that won, so an invalid name in
+        // the file that a valid --control-group overrides is no error.
+        if let Some(group) = &config.control_group {
+            validate_control_group(group)?;
+        }
         if let Some(pkey_file) = auth_private_key {
             config.auth_private_key = Some(path::absolute(pkey_file).or_else(|e| {
                 Err(ArgsError::PathError(format!(
@@ -308,13 +334,6 @@ impl Config {
                     e
                 )))
             })?);
-        }
-        config.set_from_common(common)?;
-        if let Some(config_file) = config_file {
-            let base_dir = config_file.config_path.parent().unwrap();
-            config.set_from_globals(&config_file.global, base_dir)?;
-            config.set_from_authentication(&config_file.authentication, base_dir)?;
-            config.set_from_node(&config_file.node)?;
         }
         Ok(config)
     }
@@ -522,7 +541,9 @@ impl Config {
         Ok(())
     }
 
-    // Overwrite our internal state with the values present in the global section.
+    // Overwrite our internal state with the values present in the global
+    // section. This runs before set_from_common, so a command line flag
+    // overrides each value set here (zl-zipline#278).
     fn set_from_globals(
         &mut self,
         config: &GlobalConfigSection,
@@ -536,12 +557,10 @@ impl Config {
             }
             self.control_path_derived = false;
         }
-        // The command line wins: set_from_common ran first, so only fill
-        // the value in when no flag supplied it.
-        if self.control_group.is_none() {
-            if let Some(group) = &config.control_group {
-                self.control_group = Some(validate_control_group(group)?);
-            }
+        if let Some(group) = &config.control_group {
+            // Validated in new_for_node once the command line has had its
+            // say: an invalid name that a flag overrides is no error.
+            self.control_group = Some(group.clone());
         }
         if let Some(self_addr) = &config.self_addr {
             self.self_addr = *self_addr;
@@ -571,10 +590,10 @@ impl Config {
             self.tun_if = Some(tun_if.clone());
         }
         if let Some(actor_addr) = &config.zpr_addr {
-            self.zpr_addr.extend(&*actor_addr);
+            self.zpr_addr = actor_addr.clone();
         }
         if let Some(logging) = &config.logging {
-            self.logging.extend(logging.into_iter().cloned());
+            self.logging = logging.clone();
         }
         if let Some(io_engine) = &config.io_engine {
             self.batch_io_engine = io_engine.clone();
@@ -617,7 +636,11 @@ impl Config {
         Ok(())
     }
 
-    // Overwrite our internal state with the values present in the CommonArgs (from command line)
+    // Overwrite our internal state with the values present in the CommonArgs
+    // (from command line). This runs after the config file sections, so
+    // every flag that is given wins (zl-zipline#278); a flag that is not
+    // given leaves the file's value, or the default, in place. A list flag
+    // (`--zpr-addr`, `--logging`) replaces the whole list.
     fn set_from_common(&mut self, common: &CommonArgs) -> Result<(), ArgsError> {
         if let Some(control_path) = &common.control_path {
             let cp = PathBuf::from(control_path);
@@ -630,7 +653,8 @@ impl Config {
             self.control_path_derived = false;
         }
         if let Some(group) = &common.control_group {
-            self.control_group = Some(validate_control_group(group)?);
+            // Validated in new_for_node, with the file's value.
+            self.control_group = Some(group.clone());
         }
         if let Some(self_addr) = &common.self_addr {
             self.self_addr = *self_addr;
@@ -676,12 +700,16 @@ impl Config {
             self.tun_if = Some(tun_if.clone());
         }
         if let Some(addrs) = &common.zpr_addr {
-            self.zpr_addr.extend(addrs);
+            self.zpr_addr = addrs.clone();
         }
-
-        self.logging.extend(common.logging.iter().cloned());
-
-        self.batch_io_engine = common.io_engine.clone();
+        // clap gives an empty list when `--logging` is absent: an empty
+        // `--logging` is refused by `num_args = 1..`.
+        if !common.logging.is_empty() {
+            self.logging = common.logging.clone();
+        }
+        if let Some(io_engine) = &common.io_engine {
+            self.batch_io_engine = io_engine.clone();
+        }
 
         self.km_impl = match common.km_impl.as_str() {
             "noise" => KM_ID_NOISE,
@@ -747,6 +775,22 @@ pub struct NodeConfig {
     pub global: GlobalConfigSection,
     pub node: Option<NodeConfigSection>,
     pub authentication: Option<AuthenticationConfigSection>,
+}
+
+impl NodeConfig {
+    /// Drop each `[node]` value that a given `ph zode` flag replaces
+    /// (zl-zipline#278 review). [Config::new_for_node] validates the
+    /// `[node]` values when it applies them, before the caller applies
+    /// these flags. Without this, an invalid `[node.initial_link]` in the
+    /// file stops ph although `--initial-link` gives a valid value. With
+    /// no flag, the file value stays, and is validated as before.
+    pub fn drop_node_values_replaced_by_flags(&mut self, initial_link: bool) {
+        if let Some(node) = self.node.as_mut() {
+            if initial_link {
+                node.initial_link = None;
+            }
+        }
+    }
 }
 
 // The `[node]` section of a Zode config file.

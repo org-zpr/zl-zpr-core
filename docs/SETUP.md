@@ -1,63 +1,70 @@
 # Setting up a ZPRnet by hand
 
-A step-by-step walkthrough of standing up a minimal ZPRnet: one node, one
-visa service, and the adapters that connect them. It ends with a reference
-for the control socket and for certificate verification.
+A step-by-step walkthrough of standing up a minimal ZPRnet of Zodes: a
+relay Zode that hosts the visa service, and endpoint Zodes that join through
+it. It ends with a reference for the control socket and for certificate
+verification.
+
+A Zode is a ZPR node that carries its own host's traffic: `ph zode`, the
+only mode of `ph`. Every Zode is either a **relay** (`relay = true`), which
+never dials and accepts links from the Zodes in its topology, or dials its
+relay over its **initial link** (`initial_link`). Exactly one of the two is
+required.
 
 The scripts in [`../integration-test/`](../integration-test/) do all of this
-automatically on network namespaces; read them when a step here is unclear
-or has drifted.
+automatically on network namespaces (`lib/zode_funcs.sh` starts the relay
+and the Zodes, and `pregen/zodes.zplc` is their policy); read them when a
+step here is unclear or has drifted.
 
 You need these binaries on hand:
 
 * `ph` from this repository (`make`, then `target/debug/ph`).
-* `vs` from the [zpr-visaservice repository](https://github.com/org-zpr/zpr-visaservice).
-* `zplc` from the [zpr-compiler repository](https://github.com/org-zpr/zpr-compiler),
+* `vs` from the [zl-zpr-visaservice repository](https://github.com/org-zpr/zl-zpr-visaservice).
+* `zplc` from the [zl-zpr-compiler repository](https://github.com/org-zpr/zl-zpr-compiler),
   unless you already have a compiled policy.
 
-A minimal ZPRnet has a node and a visa service. You will probably also
-want a service or two that run on the net, plus some client adapters
-that connect in and access the services.
+Take `vs` and `zplc` from a build set compatible with this `ph` (see
+`docs/BUILD.md`, "Compatible build sets", in `zl-zpr-dev-context`): a
+compiler without Zode support rejects the policy below, whose endpoint
+Zodes have no substrate addresses.
+
+This walkthrough uses three Linux hosts:
+
+* the relay, `relay`, on substrate address `129.6.7.1`, with ZPR address
+  `fd5a:5052::2`. It also runs Valkey and the visa service, which listens on
+  `vs.zpr` (`fd5a:5052::1`), an address the relay puts on its own TUN;
+* `web`, ZPR address `fd5a:5052::3`, which serves HTTP on port 80;
+* `laptop`, ZPR address `fd5a:5052::4`, which may reach `web`'s service.
+
+Each name is also the Zode's certificate CN, and its node name in the
+policy.
 
 
 ## Create authentication keys to share with the visa service
 
-In order to connect to the initial ZPRnet each adapter needs to share an
-RSA key with the visa service.  This is done via policy.  Since we are
-going to need a node and a visa service we need two keys.
+Each Zode authenticates to the visa service with an RSA key whose public
+half is in the policy. The policy also names one for `vs.zpr`, as the test
+fixtures do:
 
 ```sh
-openssl genrsa -out node-private-key.pem
-openssl genrsa -out vs-private-key.pem
+for NAME in relay web laptop vs; do
+  openssl genrsa -out $NAME-private-key.pem
+  openssl rsa -in $NAME-private-key.pem -pubout -out $NAME-public-key.pem
+done
 ```
 
-The private keys stay with the visa service adapter and node, but we need
-to put the public keys in the policy, so first extract them:
-
-```sh
-openssl rsa -in node-private-key.pem -pubout -out node-public-key.pem
-openssl rsa -in vs-private-key.pem -pubout -out vs-public-key.pem
-```
-
-Then in the policy `zplc` file, add a bootstrap section that looks like
-this:
-
-```toml
-[bootstrap]
-"node.zpr.org" = "/path/to/node-public-key.pem"
-"vs.zpr" = "/path/to/vs-public-key.pem"
-```
+Each Zode keeps its private key (`auth_private_key` below); the public keys
+go into the policy's `[bootstrap]` section.
 
 
 ## Create a certificate authority keypair
 
 In addition to the visa service authentication, there is a separate
-authentication check when the link is first brought up between an adapter
-and a node.  This uses certificates holding noise keys and signed by a
-certificate authority (CA).  Adapters verify the certs they get from
-a node.  So we need a certificate authority:
+authentication check when a link between two Zodes comes up. This uses
+certificates holding noise keys and signed by a certificate authority (CA),
+and each Zode verifies its peer's. So we need a certificate authority.
 
-We'll put the authority related file into a directory named `authority`.
+We'll put the authority related files into a directory named `authority`.
 You will be prompted for a pass phrase. You'll need to use that whenever
 you sign a certificate using the authority key.
 
@@ -74,19 +81,21 @@ openssl genrsa -aes256 -out auth-ca.key 4096
 openssl req -x509 -new -nodes -key auth-ca.key -sha256 -days 1826 -out auth-ca.crt
 ```
 
-## Create a signed noise certificate for the node
+## Create a signed noise certificate for each Zode
 
-Using the handy `zpr-pki` script:
+Using the handy `zpr-pki` script, one certificate per Zode, with the Zode's
+name as its CN:
 
 ```sh
-./integration-test/lib/zpr-pki genkey >node-noise.key
-
-# First extract a public key from the private one
-./integration-test/lib/zpr-pki pubkey <node-noise.key >node-noise-pub.pem
-
-# Then sign the public key
-./integration-test/lib/zpr-pki gensignedcert authority/auth-ca.crt authority/auth-ca.key \
-  /CN=node.zpr.org 365 < node-noise-pub.pem >node-noise.crt
+for NAME in relay web laptop; do
+  # umask 077: the private key is readable by its owner only
+  (umask 077; ./integration-test/lib/zpr-pki genkey >$NAME-noise.key)
+  # First extract a public key from the private one
+  ./integration-test/lib/zpr-pki pubkey <$NAME-noise.key >$NAME-noise-pub.pem
+  # Then sign the public key
+  ./integration-test/lib/zpr-pki gensignedcert authority/auth-ca.crt authority/auth-ca.key \
+    /CN=$NAME 365 < $NAME-noise-pub.pem >$NAME-noise.crt
+done
 ```
 
 ## Create TLS credentials for the visa service
@@ -104,68 +113,61 @@ openssl req -new -newkey rsa:4096 -x509 -sha256 -days 365 -nodes -out admin-tls-
 ```
 
 
-## Create a configuration file for your node
+## Create a configuration file for each Zode
 
-Assuming:
-- Node substrate (dock) address is `129.6.7.1`
-- Node ZPR address is `fd5a:5052:90de::1`
+The schema, with every key explained, is
+[`adapter/ph/example-node-config.toml`](../adapter/ph/example-node-config.toml).
+Unknown sections and keys are refused. Most settings can also be given on
+the command line (`ph zode --help`). `--relay`, `--initial-link`,
+`--forwarding`, `--advertised-substrate-addr` and `--control-group`
+override the file. For the other `[global]` settings the file sets, the
+file wins, so change them there, except `--zpr-addr`, whose addresses are
+put *before* the file's list. The first address is the Zode's own, so give
+the whole list in one place.
 
-Sample configuration, place in a file named `node-conf.toml`.
+The relay, `relay-conf.toml`. It lists its own ZPR address first and
+`vs.zpr` after it, and puts both on its TUN. `forwarding = true` lets it
+carry traffic between the other Zodes:
 
 ```toml
 [global]
-# ca_file is needed for the node to verify adapter certificates and recognize
-# the visa-service adapter as special.  Without it, VS routing will not work.
 ca_file = "authority/auth-ca.crt"
-certificate_file = "node-noise.crt"
-private_key_file = "node-noise.key"
+certificate_file = "relay-noise.crt"
+private_key_file = "relay-noise.key"
 self_addr = "129.6.7.1:5000"
-zpr_addr = [ "fd5a:5052:90de::1" ]
+zpr_addr = [ "fd5a:5052::2", "fd5a:5052::1" ]
 tun_if = "tun9"
+
+[node]
+relay = true
+forwarding = true
 
 [authentication]
-auth_private_key = "node-private-key.pem"
+auth_private_key = "relay-private-key.pem"
 ```
 
-
-## Create a signed noise certificate for the visa service adapter
-
-The visa service adapter must present a CA-signed certificate so the node can
-recognize it as the special visa-service peer.  The certificate CN **must** be
-`vs.zpr` — that is the hard-coded visa-service distinguished name the node
-matches against.  Generate and sign one:
-
-```sh
-./integration-test/lib/zpr-pki genkey >vs-noise.key
-./integration-test/lib/zpr-pki pubkey <vs-noise.key >vs-noise-pub.pem
-./integration-test/lib/zpr-pki gensignedcert authority/auth-ca.crt authority/auth-ca.key \
-  /CN=vs.zpr 365 < vs-noise-pub.pem >vs-noise.crt
-```
-
-
-## Create a configuration file for the visa service adapter
-
-Sample configuration, place in a file named `adapter-vs-conf.toml`.
+An endpoint Zode, `web-conf.toml`. Its initial link names the relay's
+substrate address and certificate CN. With no `self_addr` it binds the
+wildcard address, and reports its initial link's local address to the visa
+service, so it needs no address of its own in the config:
 
 ```toml
 [global]
-# ca_file is optional for link establishment, but the VS adapter must present
-# a CA-signed certificate_file so the node can recognize it as the visa service.
 ca_file = "authority/auth-ca.crt"
-certificate_file = "vs-noise.crt"   # CN must be "vs.zpr"
-private_key_file = "vs-noise.key"
-zpr_addr = [ "fd5a:5052::1" ]
+certificate_file = "web-noise.crt"
+private_key_file = "web-noise.key"
+zpr_addr = [ "fd5a:5052::3" ]
 tun_if = "tun9"
 
-[adapter]
-node_addr = "129.6.7.1:5000"
-node_public_key_file = "node-noise-pub.pem"
-bootstrap_key = "vs-private-key.pem"
+[node]
+initial_link = { addr = "129.6.7.1:5000", cn = "relay" }
+
+[authentication]
+auth_private_key = "web-private-key.pem"
 ```
 
-`name` is not set here because `certificate_file` is present — the CN is read
-from the certificate, not from `name`.  `name` is only required for adapters
-that have no `certificate_file` (self-signed cert path).
+`laptop-conf.toml` is the same with `laptop` in place of `web` and
+`fd5a:5052::4` as its address.
 
 
 ## Configure the visa service (optional)
@@ -181,7 +183,7 @@ name for it is `vs.toml`, so:
 
 ## Start Valkey
 
-Valkey is **required** by the visa service.
+Valkey is **required** by the visa service. Run it on the relay host.
 
 On linux systems it may be installed as a service:
 
@@ -202,37 +204,69 @@ valkey-server
 
 ## Write a policy and compile it.
 
-Here is a simple policy to let any connected "user" access a "WebService".
+Here is a simple policy to let `laptop` access a "WebService" on `web`,
+over HTTP port 80.
 
-We assume:
-- WebService is connected using an adapter with `CN=web.zpr.org`.
-- WebService has a bootstrap public RSA key in `web-public-key.pem`.
-- WebService is accessed using HTTP port 80.
-
-Create a file called `zpr-full-access.zpl` with these contents:
+Create a file called `zpr-web.zpl` with these contents:
 
 ```
-Define WebService as a service with device.zpr.adapter.cn:'web.zpr.org'.
-Allow user to access WebService.
+define zode as a device with zpr.adapter.cn.
+
+define Laptop as zode with zpr.adapter.cn:laptop.
+
+define WebService as a service with device.zpr.adapter.cn:web.
+
+allow Laptop to access WebService.
 ```
 
-Then write a configuration file.
-Create a file called `zpr-full-access.zplc` with these contents.
+Then write a configuration file. It names each Zode, the links between
+them, and the relay that hosts the visa service (`dock_node`). Only the
+relay has a substrate address in the policy: the visa service learns each
+other Zode's address from what it reports when it connects. Create a file
+called `zpr-web.zplc` with these contents:
 
 ```toml
-[nodes."node"]
-provider = [ ["device.zpr.adapter.cn", "node.zpr.org"]]
-zpr_address = "fd5a:5052:90de::1"
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"web.zpr" = "fd5a:5052::3"
+"laptop.zpr" = "fd5a:5052::4"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "129.6.7.1:5000"
+
+[nodes.web]
+provider = [ [ "device.zpr.adapter.cn", "web" ] ]
+zpr_address = "web.zpr"
+
+[nodes.laptop]
+provider = [ [ "device.zpr.adapter.cn", "laptop" ] ]
+zpr_address = "laptop.zpr"
+
+[links.relay-web]
+peers = [ { node = "relay" }, { node = "web" } ]
+
+[links.relay-laptop]
+peers = [ { node = "relay" }, { node = "laptop" } ]
 
 [trusted_services.default]
+cert_path = "authority/auth-ca.crt"
 
 [visa_service]
-dock_node = "node"
-admin_attrs = [ [ "device.zpr.adapter.cn", "admin.zpr.org" ] ]
+dock_node = "relay"
 
 [bootstrap]
-"node.zpr.org" = "node-public-key.pem"
-"web.zpr.org" = "web-public-key.pem"
+"relay" = "relay-public-key.pem"
+"web" = "web-public-key.pem"
+"laptop" = "laptop-public-key.pem"
+"vs.zpr" = "vs-public-key.pem"
 
 [protocols.http]
 l4protocol = "iana.TCP"
@@ -245,61 +279,45 @@ protocol = "http"
 To compile, use the compiler:
 
 ```bash
-zplc zpr-full-access.zpl
+zplc zpr-web.zpl
 
-# This will create the binary policy file, "zpr-full-access.bin2"
+# This will create the binary policy file, "zpr-web.bin2"
 ```
 
-## Start up the node, the visa service and the visa service adapter.
+## Start the relay, the visa service, and the endpoint Zodes
 
-Assuming you have three separate hosts for this. The node should be run
-on a Linux host but other platforms may work.  This assumes Linux.  Note
-that for any node or adapter where the ZPR address is specified in the
-config file, and you are running on Linux, you must manually configure
-the network TUN interface to work around a known bug in the Linux
-TUN library we are using.
+`ph` expects to be able to access directory `/var/run/zpr`. On each host:
 
-So to prepare the Linux host to run the node, first set up the tun.
-In the config file above we set the name to `tun9` so we set that up
-here:
+    sudo mkdir -p /var/run/zpr
+
+On Linux, create each Zode's TUN interface first, as the integration tests
+do: a multi-queue TUN, up, with no address. `ph zode` applies its own ZPR
+addresses to it (the relay's `vs.zpr` included).
 
 ```bash
-# IP configuration for the node.
 sudo ip tuntap add name tun9 mode tun multi_queue
-sudo ip link set tun9 mtu 1400
-sudo ip addr add fd5a:5052:90de::1/32 dev tun9
 sudo ip link set tun9 up
 ```
 
-The binary also expects to be able to access directory `/var/run/zpr`, so:
+On the relay host, start the relay:
 
-    sudo mkdir /var/run/zpr
+    sudo ./ph zode -c /path/to/relay-conf.toml
 
-Then you can start the node:
+The visa service binds `vs.zpr`, so start it only once the relay has put
+`fd5a:5052::1` on `tun9` (`ip -6 addr show dev tun9`), on the same host:
 
-    sudo ./ph node -c /path/to/node-conf.toml
+    ./vs /path/to/zpr-web.bin2
 
-If the visa service is also running on linux as this guide assumes, then we
-need to configure its TUN interface similar to what we did for the node.
+The relay connects to the visa service and logs `registered VSS`. Then, on
+the `web` and `laptop` hosts:
 
-```bash
-# IP configuration for the visa service adapter.
-sudo ip tuntap add name tun9 mode tun multi_queue
-sudo ip link set tun9 mtu 1400
-sudo ip addr add fd5a:5052::1/32 dev tun9
-sudo ip link set tun9 up
-```
+    sudo ./ph zode -c /path/to/web-conf.toml
+    sudo ./ph zode -c /path/to/laptop-conf.toml
 
-Now start the visa service:
-
-    ./vs /path/to/zpr-full-access.bin2
-
-On the visa service host, in another terminal start the adapter:
-
-    sudo ./ph adapter -c /path/to/adapter-vs-conf.toml
-
-
-Now you can attach additional adapters and start up the "WebService".
+Each dials the relay, receives bootstrap visas from it, connects to the visa
+service, and logs `registered VSS`. `ph-cli link show` on each shows its
+link to the relay `(Active)`. Now start the web service on `web`, and
+`laptop` can reach it at `http://[fd5a:5052::3]/`.
 
 
 ## Control socket ownership and `ph-cli` access
@@ -321,7 +339,7 @@ from `HOME`/`XDG_DATA_HOME`, since `ph` runs in root's environment and
 
 `ph-cli`, run as that same user with no `sudo` and no `-p`, looks in the
 per-user directory for its own uid first and connects directly. Because each
-invoking user gets their own directory, two adapters started by two different
+invoking user gets their own directory, two Zodes started by two different
 users on one host do not collide.
 
 **systemd-started (owner unknown).** When `ph` is started by systemd,
@@ -361,56 +379,54 @@ dead `ph` (nothing unlinks it on a crash) never shadows a live server at a
 later path. If none answers, `ph-cli` fails with an error naming every
 path tried. An explicit `-p` (control) always wins, on both `ph` and
 `ph-cli`, as does an explicit `control_path` in the config file — so
-multi-adapter and test setups keep full control.
+multi-Zode and test setups keep full control.
 
 **Security note.** Reaching the control socket means being able to start and
-stop links and register an `AuthAgent` — i.e. to supply and observe user
-credentials for this adapter, and to receive the IdP `client_secret` in a
-HelloResponse. Socket access is adapter control. Membership in the
+stop links and to log a user in or out on this Zode (`ph-cli connect`,
+`auth-agent`, `logout`) — i.e. to supply and observe user credentials for
+this Zode. Socket access is Zode control. Membership in the
 configured control group grants exactly that, on every platform, so treat
 it accordingly: it is not a low-privilege convenience group.
 
 
 ## Windows
 
-`ph` runs on Windows 10/11 x64 in both roles. `ph adapter` creates a Wintun
-interface, docks to a node, and carries this machine's own traffic, exactly
-like `sudo ph adapter -c x.toml` on Linux. `ph node` creates a Wintun
-interface, applies its own ZPR address and the visa-service route to it,
-accepts docking adapters, and forwards their traffic, exactly like
-`sudo ph node -c x.toml` on Linux — within the constraints below.
+`ph zode` runs on Windows 10/11 x64. It creates a Wintun interface, applies
+its own ZPR address to it, links to its relay, and carries this machine's
+own traffic, exactly like `sudo ph zode -c x.toml` on Linux — within the
+constraints below.
 
-**Windows node constraints** (deliberate, in this release):
+**Windows constraints** (deliberate, in this release):
 
 * **Wildcard and multi-homed binds are allowed**, as on unix: the Windows
   engine reads each datagram's destination and sets each send's source
   with `IP_PKTINFO`/`IPV6_PKTINFO` (`WSARecvMsg`/`WSASendMsg`,
-  [zipline#150](https://github.com/org-zpr/zl-zipline/issues/150)). A
-  wildcard `self_addr` needs `advertised_substrate_addr`, as on every OS;
-  with a concrete `self_addr` it defaults to that. Following a network
-  change while running is
-  [zl-zipline#230](https://github.com/org-zpr/zl-zipline/issues/230).
+  [zipline#150](https://github.com/org-zpr/zl-zipline/issues/150)). A Zode
+  with a wildcard `self_addr` reports its initial link's local address to
+  the visa service, so the address follows a network change
+  ([zl-zipline#230](https://github.com/org-zpr/zl-zipline/issues/230)); a
+  relay with a wildcard `self_addr` needs `advertised_substrate_addr`.
 * **Elevated console** — Wintun device creation requires Run as
-  administrator, same as the adapter role.
+  administrator.
 * **A single, unbatched datapath worker** — Wintun enforces one queue and
   the `windows_unbatched` engine drives one substrate socket; functional
   parity with Linux is the bar, throughput is not (measured numbers are in
   the test document below).
-* **Inbound firewall rules are required**: UDP on the dock port (5000 by
-  default) on the LAN interface, and TCP 8183 (the VSS listener) on the
-  Wintun interface, which Windows places on the Public profile where
-  unsolicited inbound is dropped. The exact rules and when each can be added
-  are in the test document below.
+* **An inbound firewall rule is required** for TCP 8183 (the VSS listener)
+  on the Wintun interface, which Windows places on the Public profile where
+  unsolicited inbound is dropped. A Zode that dials its relay needs no rule
+  for its link; a relay also needs UDP on its link port (5000 by default).
+  The exact rule and when it can be added are in the test document below.
 * **One `ph` instance per user without `--control-path`**: the default
-  control path is derived from the owner alone, so a node and an adapter for
-  the same user on one host need explicit `--control-path`s to coexist
+  control path is derived from the owner alone, so two Zodes for the same
+  user on one host need explicit `--control-path`s to coexist
   ([zipline#169](https://github.com/org-zpr/zl-zipline/issues/169)).
 
-The hand-run, end-to-end verification of the Windows node (a Windows VM
-forwarding real traffic between Linux adapters and hosting the visa
-service's support service) is
-[`integration-test/windows-node-test.md`](../integration-test/windows-node-test.md);
-run it whenever a change touches the Windows node path. CI covers Windows
+The hand-run, end-to-end verification of a Windows Zode (a Windows VM
+joining a relay on a Linux host, reaching the visa service, a user login,
+and control pipe access) is
+[`integration-test/windows-zode-test.md`](../integration-test/windows-zode-test.md);
+run it whenever a change touches the Windows path. CI covers Windows
 builds and unit tests (`.github/workflows/adapter.yml` builds and tests `ph`
 and `ph-cli` on `windows-latest`), but there is no automated end-to-end
 Windows tier that carries real traffic
@@ -462,14 +478,14 @@ Cross-checking from Linux without a Windows box:
 1. Download the signed `wintun.dll` (x64) from
    [wintun.net](https://www.wintun.net) and place it **in the same directory
    as `ph.exe`**. It is loaded at runtime; without it `ph` exits at startup.
-2. Write an adapter config as on Linux (same TOML schema; see the adapter
-   examples above). Windows-style paths in double-quoted TOML strings need
+2. Write a Zode config as on Linux (same TOML schema; see the examples
+   above). Windows-style paths in double-quoted TOML strings need
    escaped backslashes — prefer single-quoted literals: `ca_file = 'C:\zpr\ca.crt'`.
 3. Start from an **elevated** (Run as administrator) console — Wintun device
    creation requires it:
 
    ```powershell
-   .\ph.exe adapter -c adapter.toml
+   .\ph.exe zode -c zode.toml
    ```
 
 4. `ph-cli.exe` talks to it over a named pipe instead of the unix socket;
@@ -503,7 +519,7 @@ users running `ph-cli` as themselves, not elevated — work:
 
 ```powershell
 # Service-run ph (the packager's service unit passes the name):
-ph.exe adapter -c C:\ProgramData\zipline\adapter.toml --control-group zipline
+ph.exe zode -c C:\ProgramData\zipline\zode.toml --control-group zipline
 ```
 
 The setting is the same one the unix arm uses: `control_group` in
@@ -522,7 +538,7 @@ all three platforms: it creates the group at install, deletes it at
 uninstall, and passes the name to `ph` from its service unit
 (`zipline-svc` on Windows, `zipline.service` / the launchd plist on
 Linux/macOS) — [org-zpr/zipline#29](https://github.com/org-zpr/zipline/issues/29).
-An administrator then adds the users who may drive the adapter
+An administrator then adds the users who may drive the Zode
 (`net localgroup zipline <user> /add`); that is the deliberate admission
 step, and nothing is opened up by default. Until a unit passes the name,
 the group exists but grants nothing.
@@ -532,7 +548,7 @@ How each launch mode is covered:
 | How `ph` runs | Who reaches the pipe | How |
 |---|---|---|
 | Service (LocalSystem) — the expected common case | members of the configured group, not elevated | group ACE |
-| Elevated console, same user as `ph-cli` | that user, elevated or not (non-elevated: checked by the VM smoke) | user-SID ACE |
+| Elevated console, same user as `ph-cli` | that user, elevated or not (non-elevated: checked by the VM test) | user-SID ACE |
 | Elevated console via over-the-shoulder credentials (a different admin account) | members of the configured group | group ACE |
 
 **Re-logon caveat.** Group membership is read into a user's token at
@@ -540,160 +556,73 @@ logon: a user just added to the group must log off and on again (or start
 a new logon session) before `ph-cli` can open the pipe.
 
 The security note above applies unchanged: membership in the control group
-is adapter control.
+is Zode control.
 
-For an end-to-end walkthrough against a Linux node and visa service, see
-[`integration-test/windows-adapter-test.md`](../integration-test/windows-adapter-test.md).
+The operator-run checks of each launch mode are section 4 of
+[`integration-test/windows-zode-test.md`](../integration-test/windows-zode-test.md).
 
 
 ## macOS
 
-`ph` runs on a Mac — Apple Silicon or Intel — in both roles, started by
-hand with `sudo ph node -c x.toml` / `sudo ph adapter -c x.toml` exactly as
-on Linux. The node creates a utun interface, applies its own ZPR address to
-it, accepts docking adapters, forwards their traffic, and reaches the visa
-service through its own TUN. The adapter creates a utun, docks to a node,
-and carries this machine's own traffic. The node role first; the adapter
-subsection follows.
+`ph zode` runs on a Mac — Apple Silicon or Intel — started by hand with
+`sudo ph zode -c x.toml`, exactly as on Linux. It creates a utun interface,
+applies its own ZPR address to it, links to its relay, and carries this
+machine's own traffic.
 
-**macOS node constraints** (deliberate, in this release):
+**macOS constraints** (deliberate, in this release):
 
-* **A dev/demo node** — the adapters and the visa service stay on Linux;
-  functional parity with Linux is the bar, not throughput. No launchd
-  service; `ph` is started by hand from a terminal.
+* **A dev/demo Zode** — functional parity with Linux is the bar, not
+  throughput. No launchd service; `ph` is started by hand from a terminal.
 * **`sudo` is required** — creating a utun needs root, same as the TUN on
-  Linux.
+  Linux. No TUN pre-creation is needed or possible: `ph` creates the utun
+  itself through `TunCtl`. `tun_if`, when set, must be of the form `utunN`;
+  left unset, the kernel picks the name.
 * **A single, unbatched datapath worker** — the macOS `posix_unbatched`
   engine forces one worker (`new_mq` rejects more). Wildcard and
-  multi-homed binds are allowed (pktinfo), as on the Windows node.
-  Measured single-worker numbers are in the test document below.
-* **One `ph` instance per user without `--control-path`**: the default
-  control path is derived from the owner alone, so a node and an adapter
-  for the same user on one host need explicit `--control-path`s to coexist
-  ([zipline#169](https://github.com/org-zpr/zl-zipline/issues/169)).
-
-**Addressing.** The node creates the utun through `TunCtl` and applies its
-ZPR address with `ifconfig <utun> inet6 <addr>/32 alias`. The alias alone
-installs the on-link `fd5a:5052::/32` route via the utun — no explicit
-route is needed; the kernel does it as part of the alias (verified in the
-first end-to-end run, 2026-10-02). No manual `ifconfig` or `route` step is
-required before starting the node.
-
-**Firewall.** The application firewall was **not exercised** in the first
-end-to-end run — it was disabled on the test Mac
-(`socketfilterfw --getglobalstate`: State = 0) and left off by choice.
-`/usr/libexec/ApplicationFirewall/socketfilterfw` is the knob to check if
-inbound UDP on the dock port or TCP 8183 (the VSS listener) is blocked on
-a Mac where the firewall is on; no tested command set exists yet.
-
-The hand-run, end-to-end verification of the macOS node (a Mac forwarding
-real traffic between Linux adapters and hosting the visa service's support
-service) is
-[`integration-test/macos-node-test.md`](../integration-test/macos-node-test.md);
-run it whenever a change touches the macOS node path. There is no automated
-macOS end-to-end tier.
-
-### macOS adapter
-
-`sudo ph adapter -c x.toml`, same TOML schema as Linux (see the adapter
-examples above). `tun_if`, when set, must be of the form `utunN`; left
-unset, the kernel picks the name. No TUN pre-creation is needed or
-possible — `ph` creates the utun itself through `TunCtl`, and the known
-Linux pre-creation workaround does not apply.
-
-**macOS adapter constraints** (deliberate, in this release — verified
-against the code, not copied from the node list):
-
-* **A dev/demo adapter** — functional parity with Linux is the bar, not
-  throughput. No launchd service; `ph` is started by hand from a terminal.
-* **`sudo` is required** — creating a utun needs root, same as the node
-  role (`TunCtl::new_mq` goes through the same `PF_SYSTEM` control
-  socket).
-* **A single, unbatched datapath worker** — the one-worker limit is in
-  `new_mq` itself (`concurrency` must be 1 on macOS) and in the platform
-  default, so it binds the adapter role exactly as it does the node;
-  the engine is the same `posix_unbatched`.
-* **IPv6 ZPR addresses only** — `TunCtl::add_address` (and `add_route`)
-  return `Unsupported` for IPv4 on macOS; the ZPR internal network is
+  multi-homed binds are allowed (pktinfo), as on Windows.
+* **IPv6 ZPR addresses only** — `TunCtl::add_address`
+  returns `Unsupported` for IPv4 on macOS; the ZPR internal network is
   IPv6 (`fd5a:5052::/32`).
-* **One adapter per host** — at startup, and again at every link
-  activation, the adapter refuses to run when `fd5a:5052::/32` already
-  routes to another live interface
-  ([zipline#101](https://github.com/org-zpr/zl-zipline/issues/101)).
-  This also means a node and an adapter cannot share a Mac.
 * **One `ph` instance per user without `--control-path`**: the default
   control path is derived from the owner alone
   ([zipline#169](https://github.com/org-zpr/zl-zipline/issues/169)).
 
-**Addressing.** Unlike the node, the adapter does not self-address at
-startup: the utun is created **unaddressed**
-([zipline#161](https://github.com/org-zpr/zl-zipline/issues/161)), and
-when the dock link activates with a granted ZPR address, the activation
-sequence in `link_state.rs` applies it via `TunCtl::add_address`
-(`ifconfig <utun> inet6 <addr>/32 alias`) and then ensures the internal-
-network route via `TunCtl::add_route` (`/sbin/route -n add -inet6
-fd5a:5052::/32 -interface <utun>` — idempotent: a route already present
-is verified to run via this utun and replaced if not,
-[zipline#100](https://github.com/org-zpr/zl-zipline/issues/100)). On
-macOS the `/32` alias alone already installs the on-link route (verified
-in the node's first end-to-end run, 2026-10-02), so the explicit
-`add_route` is normally a no-op safety net. No manual `ifconfig` or
-`route` step is required.
+**Addressing.** The Zode creates the utun through `TunCtl` and applies its
+ZPR address with `ifconfig <utun> inet6 <addr>/32 alias`. The alias alone
+installs the on-link `fd5a:5052::/32` route via the utun — no explicit
+route is needed; the kernel does it as part of the alias (verified in the
+first end-to-end run, 2026-10-02). No manual `ifconfig` or `route` step is
+required before starting `ph`.
 
-**Firewall (provisional).** The adapter run has not yet exercised the
-application firewall — these notes are derived from the node-role
-findings and stay provisional until the adapter checklist's firewall item
-is executed (zipline#174). The adapter *originates* its dock (outbound
-UDP), so docking is expected to work with the firewall on; the exposed
-piece is inbound traffic through the established flow and ZPR-internal
-services the Mac answers. `/usr/libexec/ApplicationFirewall/socketfilterfw`
-is the knob if anything is blocked; rules key on the executable's path,
-so allow the copy of `ph` the run actually starts.
+**Firewall.** The application firewall has **not been exercised** — it was
+disabled on the test Mac (`socketfilterfw --getglobalstate`: State = 0).
+A Zode that dials its relay needs nothing for its link; the exposed piece
+is TCP 8183 (the VSS listener), which the visa service reaches over the
+utun. `/usr/libexec/ApplicationFirewall/socketfilterfw` is the knob if it
+is blocked; rules key on the executable's path, so allow the copy of `ph`
+you actually start.
 
-The hand-run, end-to-end verification of the macOS adapter (a Mac docking
-to a Linux node and carrying real traffic both ways) is
-[`integration-test/macos-adapter-test.md`](../integration-test/macos-adapter-test.md);
-run it whenever a change touches the macOS adapter path. Its first
-execution — and the firewall findings above — is tracked as
-[zipline#174](https://github.com/org-zpr/zl-zipline/issues/174).
+The hand-run, end-to-end verification of a macOS Zode (a Mac joining a
+relay on a Linux host, reaching the visa service, and a user login) is
+[`integration-test/macos-zode-test.md`](../integration-test/macos-zode-test.md);
+run it whenever a change touches the macOS path. There is no automated
+macOS end-to-end tier.
 
 
 ## Certificate and peer verification reference
 
-### Local certificate (`certificate_file` / `name`)
+### Local certificate (`certificate_file`)
 
-| Role | `certificate_file` | `name` | Behavior |
-|------|-------------------|--------|-----------|
-| node | required | ignored | Provided cert is used; node name comes from the cert CN |
-| adapter | present | optional | Provided cert is used; CN comes from the cert where needed |
-| adapter | absent | required | Self-signed cert is generated with CN from `name` |
-| adapter | absent | absent | Config validation fails |
-
-For adapters, CLI `--name` overrides `[adapter].name` in the config file.
+A Zode needs `certificate_file`, and `private_key_file` or
+`--noise-private-key`; config validation fails without them. Its name is
+the certificate's CN, which is also its node name in the policy.
 
 ### Peer certificate verification (`ca_file`)
 
+Every link is between two Zodes, and each verifies the other's certificate
+against `ca_file`:
+
 | `ca_file` | Behavior |
 |-----------|-----------|
-| present | Peer cert signatures are verified against the CA; unverified peers are handled by link-type rules (see below) |
-| absent | Peer cert signatures are not CA-verified; a warning is logged at startup and unverified peers are accepted |
-
-Link-type rules when `ca_file` is configured:
-
-| Link direction | Unverified peer cert | Action |
-|---------------|---------------------|--------|
-| Adapter → Node | Node cert unverified | Link rejected |
-| Node → Node | Peer node cert unverified | Link rejected |
-| Node → Adapter | Adapter cert unverified | Link accepted with a warning |
-
-### Special peers (visa service adapter)
-
-The visa service adapter is recognized as "special" by the node **only** when
-the adapter presents a CA-verified certificate claiming the visa-service DN.
-This means:
-
-- The **node** must configure `ca_file` (to verify the VS adapter's cert).
-- The **VS adapter** must present a CA-signed `certificate_file` (not a self-signed cert).
-
-Without both conditions, the VS adapter connects as an ordinary adapter and
-visa-service traffic is not routed to it.
+| present | The peer's certificate must be signed by the CA; a link to a peer whose certificate is not is rejected |
+| absent | `ph` logs `no ca_file configured; peer certificates will not be verified` at startup, and the noise key manager (the default) refuses to start any Zode link |

@@ -28,13 +28,12 @@ pub enum AuthFailureReason {
     /// Discovery/token endpoint failure (not an authentication problem).
     IdpUnreachable(String),
     AgentError(String),
-    /// The visa service refused the credentials (Grant status Rejected).
+    /// The visa service refused the credentials.
     VisaServiceRejected(String),
-    /// Login worked, but no join policy admits this endpoint (Grant status
-    /// PolicyDenied).
+    /// Login worked, but no join policy admits this endpoint.
     PolicyDenied,
     /// The authentication backend is temporarily unavailable, or no
-    /// authentication method is available to this adapter.
+    /// authentication method is available to this Zode.
     AuthUnavailable,
     /// A Zode's own login (zl-zipline#233): the node's VS-API session was
     /// replaced (a reconnect, a visa-service restart, a rejoin or a K2
@@ -45,30 +44,14 @@ pub enum AuthFailureReason {
     LoginExpired,
 }
 
-impl AuthFailureReason {
-    /// The reason recorded when the node refuses a Grant with `status`.
-    pub fn from_grant_status(status: crate::zdp::AuthenticationStatus) -> Self {
-        use crate::zdp::AuthenticationStatus;
-        match status {
-            AuthenticationStatus::PolicyDenied => Self::PolicyDenied,
-            AuthenticationStatus::Retryable => Self::AuthUnavailable,
-            AuthenticationStatus::Rejected => {
-                Self::VisaServiceRejected("visa service rejected authentication".to_string())
-            }
-            other => Self::VisaServiceRejected(format!("grant failed with status {other:?}")),
-        }
-    }
-}
-
 /// A single credential request forwarded to the out-of-band AuthAgent
 /// (ph-cli). The admin worker bridges these onto the Cap'n Proto client it
 /// received in startLink.
 pub struct OidcCredentialRequest {
     /// The advertised identity provider to authenticate against.
     pub idp: auth::OidcIdpInfo,
-    /// The OIDC nonce: derived from the link challenge
-    /// ([auth::oidc_nonce_for_challenge]) for a docked actor, or minted by
-    /// the visa service for a Zode's own login (zl-zipline#233).
+    /// The OIDC nonce, minted by the visa service for a Zode's own login
+    /// (zl-zipline#233).
     pub nonce: String,
     /// `false` means "satisfy from a stored refresh token or fail"; the agent
     /// must never open a browser on a non-interactive request.
@@ -156,38 +139,6 @@ pub async fn request_id_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zdp::AuthenticationStatus;
-
-    /// Each refused Grant status maps to the reason ph-cli reports.
-    #[test]
-    fn test_reason_from_grant_status() {
-        assert_eq!(
-            AuthFailureReason::from_grant_status(AuthenticationStatus::PolicyDenied),
-            AuthFailureReason::PolicyDenied
-        );
-        assert_eq!(
-            AuthFailureReason::from_grant_status(AuthenticationStatus::Retryable),
-            AuthFailureReason::AuthUnavailable
-        );
-        assert!(matches!(
-            AuthFailureReason::from_grant_status(AuthenticationStatus::Rejected),
-            AuthFailureReason::VisaServiceRejected(_)
-        ));
-    }
-
-    /// The challenge bytes are nonce || ctime || hmac, in that order.
-    #[test]
-    fn test_challenge_bytes_layout() {
-        let payload = auth::ZdpInitAuthenticationPayload {
-            nonce: [1; 8],
-            ctime: 0x0203_0405_0607_0809u64.into(),
-            hmac: [7; 32],
-        };
-        let bytes = payload.challenge_bytes();
-        assert_eq!(&bytes[0..8], &[1; 8]);
-        assert_eq!(&bytes[8..16], &payload.ctime.to_bytes());
-        assert_eq!(&bytes[16..48], &[7; 32]);
-    }
 
     /// A reply the agent never sends within the bound is an interaction
     /// timeout; a dropped reply is an agent error; a closed agent is NoAgent.

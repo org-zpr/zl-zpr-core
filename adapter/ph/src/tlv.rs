@@ -35,6 +35,9 @@ impl DataType {
     pub const A2A_DH_PUBKEY: TlvType = 7; // Actor to Actor Diffie-Hellman Public Key
     pub const BOOTSTRAP_VISA: TlvType = 8;
     pub const ACTOR_AUTH_PROTOCOL: TlvType = 9;
+    /// Marked the visa service adapter's dock, which is gone
+    /// (zl-zipline#234). Never sent; a Zode refuses a HelloResponse that
+    /// carries it.
     pub const VS_BOOTSTRAP_LINK: TlvType = 10;
     /// Zipline-local (zipline#12): OIDC identity provider advertisement
     /// (JSON OidcIdpInfo) in HelloResponse. Formerly 9; moved when upstream
@@ -56,13 +59,6 @@ impl TlvEncoding {
         Self {
             tlv_type: DataType::ACTOR_AUTH_PROTOCOL,
             value: TlvValue::U16(ACTOR_AUTH_PROTOCOL_VERSION),
-        }
-    }
-
-    pub fn new_vs_bootstrap_link() -> Self {
-        Self {
-            tlv_type: DataType::VS_BOOTSTRAP_LINK,
-            value: TlvValue::U16(1),
         }
     }
 

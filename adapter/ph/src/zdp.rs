@@ -35,16 +35,12 @@ pub enum ZdpPacketType {
     HelloResponse = 135,
     ConfigurationRequest = 136,
     ConfigurationResponse = 137,
-    AcquireZprAddress = 138, // TODO: add to RFC 6
-    GrantZprAddress = 139,   // TODO: add to RFC 6
-    RevokeZprAddress = 140,
-    InitAuthenticationRequest = 141, // TODO: add to RFC 6
-    StartAuthentication = 142,       // Experimental; see diagrams/actor_authorization.md
-    AbandonAuthenticationAttempt = 143,
-    // Zipline-local assignments (zipline#66). Formerly 142/143; moved when
-    // upstream #1410 claimed those for StartAuthentication/Abandon.
-    RenewAuthenticationRequest = 144, // TODO: add to RFC 6 (zipline#66)
-    RenewAuthenticationResponse = 145, // TODO: add to RFC 6 (zipline#66)
+    // 138-145 carried the authorization and renewal of an actor docked
+    // over an adapter link (AcquireZprAddress, GrantZprAddress,
+    // RevokeZprAddress, InitAuthenticationRequest, StartAuthentication,
+    // AbandonAuthenticationAttempt, RenewAuthenticationRequest/Response).
+    // No actor docks on a Zode (zl-zipline#234): the numbers stay reserved,
+    // and a message of these types is refused as an unknown type.
     // Zipline-local (zl-zipline#252, ZODE_LINKS.md J4): a relay hands a
     // joining Zode its two bootstrap visas, after Hello and on Zode links
     // only. Body and checks: [crate::bootstrap_handoff].
@@ -82,24 +78,6 @@ pub enum ResponseCode {
     Other = 1,
     UnsupportedProtocol = 2,
     TemporarilyUnavailable = 3,
-}
-
-/// Outcome of an actor authentication step, carried in GrantZprAddress and
-/// (zipline#66) RenewAuthenticationResponse.
-#[open_enum]
-#[derive(Copy, Clone, Debug, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(u8)]
-pub enum AuthenticationStatus {
-    Success = 0,
-    /// Credentials or evidence rejected (bad signature, bad token, malformed
-    /// request). Terminal: the adapter latches the rejection.
-    Rejected = 1,
-    /// The authentication backend is temporarily unavailable; retry later.
-    Retryable = 2,
-    /// Zipline-local (zipline#12): authentication succeeded, but no join
-    /// policy admits this endpoint. Terminal like [Self::Rejected]; kept
-    /// distinct so ph-cli can tell the user which one happened.
-    PolicyDenied = 3,
 }
 
 #[derive(Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
@@ -171,76 +149,6 @@ pub struct ZdpHelloResponseHeader {
     //   - TLV type (u8)
     //   - TLV length (u8)
     //   - TLV value (variable length)
-}
-
-/// Bitflags for the [ZdpInitAuthenticationRequestHeader] flags field.
-pub mod init_authentication_flags {
-    pub const BOOTSTRAP_SUPPORT: u8 = 0x01;
-}
-
-/// Tentative -- pending inclusion into spec.
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(packed)]
-pub struct ZdpInitAuthenticationRequestHeader {
-    pub status: AuthenticationStatus,
-    pub flags: u8,
-    pub data_len: U16,
-    // Followed by challenge payload, eg ZdpInitAuthenticationPayload in auth.rs.
-}
-
-/// Renew Authentication request (node → adapter; zipline#66, pending RFC 6).
-///
-/// Sent on an Active NodeToAdapter link when the docked actor's
-/// authentication nears expiry: carries a fresh challenge, minted exactly
-/// like the one in [ZdpInitAuthenticationRequestHeader]'s payload, that the
-/// renewed credential must be bound to.
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(packed)]
-pub struct ZdpRenewAuthenticationRequestHeader {
-    pub data_len: U16,
-    // Followed by the challenge payload (ZdpInitAuthenticationPayload in auth.rs).
-}
-
-/// Renew Authentication response (adapter → node; zipline#66, pending RFC 6).
-///
-/// On [AuthenticationStatus::Success] carries the renewed auth blob — the
-/// same base64-encoded JSON encoding [ZdpAcquireZprAddressHeader]'s blob uses.
-/// [AuthenticationStatus::Retryable] means no AuthAgent is registered (or it
-/// could not answer); the blob is then empty.
-///
-/// `challenge` echoes the request's challenge bytes (nonce || ctime ||
-/// hmac) on EVERY response, success or failure, so the node can correlate
-/// a response with the attempt it answers before consuming any state: a
-/// delayed answer to an already-abandoned attempt must not be recorded
-/// against the current one (PR #17 review).
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(packed)]
-pub struct ZdpRenewAuthenticationResponseHeader {
-    pub status_code: AuthenticationStatus,
-    pub blob_len: U16,
-    pub challenge: [u8; 48],
-    // Followed by the BLOB (blob_len bytes): base64 encoded json string.
-}
-
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(packed)]
-pub struct ZdpAcquireZprAddressHeader {
-    pub blob_len: U16,
-    pub ip_version: L3Type, // Length of address determined by IP type
-    pub addr_count: u8,
-    // Followed in memory by:
-    //  - BLOB (of blob_len bytes) is-a base64 encoded json string.
-    //  - IP addresses (addr_count * IP address size bytes)
-}
-
-#[derive(FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(packed)]
-pub struct ZdpGrantZprAddressHeader {
-    pub status_code: AuthenticationStatus,
-    pub ip_version: L3Type, // Length of address determined by IP type
-    pub addr_count: u8,
-    // Followed in memory by:
-    //  - IP addresses (addr_count * IP address size bytes)
 }
 
 #[open_enum]

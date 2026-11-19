@@ -6,8 +6,6 @@ use crate::mgmt;
 use crate::pki;
 use crate::prelude::*;
 use crate::sample_ring::SampleRing;
-use crate::special_peers;
-use crate::special_peers::SpecialPeerName;
 use crate::zdp::{ResponseCode, TerminateReason};
 
 use std::fmt::{Display, Formatter};
@@ -19,21 +17,17 @@ use thiserror::Error;
 use zpr::addrs::ZPRNET_PREFIX_LEN;
 use zpr_utils::net_defs::IpAddress;
 
-/// Encrypted link lifecycle; actor authorization is independent
-/// ([crate::actor_auth]).
+/// Encrypted link lifecycle.
 ///
 /// Zipline additions to upstream #1410's link layer (search "zipline#"):
 /// OIDC IdP advertisement in Hello (zipline#12), keep-alive miss tolerance
-/// and VSConn recycling (zipline#113), the node keying timeout
-/// (zipline#173), the renewal tick (zipline#45), and a fresh ZDP-R session
-/// per Start.
+/// (zipline#113), the node keying timeout (zipline#173), and a fresh ZDP-R
+/// session per Start.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum LinkState {
     Inactive,
     Keying,
     Helloing,
-    /// disconnecting from visa service; only entered for the node->VS adapter link
-    Disconnecting(TerminateReason),
     Closing,
     Resetting,
     Active,
@@ -67,7 +61,6 @@ pub enum LinkEvent {
     ReceivedKeepAliveResponse,
     ReceivedTerminateLink(TerminateReason),
     ReceivedTerminateAck,
-    ReceivedDisconnectAck, // from visa service
     Close(TerminateReason),
     CloseDone,
     Error,
@@ -369,20 +362,15 @@ impl LinkStateWrapper {
             // providers and no bootstrap flag. The peer is known by its
             // CN-checked certificate, and its ZPR address comes from the
             // topology, never from Hello.
-            mgmt::requests::send_hello_success_response(asm, self.id, 0, &[], None, false)
-                .enqueue();
+            mgmt::requests::send_hello_success_response(asm, self.id, 0, &[], None).enqueue();
             return self.run_active_zode(asm, locked_fsm);
         }
-        let is_vs = asm
-            .peer_table
-            .lookup_special_peer(SpecialPeerName::VisaServiceAdapter)
-            .is_some_and(|id| id.get() == self.id);
         let aaa = asm.address_pool.lock().unwrap().as_mut().map(|pool| {
             let aaa = pool.get_aaa_address();
             debug!(target: LINK_STATE, "allocated AAA {aaa}; {} active reservations", pool.len());
             aaa
         });
-        if aaa.is_none() && !is_vs {
+        if aaa.is_none() {
             mgmt::requests::send_hello_error_response(
                 asm,
                 self.id,
@@ -401,7 +389,6 @@ impl LinkStateWrapper {
             0,
             &crate::auth_agent::advertised_oidc_idps(asm, self.id),
             aaa,
-            is_vs,
         )
         .enqueue();
         self.run_active(asm, locked_fsm)
@@ -526,7 +513,6 @@ impl LinkStateWrapper {
             LinkEvent::ReceivedKeepAliveResponse => self.process_keep_alive_response(asm),
             LinkEvent::ReceivedTerminateLink(code) => self.process_terminate_link(asm, code),
             LinkEvent::ReceivedTerminateAck => self.process_terminate_ack(asm),
-            LinkEvent::ReceivedDisconnectAck => self.process_disconnect_ack(asm),
             LinkEvent::Close(code) => self.initiate_close(asm, code),
             LinkEvent::CloseDone => Ok(self.complete_close(asm)),
             LinkEvent::Error => self.process_error_response(asm),
@@ -647,9 +633,7 @@ impl LinkStateWrapper {
         };
 
         // zl-zipline#220, #250: a Zode link is checked once the peer's CN
-        // is known, and refused with a logged reason. This runs before the
-        // certificate block below so a refused peer never claims a
-        // special-peer name.
+        // is known, and refused with a logged reason.
         //
         // An inbound Zode link that passes replaces any established link to
         // the same peer (ZODE_LINKS.md rule 5), once the guards below are
@@ -683,75 +667,17 @@ impl LinkStateWrapper {
             }
         }
 
-        // Set when a relay refuses the visa service's adapter (below).
-        let mut refuse_vs_adapter = false;
         if let Some(ref peer_cert) = sa.peer_cert {
             let cert = peer_cert.get_cert();
-            let is_verified = peer_cert.is_verified();
-
-            // Note, keying will have failed if we requested verification (i.e. were
-            // connecting to node) but the cert couldn't be verified.  So here,
-            // we only need to verify the case that we are only conditionally verifying
-            // (i.e., we are being connected to by a special adapter).
-
-            if is_verified {
+            if peer_cert.is_verified() {
                 info!(target: LINK_STATE, "{} has verified name {}", asm.formatted_link_id(link_id), pki::subject_name(cert));
             } else {
                 warn!(target: LINK_STATE, "{} has unverified name {}", asm.formatted_link_id(link_id), pki::subject_name(cert));
-            }
-
-            let subject_der = match pki::subject_der(cert) {
-                Ok(der) => der,
-                Err(e) => {
-                    warn!(target: LINK_STATE, "{} cannot encode certificate subject DN: {e}", asm.formatted_link_id(link_id));
-                    Vec::new()
-                }
-            };
-
-            if self.link_type == LinkType::NodeToNode {
-                // Special peers are adapters (the visa service's); a Zode
-                // link never claims a special-peer name (zl-zipline#250).
-                for name in special_peers::special_peer_names_from_subject_der(&subject_der) {
-                    warn!(target: LINK_STATE, "{} is a Zode link whose certificate claims special peer name {name:?}; ignoring", asm.formatted_link_id(link_id));
-                }
-            } else if !is_verified {
-                for name in special_peers::special_peer_names_from_subject_der(&subject_der) {
-                    warn!(
-                        target: LINK_STATE,
-                        "{} presented unverified certificate claiming special peer name {name:?}; ignoring", asm.formatted_link_id(link_id)
-                    );
-                }
-            } else if asm.config.get().relay
-                && special_peers::special_peer_names_from_subject_der(&subject_der)
-                    .contains(SpecialPeerName::VisaServiceAdapter)
-            {
-                // A relay hosts the visa service on its own TUN, as the
-                // local actor vs.zpr (zl-zipline#229, gate g117 q4): there
-                // is no adapter-docked visa service to accept.
-                warn!(target: LINK_STATE, "{} relay hosts the visa service itself; refusing a dock from the visa service's adapter; closing", asm.formatted_link_id(link_id));
-                refuse_vs_adapter = true;
-            } else {
-                // assign special-peer name if this peer is special
-                for name in special_peers::special_peer_names_from_subject_der(&subject_der) {
-                    match asm.peer_table.assign_special_name(name, link_id) {
-                        Ok(()) => {
-                            info!(target: LINK_STATE, "{} assigned special name {name:?}", asm.formatted_link_id(link_id))
-                        }
-                        Err(_) => {
-                            warn!(target: LINK_STATE, "Unable to assign {} special name {name:?}", asm.formatted_link_id(link_id))
-                        }
-                    }
-                }
             }
         }
 
         drop(sa);
         drop(peer_state);
-
-        if refuse_vs_adapter {
-            drop(locked_fsm);
-            return self.initiate_close(asm, TerminateReason::Reset);
-        }
 
         debug!(target: LINK_STATE, "{} finished keying.  Starting hello", asm.formatted_link_id(link_id));
 
@@ -913,86 +839,6 @@ impl LinkStateWrapper {
         }
     }
 
-    /// Nodes only. Check if this is the link to the adapter in front of the visa service
-    /// and if so try to de-register this node from the VS and also stop the VSConn.
-    ///
-    /// If the link is still working then this can also try to send a polite
-    /// "de-register" message to the visa service before we shut off our
-    /// VSConn processor.
-    fn maybe_disconnect_visa_service_client(
-        &self,
-        asm: &Arc<Assembly>,
-        deregister: bool,
-        reason: TerminateReason,
-    ) -> Result<(), LinkStateError> {
-        let mut locked_fsm = self.locked_fsm.lock().unwrap();
-
-        if matches!(reason, TerminateReason::Shutdown) {
-            locked_fsm.shutting_down = true;
-        }
-
-        if matches!(self.link_type, LinkType::NodeToAdapter) {
-            let link_id = self.id;
-            let vs_id = asm
-                .peer_table
-                .lookup_special_peer(SpecialPeerName::VisaServiceAdapter);
-            if vs_id.is_some() && vs_id.unwrap().get() == link_id {
-                // Only a genuine shutdown stops the VSConn run loop: `Stop`
-                // makes `run_with_reconnect` return permanently, after which
-                // every VS API call fails `ConnClosed` forever (zipline#113).
-                // A failure-driven close (keep-alive timeout, link error)
-                // falls through to the ordinary close below — but VSConn's
-                // current run loop must be explicitly restarted: if the
-                // Cap'n Proto TCP connection survived the link flap (or the
-                // failure was ZDP-only), the loop would otherwise stay
-                // parked, never emit RunLoopExits/RunLoopStarts, and
-                // vs_worker — gated on RunLoopStarts before it re-runs
-                // register_vss — would leave the replacement link's
-                // deferred_vs_connect pending forever. `restart` recycles
-                // the loop without stopping the reconnect manager; if the
-                // loop is already mid-dial or in its reconnect delay, the
-                // command is discarded, which is fine.
-                if !matches!(reason, TerminateReason::Shutdown) {
-                    info!(target: LINK_STATE,
-                        "{}: VS adapter link closing ({reason:?}); restarting VSConn run loop for reconnect",
-                        asm.formatted_link_id(link_id));
-                    if let Some(vsconn) = asm.vsconn.as_ref() {
-                        let restart_hndl = vsconn.clone();
-                        tokio::task::spawn_local(async move {
-                            if let Err(e) = restart_hndl.restart().await {
-                                // ConnClosed here means the run loop is
-                                // between dials — already restarting.
-                                debug!(target: LINK_STATE,
-                                    "VSConn restart command not delivered (already recycling): {e}");
-                            }
-                        });
-                    }
-                } else if let Some(vsconn) = asm.vsconn.as_ref() {
-                    locked_fsm.set_state(LinkState::Disconnecting(reason));
-
-                    let task_asm = asm.clone();
-                    let spawn_hndl = vsconn.clone();
-                    tokio::task::spawn_local(async move {
-                        debug!(target: LINK_STATE, "deregister of VS peer detected, stopping VSConn (deregister:{deregister})");
-                        if let Err(e) = spawn_hndl.stop(deregister).await {
-                            error!(target: LINK_STATE, "stop command to VSConn failed: {e}");
-                        }
-                        debug!(target: LINK_STATE, "VSConn shut down");
-
-                        // ignore error here, it just means we've moved on to another state and got the ACK (very) late
-                        let _ = task_asm
-                            .process_link_state_event(link_id, LinkEvent::ReceivedDisconnectAck);
-                    });
-
-                    return Ok(());
-                } // else fallthrough
-            } // else fallthrough
-        } // else fallthrough
-
-        // else all the above...
-        self.continue_close(asm, locked_fsm, reason)
-    }
-
     /// Initiate the shutdown of the link
     /// Transitions to Closing from any running state
     /// Generates a Terminate Request packet
@@ -1011,24 +857,14 @@ impl LinkStateWrapper {
         let link_id = self.id;
         info!(target: LINK_STATE,"Initiating shutdown on {}", asm.formatted_link_id(link_id));
 
-        self.maybe_disconnect_visa_service_client(asm, true, reason)
-    }
-
-    fn process_disconnect_ack(&self, asm: &Arc<Assembly>) -> Result<(), LinkStateError> {
-        let locked_fsm = self.locked_fsm.lock().unwrap();
-        match (self.link_type, locked_fsm.state) {
-            (LinkType::NodeToAdapter, LinkState::Disconnecting(reason)) => {
-                debug!(target: LINK_STATE, "{} received disconnect ack", asm.formatted_link_id(self.id));
-                self.continue_close(asm, locked_fsm, reason)
-            }
-            (_, _) => Err(LinkStateError::InvalidOperation(
-                "Discarded unsolicited init auth ack".to_string(),
-            )),
+        let mut locked_fsm = self.locked_fsm.lock().unwrap();
+        if matches!(reason, TerminateReason::Shutdown) {
+            locked_fsm.shutting_down = true;
         }
+        self.continue_close(asm, locked_fsm, reason)
     }
 
-    /// Continue shutdown of the link.  Occurs after having disconnected
-    /// from the visa service (if applicable).
+    /// Continue shutdown of the link: enter Closing and send the Terminate.
     fn continue_close(
         &self,
         asm: &Arc<Assembly>,
@@ -1041,9 +877,6 @@ impl LinkStateWrapper {
         // If we get a response to our terminate we also go to `clean_up_link_state`.
         self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_TERMINATE_TIMEOUT);
         drop(locked_fsm);
-        if let Some(peer) = asm.peer_table.get(self.id) {
-            peer.actor_auth.link_down(asm).detach_all();
-        }
         let task_asm = asm.clone();
         let ingress_link_id = self.id;
         tokio::task::spawn_local(async move {
@@ -1078,10 +911,6 @@ impl LinkStateWrapper {
             LinkState::Closing | LinkState::Resetting => {
                 drop(locked_fsm);
                 info!(target: LINK_STATE, "{} is clearing its state", asm.formatted_link_id(link_id));
-                if let Some(peer) = asm.peer_table.get(link_id) {
-                    join_set = peer.actor_auth.link_down(asm);
-                }
-
                 let mut link_data = self.locked_data.lock().unwrap();
                 let aaa = self.aaa_address();
                 self.aaa_address.write(None);
@@ -1281,11 +1110,6 @@ impl LinkStateWrapper {
         self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_PERIOD);
         drop(locked_fsm);
 
-        // Piggyback the auth-renewal check on the keep-alive heartbeat
-        // (zipline#45): every successful echo response on an Active link is
-        // a renewal tick.
-        crate::actor_renewal::maybe_renew(asm, self.id);
-
         Ok(())
     }
 
@@ -1397,7 +1221,6 @@ mod tests {
             LinkState::Inactive,
             LinkState::Keying,
             LinkState::Helloing,
-            LinkState::Disconnecting(TerminateReason::Other),
             LinkState::Closing,
             LinkState::Resetting,
             LinkState::Error,
@@ -1523,22 +1346,6 @@ mod tests {
             .await;
     }
 
-    #[tokio::test]
-    async fn only_designated_vs_bootstrap_can_establish_without_pool() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
-                asm.peer_table
-                    .assign_special_name(SpecialPeerName::VisaServiceAdapter, 3)
-                    .unwrap();
-                let node = hello_link(LinkType::NodeToAdapter);
-                node.process_hello_request(&asm).unwrap();
-                assert!(node.is_ready());
-                assert!(node.aaa_address().is_none());
-            })
-            .await;
-    }
-
     /// Insert a node-side (NodeToAdapter) peer and return its link id.
     fn add_node_peer(asm: &Arc<Assembly>) -> LinkId {
         add_peer(asm, LinkType::NodeToAdapter, 9500)
@@ -1611,84 +1418,6 @@ mod tests {
                 asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
                     .unwrap();
                 assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
-            })
-            .await
-    }
-
-    /// zl-zipline#220 review: a CA-verified Zode outside the topology that
-    /// presents the visa service's DN must not claim the VisaServiceAdapter
-    /// special-peer slot before the CN check closes its link.
-    #[tokio::test(start_paused = true)]
-    async fn test_zode_link_outside_topology_claims_no_special_name() {
-        LocalSet::new()
-            .run_until(async {
-                let asm = zode_assembly(&["relay.zpr"]);
-                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, zpr::dn::VISA_SERVICE_CN);
-                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
-                    .unwrap();
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
-                assert_eq!(
-                    asm.peer_table
-                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
-                    None
-                );
-            })
-            .await
-    }
-
-    /// A keyable node-side assembly, a relay if `relay`, with an adapter
-    /// link in Keying whose verified certificate carries the visa service's
-    /// DN. Returns the assembly and the link (zl-zipline#229).
-    fn vs_adapter_keyed(relay: bool) -> (Arc<Assembly>, LinkId) {
-        let asm = keyable_assembly();
-        let mut cfg = (*asm.config.get()).clone();
-        cfg.relay = relay;
-        asm.config.write(cfg);
-        let link_id = add_node_peer(&asm);
-        crate::peer_table::test::set_verified_peer_cn(&asm, link_id, zpr::dn::VISA_SERVICE_CN);
-        asm.peer_table
-            .get(link_id)
-            .unwrap()
-            .link_state_machine
-            .test_set_keying();
-        (asm, link_id)
-    }
-
-    /// zl-zipline#229 (gate g117 q4): a relay hosts the visa service on its
-    /// own TUN, so it refuses a dock from the visa service's adapter: the
-    /// link closes at KeyingDone and claims no special-peer name.
-    #[tokio::test(start_paused = true)]
-    async fn test_relay_refuses_visa_service_adapter_dock() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, link_id) = vs_adapter_keyed(true);
-                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
-                    .unwrap();
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Closing);
-                assert_eq!(
-                    asm.peer_table
-                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
-                    None
-                );
-            })
-            .await
-    }
-
-    /// zl-zipline#229: a node that is not a relay still takes the visa
-    /// service's adapter dock (the `one-node-*` layouts, until #234).
-    #[tokio::test(start_paused = true)]
-    async fn test_non_relay_assigns_visa_service_adapter() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, link_id) = vs_adapter_keyed(false);
-                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
-                    .unwrap();
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
-                assert_eq!(
-                    asm.peer_table
-                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
-                    std::num::NonZero::new(link_id)
-                );
             })
             .await
     }
@@ -2062,30 +1791,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    /// Review round 1: a Zode link never claims a special-peer name, even
-    /// when it is accepted and its certificate carries the visa service's
-    /// DN; special peers are adapters.
-    #[tokio::test(start_paused = true)]
-    async fn test_accepted_zode_link_claims_no_special_name() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, _egress) = zode_keys_assembly("a.zpr");
-                *asm.topology.write().unwrap() = vec![crate::peer_table::test::topology_link(
-                    zpr::dn::VISA_SERVICE_CN,
-                )];
-                let link_id = zode_link_keyed(&asm, ZodeEnd::Answerer, zpr::dn::VISA_SERVICE_CN);
-                asm.process_link_state_event(link_id, LinkEvent::KeyingDone)
-                    .unwrap();
-                assert_eq!(link_state_of(&asm, link_id), LinkState::Helloing);
-                assert_eq!(
-                    asm.peer_table
-                        .lookup_special_peer(SpecialPeerName::VisaServiceAdapter),
-                    None
-                );
-            })
-            .await
-    }
-
     /// Rule 5: an accepted inbound link from a peer that already has an
     /// established link replaces it. The old link's id is dropped from the
     /// peer table and its key-management state, and exactly one link
@@ -2382,222 +2087,6 @@ mod tests {
                     "miss {} must close the link",
                     config::KEEP_ALIVE_MAX_MISSES
                 );
-            })
-            .await
-    }
-
-    /// Build a real [libnode::vsconn::VSConn] aimed at `vs_addr`, plus a
-    /// test assembly whose VS special peer is an Active NodeToAdapter link
-    /// (zipline#113 recovery tests). Returns the assembly, the VS link id,
-    /// and the VSConn instance (run it yourself so the test owns its task).
-    /// Pass a refusing address (e.g. `127.0.0.1:1`) to keep the run loop in
-    /// its dial/retry phase, or a live TLS server's address to get it parked
-    /// in its command loop.
-    fn assembly_with_vs_peer(
-        vs_addr: std::net::SocketAddr,
-    ) -> (Arc<Assembly>, LinkId, libnode::vsconn::VSConn) {
-        let key = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
-        let vsconn = libnode::vsconn::VSConn::new(
-            16,
-            vs_addr,
-            "test-node".to_string(),
-            key,
-            libnode::vsconn::fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()),
-            std::net::Ipv4Addr::LOCALHOST.into(),
-        );
-        // Observable egress: the close path puts a Terminate on the mgmt
-        // substrate queue, which must have a live receiver.
-        let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(8);
-        let mut builder = TestAssemblyBuilder::new();
-        builder.mgmt_substrate_egress = Some(crate::queues::MgmtSubstrateEgress::new(egress_tx));
-        builder.vsconn = Some(Some(vsconn.handle()));
-        let asm = Arc::new(create_assembly(builder));
-        // Leak the receiver so the egress queue outlives the test body.
-        std::mem::forget(egress_rx);
-        let link_id = add_node_peer(&asm);
-        asm.peer_table
-            .assign_special_name(SpecialPeerName::VisaServiceAdapter, link_id)
-            .unwrap();
-        asm.peer_table
-            .get(link_id)
-            .unwrap()
-            .link_state_machine
-            .test_set_state(LinkState::Active);
-        (asm, link_id, vsconn)
-    }
-
-    /// zipline#113: closing the VS adapter link because of a keep-alive
-    /// timeout must NOT send `VS2Command::Stop` — the VSConn run loop stays
-    /// alive so it can reconnect. Before the fix, ANY close of the VS
-    /// special-peer link stopped VSConn, and `run_with_reconnect` treated
-    /// that clean return as a permanent shutdown (`terminated: Ok(())`),
-    /// after which every VS API call failed `ConnClosed` forever.
-    #[tokio::test]
-    async fn test_vs_link_timeout_close_leaves_vsconn_running() {
-        LocalSet::new()
-            .run_until(async {
-                // Nothing listens on port 1: connect is refused fast, so the
-                // run loop stays in its dial/retry phase.
-                let (asm, link_id, mut vsconn) =
-                    assembly_with_vs_peer("127.0.0.1:1".parse().unwrap());
-
-                let vsconn_task = tokio::task::spawn_local(async move {
-                    vsconn.run_with_reconnect(Duration::from_millis(200)).await
-                });
-                // Let the run loop start its first (refused) connect attempt.
-                tokio::time::sleep(Duration::from_millis(50)).await;
-
-                // Keep-alive gave up on the link: close with RequestTimedOut.
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::Close(TerminateReason::RequestTimedOut),
-                )
-                .unwrap();
-
-                // Give a (wrongly sent) Stop ample time to be consumed by the
-                // reconnect loop: it polls the command channel while waiting.
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                assert!(
-                    !vsconn_task.is_finished(),
-                    "a timeout-driven VS link close must leave the VSConn run \
-                     loop alive to reconnect; it received a Stop and exited"
-                );
-                vsconn_task.abort();
-            })
-            .await
-    }
-
-    /// Companion (zipline#113): a Shutdown-reason close of the VS adapter
-    /// link still stops VSConn — `Stop` stays reserved for process exit.
-    #[tokio::test]
-    async fn test_vs_link_shutdown_close_still_stops_vsconn() {
-        LocalSet::new()
-            .run_until(async {
-                let (asm, link_id, mut vsconn) =
-                    assembly_with_vs_peer("127.0.0.1:1".parse().unwrap());
-
-                let vsconn_task = tokio::task::spawn_local(async move {
-                    vsconn.run_with_reconnect(Duration::from_millis(200)).await
-                });
-                tokio::time::sleep(Duration::from_millis(50)).await;
-
-                asm.process_link_state_event(link_id, LinkEvent::Close(TerminateReason::Shutdown))
-                    .unwrap();
-
-                let res = tokio::time::timeout(Duration::from_secs(5), vsconn_task)
-                    .await
-                    .expect("Shutdown close must stop the VSConn run loop")
-                    .expect("VSConn task panicked");
-                assert!(res.is_ok(), "run_with_reconnect exits Ok on Stop: {res:?}");
-            })
-            .await
-    }
-
-    /// A minimal local TLS server: accepts connections, completes the TLS
-    /// handshake, then holds each stream open. Enough for `VSConn::run` to
-    /// get past TLS and emit `RunLoopStarts`; no Cap'n Proto traffic is
-    /// exchanged. Returns the bound address. Mirrors the libnode2 test
-    /// helper of the same name.
-    async fn spawn_tls_holding_server() -> std::net::SocketAddr {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let chain = vec![CertificateDer::from(cert.cert.der().clone())];
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
-        let cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(chain, key)
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::task::spawn_local(async move {
-            while let Ok((sock, _)) = listener.accept().await {
-                let acceptor = acceptor.clone();
-                tokio::task::spawn_local(async move {
-                    if let Ok(_tls) = acceptor.accept(sock).await {
-                        // Hold the connection open; never speak.
-                        std::future::pending::<()>().await;
-                    }
-                });
-            }
-        });
-        addr
-    }
-
-    /// Wait (up to 5 s) for the next `RunLoopStarts` lifecycle event.
-    async fn next_run_loop_start(
-        lifecycle_rx: &mut tokio::sync::broadcast::Receiver<libnode::vsconn::VSConnLifecycleEvent>,
-    ) -> Result<(), tokio::time::error::Elapsed> {
-        use libnode::vsconn::VSConnLifecycleEvent;
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match lifecycle_rx.recv().await {
-                    Ok(VSConnLifecycleEvent::RunLoopStarts) => break,
-                    Ok(_) => continue,
-                    Err(e) => panic!("lifecycle channel died: {e:?}"),
-                }
-            }
-        })
-        .await
-    }
-
-    /// zipline#113, Codex P1 on PR #40: when the VS adapter link closes on a
-    /// failure (keep-alive timeout, ZDP-only failure) while the underlying
-    /// Cap'n Proto TCP connection SURVIVES, leaving VSConn untouched is not
-    /// enough — its run loop stays parked in its command loop, never emits
-    /// `RunLoopExits`/`RunLoopStarts`, so `vs_worker` (gated on
-    /// `RunLoopStarts`) never re-runs `register_vss` and the replacement VS
-    /// link's `deferred_vs_connect` stays pending forever. The close path
-    /// must explicitly restart the current run loop: this test demands a
-    /// fresh `RunLoopStarts` after the failure-close.
-    #[tokio::test]
-    async fn test_vs_link_timeout_close_restarts_vsconn_run_loop() {
-        LocalSet::new()
-            .run_until(async {
-                // A live TLS server, so VSConn::run reaches its command loop
-                // and the TCP connection survives the link flap.
-                let server_addr = spawn_tls_holding_server().await;
-                let (asm, link_id, mut vsconn) = assembly_with_vs_peer(server_addr);
-                let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
-
-                let vsconn_task = tokio::task::spawn_local(async move {
-                    vsconn.run_with_reconnect(Duration::from_millis(50)).await
-                });
-
-                // First RunLoopStarts: the run loop is up and parked.
-                next_run_loop_start(&mut lifecycle_rx)
-                    .await
-                    .expect("VSConn never reached its first RunLoopStarts");
-
-                // Keep-alive gave up on the link: close with RequestTimedOut.
-                // The TCP connection to the (held-open) TLS server survives.
-                asm.process_link_state_event(
-                    link_id,
-                    LinkEvent::Close(TerminateReason::RequestTimedOut),
-                )
-                .unwrap();
-
-                // The close path must force the run loop to restart: a fresh
-                // RunLoopStarts (preceded by RunLoopExits) has to arrive, or
-                // vs_worker stays parked and the replacement VS link's
-                // deferred authorization is never sent.
-                assert!(
-                    next_run_loop_start(&mut lifecycle_rx).await.is_ok(),
-                    "a failure-close of the VS link with a surviving TCP \
-                     connection must restart the VSConn run loop (fresh \
-                     RunLoopStarts); otherwise vs_worker never re-registers \
-                     and deferred_vs_connect is stuck pending"
-                );
-
-                // And the reconnect manager itself must stay alive.
-                assert!(
-                    !vsconn_task.is_finished(),
-                    "restart must recycle the run loop, not stop run_with_reconnect"
-                );
-                vsconn_task.abort();
             })
             .await
     }

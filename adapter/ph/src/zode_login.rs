@@ -38,6 +38,11 @@ use crate::auth::OidcIdpInfo;
 use crate::auth_agent::{AuthAgentHandle, AuthFailureReason, oidc_idps, request_id_token};
 use crate::prelude::*;
 
+/// How far ahead of the login's expiry silent renewal starts. The
+/// effective lead is clamped to half the granted lifetime
+/// ([renewal_deadline]), so short `expiration_seconds` values stay workable.
+const AUTH_RENEWAL_LEAD: Duration = Duration::from_secs(300);
+
 /// How long to wait before the next silent-renewal attempt after one
 /// failed. The wait never runs past the expiry, which logs the user out.
 const RENEWAL_RETRY_INTERVAL: Duration = Duration::from_secs(10);
@@ -718,7 +723,7 @@ fn spawn_renewal(asm: &Arc<Assembly>, generation: u64) {
 /// stays on the actor, and a later login would look like a renewal to the
 /// visa service. Exits once the login of `generation` has ended.
 async fn renewal_loop(asm: &Arc<Assembly>, generation: u64) {
-    let lead = asm.config.get().auth_renewal_lead;
+    let lead = AUTH_RENEWAL_LEAD;
     // A policy renewal can move the expiry while this sleeps.
     let mut changes = asm.zode_login.changes.subscribe();
     let mut next_attempt: Option<SystemTime> = None;

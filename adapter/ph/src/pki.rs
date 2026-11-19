@@ -105,14 +105,6 @@ pub fn subject_name(cert: &Certificate) -> &Name {
     cert.tbs_certificate().subject()
 }
 
-/// The DER encoding of the subject distinguished name
-pub fn subject_der(cert: &Certificate) -> Result<Vec<u8>, ParseError> {
-    cert.tbs_certificate()
-        .subject()
-        .to_der()
-        .map_err(|e| ParseError::DecodeError(format!("cannot encode subject DN: {e}")))
-}
-
 /// Extract the certificate's public key.
 pub fn public_key(cert: &Certificate) -> &SubjectPublicKeyInfoOwned {
     cert.tbs_certificate().subject_public_key_info()

@@ -942,14 +942,13 @@ fn get_link_summary(asm: &Arc<Assembly>, link_id: LinkId) -> String {
 mod test {
     use super::*;
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
-    use crate::auth::{self, AuthBlob};
+    use crate::auth;
     use crate::config::PACKET_BUFFER_SIZE;
     use crate::link_state::LinkType;
     use crate::packet_queue;
     use crate::peer_table;
     use crate::queues::MgmtSubstrateEgress;
     use crate::zdp;
-    use base64::prelude::*;
     use std::cell::RefCell;
     use std::net::Ipv4Addr;
     use tokio::task::LocalSet;

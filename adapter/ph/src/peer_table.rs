@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use crate::auth::AUTH_KEY_SIZE_BYTES;
 use crate::config;
 use crate::forwarding_tables::PeerForwardingTable;
 use crate::km::{KeyManager, KmTransportSA};
@@ -7,14 +6,11 @@ use crate::link_state::{LinkStateWrapper, LinkType};
 use crate::mgmt::{self, txn_mgr};
 use crate::prelude::*;
 use crate::queues;
-use crate::special_peers::*;
 use crate::zdpr;
 use bytes::Bytes;
 use cslab::{RcuCslab, RcuCslabReader};
 use dashmap::DashMap;
-use enum_map::EnumMap;
 use rcu::{RcuBox, RcuCslabEntryGuard, RcuOptionGuard};
-use std::default::Default;
 use std::future::Future;
 use std::num::NonZero;
 use std::sync::atomic::{self, Ordering};
@@ -25,7 +21,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zpr::packet_info::{ForwardingEntry, LINK_ID_UNKNOWN, LinkId, SubstrateAddr};
+use zpr::packet_info::{ForwardingEntry, LinkId, SubstrateAddr};
 use zpr_utils::net_defs::{ScopedIpAddr, ScopedIpv6Addr};
 
 const PEER_TABLE_SIZE: usize = config::MAX_ACTIVE_LINKS;
@@ -40,7 +36,6 @@ pub struct PeerState {
     pub node_state: mgmt::node::NodePeerState,
     pub mgmt_processor: queues::MgmtProcessor,
     pub mgmt_processor_worker: task::JoinHandle<()>,
-    pub auth_key: [u8; 32], // set in ::new and never changed.
     pub a2a_dh_pubkey: RcuBox<Option<x25519_dalek::PublicKey>>,
     pub zdpr_send: Mutex<zdpr::Sender<crate::packet::Packet>>,
     pub zdpr_recv: Mutex<zdpr::Receiver>,
@@ -111,24 +106,15 @@ impl PeerState {
 
         let mgmt_processor_worker = task::spawn_local(launch_mgmt_processor_worker(mp_outq));
 
-        let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
-        if link_type == LinkType::NodeToAdapter {
-            aws_lc_rs::rand::fill(&mut key)
-                .expect("failed to generate random bytes for peer auth key");
-        }
         Self {
             substrate_addr,
             interface_addr,
             link_state_machine: LinkStateWrapper::new(link_id.get(), link_type),
-            actor_auth: Arc::new(crate::actor_auth::ActorAuthorization::new(
-                link_id.get(),
-                link_type,
-            )),
+            actor_auth: Arc::new(crate::actor_auth::ActorAuthorization::new(link_type)),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,
             mgmt_processor_worker,
-            auth_key: key,
             a2a_dh_pubkey: RcuBox::new(None),
             zdpr_send: Mutex::new(zdpr::Sender::new()),
             zdpr_recv: Mutex::new(zdpr::Receiver::new(
@@ -232,8 +218,6 @@ pub struct PeerTable {
     peer_slab: Mutex<RcuCslab<PeerState>>,
     peer_slab_reader: RcuBox<RcuCslabReader<PeerState>>,
     sa_to_link: DashMap<(SubstrateAddr, ScopedIpAddr), NonZero<LinkId>>,
-    // TODO: it would be nice if this lived in the same RCU as peer_slab_reader
-    special_peers: RcuBox<EnumMap<SpecialPeerName, LinkId>>,
 }
 
 pub type PeerTableEntryGuard<'a> = RcuCslabEntryGuard<'a, PeerState>;
@@ -259,7 +243,6 @@ impl PeerTable {
             peer_slab: Mutex::new(peer_slab),
             peer_slab_reader,
             sa_to_link: DashMap::with_capacity(PEER_TABLE_SIZE),
-            special_peers: RcuBox::default(),
         }
     }
 
@@ -324,18 +307,6 @@ impl PeerTable {
             &(peer_state.substrate_addr, peer_state.interface_addr),
             link_id,
         );
-
-        self.special_peers
-            .update(|sp_ref| {
-                let mut new_sp = *sp_ref;
-                for (_name, peer_id_ref) in new_sp.iter_mut() {
-                    if *peer_id_ref == link_id {
-                        *peer_id_ref = LINK_ID_UNKNOWN;
-                    }
-                }
-                Some(new_sp)
-            })
-            .unwrap();
 
         let new_reader = peer_slab.remove((link_id as usize).wrapping_sub(1));
         std::mem::drop(peer_slab);
@@ -402,13 +373,6 @@ impl PeerTable {
     fn unmap_key(&self, key: &(SubstrateAddr, ScopedIpAddr), link_id: LinkId) {
         self.sa_to_link
             .remove_if(key, |_, mapped| mapped.get() == link_id);
-    }
-
-    pub fn lookup_special_peer(&self, name: SpecialPeerName) -> Option<NonZero<LinkId>> {
-        // synchronizes with the Release in VacantPeerTableEntry::insert();
-        // ensures anyone who reads from the slab following this sees the peer
-        // (assuming of course it hasn't been removed!)
-        NonZero::new(self.special_peers.get()[name])
     }
 
     pub fn inspect<T>(
@@ -527,26 +491,6 @@ impl PeerTable {
         handle.take()
     }
 
-    pub fn assign_special_name(
-        &self,
-        name: SpecialPeerName,
-        link_id: LinkId,
-    ) -> Result<(), PeerUpdateError> {
-        // FIXME: This can race peer removal; we ought to place
-        // `special_peers` and `peer_slab_reader` in the same RcuBox
-        self.special_peers
-            .update(|sp_ref| {
-                if sp_ref[name] == LINK_ID_UNKNOWN {
-                    let mut new_sp = *sp_ref;
-                    new_sp[name] = link_id;
-                    Some(new_sp)
-                } else {
-                    None
-                }
-            })
-            .map_err(|()| PeerUpdateError::NoAssociationForLink)
-    }
-
     /// Clear out peer state upon link close/reset
     /// This does not remove the peer, but it clears any relevant tables
     pub fn clear_peer_state(&self, link_id: LinkId) {
@@ -640,15 +584,11 @@ pub mod test {
             substrate_addr,
             interface_addr,
             link_state_machine: LinkStateWrapper::new(link_id.get(), link_type),
-            actor_auth: Arc::new(crate::actor_auth::ActorAuthorization::new(
-                link_id.get(),
-                link_type,
-            )),
+            actor_auth: Arc::new(crate::actor_auth::ActorAuthorization::new(link_type)),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,
             mgmt_processor_worker: task::spawn(async {}),
-            auth_key: [42u8; AUTH_KEY_SIZE_BYTES],
             a2a_dh_pubkey: RcuBox::new(None),
             zdpr_send: Mutex::new(zdpr::Sender::new()),
             zdpr_recv: Mutex::new(zdpr::Receiver::new(

@@ -1,4 +1,4 @@
-//! The prelude for the PH adapter. Batches imports for common types and modules.
+//! The prelude for ph. Batches imports for common types and modules.
 pub use crate::assembly::Assembly;
 pub(crate) use crate::config;
 pub use crate::logging::targets::*;

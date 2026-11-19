@@ -1096,6 +1096,87 @@ mod test {
         }
     }
 
+    /// zl-zipline#278 review: a valid `--control-group` replaces an invalid
+    /// `control_group` in the file, so the file's value is never checked.
+    /// With no flag, the invalid file value is still refused.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_flag_bypasses_invalid_file_value() {
+        let config = argparse_zode_with(
+            r#"control_group = "a,b""#,
+            &["--control-group", "from-flag"],
+        )
+        .expect("a valid --control-group replaces an invalid file value");
+        assert_eq!(config.control_group.as_deref(), Some("from-flag"));
+
+        let err = argparse_zode_with(r#"control_group = "a,b""#, &[])
+            .expect_err("an invalid file control_group with no flag");
+        assert!(err.to_string().contains("control_group"), "{err}");
+    }
+
+    /// zl-zipline#278 review: a valid `--advertised-substrate-addr` replaces
+    /// an invalid `advertised_substrate_addr` in the `[node]` section, so
+    /// the file's value is never checked. With no flag, the invalid file
+    /// value is still refused.
+    #[test]
+    #[parallel(env)]
+    fn test_advertised_addr_flag_bypasses_invalid_file_value() {
+        let node = format!("advertised_substrate_addr = \"0.0.0.0:6000\"\n{DIAL}");
+        let (cfg, _keys) = node_config_file(&node);
+        let path = cfg.get_path().to_str().unwrap();
+        let config = argparse(Some(vec![
+            "ph",
+            "zode",
+            "-c",
+            path,
+            "--advertised-substrate-addr",
+            "198.51.100.9:7000",
+        ]))
+        .expect("a valid --advertised-substrate-addr replaces an invalid file value");
+        assert_eq!(
+            config.advertised_substrate_addr,
+            Some("198.51.100.9:7000".parse::<SocketAddr>().unwrap())
+        );
+
+        let err = argparse(Some(vec!["ph", "zode", "-c", path]))
+            .expect_err("an invalid file advertised_substrate_addr with no flag");
+        assert!(
+            err.to_string().contains("advertised_substrate_addr"),
+            "{err}"
+        );
+    }
+
+    /// zl-zipline#278 review: a valid `--initial-link` replaces an invalid
+    /// `[node.initial_link]` in the file, so the file's value is never
+    /// checked. With no flag, the invalid file value is still refused.
+    #[test]
+    #[parallel(env)]
+    fn test_initial_link_flag_bypasses_invalid_file_value() {
+        for bad in [
+            "[node.initial_link]\naddr = \"0.0.0.0:5000\"\ncn = \"relay.zpr\"",
+            "[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"\"",
+        ] {
+            let (cfg, _keys) = node_config_file(bad);
+            let path = cfg.get_path().to_str().unwrap();
+            let config = argparse(Some(vec![
+                "ph",
+                "zode",
+                "-c",
+                path,
+                "--initial-link",
+                "cli.zpr@10.0.0.7:6000",
+            ]))
+            .unwrap_or_else(|e| panic!("--initial-link must replace {bad:?}: {e}"));
+            let link = config.initial_link.unwrap();
+            assert_eq!(link.cn, "cli.zpr");
+            assert_eq!(link.addr, "10.0.0.7:6000".parse::<SocketAddr>().unwrap());
+
+            let err = argparse(Some(vec!["ph", "zode", "-c", path]))
+                .expect_err("an invalid file initial_link with no flag");
+            assert!(err.to_string().contains("initial_link"), "{bad:?}: {err}");
+        }
+    }
+
     /// zl-zipline#234: `ph zode` parses the argv zipline passes
     /// (`zipline-cmd` `ph_args`).
     #[test]

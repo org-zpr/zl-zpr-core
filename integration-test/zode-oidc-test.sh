@@ -33,8 +33,8 @@
 #      so at the expiry they expire rather than being revoked. ph enforces
 #      a visa's expiry on every packet (zl-zipline#274): the user flow bound
 #      before the expiry stops at the expiry (a ping reuses its stream: an
-#      ICMP five-tuple has no echo ID), and zb counts its packets as
-#      `Visa Expired`. zb's expiry sweep then withdraws the stream, so the
+#      ICMP five-tuple has no echo ID; zb counts its packets as
+#      `Visa Expired`). zb's expiry sweep then withdraws the stream, so the
 #      next ping is a new flow: zb asks the visa service for a visa, and it
 #      is denied.
 #
@@ -143,13 +143,9 @@ if [[ "$PASS" == 0 ]]; then
   assert_status 5 "Last failure: LoginExpired" "login-status: logged out, the login expired" || PASS=1
   assert_zb_actor_lacks "the visa service's actor of zb has no user attribute left" user. || PASS=1
   zode_no_ping zb "$RELAY_ZPR_ADDR" "a user flow bound before the expiry stops at the expiry" || PASS=1
-  DROPPED=$(zb_counter "Visa Expired")
-  if (( DROPPED > 0 )); then
-    echo "assertion OK: zb drops the bound flow's packets as expired ($DROPPED Visa Expired)"
-  else
-    echo "ASSERTION FAILED: zb's Visa Expired counter is 0"
-    PASS=1
-  fi
+  # Not asserted: the sweep may have withdrawn the stream before the first
+  # ping (then the ping is a new flow, which is denied), so 0 is fine too.
+  echo "zb counted $(zb_counter "Visa Expired") Visa Expired packet(s) on the bound flow"
   REQUESTS=$(zb_counter "Visa Requested")
   if wait_for "$SWEEP_WAIT" ping_asks_for_a_visa "$REQUESTS"; then
     echo "assertion OK: zb's expiry sweep withdraws the bound flow, so the next ping asks for a new visa"

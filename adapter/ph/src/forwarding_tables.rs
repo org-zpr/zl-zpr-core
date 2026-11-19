@@ -6,7 +6,7 @@
 
 use cslab::{RcuCslab, RcuCslabReader};
 use rcu::{RcuBox, RcuCslabEntryGuard};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering, fence};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zpr::packet_info::{ForwardingEntry, LinkId, StreamId, VisaId};
@@ -30,10 +30,17 @@ const PEER_FORWARDING_TABLE_SIZE: usize = 1 << 20; // 1 million
 /// new one.
 ///
 /// `expires` is a copy of the bound visa's expiry (zl-zipline#274): the
-/// fast path checks it on every packet ([PftPep::expires_ms]) without
-/// taking the visa-table lock. The visa itself is never edited; a rebind
-/// copies the new visa's expiry in with its target.
+/// fast path checks it on every packet ([PftPep::target]) without taking
+/// the visa-table lock. The visa itself is never edited; a rebind copies
+/// the new visa's expiry in with its target.
+///
+/// A rebind changes three words, and a reader must see all three from one
+/// binding. `version` makes that so, as a sequence lock: odd while a
+/// rebind is writing, and bumped again when it is done; a reader that saw
+/// it odd, or changed across its loads, reads again.
 pub struct PftPep {
+    /// The sequence-lock version: even when the entry is stable.
+    version: AtomicU64,
     /// The next hop's `ForwardingEntry`, packed by [pack_forwarding_entry].
     next_hop: AtomicU64,
     visa_id: AtomicU64,
@@ -68,6 +75,7 @@ impl PftPep {
     /// expires at `expires`.
     pub fn new(next_hop: ForwardingEntry, visa_id: VisaId, expires: SystemTime) -> Self {
         Self {
+            version: AtomicU64::new(0),
             next_hop: AtomicU64::new(pack_forwarding_entry(next_hop)),
             visa_id: AtomicU64::new(visa_id),
             expires: AtomicU64::new(unix_ms(expires)),
@@ -88,30 +96,45 @@ impl PftPep {
     /// ([unix_ms]), and where the stream is forwarded to: what the fast
     /// path reads for each packet, which it drops at or after the expiry.
     ///
-    /// A J11 rebind may run between the two loads. The expiry is loaded
-    /// first, and [PftPep::rebind] stores it last, so a reader that sees a
-    /// rebind's expiry also sees its next hop (Release/Acquire). The one
-    /// mixed pair a reader can get is the old expiry with the new next
-    /// hop: a packet the old visa still admits goes to the successor's
-    /// target, which the J11 commit checked is live. Never the reverse,
-    /// which would let a packet of an expired visa pass on its successor's
-    /// expiry.
+    /// Both come from one binding, never the expiry of one and the next
+    /// hop of another: a reader racing a J11 rebind ([PftPep::rebind])
+    /// reads again. A rebind is a few stores, so the retry is short and
+    /// rare.
     pub fn target(&self) -> (u64, ForwardingEntry) {
-        let expires_ms = self.expires.load(AtomicOrdering::Acquire);
-        (expires_ms, self.next_hop())
+        loop {
+            let before = self.version.load(AtomicOrdering::Acquire);
+            if before % 2 == 1 {
+                // A rebind is writing.
+                std::hint::spin_loop();
+                continue;
+            }
+            let expires_ms = self.expires.load(AtomicOrdering::Relaxed);
+            let next_hop = self.next_hop.load(AtomicOrdering::Relaxed);
+            // Keeps the loads above before the version check below.
+            fence(AtomicOrdering::Acquire);
+            if self.version.load(AtomicOrdering::Relaxed) == before {
+                return (expires_ms, unpack_forwarding_entry(next_hop));
+            }
+        }
     }
 
     /// Move this entry onto `visa_id`, which expires at `expires`,
     /// forwarding to `next_hop` (J11 commit). The only writer after
-    /// [PftPep::new]; the visa table calls it under its write lock. The
-    /// expiry is stored last, so a reader that sees the new expiry also
-    /// sees the new visa ID and next hop (see [PftPep::target]).
+    /// [PftPep::new]; the visa table calls it under its write lock, so
+    /// rebinds never overlap. The version is odd while the words change,
+    /// so a reader never takes a mix of two bindings (see
+    /// [PftPep::target]).
     pub fn rebind(&self, next_hop: ForwardingEntry, visa_id: VisaId, expires: SystemTime) {
-        self.visa_id.store(visa_id, AtomicOrdering::Release);
+        let version = self.version.load(AtomicOrdering::Relaxed);
+        self.version.store(version + 1, AtomicOrdering::Relaxed);
+        // Keeps the stores below after the odd version.
+        fence(AtomicOrdering::Release);
+        self.visa_id.store(visa_id, AtomicOrdering::Relaxed);
         self.next_hop
-            .store(pack_forwarding_entry(next_hop), AtomicOrdering::Release);
+            .store(pack_forwarding_entry(next_hop), AtomicOrdering::Relaxed);
         self.expires
-            .store(unix_ms(expires), AtomicOrdering::Release);
+            .store(unix_ms(expires), AtomicOrdering::Relaxed);
+        self.version.store(version + 2, AtomicOrdering::Release);
     }
 }
 
@@ -217,15 +240,16 @@ mod tests {
         assert_eq!(pep.target().0, 2_000_000);
     }
 
-    /// Local Codex review (t320, P2): a J11 rebind races the fast path,
-    /// which must never pair the expiry of the visa a rebind moves the
-    /// stream onto with the next hop of the visa it moves it off: the old
-    /// visa may have expired, and its packets must not pass on the new
-    /// visa's expiry. A writer rebinds in a tight loop onto ever newer
-    /// targets, each expiring at its own number (in ms); a concurrent reader
-    /// must never see a next hop older than the expiry it read with it.
+    /// Local Codex review (t320 and t321, P2): a J11 rebind races the fast
+    /// path, which must read the expiry and the next hop of one and the
+    /// same binding. A new expiry with the old next hop lets a packet of
+    /// an expired visa pass on its successor's expiry; the old expiry with
+    /// the new next hop lets a packet pass on the predecessor's expiry to
+    /// a successor that expires sooner. A writer rebinds in a tight loop
+    /// onto ever newer targets, each expiring at its own number (in ms); a
+    /// concurrent reader must only ever see a target with its own expiry.
     #[test]
-    fn test_a_racing_reader_never_pairs_a_new_expiry_with_an_old_next_hop() {
+    fn test_a_racing_reader_reads_the_expiry_and_next_hop_of_one_binding() {
         const REBINDS: u32 = 2_000_000;
         let pep = PftPep::new(ForwardingEntry(1, 0), 0, UNIX_EPOCH);
         std::thread::scope(|scope| {
@@ -237,8 +261,9 @@ mod tests {
             });
             while !writer.is_finished() {
                 let (expires_ms, next_hop) = pep.target();
-                assert!(
-                    u64::from(next_hop.1) >= expires_ms,
+                assert_eq!(
+                    u64::from(next_hop.1),
+                    expires_ms,
                     "next hop {} read with the expiry of target {expires_ms}",
                     next_hop.1
                 );

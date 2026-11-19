@@ -398,9 +398,7 @@ impl FastpathWorker {
             // TODO: policy enforcement
 
             // A J11 rebind may swap the entry's target at any moment:
-            // `target` reads the expiry and the next hop so that a new
-            // expiry never comes with an old next hop, and the next hop's
-            // two IDs in one load.
+            // `target` reads the expiry and the next hop of one binding.
             let (expires_ms, next_hop) = pep.target();
             egress_link_id = next_hop.0;
             egress_stream_id = next_hop.1;

@@ -354,7 +354,7 @@ const SEND_DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
 /// un-sent PRIORITY packets stay at the head of the queue for the next call.
 ///
 /// A send that fails because the network changed under it (see
-/// [is_network_change_send_error]) drops its packet, even a PRIORITY one,
+/// [classify_send_error]) drops its packet, even a PRIORITY one,
 /// which would only fail the same way again. A batch-level error of that
 /// kind drops the first packet, the one that failed, and sends the rest.
 /// Any other send error is fatal.
@@ -397,7 +397,10 @@ fn send_substrate_egress_queue(
         ));
         match batch {
             Ok(n) => break n,
-            Err(err) if is_network_change_send_error(&err, SENDS_CARRY_SOURCE) => {
+            Err(err)
+                if classify_send_error(&err, SENDS_CARRY_SOURCE)
+                    == Some(SendDropCause::NetworkChange) =>
+            {
                 // The engines that emulate sendmmsg(2) report a failed first
                 // packet as the batch error, with nothing sent. Drop only that
                 // packet and send the rest: they may leave from other, live
@@ -426,7 +429,10 @@ fn send_substrate_egress_queue(
             match &io_results[i] {
                 Ok(_) => continue,
                 Err(err) if err.kind() == ErrorKind::WouldBlock => (),
-                Err(err) if is_network_change_send_error(err, SENDS_CARRY_SOURCE) => {
+                Err(err)
+                    if classify_send_error(err, SENDS_CARRY_SOURCE)
+                        == Some(SendDropCause::NetworkChange) =>
+                {
                     // Dropped, PRIORITY or not: leave it in place to be freed.
                     warn_send_dropped(send_drop_warned_at, &worker.substrate_egress_q[i], err);
                     dropped += 1;
@@ -465,12 +471,26 @@ fn send_substrate_egress_queue(
     );
 }
 
-/// Whether a substrate send error means the network changed under the
-/// Zode, so the packet is dropped instead of stopping `ph` (zl-zipline#230,
-/// gate g114 q6). `had_source` says whether the send named a source address
-/// (`IP_PKTINFO`/`IPV6_PKTINFO`).
+/// Why a substrate send failed in a way that drops its packet instead of
+/// stopping `ph` (see [classify_send_error]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendDropCause {
+    /// The network changed under the Zode: the send's source address is
+    /// gone, or there is no route or interface to the peer
+    /// (zl-zipline#230).
+    NetworkChange,
+    /// The host refused the send (`PermissionDenied`): a firewall rule, an
+    /// LSM, or a missing socket permission such as `SO_BROADCAST`
+    /// (zl-zipline#270).
+    Refused,
+}
+
+/// Classify a substrate send error: `Some(cause)` if the packet is dropped
+/// and `ph` goes on, `None` if the error is fatal. `had_source` says whether
+/// the send named a source address (`IP_PKTINFO`/`IPV6_PKTINFO`).
 ///
-/// After a Wi-Fi switch, the link's local address, which every egress packet
+/// [SendDropCause::NetworkChange] (zl-zipline#230, gate g114 q6): after a
+/// Wi-Fi switch, the link's local address, which every egress packet
 /// carries as its source, is gone until the keep-alive closes the link and
 /// the redial picks the new one. Measured for a send from a source address
 /// that is not local (p39):
@@ -482,19 +502,29 @@ fn send_substrate_egress_queue(
 ///
 /// `HostUnreachable` and `NetworkDown` are the same event seen from the
 /// route or the interface: no route to the peer from here, or the interface
-/// went down. Every other error is a bug or a broken socket, and stays fatal.
-fn is_network_change_send_error(err: &std::io::Error, had_source: bool) -> bool {
+/// went down.
+///
+/// [SendDropCause::Refused] (zl-zipline#270): the host refused this one
+/// send. Linux returns `EPERM` when a netfilter rule (nftables, iptables)
+/// or an LSM drops it, and `EACCES` for a broadcast from a socket without
+/// `SO_BROADCAST`; Rust reports both as `PermissionDenied`, as it does
+/// `WSAEACCES` on Windows. The socket still works, and other peers may be
+/// allowed, so the verdict is the packet's, not the socket's.
+///
+/// Every other error is a bug or a broken socket, and stays fatal.
+fn classify_send_error(err: &std::io::Error, had_source: bool) -> Option<SendDropCause> {
     match err.kind() {
         ErrorKind::NetworkUnreachable
         | ErrorKind::HostUnreachable
         | ErrorKind::NetworkDown
-        | ErrorKind::AddrNotAvailable => true,
-        ErrorKind::InvalidInput => had_source,
-        _ => false,
+        | ErrorKind::AddrNotAvailable => Some(SendDropCause::NetworkChange),
+        ErrorKind::InvalidInput if had_source => Some(SendDropCause::NetworkChange),
+        ErrorKind::PermissionDenied => Some(SendDropCause::Refused),
+        _ => None,
     }
 }
 
-/// Log a send dropped by [is_network_change_send_error], at most once per
+/// Log a send dropped by [classify_send_error], at most once per
 /// [SEND_DROP_WARN_INTERVAL] per worker (`warned_at` is the worker's last
 /// warning). Every drop is counted in `OutPacksDrop` either way.
 fn warn_send_dropped(
@@ -801,6 +831,41 @@ mod tests {
                     err.raw_os_error()
                 );
             }
+        }
+    }
+
+    // ---- zl-zipline#270: a send the host refuses ----
+
+    /// The destination of a send the host refuses without any firewall
+    /// setup: the IPv4 limited broadcast address, which a socket without
+    /// `SO_BROADCAST` may not send to (Linux and macOS: `EACCES`; Windows:
+    /// `WSAEACCES`). The source is loopback, a local address.
+    fn refused_send_addrs() -> (std::net::SocketAddr, zpr_utils::net_defs::ScopedIpAddr) {
+        use std::net::Ipv4Addr;
+        (
+            (Ipv4Addr::BROADCAST, 9).into(),
+            std::net::IpAddr::from(Ipv4Addr::LOCALHOST).into(),
+        )
+    }
+
+    /// zl-zipline#270: a send the host refuses fails, on every engine, with
+    /// an error the classifier maps to `Refused`. This pins the real errno
+    /// each engine reports, as the vanished-source test does for #230.
+    #[test]
+    fn send_refused_by_host_is_classified() {
+        for name in batch_io::engine_names() {
+            let sender = UdpSocket::bind("0.0.0.0:0").unwrap();
+            sender.set_nonblocking(true).unwrap();
+            let (dst, src) = refused_send_addrs();
+            let err = first_send_error(name, &sender, dst, src);
+            assert_eq!(
+                classify_send_error(&err, true),
+                Some(SendDropCause::Refused),
+                "engine {name}: a refused send to {dst} failed with {err} ({:?}, errno {:?}), \
+                 which the classifier does not accept as refused",
+                err.kind(),
+                err.raw_os_error()
+            );
         }
     }
 

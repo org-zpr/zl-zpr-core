@@ -118,12 +118,12 @@ openssl req -new -newkey rsa:4096 -x509 -sha256 -days 365 -nodes -out admin-tls-
 The schema, with every key explained, is
 [`adapter/ph/example-node-config.toml`](../adapter/ph/example-node-config.toml).
 Unknown sections and keys are refused. Most settings can also be given on
-the command line (`ph zode --help`). `--relay`, `--initial-link`,
-`--forwarding`, `--advertised-substrate-addr` and `--control-group`
-override the file. For the other `[global]` settings the file sets, the
-file wins, so change them there, except `--zpr-addr`, whose addresses are
-put *before* the file's list. The first address is the Zode's own, so give
-the whole list in one place.
+the command line (`ph zode --help`). `ph zode` applies the file first and
+the command line last, so every flag you give overrides the file's value
+(zl-zipline#278). A list flag replaces the file's whole list: `--zpr-addr`
+replaces `zpr_addr`, so give every address of the Zode, its own address
+first; any `--logging` replaces the file's `logging` list, and the file's
+pairs are not kept.
 
 The relay, `relay-conf.toml`. It lists its own ZPR address first and
 `vs.zpr` after it, and puts both on its TUN. `forwarding = true` lets it

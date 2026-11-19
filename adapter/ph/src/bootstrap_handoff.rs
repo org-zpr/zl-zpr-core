@@ -388,6 +388,21 @@ pub fn start_relay_hand_off(asm: &Arc<Assembly>, link_id: LinkId, peer_cn: &str)
     });
 }
 
+/// The connection (its transaction manager) and peer substrate address of
+/// link `link_id`, if it is Active and its verified CN is `peer_cn`; else
+/// None. The relay checks this before its bootstrap-visa request and again
+/// after the answer.
+fn active_link_for(
+    asm: &Assembly,
+    link_id: LinkId,
+    peer_cn: &str,
+) -> Option<(Arc<crate::mgmt::txn_mgr::TxnMgr>, SocketAddr)> {
+    let peer = asm.peer_table.get(link_id)?;
+    let up = peer.link_state_machine.get_state() == LinkState::Active
+        && peer.verified_peer_cn().as_deref() == Some(peer_cn);
+    up.then(|| (peer.txn_mgr.clone(), peer.substrate_addr))
+}
+
 /// Relay side (J2, J7): ask the visa service, through `request`, for the
 /// bootstrap visas of the joiner `peer_cn` on Zode link `link_id`.
 ///
@@ -422,11 +437,11 @@ pub async fn relay_hand_off<F, Fut>(
     F: FnOnce(String, SocketAddr) -> Fut,
     Fut: std::future::Future<Output = Result<BootstrapVisas, VSApiError>>,
 {
-    let Some((connection, observed)) = asm
-        .peer_table
-        .get(link_id)
-        .map(|peer| (peer.txn_mgr.clone(), peer.substrate_addr))
-    else {
+    // The hand-off task runs after `link_up`, so the slot may hold another
+    // peer by now, or the link may be closing: then ask nothing, so one
+    // peer's address is never reported under another's CN.
+    let Some((connection, observed)) = active_link_for(asm, link_id, &peer_cn) else {
+        info!(target: VISA_MGMT, "{}: link to {peer_cn:?} is no longer up; not requesting bootstrap visas", asm.formatted_link_id(link_id));
         return;
     };
     info!(target: VISA_MGMT, "{}: requesting bootstrap visas for {peer_cn:?} observed at {observed}", asm.formatted_link_id(link_id));
@@ -439,11 +454,8 @@ pub async fn relay_hand_off<F, Fut>(
     // The peer entry's transaction manager is created with the connection,
     // so the same `Arc` means the same connection, not a later one that
     // reuses the slot.
-    let still_up = asm.peer_table.get(link_id).is_some_and(|peer| {
-        Arc::ptr_eq(&peer.txn_mgr, &connection)
-            && peer.link_state_machine.get_state() == LinkState::Active
-            && peer.verified_peer_cn().as_deref() == Some(peer_cn.as_str())
-    });
+    let still_up = active_link_for(asm, link_id, &peer_cn)
+        .is_some_and(|(now, _)| Arc::ptr_eq(&now, &connection));
     if !still_up {
         info!(target: VISA_MGMT, "{}: link to {peer_cn:?} went away during the bootstrap-visa request; dropping the answer", asm.formatted_link_id(link_id));
         return;
@@ -1609,6 +1621,50 @@ mod tests {
                 })
                 .await;
                 assert!(!holds(&asm, FWD_ID) && !holds(&asm, REV_ID));
+                assert!(sent_handoffs(&mut egress).await.is_empty());
+            })
+            .await
+    }
+
+    /// Hosted review (Copilot): the hand-off task runs after `link_up`, so
+    /// by then the link's slot may hold another peer, or the link may be
+    /// closing. The relay then asks nothing: it never reports one peer's
+    /// address under another's CN (zl-zipline#264).
+    #[tokio::test(start_paused = true)]
+    async fn test_relay_asks_nothing_unless_the_link_is_active_for_the_cn() {
+        LocalSet::new()
+            .run_until(async {
+                let asked = Rc::new(RefCell::new(0));
+
+                // The slot now holds a peer with another verified CN.
+                let (asm, link, mut egress) = relay_with_joiner();
+                let asked_by = asked.clone();
+                relay_hand_off(&asm, link, "someone-else".to_owned(), |_, _| async move {
+                    *asked_by.borrow_mut() += 1;
+                    Ok(answer())
+                })
+                .await;
+                assert_eq!(
+                    *asked.borrow(),
+                    0,
+                    "a CN that is not the link's verified CN"
+                );
+                assert!(sent_handoffs(&mut egress).await.is_empty());
+
+                // The link is closing.
+                let (asm, link, mut egress) = relay_with_joiner();
+                asm.peer_table
+                    .get(link)
+                    .unwrap()
+                    .link_state_machine
+                    .test_set_state(LinkState::Closing);
+                let asked_by = asked.clone();
+                relay_hand_off(&asm, link, JOINER_CN.to_owned(), |_, _| async move {
+                    *asked_by.borrow_mut() += 1;
+                    Ok(answer())
+                })
+                .await;
+                assert_eq!(*asked.borrow(), 0, "a link that is not Active");
                 assert!(sent_handoffs(&mut egress).await.is_empty());
             })
             .await

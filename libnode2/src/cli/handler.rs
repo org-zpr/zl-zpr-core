@@ -253,8 +253,36 @@ pub async fn run_handler(
         }
     }
 
+    deregister_and_stop(&handle, connected, &output_tx).await;
+    vss_aborter.abort();
+
+    Ok(())
+}
+
+/// Leave the visa service and stop the VSConn run loop.
+///
+/// When `connected`, first tell the visa service this node is going away
+/// (`notify_disconnect`, reason `NodeShutdown`), so it drops the node at
+/// once (zl-zipline#284). A failure is reported and the stop goes on. Then
+/// stop the run loop. Progress goes to `output_tx`, for the REPL pane.
+pub(crate) async fn deregister_and_stop(
+    handle: &VSConnHandle,
+    connected: bool,
+    output_tx: &mpsc::UnboundedSender<String>,
+) {
+    if connected {
+        info!("deregistering from the visa service");
+        let notice = DisconnectNotice {
+            zpr_addr: None,
+            reason: DisconnectReason::NodeShutdown,
+        };
+        if let Err(e) = handle.notify_disconnect(notice).await {
+            error!("failed to deregister: {:?}", e);
+            let _ = output_tx.send(format!("failed to deregister: {:?}", e));
+        }
+    }
     info!("requesting a stop");
-    match handle.stop(true).await {
+    match handle.stop().await {
         Ok(_) => {
             info!("stopped VSConn");
             let _ = output_tx.send("stopped vsconn".to_string());
@@ -264,7 +292,4 @@ pub async fn run_handler(
             let _ = output_tx.send(format!("failed to stop VSConn: {:?}", e));
         }
     }
-    vss_aborter.abort();
-
-    Ok(())
 }

@@ -156,7 +156,11 @@ impl Assembly {
     }
 
     /// Graceful shutdown routine.  Not guaranteed to be called
+    ///
+    /// Deregisters from the visa service first, while the links (and so
+    /// the VS-API session) are still up, then resets every peer link.
     pub async fn shutdown(self: &Arc<Self>) {
+        self.deregister_from_vs().await;
         self.shutdown_node().await;
         // Tear the TUN device down last, after the peers are gone
         // (zipline#130): on Windows this quiesces the Wintun session; the
@@ -164,6 +168,40 @@ impl Assembly {
         // Best-effort — the process is exiting either way.
         if let Err(e) = self.tun_ctl.teardown() {
             error!(target: STARTUP, "TUN teardown failed during shutdown: {e}");
+        }
+    }
+
+    /// Tell the visa service this Zode is leaving: `notify_disconnect`
+    /// naming no address (this Zode itself), reason `NodeShutdown`, so it
+    /// drops this Zode's actor and the services it provides at once
+    /// (zl-zipline#284) rather than a grace after the links go down.
+    ///
+    /// Best-effort and bounded by [config::SHUTDOWN_DEREGISTER_TIMEOUT]: a
+    /// failure or a timeout is logged and shutdown goes on. Does nothing
+    /// without a VS-API connection.
+    async fn deregister_from_vs(&self) {
+        let Some(vsconn) = &self.vsconn else {
+            return;
+        };
+        let notice = zpr::vsapi_types::DisconnectNotice {
+            zpr_addr: None,
+            reason: zpr::vsapi_types::DisconnectReason::NodeShutdown,
+        };
+        match tokio::time::timeout(
+            config::SHUTDOWN_DEREGISTER_TIMEOUT,
+            vsconn.notify_disconnect(notice),
+        )
+        .await
+        {
+            Ok(Ok(())) => info!(target: STARTUP, "Deregistered from the visa service"),
+            Ok(Err(e)) => {
+                warn!(target: STARTUP, "Could not deregister from the visa service: {e:?}; shutting down anyway")
+            }
+            Err(_) => warn!(
+                target: STARTUP,
+                "The visa service did not answer the deregistration within {:?}; shutting down anyway",
+                config::SHUTDOWN_DEREGISTER_TIMEOUT
+            ),
         }
     }
 
@@ -1743,6 +1781,154 @@ pub mod test {
                 asm.find_egress_link(zode_addr()).map(NonZero::get),
                 Some(link)
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod graceful_shutdown {
+        //! zl-zipline#284 (ZODE_LINKS.md "Loss"): a graceful shutdown tells
+        //! the visa service the Zode is leaving, `notify_disconnect` with
+        //! reason `NodeShutdown`, before it resets any link, so the visa
+        //! service drops its actor (and the services it provides) at once.
+        //! It is best-effort and bounded: shutdown goes on regardless.
+
+        use super::*;
+        use crate::fake_vs::{FakeVsState, connected_vsconn, eventually};
+        use crate::link_state::LinkState;
+        use crate::peer_table::test::insert_up_zode_link;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::time::Duration;
+        use zpr::vsapi_types::DisconnectReason;
+
+        /// The ZPR address of the Zode under test.
+        const NODE_ADDR: &str = "fd5a:5052:8::1";
+
+        /// The egress queue a test holds, so a link reset can send.
+        type EgressRx = packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
+
+        /// A Zode with a VS-API session to a fake visa service in `state`
+        /// and one up Zode link. Returns the link's ID too.
+        async fn zode_with_a_link(
+            state: FakeVsState,
+        ) -> (Arc<Assembly>, Rc<RefCell<FakeVsState>>, LinkId, EgressRx) {
+            let addr: IpAddr = NODE_ADDR.parse().unwrap();
+            let (fake, vs_handle) = connected_vsconn(state, addr).await;
+            let (egress_tx, egress_rx) = packet_queue::packet_queue(256);
+            let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+                vsconn: Some(Some(vs_handle)),
+                config: Some(rcu::RcuBox::new(config::Config {
+                    zpr_addr: vec![addr],
+                    ..Default::default()
+                })),
+                mgmt_substrate_egress: Some(MgmtSubstrateEgress::new(egress_tx)),
+                ..TestAssemblyBuilder::new()
+            }));
+            let link = insert_up_zode_link(&asm, "b.zpr", "fd5a:5052:8::2".parse().unwrap());
+            (asm, fake, link, egress_rx)
+        }
+
+        /// True while `link` is still up.
+        fn link_is_up(asm: &Assembly, link: LinkId) -> bool {
+            asm.peer_table
+                .get(link)
+                .is_some_and(|peer| peer.link_state_machine.get_state() == LinkState::Active)
+        }
+
+        /// One `notify_disconnect(NodeShutdown)` reaches the visa service
+        /// while the peer link still exists, and the link is reset after.
+        #[tokio::test]
+        async fn graceful_shutdown_deregisters_before_resetting_links() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, fake, link, _egress) = zode_with_a_link(FakeVsState {
+                        notify_disconnect_delay: Some(Duration::from_millis(500)),
+                        ..Default::default()
+                    })
+                    .await;
+                    let shutdown = tokio::task::spawn_local({
+                        let asm = asm.clone();
+                        async move { asm.shutdown().await }
+                    });
+                    assert!(
+                        eventually(Duration::from_secs(5), || !fake
+                            .borrow()
+                            .disconnects
+                            .is_empty())
+                        .await,
+                        "shutdown never sent notify_disconnect"
+                    );
+                    // The fake holds its answer for a while: the link must
+                    // still be up while the visa service is told.
+                    assert!(
+                        link_is_up(&asm, link),
+                        "the link was reset before deregistering"
+                    );
+                    shutdown.await.unwrap();
+                    assert_eq!(
+                        fake.borrow().disconnects,
+                        vec![DisconnectReason::NodeShutdown]
+                    );
+                    assert!(
+                        !link_is_up(&asm, link),
+                        "the link is reset after deregistering"
+                    );
+                })
+                .await
+        }
+
+        /// A visa service that never answers holds shutdown up for
+        /// [config::SHUTDOWN_DEREGISTER_TIMEOUT] at most; then the links
+        /// are reset anyway.
+        #[tokio::test]
+        async fn graceful_shutdown_is_bounded_when_the_vs_does_not_answer() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, _fake, link, _egress) = zode_with_a_link(FakeVsState {
+                        notify_disconnect_delay: Some(Duration::from_secs(3600)),
+                        ..Default::default()
+                    })
+                    .await;
+                    // Paused only now: the TLS session above needs real time.
+                    tokio::time::pause();
+                    let start = tokio::time::Instant::now();
+                    asm.shutdown().await;
+                    let waited = start.elapsed();
+                    assert!(
+                        waited >= config::SHUTDOWN_DEREGISTER_TIMEOUT,
+                        "shutdown did not wait for the deregistration ({waited:?})"
+                    );
+                    assert!(
+                        waited < config::SHUTDOWN_DEREGISTER_TIMEOUT + Duration::from_secs(1),
+                        "shutdown waited {waited:?}"
+                    );
+                    assert!(
+                        !link_is_up(&asm, link),
+                        "the link is reset after the timeout"
+                    );
+                })
+                .await
+        }
+
+        /// A refused deregistration is logged and shutdown goes on: the
+        /// links are still reset.
+        #[tokio::test]
+        async fn graceful_shutdown_goes_on_when_deregistration_fails() {
+            tokio::task::LocalSet::new()
+                .run_until(async {
+                    let (asm, fake, link, _egress) = zode_with_a_link(FakeVsState {
+                        fail_notify_disconnect: true,
+                        ..Default::default()
+                    })
+                    .await;
+                    asm.shutdown().await;
+                    assert_eq!(
+                        fake.borrow().disconnects,
+                        vec![DisconnectReason::NodeShutdown]
+                    );
+                    assert!(!link_is_up(&asm, link), "the link is reset anyway");
+                })
+                .await
         }
     }
 }

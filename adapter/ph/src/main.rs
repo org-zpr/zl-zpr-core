@@ -459,6 +459,7 @@ fn main() -> ExitCode {
         vs_session_up: std::sync::atomic::AtomicBool::new(false),
         bootstrap_handoff: Default::default(),
         relay_named_by_topology: std::sync::atomic::AtomicBool::new(false),
+        last_visa_sweep: std::sync::Mutex::new(None),
         capture_queue: cap_inq,
         capture_worker: CaptureWorker::new(),
         flow_control: FlowControl::new(),

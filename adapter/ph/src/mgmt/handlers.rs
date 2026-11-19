@@ -1194,6 +1194,7 @@ mod teardown_test {
     use crate::forwarding_tables::PftPep;
     use crate::link_state::LinkState;
     use crate::mgmt::core;
+    use crate::visa_table::tests::never_expires;
 
     type EgressRx = crate::packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
 
@@ -1213,7 +1214,7 @@ mod teardown_test {
             .get(link)
             .unwrap()
             .pft
-            .insert(PftPep::new(ForwardingEntry(link, 1), 3000))
+            .insert(PftPep::new(ForwardingEntry(link, 1), 3000, never_expires()))
             .unwrap()
     }
 

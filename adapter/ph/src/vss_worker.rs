@@ -314,6 +314,7 @@ mod tests {
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::link_state::LinkState;
     use std::net::IpAddr;
+    use std::time::SystemTime;
     use tokio::task::LocalSet;
     use zpr_utils::net_defs::IpAddress;
 
@@ -408,7 +409,7 @@ mod tests {
         asm.visa_table
             .write()
             .unwrap()
-            .bind(8101, binding.clone())
+            .bind(8101, binding.clone(), SystemTime::now())
             .unwrap();
 
         // Same ID, different contents: another configuration, a next hop,

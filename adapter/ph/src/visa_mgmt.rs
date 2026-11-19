@@ -88,21 +88,42 @@ pub fn handle_revocation(
     asm: &Assembly,
     visa_id: VisaId,
 ) -> Result<(), visa_table::VisaTableError> {
-    // Revoke under the write lock, but hold the withdrawn forwarding
-    // entries until the lock is released, then withdraw each stream from
-    // the adapters still bound to it — same rule and same helper as
-    // `Assembly::drop_peer` (zipline#21, zipline#85): the send path must
-    // never nest under the visa-table lock. Zode links get no withdrawal
-    // (F5, zl-zipline#251): the visa service revokes the visa on every
-    // Zode on the path itself.
-    let withdrawn = asm
-        .visa_table
-        .write()
-        .unwrap()
-        .revoke(&asm.peer_table, visa_id)?;
+    // Revoke under the write lock, then withdraw each stream from the
+    // adapters still bound to it once the lock is released, as
+    // `Assembly::drop_peer` does (zipline#21, zipline#85). Zode links get
+    // no withdrawal (F5, zl-zipline#251): the visa service revokes the
+    // visa on every Zode on the path itself.
+    asm.update_visa_table_and_withdraw(|visa_table, peer_table| {
+        match visa_table.revoke(peer_table, visa_id) {
+            Ok(withdrawn) => (Ok(()), withdrawn),
+            Err(e) => (Err(e), Vec::new()),
+        }
+    })
+}
 
-    asm.withdraw_streams(withdrawn, None);
-    Ok(())
+/// The expiry sweep (zl-zipline#274), if it is due: at most once every
+/// [config::VISA_EXPIRY_SWEEP_INTERVAL], whoever calls. The link
+/// keep-alive calls it on every tick of every Zode link (operator, g184 q7:
+/// no timer of its own). Every stream crosses a Zode link, so whenever
+/// there is something to sweep, a keep-alive is ticking.
+pub fn sweep_expired_visas_if_due(asm: &Assembly) {
+    {
+        let mut last = asm.last_visa_sweep.lock().unwrap();
+        if last.is_some_and(|at| at.elapsed() < config::VISA_EXPIRY_SWEEP_INTERVAL) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    sweep_expired_visas(asm, std::time::SystemTime::now());
+}
+
+/// Sweep the visas that have expired at `now` out of the visa table
+/// ([visa_table::VisaTable::handle_expirations]), and withdraw their
+/// streams from this Zode's own actor, so its next packet binds afresh.
+pub fn sweep_expired_visas(asm: &Assembly, now: std::time::SystemTime) {
+    asm.update_visa_table_and_withdraw(|visa_table, peer_table| {
+        ((), visa_table.handle_expirations(peer_table, now))
+    });
 }
 
 #[cfg(test)]

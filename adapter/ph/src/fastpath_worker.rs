@@ -71,6 +71,10 @@ fn fastpath_main(mut worker: FastpathWorker, mut io: FastpathIo) {
         // owned snapshot of the results.)
         drop(wait_set);
 
+        // One clock read for every packet this wakeup handles: the
+        // per-packet visa-expiry check compares against it.
+        worker.refresh_clock();
+
         // FAIRNESS
         //
         // There are two types of resources these I/O routines contend for:

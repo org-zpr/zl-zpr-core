@@ -21,19 +21,22 @@
 #      cache does not know: it fetches the IdP's live JWKS once, admits
 #      the login, and the user flow is admitted.
 #   2. Revocation. A resident `ph-cli auth-agent` logs zb in and renews
-#      the login once, then `fake-idp.py --revoke-refresh` models the user withdrawing the
+#      the login once, and zb binds the user flow. Then
+#      `fake-idp.py --revoke-refresh` models the user withdrawing the
 #      application's access. The next silent renewal presents the refresh
 #      grant and the IdP refuses it (`invalid_grant`). zb retries until the
 #      login expires and then logs the user out itself: the visa service's
-#      actor of zb loses every user attribute, and a new user flow is
-#      denied while the device flow still works.
+#      actor of zb loses every user attribute, and the device flow still
+#      works.
 #
-#      The leg binds no user flow while logged in. The visa service bounds
-#      a user flow's visas by the login's expiry, so at the expiry they have
-#      expired rather than been revoked, and ph checks a visa's expiry only
-#      when a new flow is matched (zl-zipline#271): a stream bound before
-#      the expiry outlives it (zl-zipline#274). Leg 1 shows that a login
-#      admits the user flow.
+#      The visa service bounds a user flow's visas by the login's expiry,
+#      so at the expiry they expire rather than being revoked. ph enforces
+#      a visa's expiry on every packet (zl-zipline#274): the user flow bound
+#      before the expiry stops at the expiry (a ping reuses its stream: an
+#      ICMP five-tuple has no echo ID; zb counts its packets as
+#      `Visa Expired`). zb's expiry sweep then withdraws the stream, so the
+#      next ping is a new flow: zb asks the visa service for a visa, and it
+#      is denied.
 #
 # Each check names the log line, IdP request or ph-cli output it reads.
 #
@@ -66,6 +69,23 @@ REFRESH_REFUSED='"POST /token[^"]*" 400'
 # 30 s in and is retried every 10 s, so the expiry comes at most about
 # 60 s after the grant is revoked. Generous for a slow runner.
 REVOCATION_WAIT=90
+
+# zb's expiry sweep runs at most every 10 s, on a 3 s link keep-alive tick
+# (config.rs VISA_EXPIRY_SWEEP_INTERVAL). Generous for a slow runner.
+SWEEP_WAIT=30
+
+# The sum of zb's counter $1 (as `ph-cli counters` names it) over its
+# management and fast-path counts.
+function zb_counter() {
+  "$PH_DEBUG_BIN" -p zb.sock counters | awk -F': ' -v name="$1" '$1 == name { n += $2 } END { print n + 0 }'
+}
+
+# Ping the relay from zb once, and succeed when zb has asked the visa
+# service for more than $1 visas: the ping started a new flow.
+function ping_asks_for_a_visa() {
+  in_ns zpr-zb ping -q -n -c 1 -W 1 "$RELAY_ZPR_ADDR" > /dev/null 2>&1 || true
+  (( $(zb_counter "Visa Requested") > $1 ))
+}
 
 if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
@@ -110,6 +130,7 @@ if [[ "$PASS" == 0 ]]; then
   # Silent means back-channel only: a refresh-grant POST, no request to
   # the authorization endpoint.
   assert_log_count idp-zb.log "$AUTH_REQUEST" "$AUTH_REQUESTS" "the renewal made no authorization-endpoint request" || PASS=1
+  zode_ping zb "$RELAY_ZPR_ADDR" "the user flow is admitted before the login expires" "$USER_FLOW_WARMUP" || PASS=1
 fi
 
 if [[ "$PASS" == 0 ]]; then
@@ -121,6 +142,17 @@ if [[ "$PASS" == 0 ]]; then
   wait_log_after "$REVOCATION_WAIT" zb.log "$EXPIRED" 0 "the login expires and zb logs the user out" || PASS=1
   assert_status 5 "Last failure: LoginExpired" "login-status: logged out, the login expired" || PASS=1
   assert_zb_actor_lacks "the visa service's actor of zb has no user attribute left" user. || PASS=1
+  zode_no_ping zb "$RELAY_ZPR_ADDR" "a user flow bound before the expiry stops at the expiry" || PASS=1
+  # Not asserted: the sweep may have withdrawn the stream before the first
+  # ping (then the ping is a new flow, which is denied), so 0 is fine too.
+  echo "zb counted $(zb_counter "Visa Expired") Visa Expired packet(s) on the bound flow"
+  REQUESTS=$(zb_counter "Visa Requested")
+  if wait_for "$SWEEP_WAIT" ping_asks_for_a_visa "$REQUESTS"; then
+    echo "assertion OK: zb's expiry sweep withdraws the bound flow, so the next ping asks for a new visa"
+  else
+    echo "ASSERTION FAILED: no ping asked for a new visa within ${SWEEP_WAIT} s"
+    PASS=1
+  fi
   zode_no_ping zb "$RELAY_ZPR_ADDR" "a new user flow is denied" || PASS=1
   zode_ping zb "$VS_ZPR_ADDR" "the device flow still works: the machine stays connected" || PASS=1
 fi

@@ -15,10 +15,11 @@ use crate::forwarding_tables;
 use crate::peer_table::PeerType;
 use crate::prelude::*;
 use crate::visa_mgmt;
-use crate::visa_table::{StreamBinding, Visa, VisaTable, VisaTableError};
+use crate::visa_table::{StreamBinding, VisaTable, VisaTableError};
 
 use dashmap::DashMap;
 use std::num::NonZero;
+use std::time::SystemTime;
 use zpr::vsapi_types::{CommFlag, PacketDesc, VisaRequest, VsapiFiveTuple, vsapi_ip_number};
 use zpr_utils::net_defs::IpAddress;
 
@@ -178,13 +179,9 @@ pub fn bind_actor_address(
     // Check if we already have a visa which matches this traffic. Under the
     // write lock: the match ejects an expired visa (zl-zipline#271).
 
-    let (matched, withdrawn) = asm
-        .visa_table
-        .write()
-        .unwrap()
-        .match_traffic(&asm.peer_table, &five_tuple);
-    // Outside the visa-table lock (zipline#9).
-    asm.withdraw_streams(withdrawn, None);
+    let matched = asm.update_visa_table_and_withdraw(|visa_table, peer_table| {
+        visa_table.match_traffic(peer_table, &five_tuple)
+    });
 
     if let Some(matched_visa_id) = matched {
         // We matched a visa we already have.
@@ -388,7 +385,7 @@ pub fn request_stream(
         .read()
         .unwrap()
         .get(visa_id)
-        .map(Visa::has_expired);
+        .map(|visa| visa.has_expired_at(SystemTime::now()));
     match held_visa_expired {
         // Visa found.
         Some(false) => return requested_visa_granted(asm, ingress_link_id, txn_id, visa_id),
@@ -398,7 +395,8 @@ pub fn request_stream(
         // live transit streams come from an upstream Zode that no
         // withdrawal reaches (F5), and freeing their stream IDs here could
         // hand them to an unrelated stream while that Zode still sends on
-        // them. It goes when it is revoked (a sweep is zl-zipline#274).
+        // them. The expiry sweep frees it once the stream-ID grace has
+        // passed (zl-zipline#274, VisaTable::handle_expirations).
         Some(true) => {
             info!(target: FLOW_MGMT, "refusing Stream ID Request {txn_id} from {}: visa {visa_id} has expired",
                 asm.formatted_link_id(ingress_link_id.get()));
@@ -844,8 +842,14 @@ fn rebind_granted(
     new_egress: ForwardingEntry,
 ) {
     let mut visa_table = asm.visa_table.write().unwrap();
-    let committed =
-        visa_table.commit_supersede(&asm.peer_table, old, new, ingress.clone(), new_egress);
+    let committed = visa_table.commit_supersede(
+        &asm.peer_table,
+        old,
+        new,
+        ingress.clone(),
+        new_egress,
+        SystemTime::now(),
+    );
     // Read under the same lock as the refusal, so the two agree.
     let newer = visa_table.successor_of(old);
     drop(visa_table);
@@ -956,11 +960,21 @@ fn requested_tether_granted(
                     ingress: ForwardingEntry(ingress_link_id.get(), ingress_tether_entry.key()),
                     egress: ForwardingEntry(egress_link_id.get(), egress_tether_id),
                 };
-                match visa_table.bind(visa_id, binding.clone()) {
+                // A visa that has expired since the request came in binds
+                // nothing (zl-zipline#274).
+                match visa_table.bind(visa_id, binding.clone(), SystemTime::now()) {
                     Err(_) => Err("policy error"),
                     Ok(successor) => {
-                        let ingress_tether_id = ingress_tether_entry
-                            .insert(forwarding_tables::PftPep::new(binding.egress, visa_id));
+                        // The entry carries the visa's expiry, which the
+                        // fast path checks on every packet.
+                        let expires = visa_table
+                            .get(visa_id)
+                            .expect("a bound visa is held")
+                            .visa()
+                            .expires;
+                        let ingress_tether_id = ingress_tether_entry.insert(
+                            forwarding_tables::PftPep::new(binding.egress, visa_id, expires),
+                        );
                         Ok((ingress_tether_id, tc, peer_a2a_dh_pubkey, successor))
                     }
                 }
@@ -2011,6 +2025,7 @@ mod tests {
             .insert(forwarding_tables::PftPep::new(
                 ForwardingEntry(zode_link, 42),
                 own_visa,
+                never_expires(),
             ))
             .unwrap();
         visa_table
@@ -2020,6 +2035,7 @@ mod tests {
                     ingress: ForwardingEntry(actor, actor_stream),
                     egress: ForwardingEntry(zode_link, 42),
                 },
+                SystemTime::now(),
             )
             .unwrap();
         drop(visa_table);
@@ -3068,6 +3084,7 @@ mod tests {
                     .insert(forwarding_tables::PftPep::new(
                         ForwardingEntry(zode_link, 42),
                         expired,
+                        never_expires(),
                     ))
                     .unwrap();
                 visa_table
@@ -3077,6 +3094,7 @@ mod tests {
                             ingress: ForwardingEntry(actor, live_stream),
                             egress: ForwardingEntry(zode_link, 42),
                         },
+                        crate::visa_table::tests::before_the_expiry(),
                     )
                     .unwrap();
                 drop(visa_table);
@@ -3139,6 +3157,7 @@ mod tests {
                     .insert(forwarding_tables::PftPep::new(
                         ForwardingEntry(link_b, 42),
                         expired,
+                        never_expires(),
                     ))
                     .unwrap();
                 visa_table
@@ -3148,6 +3167,7 @@ mod tests {
                             ingress: ForwardingEntry(link_a.get(), live_stream),
                             egress: ForwardingEntry(link_b, 42),
                         },
+                        crate::visa_table::tests::before_the_expiry(),
                     )
                     .unwrap();
                 drop(visa_table);
@@ -3169,5 +3189,165 @@ mod tests {
                 );
             })
             .await
+    }
+
+    // ---- Visa expiry on every use (zl-zipline#274) ----
+
+    /// zl-zipline#274 (D2): the visa a Stream ID Request named was live
+    /// when the request came in, and has expired by the time the next hop
+    /// grants its stream. The grant is not installed: the requestor gets
+    /// the policy-error refusal, and no PFT entry or binding is left. The
+    /// same holds for a visa fetched by ID meanwhile, which is bound
+    /// through the same path.
+    #[tokio::test]
+    async fn test_a_stream_id_grant_for_an_expired_visa_is_rejected() {
+        let (asm, mut egress_rx, link_a, link_b) = middle_node();
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, VISA_ID);
+        try_recv_packet(&mut egress_rx).expect("a StreamIdRequest to the next hop");
+
+        // While the next-hop bind is outstanding, the visa's lifetime runs
+        // out. A held visa is never edited, so the table is given what it
+        // holds from then on: the same visa, expired.
+        {
+            let mut visa_table = asm.visa_table.write().unwrap();
+            visa_table.revoke(&asm.peer_table, VISA_ID).unwrap();
+            visa_table
+                .insert_visa(new_vsapi_visa_forward_only_from(
+                    VISA_ID,
+                    crate::visa_table::tests::ALREADY_EXPIRED,
+                    Some(prev_hop()),
+                    next_hop(),
+                ))
+                .unwrap();
+        }
+
+        let egress_txn = asm
+            .peer_table
+            .get(link_b)
+            .unwrap()
+            .node_state
+            .awaiting_next_hop_bind_table
+            .iter()
+            .next()
+            .expect("the next-hop bind is outstanding")
+            .key()
+            .clone();
+        install_tether(&asm, NonZero::new(link_b).unwrap(), &egress_txn, 42).unwrap();
+
+        assert_only_stream_id_error_response(&mut egress_rx, link_a);
+        assert_eq!(
+            asm.peer_table.get(link_a).unwrap().pft.len(),
+            0,
+            "no PFT entry"
+        );
+        assert!(asm.visa_table.read().unwrap().bindings(VISA_ID).is_empty());
+        assert!(no_bind_state(&asm, link_a));
+    }
+
+    // ---- The expiry sweep (zl-zipline#274, D3) ----
+
+    /// zl-zipline#274 (D3): the sweep ejects a visa whose stream enters
+    /// from this Zode's own actor at its expiry, and withdraws that stream
+    /// from the actor once the visa-table lock is released, so the actor's
+    /// next packet binds afresh: it gets a new visa, or a denial once the
+    /// login behind it is gone.
+    #[tokio::test]
+    async fn test_the_expiry_sweep_withdraws_local_streams() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, _egress_rx, mut hairpin_rx) = node_with_visa_and_no_vs_session();
+                let (actor, _dock) = asm
+                    .peer_table
+                    .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+                let actor = actor.get();
+                let zode_link = insert_up_zode_link(&asm, "next-hop.zpr", next_hop());
+                let expiring: VisaId = VISA_ID + 300;
+                let expires = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+                let live_stream = bind_local_stream(&asm, actor, zode_link, expiring, expires);
+
+                crate::visa_mgmt::sweep_expired_visas(&asm, expires);
+
+                assert!(
+                    !asm.visa_table.read().unwrap().contains(expiring),
+                    "the expired visa is ejected"
+                );
+                let pkt = hairpin_rx
+                    .try_recv()
+                    .expect("a withdrawal to the local actor");
+                assert!(
+                    decode_per_flow(&pkt) == (zdp::ZdpPacketType::StreamIdWithdrawal, live_stream)
+                );
+            })
+            .await
+    }
+
+    /// zl-zipline#274 (g184 q7): the sweep hangs off the link keep-alive,
+    /// which fires every few seconds on every Zode link, but sweeps at most
+    /// once every `VISA_EXPIRY_SWEEP_INTERVAL`. The first call sweeps; one
+    /// straight after it leaves an expired visa for the next interval.
+    #[tokio::test]
+    async fn test_the_expiry_sweep_runs_at_most_once_an_interval() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, _egress_rx, _hairpin_rx) = node_with_visa_and_no_vs_session();
+                let insert_expired = |visa_id: VisaId| {
+                    asm.visa_table
+                        .write()
+                        .unwrap()
+                        .insert_visa(client_visa(
+                            visa_id,
+                            crate::visa_table::tests::ALREADY_EXPIRED,
+                        ))
+                        .unwrap();
+                };
+                let held = |visa_id: VisaId| asm.visa_table.read().unwrap().contains(visa_id);
+
+                insert_expired(VISA_ID + 310);
+                crate::visa_mgmt::sweep_expired_visas_if_due(&asm);
+                assert!(!held(VISA_ID + 310), "the first call sweeps");
+
+                insert_expired(VISA_ID + 311);
+                crate::visa_mgmt::sweep_expired_visas_if_due(&asm);
+                assert!(held(VISA_ID + 311), "not due again yet");
+            })
+            .await
+    }
+
+    /// Bind a stream from the local `actor` to `zode_link` under the visa
+    /// `visa_id`, a client visa expiring at `expires`, as a bind before the
+    /// expiry would have. Returns the actor's stream ID.
+    fn bind_local_stream(
+        asm: &Assembly,
+        actor: LinkId,
+        zode_link: LinkId,
+        visa_id: VisaId,
+        expires: std::time::SystemTime,
+    ) -> StreamId {
+        let mut visa_table = asm.visa_table.write().unwrap();
+        visa_table
+            .insert_visa(client_visa(visa_id, expires))
+            .unwrap();
+        let stream = asm
+            .peer_table
+            .get(actor)
+            .unwrap()
+            .pft
+            .insert(forwarding_tables::PftPep::new(
+                ForwardingEntry(zode_link, 42),
+                visa_id,
+                expires,
+            ))
+            .unwrap();
+        visa_table
+            .bind(
+                visa_id,
+                StreamBinding {
+                    ingress: ForwardingEntry(actor, stream),
+                    egress: ForwardingEntry(zode_link, 42),
+                },
+                crate::visa_table::tests::before_the_expiry(),
+            )
+            .unwrap();
+        stream
     }
 }

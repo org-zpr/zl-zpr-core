@@ -775,6 +775,13 @@ impl LinkStateWrapper {
                 // store new echo handle and kick off timeout
                 locked_fsm.echo_handle = Some((Instant::now(), jh.abort_handle()));
                 self.set_timeout(asm, &mut locked_fsm, config::DEFAULT_KEEP_ALIVE_TIMEOUT);
+                drop(locked_fsm);
+
+                // Housekeeping on the keep-alive tick (zl-zipline#274,
+                // g184 q7): the expiry sweep, rate-limited across all
+                // links. Outside the FSM lock: it takes the visa-table
+                // lock and sends withdrawals.
+                crate::visa_mgmt::sweep_expired_visas_if_due(asm);
                 Ok(())
             }
 

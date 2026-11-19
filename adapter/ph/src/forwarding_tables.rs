@@ -6,8 +6,9 @@
 
 use cslab::{RcuCslab, RcuCslabReader};
 use rcu::{RcuBox, RcuCslabEntryGuard};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering, fence};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 use zpr::packet_info::{ForwardingEntry, LinkId, StreamId, VisaId};
 
 const PEER_FORWARDING_TABLE_SIZE: usize = 1 << 20; // 1 million
@@ -27,10 +28,35 @@ const PEER_FORWARDING_TABLE_SIZE: usize = 1 << 20; // 1 million
 /// one under the same key. `next_hop` packs the link and stream IDs into
 /// one word, so a reader never sees half of an old target and half of a
 /// new one.
+///
+/// `expires` is a copy of the bound visa's expiry (zl-zipline#274): the
+/// fast path checks it on every packet ([PftPep::target]) without taking
+/// the visa-table lock. The visa itself is never edited; a rebind copies
+/// the new visa's expiry in with its target.
+///
+/// A rebind changes three words, and a reader must see all three from one
+/// binding. `version` makes that so, as a sequence lock: odd while a
+/// rebind is writing, and bumped again when it is done; a reader that saw
+/// it odd, or changed across its loads, reads again.
 pub struct PftPep {
+    /// The sequence-lock version: even when the entry is stable.
+    version: AtomicU64,
     /// The next hop's `ForwardingEntry`, packed by [pack_forwarding_entry].
     next_hop: AtomicU64,
     visa_id: AtomicU64,
+    /// The bound visa's expiry, in milliseconds since the UNIX epoch
+    /// ([unix_ms]). From this instant on, the stream forwards nothing.
+    expires: AtomicU64,
+}
+
+/// `time` in milliseconds since the UNIX epoch, the unit of a PFT entry's
+/// expiry and of the fast path's clock. A time before the epoch is 0 (long
+/// past), and one too far ahead for 64 bits saturates (never), so neither
+/// can panic.
+pub fn unix_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |since| {
+        u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+    })
 }
 
 /// Pack a `ForwardingEntry` (two 32-bit IDs) into one 64-bit word: the
@@ -45,11 +71,14 @@ fn unpack_forwarding_entry(packed: u64) -> ForwardingEntry {
 }
 
 impl PftPep {
-    /// An entry forwarding to `next_hop` under the visa `visa_id`.
-    pub fn new(next_hop: ForwardingEntry, visa_id: VisaId) -> Self {
+    /// An entry forwarding to `next_hop` under the visa `visa_id`, which
+    /// expires at `expires`.
+    pub fn new(next_hop: ForwardingEntry, visa_id: VisaId, expires: SystemTime) -> Self {
         Self {
+            version: AtomicU64::new(0),
             next_hop: AtomicU64::new(pack_forwarding_entry(next_hop)),
             visa_id: AtomicU64::new(visa_id),
+            expires: AtomicU64::new(unix_ms(expires)),
         }
     }
 
@@ -63,14 +92,49 @@ impl PftPep {
         self.visa_id.load(AtomicOrdering::Acquire)
     }
 
-    /// Move this entry onto `visa_id`, forwarding to `next_hop` (J11
-    /// commit). The only writer after [PftPep::new]; the visa table calls it
-    /// under its write lock. The visa ID is stored first, so a reader that
-    /// sees the new next hop also sees the new visa ID.
-    pub fn rebind(&self, next_hop: ForwardingEntry, visa_id: VisaId) {
-        self.visa_id.store(visa_id, AtomicOrdering::Release);
+    /// When the bound visa expires, in milliseconds since the UNIX epoch
+    /// ([unix_ms]), and where the stream is forwarded to: what the fast
+    /// path reads for each packet, which it drops at or after the expiry.
+    ///
+    /// Both come from one binding, never the expiry of one and the next
+    /// hop of another: a reader racing a J11 rebind ([PftPep::rebind])
+    /// reads again. A rebind is a few stores, so the retry is short and
+    /// rare.
+    pub fn target(&self) -> (u64, ForwardingEntry) {
+        loop {
+            let before = self.version.load(AtomicOrdering::Acquire);
+            if before % 2 == 1 {
+                // A rebind is writing.
+                std::hint::spin_loop();
+                continue;
+            }
+            let expires_ms = self.expires.load(AtomicOrdering::Relaxed);
+            let next_hop = self.next_hop.load(AtomicOrdering::Relaxed);
+            // Keeps the loads above before the version check below.
+            fence(AtomicOrdering::Acquire);
+            if self.version.load(AtomicOrdering::Relaxed) == before {
+                return (expires_ms, unpack_forwarding_entry(next_hop));
+            }
+        }
+    }
+
+    /// Move this entry onto `visa_id`, which expires at `expires`,
+    /// forwarding to `next_hop` (J11 commit). The only writer after
+    /// [PftPep::new]; the visa table calls it under its write lock, so
+    /// rebinds never overlap. The version is odd while the words change,
+    /// so a reader never takes a mix of two bindings (see
+    /// [PftPep::target]).
+    pub fn rebind(&self, next_hop: ForwardingEntry, visa_id: VisaId, expires: SystemTime) {
+        let version = self.version.load(AtomicOrdering::Relaxed);
+        self.version.store(version + 1, AtomicOrdering::Relaxed);
+        // Keeps the stores below after the odd version.
+        fence(AtomicOrdering::Release);
+        self.visa_id.store(visa_id, AtomicOrdering::Relaxed);
         self.next_hop
-            .store(pack_forwarding_entry(next_hop), AtomicOrdering::Release);
+            .store(pack_forwarding_entry(next_hop), AtomicOrdering::Relaxed);
+        self.expires
+            .store(unix_ms(expires), AtomicOrdering::Relaxed);
+        self.version.store(version + 2, AtomicOrdering::Release);
     }
 }
 
@@ -150,5 +214,68 @@ impl VacantPeerForwardingTableEntry<'_> {
 
     pub fn insert(mut self, pep: PftPep) -> StreamId {
         (self.table_guard.insert(pep).unwrap() + 1) as StreamId
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// zl-zipline#274 (D5): a J11 rebind moves the entry onto the new
+    /// visa's expiry together with its next hop and visa ID, so a renewed
+    /// stream keeps forwarding past the old visa's expiry and stops at the
+    /// new one's.
+    #[test]
+    fn test_rebind_moves_the_expiry_with_the_target() {
+        let old_expiry = UNIX_EPOCH + Duration::from_secs(1_000);
+        let new_expiry = UNIX_EPOCH + Duration::from_secs(2_000);
+        let pep = PftPep::new(ForwardingEntry(3, 42), 7100, old_expiry);
+        assert_eq!(pep.target().0, 1_000_000);
+
+        pep.rebind(ForwardingEntry(4, 43), 7101, new_expiry);
+
+        assert!(pep.next_hop() == ForwardingEntry(4, 43));
+        assert_eq!(pep.visa_id(), 7101);
+        assert_eq!(pep.target().0, 2_000_000);
+    }
+
+    /// Local Codex review (t320 and t321, P2): a J11 rebind races the fast
+    /// path, which must read the expiry and the next hop of one and the
+    /// same binding. A new expiry with the old next hop lets a packet of
+    /// an expired visa pass on its successor's expiry; the old expiry with
+    /// the new next hop lets a packet pass on the predecessor's expiry to
+    /// a successor that expires sooner. A writer rebinds in a tight loop
+    /// onto ever newer targets, each expiring at its own number (in ms); a
+    /// concurrent reader must only ever see a target with its own expiry.
+    #[test]
+    fn test_a_racing_reader_reads_the_expiry_and_next_hop_of_one_binding() {
+        const REBINDS: u32 = 2_000_000;
+        let pep = PftPep::new(ForwardingEntry(1, 0), 0, UNIX_EPOCH);
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                for i in 1..=REBINDS {
+                    let expires = UNIX_EPOCH + Duration::from_millis(u64::from(i));
+                    pep.rebind(ForwardingEntry(1, i), VisaId::from(i), expires);
+                }
+            });
+            while !writer.is_finished() {
+                let (expires_ms, next_hop) = pep.target();
+                assert_eq!(
+                    u64::from(next_hop.1),
+                    expires_ms,
+                    "next hop {} read with the expiry of target {expires_ms}",
+                    next_hop.1
+                );
+            }
+        });
+    }
+
+    /// An expiry before the UNIX epoch, which no granted visa has, counts
+    /// as long past, not as a panic.
+    #[test]
+    fn test_unix_ms_of_a_time_before_the_epoch_is_zero() {
+        assert_eq!(unix_ms(UNIX_EPOCH - Duration::from_secs(1)), 0);
+        assert_eq!(unix_ms(UNIX_EPOCH + Duration::from_millis(1_500)), 1_500);
     }
 }

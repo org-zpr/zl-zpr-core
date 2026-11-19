@@ -10,14 +10,15 @@
 # The visa service forgets a visa when it expires, so no revocation (link
 # down, rejoin) ever reaches a Zode's expired copy. Before the fix a Zode
 # kept matching new flows to it, and once the next hop had lost its copy
-# every bind was refused ("visa N not found"), for good. Now the match
-# ejects the expired visa and the Zode asks for a new one. Each scenario
+# every bind was refused ("visa N not found"), for good. Now an expired
+# visa is ejected, by the Zode's expiry sweep (zl-zipline#274) or at the
+# latest by the next match, and the Zode asks for a new one. Each scenario
 # waits until the visas of the last query have expired, then restarts a
 # Zode, so the relay drops its copies (link down):
 #   A. zb is killed and rejoins. zc's reply visa zc:53 -> zb:* has expired;
-#      zc ejects it at the first reply, and zb gets every reply.
+#      zc ejects it (sweep or first reply), and zb gets every reply.
 #   B. zc is stopped and rejoins. zb's visa zb -> zc:53 has expired; zb
-#      ejects it at the next query, and gets every reply.
+#      ejects it (sweep or next query), and gets every reply.
 #
 # Every query comes after the visas of the last one expired, so the visa
 # service refreshes the attribute then: no query falls in the attribute's
@@ -99,15 +100,16 @@ sleep 1
 dns_ok "before: zb gets UDP replies from zc" || RESULT=1
 
 echo "== A. zb is killed and rejoins after its DnsZc visas expired"
-wait_past_expiry
+# Counted before the wait: the expiry sweep may eject during it.
 EJECTED_BEFORE=$(log_count zc.log "$EJECTED")
+wait_past_expiry
 restart_zode zb "$ZB_SUBSTRATE_ADDR" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem" 9
 dns_ok "A: the rejoined zb gets UDP replies from zc" || RESULT=1
 wait_log_after 5 zc.log "$EJECTED" "$EJECTED_BEFORE" "A: zc ejected its expired reply visa" || RESULT=1
 
 echo "== B. zc is stopped and rejoins after zb's DnsZc visa expired"
-wait_past_expiry
 EJECTED_BEFORE=$(log_count zb.log "$EJECTED")
+wait_past_expiry
 # The UDP/53 service keeps running in zc's namespace across the restart.
 restart_zode zc "$ZC_SUBSTRATE_ADDR" "$ZC_ZPR_ADDR" "$PREGEN/zc-rsa-key.pem" TERM
 dns_ok "B: zb gets UDP replies from the rejoined zc" || RESULT=1

@@ -8,6 +8,7 @@ use crate::batch_io::BatchIoEngine;
 use crate::classifier::{self, ClassifierResult};
 use crate::counters::{Aggregate, FastpathCounterType, FastpathCounters};
 use crate::defs::Direction;
+use crate::forwarding_tables;
 use crate::km::{Codec, KmTransportSA};
 use crate::km_noise::NOISE_PADLEN;
 use crate::prelude::*;
@@ -70,6 +71,13 @@ pub struct FastpathWorker {
 
     pub actor_input_q: Vec<Packet>,
     pub substrate_egress_q: Vec<QueuedEgressPacket>,
+
+    /// The wall clock in milliseconds since the UNIX epoch
+    /// ([forwarding_tables::unix_ms]), read once per wakeup
+    /// ([FastpathWorker::refresh_clock]) for the per-packet visa-expiry
+    /// check (zl-zipline#274). The wall clock, as a visa's expiry is an
+    /// absolute time from the visa service.
+    pub now_ms: u64,
 }
 
 impl FastpathWorker {
@@ -102,7 +110,16 @@ impl FastpathWorker {
 
             actor_input_q: Vec::with_capacity(config.buffer_count),
             substrate_egress_q: Vec::with_capacity(config.buffer_count),
+
+            now_ms: forwarding_tables::unix_ms(SystemTime::now()),
         }
+    }
+
+    /// Read the wall clock into [FastpathWorker::now_ms]. Called once per
+    /// wakeup, so the clock is read once per batch, not once per packet;
+    /// the expiry check is late by at most one loop iteration.
+    pub fn refresh_clock(&mut self) {
+        self.now_ms = forwarding_tables::unix_ms(SystemTime::now());
     }
 
     /// Drop a packet and count the drop with the given reason.
@@ -380,11 +397,21 @@ impl FastpathWorker {
 
             // TODO: policy enforcement
 
-            // One load: a J11 rebind may swap the entry's target at
-            // any moment, and both IDs must come from the same target.
-            let next_hop = pep.next_hop();
+            // A J11 rebind may swap the entry's target at any moment:
+            // `target` reads the expiry and the next hop of one binding.
+            let (expires_ms, next_hop) = pep.target();
             egress_link_id = next_hop.0;
             egress_stream_id = next_hop.1;
+
+            // Visa expiry, on every packet at every hop (zl-zipline#274):
+            // a stream stops when its visa does, whenever it was bound.
+            // Dropped silently, like an unknown stream ID.
+            if self.now_ms >= expires_ms {
+                drop(pep);
+                drop(ingress_peer_state);
+                self.drop_and_count(pkt, FastpathCounterType::VisaExpired);
+                return;
+            }
 
             // Security Testing: if this is a transit stream (in from one
             // peer and out to another, neither of them this node's own
@@ -1178,6 +1205,7 @@ mod test {
 
     use super::*;
     use crate::config::PACKET_BUFFER_SIZE;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn test_encrypt_decrypt_null() {
@@ -1257,27 +1285,9 @@ mod test {
             "b.zpr",
             crate::link_state::LinkState::Active,
         );
-        let mut worker = FastpathWorker::new(
-            FastpathWorkerConfig {
-                batch_io_engine: crate::batch_io::auto_select_engine(),
-                buffer_count: 4,
-                batch_size: 4,
-                #[cfg(feature = "enable-security-testing")]
-                mangle_forwarded_pings: false,
-                #[cfg(feature = "enable-security-testing")]
-                unkeyed_a2a_micv: false,
-                #[cfg(feature = "enable-security-testing")]
-                recompute_micvs: false,
-            },
-            0,
-            asm.clone(),
-        );
+        let mut worker = test_worker(asm.clone());
 
-        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
-        pkt.put(&b"a transit payload"[..]);
-        pkt.metadata_mut().ingress_link_id = zode;
-        pkt.metadata_mut().ingress_stream_id = 77;
-        worker.forward(pkt);
+        worker.forward(transit_packet(zode, 77));
 
         assert_eq!(
             worker.batch_counters[FastpathCounterType::UnknownStreamId].get_count(),
@@ -1293,6 +1303,94 @@ mod test {
             ),
             "nothing is sent upstream"
         );
+    }
+
+    /// A fastpath worker on `asm` with a few buffers and no security
+    /// testing.
+    fn test_worker(asm: Arc<Assembly>) -> FastpathWorker {
+        FastpathWorker::new(
+            FastpathWorkerConfig {
+                batch_io_engine: crate::batch_io::auto_select_engine(),
+                buffer_count: 4,
+                batch_size: 4,
+                #[cfg(feature = "enable-security-testing")]
+                mangle_forwarded_pings: false,
+                #[cfg(feature = "enable-security-testing")]
+                unkeyed_a2a_micv: false,
+                #[cfg(feature = "enable-security-testing")]
+                recompute_micvs: false,
+            },
+            0,
+            asm,
+        )
+    }
+
+    /// A worker on a fresh assembly with two up Zode links, A and B, and a
+    /// PFT entry on A forwarding to stream 9 on B under a visa expiring at
+    /// `expires`. Returns the worker, link A and the entry's stream ID.
+    fn worker_with_transit_stream(expires: SystemTime) -> (FastpathWorker, LinkId, StreamId) {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::forwarding_tables::PftPep;
+        use crate::link_state::LinkState;
+        use crate::peer_table::test::insert_zode_peer_with_verified_cn;
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let link_a = insert_zode_peer_with_verified_cn(&asm, "a.zpr", LinkState::Active);
+        let link_b = insert_zode_peer_with_verified_cn(&asm, "b.zpr", LinkState::Active);
+        let stream = asm
+            .peer_table
+            .get(link_a)
+            .unwrap()
+            .pft
+            .insert(PftPep::new(ForwardingEntry(link_b, 9), 7000, expires))
+            .unwrap();
+        (test_worker(asm), link_a, stream)
+    }
+
+    /// A transit packet arriving on `link` with the stream ID `stream`.
+    fn transit_packet(link: LinkId, stream: StreamId) -> Packet {
+        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
+        pkt.put(&b"a transit payload"[..]);
+        pkt.metadata_mut().ingress_link_id = link;
+        pkt.metadata_mut().ingress_stream_id = stream;
+        pkt
+    }
+
+    /// zl-zipline#274 (D1): visa expiry is enforced on every packet. A
+    /// packet on a stream whose visa expired, by the worker's clock, is
+    /// dropped silently and counted as `VisaExpired`; nothing is forwarded.
+    /// This holds at every hop, as `forward` is the one path every bound
+    /// packet takes.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_packet_on_an_expired_stream_is_dropped_and_counted() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (mut worker, link_a, stream) = worker_with_transit_stream(expires);
+        worker.now_ms = 1_000_000; // the visa's expiry instant
+
+        worker.forward(transit_packet(link_a, stream));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::VisaExpired].get_count(),
+            1
+        );
+        assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// The other side of [test_a_packet_on_an_expired_stream_is_dropped_and_counted]:
+    /// the same stream, a millisecond before the expiry, forwards.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_packet_on_a_live_stream_is_forwarded() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (mut worker, link_a, stream) = worker_with_transit_stream(expires);
+        worker.now_ms = 999_999;
+
+        worker.forward(transit_packet(link_a, stream));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::VisaExpired].get_count(),
+            0
+        );
+        assert_eq!(worker.substrate_egress_q.len(), 1, "forwarded to link B");
     }
 
     #[test]

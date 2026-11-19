@@ -1049,6 +1049,21 @@ mod test {
         assert_eq!(config.control_group.as_deref(), Some("from-flag"));
     }
 
+    /// zl-zipline#278 (review on core#141): a valid `--control-group`
+    /// overrides an invalid `control_group` in the file. Only the value
+    /// that wins is validated, so the file's bad name does not stop the
+    /// Zode.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_flag_overrides_invalid_file_value() {
+        let config = argparse_zode_with(
+            r#"control_group = "bad,name""#,
+            &["--control-group", "from-flag"],
+        )
+        .expect("the flag's valid name wins over the file's invalid name");
+        assert_eq!(config.control_group.as_deref(), Some("from-flag"));
+    }
+
     /// zipline#154: the flag alone sets it too.
     #[test]
     #[parallel(env)]

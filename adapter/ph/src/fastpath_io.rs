@@ -875,62 +875,130 @@ mod tests {
     /// PRIORITY packet is dropped too: it would only fail again.
     #[tokio::test(flavor = "local")]
     async fn substrate_send_from_vanished_source_drops_and_counts() {
-        use crate::counters::FastpathCounterType;
-        use crate::fastpath::QueuedEgressPacket;
-        use crate::packet::{Packet, flags};
-        use bytes::BufMut as _;
-
         for name in batch_io::engine_names() {
             for priority in [false, true] {
                 let engine = batch_io::select_engine_by_name(name).unwrap();
                 let mut worker = test_worker(engine);
                 let (sender, receiver, gone) = vanished_source_setup(false);
                 let buffers_before = worker.buffers.len();
-                let mut pkt = Packet::new(worker.buffers.pop().unwrap(), 64);
-                pkt.put(&b"a keep-alive"[..]);
-                if priority {
-                    pkt.metadata_mut().flags |= flags::PRIORITY;
-                }
-                worker.substrate_egress_q.push(QueuedEgressPacket {
-                    pkt,
-                    dst: receiver.local_addr().unwrap(),
-                    src: gone,
-                });
-
-                let mut bio = engine.instantiate(4).unwrap();
-                let mut results = Vec::new();
-                let mut warned_at = None;
-                send_substrate_egress_queue(
-                    &mut bio,
-                    &sender,
-                    &mut results,
+                queue_test_packet(
                     &mut worker,
-                    &mut warned_at,
+                    b"a keep-alive",
+                    receiver.local_addr().unwrap(),
+                    gone,
+                    priority,
                 );
 
-                let what = format!("engine {name}, priority {priority}");
-                assert_eq!(
-                    worker.batch_counters[FastpathCounterType::OutPacksDrop].get_count(),
-                    1,
-                    "{what}: the packet is counted as dropped"
-                );
-                assert_eq!(
-                    worker.batch_counters[FastpathCounterType::OutPacksSent].get_count(),
-                    0,
-                    "{what}: nothing was sent"
-                );
-                assert!(
-                    worker.substrate_egress_q.is_empty(),
-                    "{what}: nothing is retained"
-                );
-                assert_eq!(
-                    worker.buffers.len(),
+                let warned_at = send_test_queue(engine, &sender, &mut worker);
+
+                assert_one_packet_dropped(
+                    &worker,
                     buffers_before,
-                    "{what}: the buffer is freed"
+                    warned_at,
+                    &format!("engine {name}, priority {priority}"),
                 );
-                assert!(warned_at.is_some(), "{what}: the drop is logged");
             }
         }
+    }
+
+    /// zl-zipline#270: with a packet the host refuses to send in the
+    /// substrate egress queue, the fastpath drops and counts it in
+    /// `OutPacksDrop` instead of panicking ("unrecoverable I/O error:
+    /// Permission denied"), frees its buffer and logs the drop. A PRIORITY
+    /// packet is dropped too: it would only be refused again.
+    #[tokio::test(flavor = "local")]
+    async fn substrate_send_refused_drops_and_counts() {
+        for name in batch_io::engine_names() {
+            for priority in [false, true] {
+                let engine = batch_io::select_engine_by_name(name).unwrap();
+                let mut worker = test_worker(engine);
+                let sender = UdpSocket::bind("0.0.0.0:0").unwrap();
+                sender.set_nonblocking(true).unwrap();
+                let (dst, src) = refused_send_addrs();
+                let buffers_before = worker.buffers.len();
+                queue_test_packet(&mut worker, b"a refused packet", dst, src, priority);
+
+                let warned_at = send_test_queue(engine, &sender, &mut worker);
+
+                assert_one_packet_dropped(
+                    &worker,
+                    buffers_before,
+                    warned_at,
+                    &format!("engine {name}, priority {priority}"),
+                );
+            }
+        }
+    }
+
+    /// Queue a packet with body `body`, from `src` to `dst`, on `worker`'s
+    /// substrate egress queue, flagged PRIORITY if `priority`.
+    fn queue_test_packet(
+        worker: &mut crate::fastpath::FastpathWorker,
+        body: &[u8],
+        dst: std::net::SocketAddr,
+        src: zpr_utils::net_defs::ScopedIpAddr,
+        priority: bool,
+    ) {
+        use crate::fastpath::QueuedEgressPacket;
+        use crate::packet::{Packet, flags};
+        use bytes::BufMut as _;
+
+        let mut pkt = Packet::new(worker.buffers.pop().unwrap(), 64);
+        pkt.put(body);
+        if priority {
+            pkt.metadata_mut().flags |= flags::PRIORITY;
+        }
+        worker
+            .substrate_egress_q
+            .push(QueuedEgressPacket { pkt, dst, src });
+    }
+
+    /// Run [send_substrate_egress_queue] once over `worker`'s queue on a
+    /// fresh instance of `engine`, from `sender`. Returns the time of the
+    /// drop warning, if one was logged.
+    fn send_test_queue(
+        engine: &'static batch_io::BatchIoEngine,
+        sender: &UdpSocket,
+        worker: &mut crate::fastpath::FastpathWorker,
+    ) -> Option<std::time::Instant> {
+        let mut bio = engine.instantiate(4).unwrap();
+        let mut results = Vec::new();
+        let mut warned_at = None;
+        send_substrate_egress_queue(&mut bio, sender, &mut results, worker, &mut warned_at);
+        warned_at
+    }
+
+    /// Assert that the one queued packet was dropped: counted in
+    /// `OutPacksDrop`, not sent, not retained, its buffer freed (the pool is
+    /// back to `buffers_before`), and the drop logged. `what` names the case.
+    fn assert_one_packet_dropped(
+        worker: &crate::fastpath::FastpathWorker,
+        buffers_before: usize,
+        warned_at: Option<std::time::Instant>,
+        what: &str,
+    ) {
+        use crate::counters::FastpathCounterType;
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::OutPacksDrop].get_count(),
+            1,
+            "{what}: the packet is counted as dropped"
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::OutPacksSent].get_count(),
+            0,
+            "{what}: nothing was sent"
+        );
+        assert!(
+            worker.substrate_egress_q.is_empty(),
+            "{what}: nothing is retained"
+        );
+        assert_eq!(
+            worker.buffers.len(),
+            buffers_before,
+            "{what}: the buffer is freed"
+        );
+        assert!(warned_at.is_some(), "{what}: the drop is logged");
     }
 
     /// A fastpath worker with four buffers and a batch of four, on engine
@@ -965,9 +1033,6 @@ mod tests {
     #[tokio::test(flavor = "local")]
     async fn substrate_send_from_vanished_source_spares_the_rest_of_the_queue() {
         use crate::counters::FastpathCounterType;
-        use crate::fastpath::QueuedEgressPacket;
-        use crate::packet::{Packet, flags};
-        use bytes::BufMut as _;
         use std::net::Ipv4Addr;
 
         for name in batch_io::engine_names() {
@@ -986,28 +1051,16 @@ mod tests {
                         std::net::IpAddr::from(Ipv4Addr::LOCALHOST).into(),
                     ),
                 ] {
-                    let mut pkt = Packet::new(worker.buffers.pop().unwrap(), 64);
-                    pkt.put(body);
-                    if priority {
-                        pkt.metadata_mut().flags |= flags::PRIORITY;
-                    }
-                    worker.substrate_egress_q.push(QueuedEgressPacket {
-                        pkt,
-                        dst: receiver.local_addr().unwrap(),
+                    queue_test_packet(
+                        &mut worker,
+                        body,
+                        receiver.local_addr().unwrap(),
                         src,
-                    });
+                        priority,
+                    );
                 }
 
-                let mut bio = engine.instantiate(4).unwrap();
-                let mut results = Vec::new();
-                let mut warned_at = None;
-                send_substrate_egress_queue(
-                    &mut bio,
-                    &sender,
-                    &mut results,
-                    &mut worker,
-                    &mut warned_at,
-                );
+                send_test_queue(engine, &sender, &mut worker);
 
                 let what = format!("engine {name}, priority {priority}");
                 let mut buf = [0u8; 64];

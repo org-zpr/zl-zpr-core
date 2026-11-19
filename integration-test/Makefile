@@ -42,7 +42,7 @@ TESTS := $(filter-out a2a-pubkey-test.sh,$(sort $(wildcard *-test.sh)))
 # with a bare `-e NAME`, which copies the caller's value in.  Unset ones are not
 # mentioned at all, so the image's own ENV (USER, VALKEY_SERVER_BIN, ...) stands.
 FORWARD_ENV := DEBUG_TARGETS KM_IMPL NETEM_PARAMS NODE_AUTH_PRIVATE_KEY FAKE_IDP_PORT \
-               SKIP_NOTIFY ZPR_TEST_VERBOSE \
+               SKIP_NOTIFY ZPR_TEST_VERBOSE PH_DEBUG_BUILD \
                PH_BIN PH_DEBUG_BIN VS_BIN VS_ADMIN_BIN ZPR_ATTR_SERVER_BIN ZPDUMP_BIN VALKEY_SERVER_BIN
 DOCKER_ENV := $(foreach v,$(FORWARD_ENV),$(if $(filter undefined,$(origin $(v))),,-e $(v)))
 

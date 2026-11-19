@@ -345,7 +345,6 @@ function launch_relay() {
     zode \
     --logging "$DEBUG_TARGETS" \
     --control-path relay.sock \
-    --advertised-substrate-addr "$RELAY_SUBSTRATE_ADDR:$ZODE_PORT" \
     --ca-file ca.crt \
     --certificate-file relay.crt \
     --private-key-file relay.key \

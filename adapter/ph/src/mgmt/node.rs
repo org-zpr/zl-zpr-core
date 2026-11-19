@@ -1466,7 +1466,6 @@ mod tests {
             "127.0.0.1:1".parse().unwrap(),
             "test-node".to_string(),
             key,
-            libnode::vsconn::fixed_substrate_addr("127.0.0.1:5000".parse().unwrap()),
             std::net::Ipv4Addr::LOCALHOST.into(),
         );
         node_assembly(Some(vsconn.handle()))

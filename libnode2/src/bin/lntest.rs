@@ -19,14 +19,6 @@ async fn main() {
 
     let vs_sa: SocketAddr = args.vs_addr.parse().expect("failed to parse vs-addr");
     let node_zpr_addr: IpAddr = args.self_addr.parse().expect("failed to parse self_addr");
-    let substrate_addr: SocketAddr = args
-        .substrate_addr
-        .parse()
-        .expect("failed to parse substrate_addr");
-    assert!(
-        !substrate_addr.ip().is_unspecified() && substrate_addr.port() != 0,
-        "substrate_addr must be a concrete address peers could dial"
-    );
     let cfg = Config { node_zpr_addr };
 
     let log_buf = LogBuffer::default();
@@ -40,7 +32,6 @@ async fn main() {
         vs_sa,
         args.node_cn,
         private_key,
-        libnode2::vsconn::fixed_substrate_addr(substrate_addr),
         // The VS-API connection leaves from the node's own address (zl-zipline#229).
         node_zpr_addr,
     );

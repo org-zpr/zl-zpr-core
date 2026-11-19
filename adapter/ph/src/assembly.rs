@@ -1234,37 +1234,108 @@ pub mod test {
             builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
             let asm = Arc::new(create_assembly(builder));
 
-            let visa_id = 3000;
             let mut visa_table = asm.visa_table.write().unwrap();
-            let v = new_vsapi_visa_tcp_default(visa_id as u64, never_expires());
+            let v = new_vsapi_visa_tcp_default(VISA_ID, never_expires());
             let _ = visa_table.insert_visa(v);
 
-            let mut bound = Vec::new();
-            for (i, link_type) in link_types.iter().enumerate() {
-                let octet = i as u8 + 1;
-                let entry = asm.peer_table.vacant_entry().unwrap();
-                let key = entry.key();
-                let link = entry
-                    .insert(create_dummy_peer_state(
-                        key,
-                        *link_type,
-                        SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(octet, 2, 3, 4)), 443),
-                        net_defs::ScopedIpAddr::V4(Ipv4Addr::new(octet, 2, 3, 5)),
-                    ))
-                    .get();
-                let tether = asm
-                    .peer_table
-                    .get(link)
-                    .unwrap()
-                    .pft
-                    .insert(PftPep::new(ForwardingEntry(link, 1), visa_id))
-                    .unwrap();
-                visa_table.bind(visa_id, binding_on(link, tether)).unwrap();
-                bound.push((link, tether));
-            }
             drop(visa_table);
 
+            let bound = link_types
+                .iter()
+                .enumerate()
+                .map(|(i, link_type)| {
+                    let link = add_dummy_peer(&asm, *link_type, i as u8 + 1);
+                    (link, bind_visa_on(&asm, link))
+                })
+                .collect();
+
             (asm, egress_rx, bound)
+        }
+
+        /// The visa every setup here inserts.
+        const VISA_ID: VisaId = 3000;
+
+        /// Add a dummy peer of `link_type`, with substrate address
+        /// `octet.2.3.4:443`, and return its link ID.
+        fn add_dummy_peer(asm: &Assembly, link_type: LinkType, octet: u8) -> LinkId {
+            let entry = asm.peer_table.vacant_entry().unwrap();
+            let key = entry.key();
+            entry
+                .insert(create_dummy_peer_state(
+                    key,
+                    link_type,
+                    SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(octet, 2, 3, 4)), 443),
+                    net_defs::ScopedIpAddr::V4(Ipv4Addr::new(octet, 2, 3, 5)),
+                ))
+                .get()
+        }
+
+        /// Give [VISA_ID] a forwarding entry on `link` and bind it there.
+        /// Returns the entry's tether (stream) ID.
+        fn bind_visa_on(asm: &Assembly, link: LinkId) -> StreamId {
+            let tether = asm
+                .peer_table
+                .get(link)
+                .unwrap()
+                .pft
+                .insert(PftPep::new(ForwardingEntry(link, 1), VISA_ID))
+                .unwrap();
+            asm.visa_table
+                .write()
+                .unwrap()
+                .bind(VISA_ID, binding_on(link, tether))
+                .unwrap();
+            tether
+        }
+
+        /// A Zode with its own actor on the local actor link of the real
+        /// internal pair, and `zode_links` dummy Zode links, with [VISA_ID]
+        /// bound on the local actor link and on every Zode link. What is
+        /// sent to the local actor arrives on the hairpin, not on the
+        /// substrate egress queue. Needs a `LocalSet`: the internal pair
+        /// spawns its workers.
+        ///
+        /// Returns (asm, egress queue receiver, hairpin receiver, the local
+        /// actor's (link, tether), the pair's other (dock) link, each Zode
+        /// link's (link, tether)).
+        fn setup_visa_on_actor_and_zode_links(
+            zode_links: u8,
+        ) -> (
+            Arc<Assembly>,
+            packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+            tokio::sync::mpsc::Receiver<crate::packet::Packet>,
+            (LinkId, StreamId),
+            LinkId,
+            Vec<(LinkId, StreamId)>,
+        ) {
+            let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
+            let (hairpin_tx, hairpin_rx) = tokio::sync::mpsc::channel(8);
+
+            let mut builder = TestAssemblyBuilder::new();
+            builder.visa_table = Some(VisaTable::new());
+            builder.mgmt_substrate_egress = Some(MgmtSubstrateEgress::new(egress_tx));
+            builder.mgmt_hairpin_dispatch =
+                Some(crate::queues::MgmtHairpinDispatch::new(hairpin_tx));
+            let asm = Arc::new(create_assembly(builder));
+            let _ = asm
+                .visa_table
+                .write()
+                .unwrap()
+                .insert_visa(new_vsapi_visa_tcp_default(VISA_ID, never_expires()));
+
+            let (local_actor, dock) = asm
+                .peer_table
+                .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+            let local_actor = local_actor.get();
+            let actor = (local_actor, bind_visa_on(&asm, local_actor));
+            let zodes = (1..=zode_links)
+                .map(|octet| {
+                    let link = add_dummy_peer(&asm, LinkType::NodeToNode, octet);
+                    (link, bind_visa_on(&asm, link))
+                })
+                .collect();
+
+            (asm, egress_rx, hairpin_rx, actor, dock.get(), zodes)
         }
 
         /// [setup_visa_on_links] on two internal links.
@@ -1292,42 +1363,66 @@ pub mod test {
         ) -> Vec<(LinkId, StreamId)> {
             let mut got = Vec::new();
             while let Some(pkt) = try_recv_packet(rx) {
-                let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
-                assert_eq!(base_hdr.packet_type, zdp::ZdpPacketType::StreamIdWithdrawal);
-                let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
-                let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
-                got.push((pkt.metadata().egress_link_id, per_flow_hdr.stream_id.into()));
+                got.push((pkt.metadata().egress_link_id, withdrawn_stream(&pkt)));
             }
             got
         }
 
+        /// The StreamIdWithdrawals on the hairpin to the local actor, as
+        /// (link, stream). The hairpin delivers a packet as received on the
+        /// other end of the internal pair, so the link is that end's.
+        fn withdrawals_on_hairpin(
+            rx: &mut tokio::sync::mpsc::Receiver<crate::packet::Packet>,
+        ) -> Vec<(LinkId, StreamId)> {
+            let mut got = Vec::new();
+            while let Ok(pkt) = rx.try_recv() {
+                got.push((pkt.metadata().ingress_link_id, withdrawn_stream(&pkt)));
+            }
+            got
+        }
+
+        /// The stream `pkt`, which must be a StreamIdWithdrawal, withdraws.
+        fn withdrawn_stream(pkt: &crate::packet::Packet) -> StreamId {
+            let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+            assert_eq!(base_hdr.packet_type, zdp::ZdpPacketType::StreamIdWithdrawal);
+            let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+            let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
+            per_flow_hdr.stream_id.into()
+        }
+
         /// F5 (zl-zipline#251): a revocation of a visa bound from this Zode's
-        /// own actor (an internal link) to a Zode link sends exactly one
-        /// withdrawal, to the actor, and none on the Zode link.
-        #[tokio::test]
+        /// own actor (the local actor link) to a Zode link sends exactly one
+        /// withdrawal, to the actor over the hairpin, and none on the Zode
+        /// link or anywhere else on the substrate.
+        #[tokio::test(flavor = "local")]
         async fn test_revocation_sends_no_withdrawal_on_zode_link() {
-            let (asm, mut egress_rx, bound) =
-                setup_visa_on_links(&[LinkType::Internal, LinkType::NodeToNode]);
+            let (asm, mut egress_rx, mut hairpin_rx, (_, actor_tether), dock, _zodes) =
+                setup_visa_on_actor_and_zode_links(1);
 
-            crate::visa_mgmt::handle_revocation(&asm, 3000).unwrap();
+            crate::visa_mgmt::handle_revocation(&asm, VISA_ID).unwrap();
 
-            assert_eq!(withdrawals_sent(&mut egress_rx), vec![bound[0]]);
+            assert_eq!(
+                withdrawals_on_hairpin(&mut hairpin_rx),
+                vec![(dock, actor_tether)]
+            );
+            assert_eq!(withdrawals_sent(&mut egress_rx), vec![]);
         }
 
         /// F5 (zl-zipline#251): dropping another link that holds the same
-        /// visa sends exactly one withdrawal, to this Zode's own actor (an
-        /// internal link), and none on the surviving Zode link.
-        #[tokio::test]
+        /// visa sends exactly one withdrawal, to this Zode's own actor over
+        /// the hairpin, and none on the surviving Zode link.
+        #[tokio::test(flavor = "local")]
         async fn test_drop_peer_sends_no_withdrawal_on_zode_link() {
-            let (asm, mut egress_rx, bound) = setup_visa_on_links(&[
-                LinkType::Internal,
-                LinkType::NodeToNode,
-                LinkType::NodeToNode,
-            ]);
+            let (asm, mut egress_rx, mut hairpin_rx, (_, actor_tether), dock, zodes) =
+                setup_visa_on_actor_and_zode_links(2);
 
-            asm.drop_peer(bound[2].0);
+            asm.drop_peer(zodes[1].0);
 
-            assert_eq!(withdrawals_sent(&mut egress_rx), vec![bound[0]]);
+            assert_eq!(
+                withdrawals_on_hairpin(&mut hairpin_rx),
+                vec![(dock, actor_tether)]
+            );
+            assert_eq!(withdrawals_sent(&mut egress_rx), vec![]);
         }
 
         fn try_recv_packet(
@@ -1385,7 +1480,7 @@ pub mod test {
             let (asm, mut egress_rx, link_a, link_b, tether_a, tether_b) = setup_two_link_visa();
 
             // setup_two_link_visa inserts the visa with id 3000.
-            crate::visa_mgmt::handle_revocation(&asm, 3000).unwrap();
+            crate::visa_mgmt::handle_revocation(&asm, VISA_ID).unwrap();
 
             let mut got = Vec::new();
             while let Some(pkt) = try_recv_packet(&mut egress_rx) {

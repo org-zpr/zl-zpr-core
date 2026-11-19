@@ -37,8 +37,8 @@ pub struct FastpathIo {
     io_results: Vec<Result<usize>>,
     /// temporary recv result storage during I/O batch operations
     recv_results: Vec<Result<batch_io::ReceivedPacket>>,
-    /// When this worker last warned of a substrate send dropped after a
-    /// network change (see [warn_send_dropped]).
+    /// When this worker last warned of a dropped substrate send, whatever
+    /// its cause (see [warn_send_dropped]).
     send_drop_warned_at: Option<Instant>,
 }
 
@@ -343,10 +343,10 @@ fn get_confirm_flag(pkt: &Packet) -> batch_io::SendFlags {
     }
 }
 
-/// The shortest gap between two "send dropped after a network change"
-/// warnings from one fastpath worker: a dead source address fails every
-/// packet until the keep-alive closes the link, and one line a second is
-/// enough to show it.
+/// The shortest gap between two "dropping substrate send" warnings from one
+/// fastpath worker, whatever their cause: a dead source address fails every
+/// packet until the keep-alive closes the link, a firewall rule refuses
+/// every packet it matches, and one line a second is enough to show either.
 const SEND_DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Send the worker's queued substrate egress packets and tally the results:
@@ -399,9 +399,9 @@ fn send_substrate_egress_queue(
         match batch {
             Ok(n) => break n,
             Err(err) => {
-                if classify_send_error(&err, SENDS_CARRY_SOURCE).is_none() {
+                let Some(cause) = classify_send_error(&err, SENDS_CARRY_SOURCE) else {
                     panic!("unrecoverable I/O error: {err}");
-                }
+                };
                 // The engines that emulate sendmmsg(2) report a failed first
                 // packet as the batch error, with nothing sent. Drop only that
                 // packet and send the rest: they may leave from other, live
@@ -409,7 +409,7 @@ fn send_substrate_egress_queue(
                 // does not refuse. Each pass drops one packet, so the loop
                 // ends.
                 let first = worker.substrate_egress_q.remove(0);
-                warn_send_dropped(send_drop_warned_at, &first, &err);
+                warn_send_dropped(send_drop_warned_at, cause, &first, &err);
                 worker.batch_counters[FastpathCounterType::OutPacksDrop].increase_by(1);
                 worker.buffers.push(first.pkt.destroy());
                 if worker.substrate_egress_q.is_empty() {
@@ -430,14 +430,21 @@ fn send_substrate_egress_queue(
             match &io_results[i] {
                 Ok(_) => continue,
                 Err(err) if err.kind() == ErrorKind::WouldBlock => (),
-                Err(err) if classify_send_error(err, SENDS_CARRY_SOURCE).is_some() => {
-                    // Dropped, PRIORITY or not: leave it in place to be freed.
-                    warn_send_dropped(send_drop_warned_at, &worker.substrate_egress_q[i], err);
-                    dropped += 1;
-                    continue;
-                }
-                // TODO: pending <https://github.com/rust-lang/rust/issues/86442>, provide more info to user
-                Err(err) => panic!("unrecoverable I/O error: {err}"),
+                Err(err) => match classify_send_error(err, SENDS_CARRY_SOURCE) {
+                    Some(cause) => {
+                        // Dropped, PRIORITY or not: leave it in place to be freed.
+                        warn_send_dropped(
+                            send_drop_warned_at,
+                            cause,
+                            &worker.substrate_egress_q[i],
+                            err,
+                        );
+                        dropped += 1;
+                        continue;
+                    }
+                    // TODO: pending <https://github.com/rust-lang/rust/issues/86442>, provide more info to user
+                    None => panic!("unrecoverable I/O error: {err}"),
+                },
             }
         }
 
@@ -522,11 +529,13 @@ fn classify_send_error(err: &std::io::Error, had_source: bool) -> Option<SendDro
     }
 }
 
-/// Log a send dropped by [classify_send_error], at most once per
-/// [SEND_DROP_WARN_INTERVAL] per worker (`warned_at` is the worker's last
-/// warning). Every drop is counted in `OutPacksDrop` either way.
+/// Log a send dropped by [classify_send_error] as `cause`, at most once per
+/// [SEND_DROP_WARN_INTERVAL] per worker, whatever the cause (`warned_at` is
+/// the worker's last warning). Every drop is counted in `OutPacksDrop`
+/// either way.
 fn warn_send_dropped(
     warned_at: &mut Option<Instant>,
+    cause: SendDropCause,
     pkt: &QueuedEgressPacket,
     err: &std::io::Error,
 ) {
@@ -537,9 +546,30 @@ fn warn_send_dropped(
     *warned_at = Some(now);
     warn!(
         target: DATAPATH,
-        "dropping substrate send from {} to {}: {err} (the local address may be gone after a network change; the link's keep-alive will close it)",
-        pkt.src, pkt.dst
+        "{}",
+        send_drop_message(cause, &pkt.src, &pkt.dst, err)
     );
+}
+
+/// The warning text for a substrate send from `src` to `dst` dropped as
+/// `cause` after the error `err`. Each cause names its likely reason, so an
+/// operator knows where to look: the network for a vanished local address
+/// (zl-zipline#230), the host's firewall for a refused send
+/// (zl-zipline#270).
+fn send_drop_message(
+    cause: SendDropCause,
+    src: &net_defs::ScopedIpAddr,
+    dst: &SocketAddr,
+    err: &std::io::Error,
+) -> String {
+    let reason = match cause {
+        SendDropCause::NetworkChange => {
+            "the local address may be gone after a network change; \
+             the link's keep-alive will close it"
+        }
+        SendDropCause::Refused => "refused by the host, for example by a firewall rule",
+    };
+    format!("dropping substrate send from {src} to {dst}: {err} ({reason})")
 }
 
 fn is_ip(pi: TunPi) -> bool {

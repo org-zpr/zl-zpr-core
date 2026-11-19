@@ -353,19 +353,20 @@ const SEND_DROP_WARN_INTERVAL: Duration = Duration::from_secs(1);
 /// sent packets count in `OutPacksSent`, dropped ones in `OutPacksDrop`, and
 /// un-sent PRIORITY packets stay at the head of the queue for the next call.
 ///
-/// A send that fails because the network changed under it (see
-/// [classify_send_error]) drops its packet, even a PRIORITY one,
-/// which would only fail the same way again. A batch-level error of that
-/// kind drops the first packet, the one that failed, and sends the rest.
-/// Any other send error is fatal.
+/// A send that fails because the network changed under it, or because the
+/// host refused it (see [classify_send_error]), drops its packet, even a
+/// PRIORITY one, which would only fail the same way again. A batch-level
+/// error of that kind drops the first packet, the one that failed, and
+/// sends the rest. Any other send error is fatal.
 ///
 /// An engine that sends a prefix of the queue and then fails reports only
 /// the prefix (`Ok(n)`), not the error. The unsent rest is then handled as
 /// for any partial send, such as one that would block: PRIORITY packets
 /// stay queued, the others are dropped and counted. This was so before
 /// zl-zipline#230, and it is kept: retrying the rest at once would spin on
-/// a full socket. A vanished-source PRIORITY packet kept that way fails as
-/// the batch error on the next call, and is dropped and logged there.
+/// a full socket. A vanished-source or refused PRIORITY packet kept that
+/// way fails as the batch error on the next call, and is dropped and
+/// logged there.
 ///
 /// This is a free function rather than a [FastpathIo] method so a test can
 /// drive it with a real socket and no TUN.
@@ -397,15 +398,16 @@ fn send_substrate_egress_queue(
         ));
         match batch {
             Ok(n) => break n,
-            Err(err)
-                if classify_send_error(&err, SENDS_CARRY_SOURCE)
-                    == Some(SendDropCause::NetworkChange) =>
-            {
+            Err(err) => {
+                if classify_send_error(&err, SENDS_CARRY_SOURCE).is_none() {
+                    panic!("unrecoverable I/O error: {err}");
+                }
                 // The engines that emulate sendmmsg(2) report a failed first
                 // packet as the batch error, with nothing sent. Drop only that
                 // packet and send the rest: they may leave from other, live
-                // addresses (a multi-homed Zode). Each pass drops one packet,
-                // so the loop ends.
+                // addresses (a multi-homed Zode) or go to peers the host
+                // does not refuse. Each pass drops one packet, so the loop
+                // ends.
                 let first = worker.substrate_egress_q.remove(0);
                 warn_send_dropped(send_drop_warned_at, &first, &err);
                 worker.batch_counters[FastpathCounterType::OutPacksDrop].increase_by(1);
@@ -414,7 +416,6 @@ fn send_substrate_egress_queue(
                     return;
                 }
             }
-            Err(err) => panic!("unrecoverable I/O error: {err}"),
         }
     };
 
@@ -429,10 +430,7 @@ fn send_substrate_egress_queue(
             match &io_results[i] {
                 Ok(_) => continue,
                 Err(err) if err.kind() == ErrorKind::WouldBlock => (),
-                Err(err)
-                    if classify_send_error(err, SENDS_CARRY_SOURCE)
-                        == Some(SendDropCause::NetworkChange) =>
-                {
+                Err(err) if classify_send_error(err, SENDS_CARRY_SOURCE).is_some() => {
                     // Dropped, PRIORITY or not: leave it in place to be freed.
                     warn_send_dropped(send_drop_warned_at, &worker.substrate_egress_q[i], err);
                     dropped += 1;
@@ -1032,7 +1030,6 @@ mod tests {
     /// the batch error.
     #[tokio::test(flavor = "local")]
     async fn substrate_send_from_vanished_source_spares_the_rest_of_the_queue() {
-        use crate::counters::FastpathCounterType;
         use std::net::Ipv4Addr;
 
         for name in batch_io::engine_names() {
@@ -1062,32 +1059,92 @@ mod tests {
 
                 send_test_queue(engine, &sender, &mut worker);
 
-                let what = format!("engine {name}, priority {priority}");
-                let mut buf = [0u8; 64];
-                let (len, _) = receiver
-                    .recv_from(&mut buf)
-                    .unwrap_or_else(|e| panic!("{what}: the live packet arrives: {e}"));
-                assert_eq!(&buf[..len], b"from a live address", "{what}");
-                assert_eq!(
-                    worker.batch_counters[FastpathCounterType::OutPacksDrop].get_count(),
-                    1,
-                    "{what}: only the packet from the old address is dropped"
-                );
-                assert_eq!(
-                    worker.batch_counters[FastpathCounterType::OutPacksSent].get_count(),
-                    1,
-                    "{what}: the packet from the live address is sent"
-                );
-                assert!(
-                    worker.substrate_egress_q.is_empty(),
-                    "{what}: nothing is retained"
-                );
-                assert_eq!(
-                    worker.buffers.len(),
+                assert_first_dropped_second_sent(
+                    &worker,
+                    &receiver,
                     buffers_before,
-                    "{what}: both buffers are freed"
+                    b"from a live address",
+                    &format!("engine {name}, priority {priority}"),
                 );
             }
         }
+    }
+
+    /// zl-zipline#270: a send the host refuses drops only its own packet:
+    /// the next packet in the queue, to a peer the host allows, is still
+    /// sent, PRIORITY or not. The engines that emulate sendmmsg(2) report a
+    /// refused first packet as the batch error.
+    #[tokio::test(flavor = "local")]
+    async fn substrate_send_refused_spares_the_rest_of_the_queue() {
+        for name in batch_io::engine_names() {
+            for priority in [false, true] {
+                let engine = batch_io::select_engine_by_name(name).unwrap();
+                let mut worker = test_worker(engine);
+                let (sender, receiver, _) = vanished_source_setup(false);
+                receiver
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .unwrap();
+                let (refused_dst, src) = refused_send_addrs();
+                let buffers_before = worker.buffers.len();
+                queue_test_packet(&mut worker, b"refused", refused_dst, src, priority);
+                queue_test_packet(
+                    &mut worker,
+                    b"to an allowed peer",
+                    receiver.local_addr().unwrap(),
+                    src,
+                    priority,
+                );
+
+                send_test_queue(engine, &sender, &mut worker);
+
+                assert_first_dropped_second_sent(
+                    &worker,
+                    &receiver,
+                    buffers_before,
+                    b"to an allowed peer",
+                    &format!("engine {name}, priority {priority}"),
+                );
+            }
+        }
+    }
+
+    /// Assert that of two queued packets the first was dropped and the
+    /// second sent: `receiver` gets `sent_body`, one packet each is counted
+    /// in `OutPacksDrop` and `OutPacksSent`, nothing is retained, and both
+    /// buffers are freed (the pool is back to `buffers_before`). `what`
+    /// names the case.
+    fn assert_first_dropped_second_sent(
+        worker: &crate::fastpath::FastpathWorker,
+        receiver: &UdpSocket,
+        buffers_before: usize,
+        sent_body: &[u8],
+        what: &str,
+    ) {
+        use crate::counters::FastpathCounterType;
+
+        let mut buf = [0u8; 64];
+        let (len, _) = receiver
+            .recv_from(&mut buf)
+            .unwrap_or_else(|e| panic!("{what}: the second packet arrives: {e}"));
+        assert_eq!(&buf[..len], sent_body, "{what}");
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::OutPacksDrop].get_count(),
+            1,
+            "{what}: only the first packet is dropped"
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::OutPacksSent].get_count(),
+            1,
+            "{what}: the second packet is sent"
+        );
+        assert!(
+            worker.substrate_egress_q.is_empty(),
+            "{what}: nothing is retained"
+        );
+        assert_eq!(
+            worker.buffers.len(),
+            buffers_before,
+            "{what}: both buffers are freed"
+        );
     }
 }

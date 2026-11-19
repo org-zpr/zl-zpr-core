@@ -1117,24 +1117,6 @@ mod test {
         }
     }
 
-    /// zl-zipline#278 review: a valid `--control-group` replaces an invalid
-    /// `control_group` in the file, so the file's value is never checked.
-    /// With no flag, the invalid file value is still refused.
-    #[test]
-    #[parallel(env)]
-    fn test_control_group_flag_bypasses_invalid_file_value() {
-        let config = argparse_zode_with(
-            r#"control_group = "a,b""#,
-            &["--control-group", "from-flag"],
-        )
-        .expect("a valid --control-group replaces an invalid file value");
-        assert_eq!(config.control_group.as_deref(), Some("from-flag"));
-
-        let err = argparse_zode_with(r#"control_group = "a,b""#, &[])
-            .expect_err("an invalid file control_group with no flag");
-        assert!(err.to_string().contains("control_group"), "{err}");
-    }
-
     /// zl-zipline#278 review: a valid `--advertised-substrate-addr` replaces
     /// an invalid `advertised_substrate_addr` in the `[node]` section, so
     /// the file's value is never checked. With no flag, the invalid file

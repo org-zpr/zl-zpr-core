@@ -310,22 +310,18 @@ impl Config {
     /// caller drops a `[node]` value that such a flag replaces before it
     /// calls this (see [NodeConfig::drop_node_values_replaced_by_flags]).
     ///
-    /// A file value that a given flag replaces is dropped before the file
-    /// is applied, because applying a file value also validates it: an
-    /// invalid or stale `control_group` in the file must not stop ph when
-    /// `--control-group` gives a valid one (zl-zipline#278 review).
+    /// A file value that a given flag replaces must not be validated: an
+    /// invalid or stale value in the file must not stop ph when the flag
+    /// gives a valid one (zl-zipline#278 review). `control_group` is
+    /// stored raw by both sources and validated once below, after the
+    /// command line applies.
     pub fn new_for_node(
         config_file: Option<NodeConfig>,
         auth_private_key: Option<PathBuf>,
         common: &CommonArgs,
     ) -> Result<Self, ArgsError> {
         let mut config = Config::default();
-        if let Some(mut config_file) = config_file {
-            // --control-group replaces the file's control_group, so do not
-            // validate the file's value (zl-zipline#278 review).
-            if common.control_group.is_some() {
-                config_file.global.control_group = None;
-            }
+        if let Some(config_file) = config_file {
             let base_dir = config_file.config_path.parent().unwrap();
             config.set_from_globals(&config_file.global, base_dir)?;
             config.set_from_authentication(&config_file.authentication, base_dir)?;

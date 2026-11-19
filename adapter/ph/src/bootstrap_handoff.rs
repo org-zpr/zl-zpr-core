@@ -429,7 +429,7 @@ pub async fn relay_hand_off<F, Fut>(
     else {
         return;
     };
-    info!(target: VISA_MGMT, "{}: requesting bootstrap visas for {peer_cn:?}", asm.formatted_link_id(link_id));
+    info!(target: VISA_MGMT, "{}: requesting bootstrap visas for {peer_cn:?} observed at {observed}", asm.formatted_link_id(link_id));
     let answer = tokio::time::timeout(
         BOOTSTRAP_REQUEST_TIMEOUT,
         request(peer_cn.clone(), observed),

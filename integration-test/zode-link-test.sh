@@ -5,8 +5,10 @@
 #
 # A relay Zode (relay = true) hosts the visa service in its own namespace,
 # on its own TUN (zl-zipline#229). Zode zb has an initial link to the relay; zb is in the relay's topology. zb has no substrate
-# address in policy (zl-zipline#255, W10), so the visa service knows it only
-# once zb connects and reports it. Zode zc has a
+# address in policy (zl-zipline#255, W10), and a Zode never reports its own
+# (zl-zipline#264), so the visa service knows it only once the relay asks for
+# zb's bootstrap visas with the address it observes zb's link come from.
+# Zode zc has a
 # certificate from the same CA and an initial link to the relay, but is in
 # no policy.
 #
@@ -20,8 +22,9 @@
 #      the self-granted 1 and 2). zb authenticates, reports its link up,
 #      registers its VSS and receives its topology. Its own VS-API visas
 #      (J5a) supersede the bootstrap pair and its live session moves onto
-#      them with no failed rebind. Once zb has connected, the visa service
-#      re-proposes the relay's topology with zb's reported address.
+#      them with no failed rebind. The relay's request carries zb's
+#      observed address, and once zb has connected, the visa service
+#      re-proposes the relay's topology with that address (zl-zipline#264).
 #      Section 7 check 1 (zl-zipline#229): the relay routes vs.zpr over lo,
 #      its VS-API session leaves from its own address, and the visa
 #      service's VSS session to zb leaves from vs.zpr.
@@ -44,11 +47,11 @@
 #   7. The relay never dials (rule 4).
 #   8. zb changes networks (zl-zipline#230): its substrate address moves to
 #      another subnet. zb binds the wildcard self_addr, a laptop Zode's
-#      default, and has no advertised_substrate_addr. Sends from the old
-#      address fail and are dropped, not fatal; the keep-alive closes the
-#      initial link, zb redials from the new address and rejoins (rule 11a,
-#      J6), and reports the new address to the visa service. Its session
-#      comes back. The visa service accepts the new address only because
+#      default. Sends from the old address fail and are dropped, not fatal;
+#      the keep-alive closes the initial link, zb redials from the new
+#      address and rejoins (rule 11a, J6), and the relay's request for the
+#      rejoin carries the new observed address (zl-zipline#264). Its session
+#      comes back. The visa service takes the observed address only because
 #      policy gives zb none (zl-zipline#255).
 #
 # Every Stream ID Request in the run crosses the relay-zb Zode link, in both
@@ -95,6 +98,9 @@ DIAL='Started Zode link with .* as the dialer'
 KEEPALIVE_LOST='failed to respond to keep-alive messages'
 # The join (J2-J5).
 REQUEST_ZB='requesting bootstrap visas for "zb"'
+# The relay's request carries the address its socket sees zb's link come
+# from (zl-zipline#264).
+REQUEST_ZB_OBSERVED="requesting bootstrap visas for \"zb\" observed at $(ere_escape "$ZB_SUBSTRATE_ADDR:$ZODE_PORT")([^0-9]|\$)"
 REQUEST_ZC='requesting bootstrap visas for "zc"'
 HANDED_ZB='handed bootstrap visas \[[0-9]+, [0-9]+\] to "zb"'
 REFUSED_ZB_J7='no bootstrap visas for "zb": .*closing the link \(J7\)'
@@ -103,9 +109,9 @@ GRANTED='node access granted to visa service'
 REGISTERED='registered VSS'
 TOPOLOGY='received topology update with [1-9][0-9]* links'
 # One topology link (vss_worker.rs process_topology): the relay's link to zb
-# with no peer address, and with the address zb reported.
+# with no peer address, and with the address the relay observed for zb.
 TOPOLOGY_ZB_UNSET="\\]-> peer unset, zpr addr $(ere_escape "$ZB_ZPR_ADDR"), peer cn \"zb\""
-TOPOLOGY_ZB_REPORTED="\\]-> peer $(ere_escape "$ZB_SUBSTRATE_ADDR:$ZODE_PORT"), zpr addr $(ere_escape "$ZB_ZPR_ADDR"), peer cn \"zb\""
+TOPOLOGY_ZB_OBSERVED="\\]-> peer $(ere_escape "$ZB_SUBSTRATE_ADDR:$ZODE_PORT"), zpr addr $(ere_escape "$ZB_ZPR_ADDR"), peer cn \"zb\""
 REPORT_RELAY_UP='reported Zode link states to the visa service: \[.*relay=Up'
 REJOIN='rejoining \(J10\)'
 # J11: a failed rebind (mgmt/node.rs rebind_failed).
@@ -116,26 +122,28 @@ REBIND_FAILED='its rebind onto visa [0-9]+ failed'
 UNRECOVERABLE='unrecoverable I/O error'
 SEND_DROPPED='dropping substrate send from'
 
-# zb binds the wildcard self_addr with no advertised address (zl-zipline#230):
-# it reports its initial link's local address, which follows scenario 8's
-# network change.
+# zb binds the wildcard self_addr (zl-zipline#230) and reports no address
+# (zl-zipline#264): the only address the visa service can have for it is
+# the relay's observation, which follows scenario 8's network change.
 ZB_BIND=0.0.0.0
 # Scenario 8's new network: a second subnet on the relay's bridge.
 RELAY_NEW_NET_ADDR=10.3.0.1
 ZB_NEW_SUBSTRATE_ADDR=10.3.0.2
-TOPOLOGY_ZB_NEW_REPORTED="\\]-> peer $(ere_escape "$ZB_NEW_SUBSTRATE_ADDR:$ZODE_PORT"), zpr addr $(ere_escape "$ZB_ZPR_ADDR"), peer cn \"zb\""
+REQUEST_ZB_NEW_OBSERVED="requesting bootstrap visas for \"zb\" observed at $(ere_escape "$ZB_NEW_SUBSTRATE_ADDR:$ZODE_PORT")([^0-9]|\$)"
+TOPOLOGY_ZB_NEW_OBSERVED="\\]-> peer $(ere_escape "$ZB_NEW_SUBSTRATE_ADDR:$ZODE_PORT"), zpr addr $(ere_escape "$ZB_ZPR_ADDR"), peer cn \"zb\""
 
 if [[ "$PASS" == 0 ]]; then
   echo "TEST STARTING"
 
   echo "== 1. zb joins"
   wait_log_after 20 relay.log "$TOPOLOGY_ZB_UNSET" 0 "before zb connects, the relay's topology names zb with no peer address (rule 13b)" || PASS=1
-  assert_no_log relay.log "$TOPOLOGY_ZB_REPORTED" "the relay has no address for zb yet" || PASS=1
+  assert_no_log relay.log "$TOPOLOGY_ZB_OBSERVED" "the relay has no address for zb yet" || PASS=1
   launch_zode zb "$ZB_BIND" "$ZB_ZPR_ADDR" "$PREGEN/zb-rsa-key.pem"
   assert_active_links 20 relay "$ZB_SUBSTRATE_ADDR" 1 "the relay has one Active link to zb" || PASS=1
   assert_active_links 5 zb "$RELAY_SUBSTRATE_ADDR" 1 "zb has one Active link to the relay" || PASS=1
   wait_log_after 10 relay.log "$REPORT_ZB_UP" 0 "the relay reports zb up to the visa service" || PASS=1
   wait_log_after 10 relay.log "$REQUEST_ZB" 0 "the relay requests zb's bootstrap visas (J2)" || PASS=1
+  assert_log_count relay.log "$REQUEST_ZB_OBSERVED" 1 "the request carries zb's observed address (zl-zipline#264)" || PASS=1
   wait_log_after 10 relay.log "$HANDED_ZB" 0 "the relay hands them off (J4)" || PASS=1
   HANDOFF=$(last_handoff_ids relay.log zb)
   assert_issued_ids "$HANDOFF" "the hand-off holds two visa-service IDs" || PASS=1
@@ -143,7 +151,7 @@ if [[ "$PASS" == 0 ]]; then
   wait_log_after 10 zb.log "$INSTALLED" 0 "zb installs the hand-off (J4)" || PASS=1
   assert_joiner_table zb.log "$HANDOFF" || PASS=1
   wait_log_after 30 zb.log "$GRANTED" 0 "zb authenticates over its bootstrap visas (J5)" || PASS=1
-  wait_log_after 20 relay.log "$TOPOLOGY_ZB_REPORTED" 0 "the relay's next topology carries zb's reported address" || PASS=1
+  wait_log_after 20 relay.log "$TOPOLOGY_ZB_OBSERVED" 0 "the observed address reached Link.peer: the relay's next topology carries it" || PASS=1
   wait_log_after 10 zb.log "$REPORT_RELAY_UP" 0 "zb reports its initial link up itself" || PASS=1
   wait_log_after 20 zb.log "$REGISTERED" 0 "zb registers its VSS" || PASS=1
   zode_ping zb "$VS_ZPR_ADDR" "zb reaches the visa service during its join" || PASS=1
@@ -274,10 +282,11 @@ if [[ "$PASS" == 0 ]]; then
   assert_active_links 5 relay "$ZB_SUBSTRATE_ADDR" 0 "the relay has no link to zb's old address" || PASS=1
   assert_active_links 5 zb "$RELAY_SUBSTRATE_ADDR" 1 "zb has one link to the relay" || PASS=1
   wait_log_after 10 relay.log "$HANDED_ZB" "$HANDOFFS" "the rejoin gets a new hand-off (J6)" || PASS=1
-  # The rejoin's fresh connect reports the new address. The visa service
-  # logs a change only on `open`, so the proof is the relay's next
-  # topology, which carries the address the visa service now holds for zb.
-  wait_log_after 30 relay.log "$TOPOLOGY_ZB_NEW_REPORTED" 0 \
+  # The rejoin's bootstrap request carries the new observed address, and
+  # the relay's next topology carries the address the visa service now
+  # holds for zb.
+  wait_log_after 10 relay.log "$REQUEST_ZB_NEW_OBSERVED" 0 "the relay observes zb's new address" || PASS=1
+  wait_log_after 30 relay.log "$TOPOLOGY_ZB_NEW_OBSERVED" 0 \
     "the visa service has zb's new substrate address: the relay's topology carries it" || PASS=1
   wait_log_after 30 zb.log "$REGISTERED" "$REGISTRATIONS" "zb's session is back: it registers its VSS again" || PASS=1
   assert_superseded 20 zb "$(last_handoff_ids relay.log zb)" || PASS=1

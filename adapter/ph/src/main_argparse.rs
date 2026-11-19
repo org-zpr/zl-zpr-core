@@ -700,9 +700,8 @@ mod test {
 
     /// zl-zipline#229 (gate g117 q2): the relay config contract, with
     /// `relay` from the `[node]` section or from `--relay`, and the
-    /// addresses from the config file or from `--zpr-addr`. A node applies
-    /// `--zpr-addr` before the file's `zpr_addr`, so the command line's
-    /// addresses come first.
+    /// addresses from the config file or from `--zpr-addr`. `--zpr-addr`
+    /// replaces the file's `zpr_addr` list (zl-zipline#278).
     #[test]
     #[parallel(env)]
     fn test_main_args_argparse_relay_lists_visa_service_addr() {
@@ -754,14 +753,18 @@ mod test {
             )
             .is_err()
         );
-        // The command line's addresses come before the file's.
+        // The command line's addresses replace the file's, so `-z vs.zpr`
+        // alone makes vs.zpr the relay's own address, which is refused.
         assert!(parse_file(r#"["fd5a:5052::2"]"#, "relay = true", &["-z", vs]).is_err());
 
         // A node that is not a relay never lists vs.zpr, nor any duplicate.
         assert!(parse_file(r#"["fd5a:5052::2"]"#, DIAL, &[]).is_ok());
         assert!(parse_file(r#"["fd5a:5052::2", "fd5a:5052::1"]"#, DIAL, &[]).is_err());
         assert!(parse_file(none, DIAL, &["-z", "fd5a:5052::2", "-z", vs]).is_err());
-        assert!(parse_file(r#"["fd5a:5052::2"]"#, DIAL, &["-z", "fd5a:5052::2"]).is_err());
+        assert!(parse_file(none, DIAL, &["-z", "fd5a:5052::2", "-z", "fd5a:5052::2"]).is_err());
+        // The file's list and the command line's list never combine
+        // (zl-zipline#278), so the same address in both is no duplicate.
+        assert!(parse_file(r#"["fd5a:5052::2"]"#, DIAL, &["-z", "fd5a:5052::2"]).is_ok());
     }
 
     #[test]

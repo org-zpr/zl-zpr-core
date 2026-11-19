@@ -12,7 +12,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use libnode::vsconn::{NodeConnect, StateFlag, VSConn, VSConnHandle, VSConnLifecycleEvent};
 use tokio::sync::broadcast;
 use zpr::vsapi::v1 as vsapi2;
-use zpr::vsapi_types::{ApiResponseError, Connection, ErrorCode, LoginNonce, ReauthRequest};
+use zpr::vsapi_types::{
+    ApiResponseError, Connection, DisconnectReason, ErrorCode, LoginNonce, ReauthRequest,
+};
 use zpr::write_to::WriteTo;
 
 /// How long a minted login nonce is valid unless a test says otherwise.
@@ -36,6 +38,11 @@ pub struct FakeVsState {
     /// When set, `notify_disconnect` fails with AuthRequired, like the
     /// real VS once it has already dropped the node (issue log).
     pub fail_notify_disconnect: bool,
+    /// The reason of every `notify_disconnect`, in order (zl-zipline#284).
+    pub disconnects: Vec<DisconnectReason>,
+    /// How long `notify_disconnect` takes to answer, after recording the
+    /// call; immediate when unset.
+    pub notify_disconnect_delay: Option<Duration>,
     /// Set when a `register_vss` call succeeds.
     pub register_succeeded: bool,
     /// How many VS-API connections (TCP) the fake accepted.
@@ -159,11 +166,22 @@ impl vsapi2::v_s_handle::Server for FakeVsHandle {
         Ok(())
     }
 
+    /// Record the reason, wait out any configured delay, then answer Ok, or
+    /// AuthRequired when `fail_notify_disconnect` is set.
     async fn notify_disconnect(
         self: Rc<Self>,
-        _params: vsapi2::v_s_handle::NotifyDisconnectParams,
+        params: vsapi2::v_s_handle::NotifyDisconnectParams,
         mut results: vsapi2::v_s_handle::NotifyDisconnectResults,
     ) -> Result<(), capnp::Error> {
+        let reason = DisconnectReason::from(params.get()?.get_req()?.get_reason_code()?);
+        let delay = {
+            let mut st = self.state.borrow_mut();
+            st.disconnects.push(reason);
+            st.notify_disconnect_delay
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let fail = self.state.borrow().fail_notify_disconnect;
         if fail {
             let mut err = results.get().init_res().init_error();

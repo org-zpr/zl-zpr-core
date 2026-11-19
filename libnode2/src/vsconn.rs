@@ -96,8 +96,10 @@ pub enum StateFlag {
 // The async "commands" that can be sent into the running visa service client.
 #[derive(Debug)]
 enum VS2Command {
-    /// Stop the local vs-api run loop, optionally de-register from the visa service first.
-    Stop(bool),
+    /// Stop the local vs-api run loop. It does not deregister: a caller
+    /// leaving the visa service sends [VSConnHandle::notify_disconnect]
+    /// first (zl-zipline#284).
+    Stop,
 
     /// Recycle the current run loop: exit it (emitting
     /// [VSConnLifecycleEvent::RunLoopExits]) so [VSConn::run_with_reconnect]
@@ -340,7 +342,7 @@ impl VSConn {
                             biased; // in case of tie this bias here means we prioritize Stop (first branch) if we get it.
 
                             cmd = self.cmd_rx.recv() => match cmd {
-                                Some(VS2Command::Stop(_)) | None => {
+                                Some(VS2Command::Stop) | None => {
                                     info!(target: VS_RPC, "VSConn: stop received during reconnect delay, exiting");
                                     return Ok(());
                                 }
@@ -370,7 +372,7 @@ impl VSConn {
                 tokio::select! {
                     result = &mut connect_fut => break result?,
                     cmd = self.cmd_rx.recv() => match cmd {
-                        Some(VS2Command::Stop(_)) | None => {
+                        Some(VS2Command::Stop) | None => {
                             info!(target: VS_RPC, "VSConn: stop received during TCP connect, exiting cleanly");
                             self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
                             return Ok(());
@@ -423,7 +425,7 @@ impl VSConn {
                                 info!(target: VS_RPC, "VSConn: command channel closed, exiting run loop");
                                 break;
                             };
-                            let is_stop_cmd = matches!(cmd, VS2Command::Stop(_));
+                            let is_stop_cmd = matches!(cmd, VS2Command::Stop);
                             if let Err(e) = self.handle_command(&mut cmd_state, cmd).await {
                                 error!(target: VS_RPC, "VSConn: handle_command error: {:?}", e);
                                 self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
@@ -484,40 +486,8 @@ impl VSConn {
         cmd: VS2Command,
     ) -> Result<(), VSApiError> {
         match cmd {
-            VS2Command::Stop(deregister) => {
+            VS2Command::Stop => {
                 debug!(target: VS_RPC, "VSConn: stop");
-                if deregister && let Some(ref handle) = cmd_state.vs_handle {
-                    let mut disconnect_request = handle.notify_disconnect_request();
-                    let mut dnotice_bldr = disconnect_request.get().init_req();
-
-                    // We are disconnecting "self" so we do not set a ZPR addr.
-
-                    dnotice_bldr.set_reason_code(vsapi2::DisconnectReason::NodeShutdown);
-
-                    debug!(target: VS_RPC, "VS-API -> notify_disconnect");
-                    let disconnect_request_response = rpc_with_timeout(
-                        "notify_disconnect",
-                        DEFAULT_RPC_TIMEOUT,
-                        disconnect_request.send().promise,
-                    )
-                    .await?;
-                    let ok_or_err = disconnect_request_response.get()?.get_res()?;
-                    match ok_or_err.which()? {
-                        vsapi2::ok_or_error::Which::Ok(_) => {
-                            info!(target: VS_RPC, "VS API notify_disconnect succeeded");
-                        }
-                        vsapi2::ok_or_error::Which::Error(err_obj) => {
-                            let err_obj = err_obj?;
-                            let err = ApiResponseError::try_from(err_obj);
-
-                            // There is no back channel for the Stop command so we just log the error.
-                            error!(
-                                target: VS_RPC,
-                                "VS API notify_disconnect failed: {:?}", err
-                            );
-                        }
-                    }
-                }
                 Ok(())
             }
 
@@ -1322,9 +1292,10 @@ impl VSConnHandle {
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
 
-    pub async fn stop(&self, deregister: bool) -> Result<(), VSApiError> {
-        let cmd = VS2Command::Stop(deregister);
-        self.send_command(cmd).await
+    /// Stop the run loop and its reconnect manager. This does not tell the
+    /// visa service: send [VSConnHandle::notify_disconnect] first to leave.
+    pub async fn stop(&self) -> Result<(), VSApiError> {
+        self.send_command(VS2Command::Stop).await
     }
 
     /// Recycle the current run loop without terminating the reconnect
@@ -1875,7 +1846,7 @@ mod tests {
                 );
 
                 // Clean exit still works from the reconnected loop.
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 tokio::time::timeout(Duration::from_secs(2), task)
                     .await
                     .expect("run loop failed to stop")
@@ -1924,6 +1895,9 @@ mod tests {
         reauth_requests: Vec<ReauthRequest>,
         /// The param names of every `connect` the fake served, in order.
         connect_param_names: Vec<Vec<String>>,
+        /// The reason of every `notifyDisconnect` the fake served, in order
+        /// (zl-zipline#284).
+        disconnects: Vec<zpr::vsapi_types::DisconnectReason>,
     }
 
     struct FakeVs {
@@ -2007,6 +1981,18 @@ mod tests {
     }
 
     impl vsapi2::v_s_handle::Server for FakeVsHandle {
+        /// Record the reason and answer Ok (zl-zipline#284).
+        async fn notify_disconnect(
+            self: Rc<Self>,
+            params: vsapi2::v_s_handle::NotifyDisconnectParams,
+            mut results: vsapi2::v_s_handle::NotifyDisconnectResults,
+        ) -> Result<(), capnp::Error> {
+            let reason = params.get()?.get_req()?.get_reason_code()?;
+            self.state.borrow_mut().disconnects.push(reason.into());
+            results.get().init_res().set_ok(());
+            Ok(())
+        }
+
         async fn ping(
             self: Rc<Self>,
             _params: vsapi2::v_s_handle::PingParams,
@@ -2152,6 +2138,7 @@ mod tests {
             login_nonce_error: None,
             reauth_requests: Vec::new(),
             connect_param_names: Vec::new(),
+            disconnects: Vec::new(),
         }));
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -2276,8 +2263,38 @@ mod tests {
                     ]],
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#284: the debug CLI's stop still deregisters the node,
+    /// through the one deregistration path, `notify_disconnect`
+    /// (`NodeShutdown`), and then stops the run loop. The CLI exists only
+    /// with the `build-lnt` feature, which libnode's CI builds.
+    #[cfg(feature = "build-lnt")]
+    #[tokio::test]
+    async fn cli_stop_deregisters_through_notify_disconnect() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, mut lifecycle_rx, state, task) =
+                    running_vsconn_against_fake_vs().await;
+                wait_for_run_loop(&mut lifecycle_rx).await;
+                handle.connect(test_node_connect()).await.expect("connect");
+
+                let (output_tx, _output_rx) = mpsc::unbounded_channel();
+                crate::cli::handler::deregister_and_stop(&handle, true, &output_tx).await;
+
+                assert_eq!(
+                    state.borrow().disconnects,
+                    vec![zpr::vsapi_types::DisconnectReason::NodeShutdown]
+                );
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .expect("the run loop stops")
+                    .unwrap()
+                    .unwrap();
             })
             .await;
     }
@@ -2317,7 +2334,7 @@ mod tests {
                     "after a successful re-auth the NEW handle must serve calls"
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2357,7 +2374,7 @@ mod tests {
                     "after a failed re-auth the OLD handle must still serve calls"
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2383,7 +2400,7 @@ mod tests {
                     vec![(FAKE_JOINER_CN.to_string(), observed)]
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2411,7 +2428,7 @@ mod tests {
                     started.elapsed()
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2445,7 +2462,7 @@ mod tests {
                     vec![(FAKE_JOINER_CN.to_string(), observed_addr())]
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2471,7 +2488,7 @@ mod tests {
                     "expected notFound, got {err:?}"
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2516,7 +2533,7 @@ mod tests {
                 assert_eq!(nonce.nonce, FAKE_LOGIN_NONCE);
                 assert_eq!(nonce.expires_at_secs(), FAKE_NONCE_EXPIRES);
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2539,7 +2556,7 @@ mod tests {
                     other => panic!("expected a quotaExceeded CodedError, got {other:?}"),
                 }
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2593,7 +2610,7 @@ mod tests {
                 assert_valid_device_leg(ss, &st.node_public_key);
                 drop(st);
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2641,7 +2658,7 @@ mod tests {
                 );
                 drop(st);
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -2692,7 +2709,7 @@ mod tests {
                 // Wait for the first failed connect and entry into the reconnect sleep.
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
 
                 tokio::time::timeout(Duration::from_secs(2), task)
                     .await
@@ -2722,7 +2739,7 @@ mod tests {
                 // Give the connect a moment to start.
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
 
                 tokio::time::timeout(Duration::from_secs(2), task)
                     .await

@@ -81,6 +81,14 @@ pub const VSCONN_RETRY_WAIT: std::time::Duration = std::time::Duration::from_sec
 /// (#1410); ZDP-R and keep-alives bound it.
 pub const OIDC_USER_INTERACTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// How long a graceful shutdown waits for the visa service to answer the
+/// Zode's `notify_disconnect(NodeShutdown)` before it tears its links down
+/// anyway (zl-zipline#284). On a healthy link the RPC takes milliseconds.
+/// The bound matters because the command can queue behind a stuck RPC
+/// (each one bounded at 10 s inside VSConn), and Windows gives a
+/// console-close handler about 5 s in total.
+pub const SHUTDOWN_DEREGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 const DEFAULT_BUFFER_COUNT: usize = 512; // should be at least 5x batch size; see fastpath_worker.rs for explanation
 const DEFAULT_BATCH_SIZE: usize = 64;
 const DEFAULT_DATAPATH_QUEUE_SIZE: usize = 256;

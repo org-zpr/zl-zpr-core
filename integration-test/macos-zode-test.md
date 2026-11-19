@@ -13,8 +13,9 @@ It exercises:
 * utun creation and the Zode's self-addressing
   (`ifconfig <utun> inet6 <addr>/32 alias`, which also puts
   `fd5a:5052::/32` on-link);
-* a wildcard bind with no advertised address: the Zode reports its initial
-  link's current local address to the visa service (zl-zipline#230);
+* a wildcard bind: the Zode reports no substrate address; the relay tells
+  the visa service the address it sees the Zode's initial link come from
+  (zl-zipline#230, #264);
 * joining through the relay, and the visa service reaching the Zode's VSS
   over the utun;
 * logging a person in on the Zode with `ph-cli` over the unix socket
@@ -39,7 +40,7 @@ The keys and certificates come from `integration-test/pregen` and are
   ┌──────────────────────────────────┐        ┌────────────────────────┐
   │ ph zode (relay), TUN zrelay      │  UDP   │ ph zode (zb)           │
   │   fd5a:5052::2, vs.zpr           │◀─:5000─┤  self_addr 0.0.0.0:5000│
-  │   advertised 192.168.0.212:5000  │        │  initial link: relay   │
+  │   self_addr 0.0.0.0:5000         │        │  initial link: relay   │
   │ valkey, vs (bind vs.zpr)         │        │  zpr-addr fd5a:5052::3 │
   └──────────────────────────────────┘        │  VSS :8183             │
                                               └────────────────────────┘
@@ -125,7 +126,6 @@ Inside the container, from `integration-test/`:
 ```sh
 source lib/common_funcs.sh; source lib/zode_funcs.sh
 PREGEN=$WORK/pregen ZODE_POLICY_BIN=zodes-remote.bin2
-RELAY_IP=192.168.0.212      # the host as the Mac sees it
 mkdir -p "$WORK/run" && cd "$WORK/run"
 create_ca_key_and_cert ca
 # A fresh, one-day CA for the fake IdP's certificate (section 3). The test
@@ -136,7 +136,6 @@ ip tuntap add name zrelay mode tun multi_queue && ip link set zrelay up
 create_actor_key_and_cert ca relay
 # The relay lists vs.zpr after its own address and applies both to zrelay.
 "$PH_BIN" zode -l all=INFO --control-path relay.sock \
-  --advertised-substrate-addr "$RELAY_IP:5000" \
   --ca-file ca.crt --certificate-file relay.crt --private-key-file relay.key \
   --auth-private-key "$PREGEN/node-rsa-key.pem" --km-impl noise \
   --relay true --forwarding true --tun-if zrelay \
@@ -175,9 +174,9 @@ Copy `ph` and `ph-cli` to a working directory such as `~/zpr-zode`, with
 `pregen/zb-rsa-key.pem`.
 
 zb runs on the default config: no `--self-addr`, so it binds the wildcard
-`0.0.0.0:5000`, and no `--advertised-substrate-addr`. On every VS-API
-`connect` and `open` it reports its initial link's current local address
-with `self_addr`'s port, so the address follows the network.
+`0.0.0.0:5000`. It never reports its own substrate address: the relay
+passes the source address it sees zb's initial link come from to the visa
+service on each join (zl-zipline#264), so the address follows the network.
 Network-change runs (moving the Mac's address) are tracked in
 [zl-zipline#263](https://github.com/org-zpr/zl-zipline/issues/263).
 

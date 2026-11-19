@@ -119,7 +119,7 @@ The schema, with every key explained, is
 [`adapter/ph/example-node-config.toml`](../adapter/ph/example-node-config.toml).
 Unknown sections and keys are refused. Most settings can also be given on
 the command line (`ph zode --help`). `--relay`, `--initial-link`,
-`--forwarding`, `--advertised-substrate-addr` and `--control-group`
+`--forwarding` and `--control-group`
 override the file. For the other `[global]` settings the file sets, the
 file wins, so change them there, except `--zpr-addr`, whose addresses are
 put *before* the file's list. The first address is the Zode's own, so give
@@ -148,8 +148,9 @@ auth_private_key = "relay-private-key.pem"
 
 An endpoint Zode, `web-conf.toml`. Its initial link names the relay's
 substrate address and certificate CN. With no `self_addr` it binds the
-wildcard address, and reports its initial link's local address to the visa
-service, so it needs no address of its own in the config:
+wildcard address. It needs no address of its own in the config: a Zode
+never reports its substrate address, and the relay tells the visa service
+the address it sees the Zode's initial link come from:
 
 ```toml
 [global]
@@ -222,7 +223,10 @@ allow Laptop to access WebService.
 Then write a configuration file. It names each Zode, the links between
 them, and the relay that hosts the visa service (`dock_node`). Only the
 relay has a substrate address in the policy: the visa service learns each
-other Zode's address from what it reports when it connects. Create a file
+other Zode's address from the relay, which observes it when that Zode's
+initial link comes up. Declare an address in the policy only where the
+observed one is wrong (a NAT that does not keep the forwarded port, say):
+the policy's address always wins. Create a file
 called `zpr-web.zplc` with these contents:
 
 ```toml
@@ -402,10 +406,11 @@ constraints below.
   engine reads each datagram's destination and sets each send's source
   with `IP_PKTINFO`/`IPV6_PKTINFO` (`WSARecvMsg`/`WSASendMsg`,
   [zipline#150](https://github.com/org-zpr/zl-zipline/issues/150)). A Zode
-  with a wildcard `self_addr` reports its initial link's local address to
-  the visa service, so the address follows a network change
-  ([zl-zipline#230](https://github.com/org-zpr/zl-zipline/issues/230)); a
-  relay with a wildcard `self_addr` needs `advertised_substrate_addr`.
+  with a wildcard `self_addr` needs no address in its config: its relay
+  tells the visa service the address it sees the Zode's initial link come
+  from, so the address follows a network change
+  ([zl-zipline#230](https://github.com/org-zpr/zl-zipline/issues/230),
+  [zl-zipline#264](https://github.com/org-zpr/zl-zipline/issues/264)).
 * **Elevated console** — Wintun device creation requires Run as
   administrator.
 * **A single, unbatched datapath worker** — Wintun enforces one queue and

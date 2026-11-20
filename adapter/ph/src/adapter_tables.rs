@@ -213,24 +213,6 @@ impl EndpointLookupTable {
 
         self.remove(&five_tuple).ok().map(|_| five_tuple)
     }
-
-    /// Remove every entry, Active and Pending, along with the pending
-    /// transaction index. Used when the dock link goes down: every tether id
-    /// in the table was issued by the node on that docking session, so none
-    /// is valid on the next one, and a Pending entry's bind request died
-    /// with the link (zipline#170). Pending entries' queued initial packets
-    /// are dropped, as if they had been dropped awaiting bind.
-    pub fn clear(&self) {
-        // Snapshot the keys and drop the iterator before removing: removing
-        // while holding a DashMap ref deadlocks. Going through `remove()`
-        // keeps `table` and `pending` consistent entry by entry; an entry
-        // inserted after the snapshot belongs to a newer bind and survives.
-        let five_tuples: Vec<FiveTuple> = self.table.iter().map(|entry| *entry.key()).collect();
-        for five_tuple in five_tuples {
-            // NotFound means a bind response removed it concurrently.
-            let _ = self.remove(&five_tuple);
-        }
-    }
 }
 
 pub struct DltPep {
@@ -297,9 +279,9 @@ impl DockLookupTable {
     }
 
     /// Remove the entry for `tether_id`. An id with no entry is ignored:
-    /// the id comes from the node, and the underlying slab panics on
-    /// removing an empty slot, so an unknown, duplicate, or already-flushed
-    /// id (see `clear()`) must not reach it.
+    /// the id comes from the node (an Unbind Egress Stream Indication,
+    /// zl-zipline#283), and the underlying slab panics on removing an empty
+    /// slot, so an unknown or duplicate id must not reach it.
     pub fn remove(&self, tether_id: StreamId) {
         let idx = (tether_id as usize).wrapping_sub(1);
         let mut table = self.table.lock().unwrap();
@@ -307,24 +289,6 @@ impl DockLookupTable {
             return;
         }
         let new_reader = table.remove(idx);
-        std::mem::drop(table);
-        self.reader.write(new_reader);
-    }
-
-    /// Remove every entry. Used when the dock link goes down: each entry
-    /// describes an inbound tether the node set up on that docking session,
-    /// and a restarted node will bind its flows afresh (zipline#170).
-    ///
-    /// All removals are published in a single new RCU generation, so readers
-    /// see either the old table or an empty one.
-    pub fn clear(&self) {
-        let mut table = self.table.lock().unwrap();
-        // Collect the indices first: `mark_removed` needs `&mut table`.
-        let indices: Vec<usize> = table.iter().map(|(idx, _)| idx).collect();
-        for idx in indices {
-            table.mark_removed(idx);
-        }
-        let new_reader = table.schedule_finalization();
         std::mem::drop(table);
         self.reader.write(new_reader);
     }
@@ -406,72 +370,18 @@ mod test {
         assert!(elt.get(&ft).is_some(), "pending entry must survive");
     }
 
-    /// `clear()` must remove Active and Pending entries alike, and forget
-    /// the Pending entries' transactions, so a fresh bind of the same
-    /// five-tuple starts cleanly (zipline#170).
-    #[test]
-    fn test_elt_clear_removes_active_and_pending_entries() {
-        let elt = EndpointLookupTable::new();
-        let txn_mgr = Arc::new(TxnMgr::new());
-        let ft_active = five_tuple(1000);
-        let ft_pending = five_tuple(2000);
-        insert_active(&elt, &txn_mgr, ft_active, 10);
-        let txn = txn_mgr.try_open().unwrap();
-        elt.insert_pending(ft_pending, new_heap_packet(), &txn)
-            .unwrap();
-
-        elt.clear();
-
-        assert!(
-            elt.get(&ft_active).is_none(),
-            "Active entry must be removed"
-        );
-        assert!(
-            elt.get(&ft_pending).is_none(),
-            "Pending entry must be removed"
-        );
-        assert!(
-            elt.lookup_pending(&txn).is_err(),
-            "pending transaction must be forgotten"
-        );
-
-        // The same five-tuple binds again from scratch.
-        insert_active(&elt, &txn_mgr, ft_active, 11);
-        assert!(
-            elt.get(&ft_active).is_some(),
-            "re-bind after clear must work"
-        );
-    }
-
-    /// DLT `clear()` must remove every entry, and the table must keep
-    /// accepting inserts afterwards (zipline#170).
-    #[test]
-    fn test_dlt_clear_removes_all_entries() {
-        let dlt = DockLookupTable::new();
-        let tc = || tc::Ip5TupleTc::new(five_tuple(1000));
-        let id_a = dlt.insert(DltPep::new(tc(), None)).unwrap();
-        let id_b = dlt.insert(DltPep::new(tc(), None)).unwrap();
-
-        dlt.clear();
-
-        assert!(dlt.get(id_a).is_none(), "first entry must be removed");
-        assert!(dlt.get(id_b).is_none(), "second entry must be removed");
-        let id_c = dlt.insert(DltPep::new(tc(), None)).unwrap();
-        assert!(dlt.get(id_c).is_some(), "insert after clear must work");
-    }
-
-    /// A guard taken before `clear()` must stay valid after it: clearing
+    /// A guard taken before `remove()` must stay valid after it: removing
     /// publishes a fresh reader, and readers still holding the old one keep
     /// reading the entry until they drop it (RCU). From upstream #1410.
     #[test]
-    fn test_dlt_clear_keeps_old_guards_valid() {
+    fn test_dlt_remove_keeps_old_guards_valid() {
         let dlt = DockLookupTable::new();
         let id = dlt
             .insert(DltPep::new(tc::Ip5TupleTc::new(five_tuple(1000)), None))
             .unwrap();
         let old_guard = dlt.get(id).unwrap();
 
-        dlt.clear();
+        dlt.remove(id);
 
         assert!(dlt.get(id).is_none(), "entry must be gone for new readers");
         assert_eq!(old_guard.tc.five_tuple(), &five_tuple(1000));
@@ -479,18 +389,17 @@ mod test {
     }
 
     /// Removing a tether id that is not in the DLT must be a no-op, not a
-    /// panic: the id comes from the node (`unbind_stream`), and after a dock
-    /// link teardown flushed the table (zipline#170) a late or duplicate
-    /// unbind must not take the adapter down.
+    /// panic: the id comes from the node (`unbind_stream`), and a late or
+    /// duplicate unbind must not take the adapter down.
     #[test]
     fn test_dlt_remove_absent_id_is_noop() {
         let dlt = DockLookupTable::new();
         let id = dlt
             .insert(DltPep::new(tc::Ip5TupleTc::new(five_tuple(1000)), None))
             .unwrap();
-        dlt.clear();
+        dlt.remove(id);
 
-        dlt.remove(id); // flushed
+        dlt.remove(id); // already removed
         dlt.remove(id + 100); // never allocated
         dlt.remove(0); // below the 1-based id range
     }

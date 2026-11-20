@@ -536,7 +536,9 @@ impl FastpathWorker {
             config::DEFAULT_MESSAGE_HEADROOM,
         );
         temp.put(compressed);
-        compress::expand(compression_mode, &five_tuple, &mut temp);
+        if compress::expand(compression_mode, &five_tuple, &mut temp).is_err() {
+            return; // not a well-formed packet; leave it alone
+        }
 
         // Locate the ICMP header in the expanded packet and pick the echo-request
         // type for this family. (IPv4 header length is variable; the IPv6 header
@@ -625,13 +627,33 @@ impl FastpathWorker {
         a2a_mac[..a2a_mac_size].copy_from_slice(&pkt.body()[pkt.body().len() - a2a_mac_size..]);
         pkt.shrink_by(a2a_mac_size);
 
-        // lookup PEP in DLT and expand compressed packet
+        // Look up the PEP in the DLT and expand the compressed packet.
+        //
+        // zl-zipline#283: the DLT ID can name another flow by now. `forward`
+        // copied it out of the PFT before this lookup, and in between the
+        // node can unbind the old stream (type 13) and a new bind can reuse
+        // the freed slot; DLT IDs have no quarantine. Then the packet is
+        // expanded with the other flow's classifier and checked with its
+        // key. That is safe: `expand` refuses a body too short for that
+        // classifier (dropped as `BadStructure`), and a body it does expand
+        // fails the MICV check below unless it expands to exactly the
+        // original packet, because the MICV covers the original flow's
+        // addresses and ports and is keyed with its A2A key. A packet that
+        // passes both is then checked against the new flow's classifier,
+        // because compression does not rebuild everything a classifier
+        // names: an ICMP type or code stays in the body, so a stale ICMP
+        // packet for the same A2A peer and addresses expands unchanged and
+        // passes the MICV. Any failure drops the packet, so it is never
+        // delivered unless the new flow's classifier admits it.
         let Some(pep) = self.asm.dlt.get(tether_id) else {
             self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
             return;
         };
 
-        compress::expand(pep.tc.compression_mode(), &pep.tc.five_tuple(), &mut pkt);
+        if compress::expand(pep.tc.compression_mode(), pep.tc.five_tuple(), &mut pkt).is_err() {
+            drop(pep);
+            return self.drop_and_count(pkt, FastpathCounterType::BadStructure);
+        }
 
         // check A2A MAC
         // TODO: use actual A2A SAID
@@ -647,6 +669,15 @@ impl FastpathWorker {
         if a2a_micv.as_bytes()[..a2a_mac_size] != a2a_mac[..a2a_mac_size] {
             drop(pep);
             return self.drop_and_count(pkt, FastpathCounterType::MicvFailure);
+        }
+
+        // Deliver only what this stream's classifier admits (see above).
+        if !pep
+            .tc
+            .classify_packet(pep.tc.five_tuple().l3_type, pkt.body())
+        {
+            drop(pep);
+            return self.drop_and_count(pkt, FastpathCounterType::ClassifierMismatch);
         }
 
         // queue decapsulated packet for send to actor
@@ -1451,6 +1482,280 @@ mod test {
             0
         );
         assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+    }
+
+    /// zl-zipline#283: a compressed body too short for the headers its DLT
+    /// classifier says it carries is dropped and counted as
+    /// `BadStructure`, not a panic. A peer Zode can send one on a valid
+    /// stream, and a packet whose DLT ID was reused for another flow is
+    /// expanded with that flow's classifier.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_short_body_as_bad_structure() {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let tcp = crate::defs::FiveTuple {
+            l3_type: L3Type::Ipv4,
+            l4_protocol: net_defs::ip_number::TCP,
+            ..Default::default()
+        };
+        let tether_id = asm
+            .dlt
+            .insert(DltPep::new(crate::tc::Ip5TupleTc::new(tcp), None))
+            .unwrap();
+        let mut worker = test_worker(asm);
+
+        // An A2A header (SAID 0), a compressed IPv4 header (header length
+        // 5, no fragment info, TTL 64) and no TCP header, then the A2A MAC.
+        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
+        pkt.put(&[0u8][..]);
+        pkt.put(&[0x50u8, 0, 0, 0, 64][..]);
+        pkt.put(&[0u8; zdp::ZDP_A2A_MAC_SIZE][..]);
+
+        worker.actor_input(tether_id, pkt);
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::BadStructure].get_count(),
+            1
+        );
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// zl-zipline#283: DLT IDs have no quarantine, so a packet sent on a
+    /// stream whose DLT ID was unbound and reused can reach the new
+    /// binding. This seals the `desc` test packet for a binding whose
+    /// classifier is that packet's own five-tuple, checks that it is
+    /// delivered there (the control), then unbinds that binding and sends
+    /// the same packet to a new binding with the same A2A peer (so the
+    /// same MICV key) and the classifier `new_tuple` makes from the old
+    /// one. Returns the worker, so the caller can check what happened to
+    /// the second packet.
+    ///
+    /// The slab frees a removed slot only once its RCU readers are gone,
+    /// so when an ID comes back is not deterministic; `actor_input` sees
+    /// only the PEP its ID names, so the old packet is sent to the new
+    /// binding's ID instead.
+    fn send_on_reused_dlt_id(
+        desc: &str,
+        new_tuple: impl FnOnce(&crate::defs::FiveTuple) -> crate::defs::FiveTuple,
+    ) -> FastpathWorker {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::tc::Ip5TupleTc;
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+        // The original flow's packet and its five-tuple.
+        let (_, body) = compress::tests::TEST_CASES
+            .iter()
+            .find(|(d, _)| *d == desc)
+            .unwrap();
+        let mut original = Packet::new(
+            Box::new([0u8; PACKET_BUFFER_SIZE]),
+            config::DEFAULT_MESSAGE_HEADROOM,
+        );
+        original.put(*body);
+        let (metadata, pkt_body) = original.metadata_mut_and_body_mut();
+        classifier::classify(metadata.five_tuple_mut(), pkt_body).unwrap();
+        let old_tuple = *original.metadata().five_tuple();
+
+        // Both bindings have the same A2A peer, so the same MICV key.
+        let peer = x25519_dalek::PublicKey::from(&x25519_dalek::ReusableSecret::random());
+        let old_pep = DltPep::new(
+            Ip5TupleTc::new(old_tuple),
+            Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+        );
+        let micv_key = old_pep.a2a_micv_key.unwrap();
+        let compression_mode = old_pep.tc.compression_mode();
+        let tether_id = asm.dlt.insert(old_pep).unwrap();
+
+        // The packet as the sending adapter seals it for the old binding
+        // (`actor_output_post_classify`): the MICV over the uncompressed
+        // packet, then compression, the MAC and the A2A header.
+        let sealed = || {
+            let mut pkt = Packet::new(
+                Box::new([0u8; PACKET_BUFFER_SIZE]),
+                config::DEFAULT_MESSAGE_HEADROOM,
+            );
+            pkt.put(*body);
+            let micv = blake3::keyed_hash(&micv_key, pkt.body());
+            compress::compress(
+                compression_mode,
+                old_tuple.l3_type,
+                old_tuple.l4_protocol,
+                &mut pkt,
+            );
+            pkt.put(&micv.as_bytes()[..zdp::ZDP_A2A_MAC_SIZE]);
+            pkt.alloc_zeroed_header::<zdp::ZdpA2aHeader>().a2a_said = 0;
+            pkt
+        };
+
+        // Control: on its own binding the packet is delivered.
+        let mut worker = test_worker(asm.clone());
+        worker.actor_input(tether_id, sealed());
+        assert_eq!(
+            worker.actor_input_q.len(),
+            1,
+            "{desc}: delivered on its own binding"
+        );
+        worker.actor_input_q.clear();
+
+        // The old binding is unbound and its DLT ID reused.
+        asm.dlt.remove(tether_id);
+        let new_pep = DltPep::new(
+            Ip5TupleTc::new(new_tuple(&old_tuple)),
+            Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+        );
+        assert_eq!(
+            new_pep.a2a_micv_key,
+            Some(micv_key),
+            "same A2A peer, same key"
+        );
+        let reused_id = asm.dlt.insert(new_pep).unwrap();
+
+        worker.actor_input(reused_id, sealed());
+        worker
+    }
+
+    /// zl-zipline#283: a packet on a reused DLT ID whose new binding has
+    /// the same A2A peer and addresses but other ports expands with the
+    /// new binding's ports and fails the MICV check, so it is dropped and
+    /// counted as `MicvFailure`, never delivered.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_packet_on_a_reused_dlt_id_as_micv_failure() {
+        let worker = send_on_reused_dlt_id("TCP mid-stream (TLS)", |old| crate::defs::FiveTuple {
+            src_port: old.src_port.wrapping_add(1),
+            dst_port: old.dst_port.wrapping_add(1),
+            ..*old
+        });
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+            1
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::BadStructure].get_count(),
+            0
+        );
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// zl-zipline#283: an ICMP or ICMPv6 classifier keeps the type in its
+    /// source port and the code in its destination port, but compression
+    /// leaves ICMP alone, so `expand` does not rebuild them and the MICV
+    /// still matches when a reused DLT ID's new binding has the same A2A
+    /// peer and addresses. The new binding's classifier must still refuse
+    /// a type it does not admit: the packet is dropped and counted as
+    /// `ClassifierMismatch`, never delivered.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_an_icmp_packet_the_reused_dlt_id_does_not_admit() {
+        // Echo Request (type 8) on a binding for Timestamp (type 13), and
+        // Neighbor Solicitation (type 135) on one for Neighbor
+        // Advertisement (type 136).
+        for (desc, new_type) in [
+            ("ICMP Echo (ping) request", 13),
+            ("ICMPv6 Neighbor Soliciation", 136),
+        ] {
+            let worker = send_on_reused_dlt_id(desc, |old| crate::defs::FiveTuple {
+                src_port: new_type,
+                ..*old
+            });
+
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::ClassifierMismatch].get_count(),
+                1,
+                "{desc}"
+            );
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+                0,
+                "{desc}: the MICV still matches"
+            );
+            assert!(
+                worker.actor_input_q.is_empty(),
+                "{desc}: nothing is delivered"
+            );
+        }
+    }
+
+    /// zl-zipline#283 (Copilot round 4): the classifier check runs on a
+    /// packet whose MICV has passed, but the A2A peer that computed that
+    /// MICV chose the body. An ICMP or ICMPv6 body shorter than its 4-byte
+    /// header, sealed with a valid MICV, is dropped and counted as
+    /// `ClassifierMismatch`, never a panic.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_truncated_icmp_body_with_a_valid_micv() {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::tc::Ip5TupleTc;
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let peer = x25519_dalek::PublicKey::from(&x25519_dalek::ReusableSecret::random());
+        let packet_of = |bytes: &[u8]| {
+            let mut pkt = Packet::new(
+                Box::new([0u8; PACKET_BUFFER_SIZE]),
+                config::DEFAULT_MESSAGE_HEADROOM,
+            );
+            pkt.put(bytes);
+            pkt
+        };
+
+        for desc in ["ICMP Echo (ping) request", "ICMPv6 Neighbor Soliciation"] {
+            // The test packet, its five-tuple and a binding for it.
+            let (_, body) = compress::tests::TEST_CASES
+                .iter()
+                .find(|(d, _)| *d == desc)
+                .unwrap();
+            let mut pkt = packet_of(body);
+            let (metadata, pkt_body) = pkt.metadata_mut_and_body_mut();
+            classifier::classify(metadata.five_tuple_mut(), pkt_body).unwrap();
+            let tuple = *pkt.metadata().five_tuple();
+            let pep = DltPep::new(
+                Ip5TupleTc::new(tuple),
+                Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+            );
+            let micv_key = pep.a2a_micv_key.unwrap();
+            let compression_mode = pep.tc.compression_mode();
+            let tether_id = asm.dlt.insert(pep).unwrap();
+
+            // Compression keeps ICMP as is, so the ICMP header starts where
+            // the compressed packet has as many bytes left as the original
+            // has after its IP header.
+            let ip_header_len = match tuple.l3_type {
+                L3Type::Ipv4 => usize::from(body[0] & 0x0f) * 4,
+                _ => size_of::<IPv6Header>(),
+            };
+            compress::compress(compression_mode, tuple.l3_type, tuple.l4_protocol, &mut pkt);
+            let icmp_start = pkt.body().len() - (body.len() - ip_header_len);
+
+            let mut worker = test_worker(asm.clone());
+            for icmp_len in 0..4 {
+                let compressed = &pkt.body()[..icmp_start + icmp_len];
+                // The MICV over the packet as the receiver expands it, so
+                // it passes.
+                let mut expanded = packet_of(compressed);
+                compress::expand(compression_mode, &tuple, &mut expanded).unwrap();
+                let micv = blake3::keyed_hash(&micv_key, expanded.body());
+                let mut sealed = packet_of(compressed);
+                sealed.put(&micv.as_bytes()[..zdp::ZDP_A2A_MAC_SIZE]);
+                sealed.alloc_zeroed_header::<zdp::ZdpA2aHeader>().a2a_said = 0;
+
+                worker.actor_input(tether_id, sealed);
+            }
+
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::ClassifierMismatch].get_count(),
+                4,
+                "{desc}"
+            );
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+                0,
+                "{desc}: the MICV is valid"
+            );
+            assert!(
+                worker.actor_input_q.is_empty(),
+                "{desc}: nothing is delivered"
+            );
+        }
     }
 
     #[test]

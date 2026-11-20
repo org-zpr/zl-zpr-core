@@ -738,14 +738,17 @@ pub async fn handle_bind_egress_stream_response(
 
 /// Handle an Unbind Egress Stream Indication (ZdpPacketType 13).
 ///
-/// Only an adapter accepts it, from its node: the node no longer sends on
-/// the stream, so the adapter removes it from its DLT. A node refuses it
-/// from everyone:
+/// Only an adapter accepts it, from its node: the node sends it to its own
+/// adapter over the local actor link when it removes or replaces a binding
+/// whose egress is that adapter, or does not use a grant the adapter gave
+/// (zl-zipline#283, `Assembly::unbind_local_egress`). The node no longer
+/// sends on the stream, so the adapter removes it from its DLT. A node
+/// refuses it from everyone:
 ///
 /// - from a Zode, by F5 (zl-zipline#251): Zode links carry no teardown
 ///   messages. A refusal closes the link (gate g88 q2).
-/// - from the local actor (gate g88 q3): no core component
-///   sends it, and F4 lists the only causes of teardown (expiry, a visa
+/// - from the local actor (gate g88 q3): the adapter never sends it to its
+///   node, and F4 lists the only causes of teardown (expiry, a visa
 ///   service revocation, a lost link).
 pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
     let Some(ingress_link_id) = NonZero::new(pkt.metadata().ingress_link_id) else {
@@ -776,7 +779,7 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
             // We are the adapter
             debug!(
                 target: ZDP,
-                "{}: unbind egress stream, adapter -> node",
+                "{}: unbind egress stream, node -> adapter",
                 asm.formatted_link_id(ingress_link_id.get())
             );
             // Remove from DLT

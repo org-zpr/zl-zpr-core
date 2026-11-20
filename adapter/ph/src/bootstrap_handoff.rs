@@ -588,13 +588,13 @@ pub fn accept(asm: &Assembly, link_id: LinkId, body: &[u8]) -> Result<(), Handof
 /// Rule 9: revoke the bootstrap visas recorded on link `link_id`'s peer
 /// entry, and drop the record. Called by `Assembly::drop_peer` under the
 /// visa-table write lock, before the entry leaves the peer table. Returns
-/// the withdrawn forwarding entries, which the caller handles after it
-/// releases the lock (zipline#9).
+/// the removed bindings, which the caller handles after it releases the
+/// lock (zipline#9).
 pub fn revoke_for_lost_link(
     visa_table: &mut VisaTable,
     peer_table: &PeerTable,
     link_id: LinkId,
-) -> Vec<ForwardingEntry> {
+) -> Vec<crate::visa_table::StreamBinding> {
     let Some(record) = peer_table
         .get(link_id)
         .and_then(|peer| peer.bootstrap_handoff.lock().unwrap().take())

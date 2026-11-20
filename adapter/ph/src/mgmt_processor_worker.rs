@@ -51,7 +51,10 @@ pub async fn launch(
     }
 }
 
-async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
+/// Parse the ZDP headers of the management packet `pkt` and hand it to
+/// the handler for its type. Crate-visible so tests can feed a packet
+/// through the same dispatch the worker uses.
+pub(crate) async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
     let Ok(base_hdr) = ZdpBaseHeader::read_from_buf(&mut pkt) else {
         return Err(HandleMgmtError::BadStructure);
     };

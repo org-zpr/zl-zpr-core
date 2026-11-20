@@ -2670,6 +2670,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "crossbeam-epoch",
  "cslab",
  "curve25519-dalek 4.1.3",
  "dashmap",

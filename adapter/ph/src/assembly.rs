@@ -417,7 +417,7 @@ impl Assembly {
         // F3 (zl-zipline#251): revoke every visa with a stream bound
         // over this link, on either side. Rule 9 (zl-zipline#252): also
         // revoke the bootstrap visas installed for it, bound or not.
-        // Revoke under the write lock, but hold the withdrawn entries
+        // Revoke under the write lock, but hold the removed bindings
         // until the lock is released: the send path takes the peer's
         // `zdpr_send` mutex, which must never nest under the visa-table
         // lock (zipline#9).
@@ -442,8 +442,9 @@ impl Assembly {
 
         // Withdraw each revoked stream from the *surviving* adapters so
         // they drop their egress bindings and re-request visas instead
-        // of blackholing traffic on dead streams (zipline#21). The
-        // dying link's own entries are skipped — that peer is gone —
+        // of blackholing traffic on dead streams (zipline#21), and unbind
+        // each local egress from this Zode's own adapter (zl-zipline#283).
+        // The dying link's own entries are skipped — that peer is gone —
         // and so are Zode links, which carry no teardown messages (F5).
         self.withdraw_streams(withdrawn, Some(link_id));
         // Rule 9: pending binds on other links that involve this link, in
@@ -458,13 +459,23 @@ impl Assembly {
         }
     }
 
-    /// Withdraw the given forwarding entries from the peers still bound to
-    /// them by sending each one a `StreamIdWithdrawal` — "the stream id YOU
-    /// send with has been withdrawn" — because `entry.1` is the tether id
-    /// the receiving adapter holds in its *outbound* ELT, not an id in its
-    /// inbound DLT (which is what UnbindEgressStreamIndication's handler
-    /// removes from). Shared by `drop_peer` (zipline#21) and
-    /// `visa_mgmt::handle_revocation` (zipline#85).
+    /// Tear down the removed `bindings` at this Zode's own actor and
+    /// adapter, the only peers a removal notifies. For each binding:
+    ///
+    /// - its ingress stream is withdrawn from the requestor with a
+    ///   `StreamIdWithdrawal` (type 5) — "the stream id YOU send with has
+    ///   been withdrawn" — because `ingress.1` is the tether id the
+    ///   requestor holds in its *outbound* ELT (zipline#21, zipline#85);
+    /// - its egress, if it is this Zode's own adapter on the local actor
+    ///   link (a destination Zode), is unbound with an
+    ///   `UnbindEgressStreamIndication` (type 13), because `egress.1` is the
+    ///   id that adapter granted in its *inbound* DLT
+    ///   ([Assembly::unbind_local_egress], zl-zipline#283).
+    ///
+    /// Shared by every removal: `drop_peer`, `visa_mgmt::handle_revocation`,
+    /// the expiry sweep (`VisaTable::handle_expirations`, zl-zipline#274), a
+    /// match that ejects an expired visa (`VisaTable::match_traffic`,
+    /// zl-zipline#271), and the VS worker's R16/J10 revocations.
     ///
     /// `excluded_link` names a dying link whose own entries must be skipped
     /// (that peer is gone) — `drop_peer` passes it. Entries whose link has
@@ -473,45 +484,68 @@ impl Assembly {
     /// Entries on Zode links are skipped too, by F5 (zl-zipline#251): Zode
     /// links carry no teardown messages. A Zode upstream loses its binding
     /// when the visa service revokes the visa there, which it does on
-    /// every Zode on the path. Withdrawals still go to adapters and the
-    /// local dock.
+    /// every Zode on the path.
     ///
     /// Lock ordering (zipline#9): call this only AFTER releasing the
     /// visa-table write lock — the send path takes the peer's `zdpr_send`
     /// mutex, which must never nest under it.
-    ///
-    /// Expiry withdraws too: a match that ejects an expired visa
-    /// (`VisaTable::match_traffic`, zl-zipline#271) and the expiry sweep
-    /// (`VisaTable::handle_expirations`, zl-zipline#274) hand their streams
-    /// here, so the actor's next packet binds afresh.
     pub(crate) fn withdraw_streams(
         &self,
-        withdrawn: Vec<ForwardingEntry>,
+        bindings: Vec<visa_table::StreamBinding>,
         excluded_link: Option<LinkId>,
     ) {
-        for entry in withdrawn {
-            let to_adapter = self
-                .peer_table
-                .get(entry.0)
-                .is_some_and(|peer| !peer.is_zode_link());
-            if Some(entry.0) == excluded_link || !to_adapter {
-                continue;
+        for visa_table::StreamBinding { ingress, egress } in bindings {
+            if Some(ingress.0) != excluded_link {
+                self.withdraw_from_requestor(&ingress);
             }
-            mgmt::requests::send_stream_id_withdrawal(self, entry.0, entry.1).enqueue();
+            if Some(egress.0) != excluded_link {
+                self.unbind_local_egress(&egress);
+            }
         }
     }
 
-    /// Run `update` on the visa table under its write lock, then withdraw
-    /// the streams it returns from this Zode's own actor and dock
+    /// Send a `StreamIdWithdrawal` for the ingress stream `ingress` to its
+    /// requestor, unless that is a Zode link (F5) or has left the peer
+    /// table.
+    fn withdraw_from_requestor(&self, ingress: &ForwardingEntry) {
+        let to_adapter = self
+            .peer_table
+            .get(ingress.0)
+            .is_some_and(|peer| !peer.is_zode_link());
+        if to_adapter {
+            mgmt::requests::send_stream_id_withdrawal(self, ingress.0, ingress.1).enqueue();
+        }
+    }
+
+    /// If `egress` is this Zode's own adapter, on the local actor link,
+    /// tell it to drop the DLT entry `egress.1` with an Unbind Egress
+    /// Stream Indication (zl-zipline#283). The node sends it over
+    /// [LOCAL_ACTOR_LINK_ID]; the hairpin delivers it to the adapter on the
+    /// dock link, which removes the entry (`adapter::unbind_stream`, which
+    /// ignores an id it does not hold). Any other egress is a Zode link,
+    /// which never carries a teardown message (F5), so nothing is sent.
+    ///
+    /// Called for a binding that is removed ([Assembly::withdraw_streams]),
+    /// replaced by a J11 rebind, or never made from a grant the adapter
+    /// gave. Sends, so never call it under the visa-table lock (zipline#9).
+    pub(crate) fn unbind_local_egress(&self, egress: &ForwardingEntry) {
+        if egress.0 != LOCAL_ACTOR_LINK_ID || self.peer_table.get(LOCAL_ACTOR_LINK_ID).is_none() {
+            return;
+        }
+        mgmt::requests::send_unbind_egress_stream_indication(self, egress.0, egress.1).enqueue();
+    }
+
+    /// Run `update` on the visa table under its write lock, then tear the
+    /// bindings it removed down at this Zode's own actor and adapter
     /// ([Assembly::withdraw_streams]) once the lock is released: the send
     /// path must never nest under the visa-table lock (zipline#9). Returns
-    /// what `update` returns besides the streams.
+    /// what `update` returns besides the bindings.
     pub(crate) fn update_visa_table_and_withdraw<T>(
         &self,
         update: impl FnOnce(
             &mut visa_table::VisaTable,
             &peer_table::PeerTable,
-        ) -> (T, Vec<ForwardingEntry>),
+        ) -> (T, Vec<visa_table::StreamBinding>),
     ) -> T {
         let (result, withdrawn) = {
             let mut visa_table = self.visa_table.write().unwrap();
@@ -1264,7 +1298,9 @@ pub mod test {
         //! Tests for zipline#21: revoking visas for a dying link must
         //! withdraw the streams from *surviving* adapters by sending them a
         //! `StreamIdWithdrawal` (none goes on a Zode link, F5); expiry
-        //! deliberately does not.
+        //! deliberately does not. And for zl-zipline#283: every removal of
+        //! a binding whose egress is this Zode's own adapter unbinds its DLT
+        //! entry with an `UnbindEgressStreamIndication`.
 
         use super::*;
         use crate::forwarding_tables::PftPep;
@@ -1322,38 +1358,62 @@ pub mod test {
         const VISA_ID: VisaId = 3000;
 
         /// Add a dummy peer of `link_type`, with substrate address
-        /// `octet.2.3.4:443`, and return its link ID.
+        /// `octet.2.3.4:443`, and return its link ID. Its ZDP-R window is
+        /// widened ([widen_zdpr_window]).
         fn add_dummy_peer(asm: &Assembly, link_type: LinkType, octet: u8) -> LinkId {
             let entry = asm.peer_table.vacant_entry().unwrap();
             let key = entry.key();
-            entry
+            let link = entry
                 .insert(create_dummy_peer_state(
                     key,
                     link_type,
                     SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(octet, 2, 3, 4)), 443),
                     net_defs::ScopedIpAddr::V4(Ipv4Addr::new(octet, 2, 3, 5)),
                 ))
-                .get()
+                .get();
+            widen_zdpr_window(asm, link);
+            link
         }
 
-        /// Give [VISA_ID] a forwarding entry on `link` and bind it there.
-        /// Returns the entry's tether (stream) ID.
+        /// Let every message these tests send on `link` go out at once:
+        /// nothing acknowledges them, and with the initial ZDP-R window of
+        /// one a second message on a link would wait behind the first, out
+        /// of sight of an "exactly these messages" assertion.
+        fn widen_zdpr_window(asm: &Assembly, link: LinkId) {
+            asm.peer_table
+                .get(link)
+                .unwrap()
+                .zdpr_send
+                .lock()
+                .unwrap()
+                .adjust_window_size(16);
+        }
+
+        /// The egress of the bindings [bind_visa_on] makes: a link no peer
+        /// has, so a removal tears down only their ingress side. The tests
+        /// that use it are about the requestor's withdrawal; an egress to
+        /// this Zode's own adapter would be unbound as well (zl-zipline#283).
+        const NO_PEER_EGRESS: ForwardingEntry = ForwardingEntry(LinkId::MAX, 1);
+
+        /// Give [VISA_ID] a forwarding entry on `link`, to
+        /// [NO_PEER_EGRESS], and bind it there. Returns the entry's tether
+        /// (stream) ID.
         fn bind_visa_on(asm: &Assembly, link: LinkId) -> StreamId {
             let tether = asm
                 .peer_table
                 .get(link)
                 .unwrap()
                 .pft
-                .insert(PftPep::new(
-                    ForwardingEntry(link, 1),
-                    VISA_ID,
-                    never_expires(),
-                ))
+                .insert(PftPep::new(NO_PEER_EGRESS, VISA_ID, never_expires()))
                 .unwrap();
+            let binding = crate::visa_table::StreamBinding {
+                ingress: ForwardingEntry(link, tether),
+                egress: NO_PEER_EGRESS,
+            };
             asm.visa_table
                 .write()
                 .unwrap()
-                .bind(VISA_ID, binding_on(link, tether), SystemTime::now())
+                .bind(VISA_ID, binding, SystemTime::now())
                 .unwrap();
             tether
         }
@@ -1378,6 +1438,39 @@ pub mod test {
             LinkId,
             Vec<(LinkId, StreamId)>,
         ) {
+            let (asm, egress_rx, hairpin_rx, local_actor, dock) =
+                zode_with_local_actor(never_expires());
+            let actor = (local_actor, bind_visa_on(&asm, local_actor));
+            let zodes = (1..=zode_links)
+                .map(|octet| {
+                    let link = add_dummy_peer(&asm, LinkType::NodeToNode, octet);
+                    (link, bind_visa_on(&asm, link))
+                })
+                .collect();
+
+            (asm, egress_rx, hairpin_rx, actor, dock, zodes)
+        }
+
+        /// The receiving end of the management hairpin, where what is sent
+        /// on a link of the internal pair arrives.
+        type HairpinRx = tokio::sync::mpsc::Receiver<crate::packet::Packet>;
+
+        /// A Zode with the real internal pair (its own actor on the local
+        /// actor link, its adapter's dock on the other) and [VISA_ID],
+        /// expiring at `expires`, but no binding yet. Needs a `LocalSet`:
+        /// the internal pair spawns its workers.
+        ///
+        /// Returns (asm, egress queue receiver, hairpin receiver, the local
+        /// actor link, the dock link).
+        fn zode_with_local_actor(
+            expires: SystemTime,
+        ) -> (
+            Arc<Assembly>,
+            packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+            HairpinRx,
+            LinkId,
+            LinkId,
+        ) {
             let (egress_tx, egress_rx) = packet_queue::packet_queue(8);
             let (hairpin_tx, hairpin_rx) = tokio::sync::mpsc::channel(8);
 
@@ -1391,21 +1484,249 @@ pub mod test {
                 .visa_table
                 .write()
                 .unwrap()
-                .insert_visa(new_vsapi_visa_tcp_default(VISA_ID, never_expires()));
+                .insert_visa(new_vsapi_visa_tcp_default(VISA_ID, expires));
 
             let (local_actor, dock) = asm
                 .peer_table
                 .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
-            let local_actor = local_actor.get();
-            let actor = (local_actor, bind_visa_on(&asm, local_actor));
-            let zodes = (1..=zode_links)
-                .map(|octet| {
-                    let link = add_dummy_peer(&asm, LinkType::NodeToNode, octet);
-                    (link, bind_visa_on(&asm, link))
-                })
-                .collect();
+            widen_zdpr_window(&asm, local_actor.get());
+            (asm, egress_rx, hairpin_rx, local_actor.get(), dock.get())
+        }
 
-            (asm, egress_rx, hairpin_rx, actor, dock.get(), zodes)
+        /// A destination Zode (zl-zipline#283): a stream under [VISA_ID],
+        /// expiring at `expires`, enters over a dummy Zode link and egresses
+        /// to this Zode's own actor, under the DLT entry its adapter
+        /// granted for it. That entry is in the DLT. Needs a `LocalSet`.
+        ///
+        /// Returns (asm, egress queue receiver, hairpin receiver, the dock
+        /// link, the Zode link, the DLT ID).
+        fn setup_destination_zode(
+            expires: SystemTime,
+        ) -> (
+            Arc<Assembly>,
+            packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+            HairpinRx,
+            LinkId,
+            LinkId,
+            StreamId,
+        ) {
+            let (asm, egress_rx, hairpin_rx, local_actor, dock) = zode_with_local_actor(expires);
+            let zode = add_dummy_peer(&asm, LinkType::NodeToNode, 1);
+            let dlt_id = asm
+                .dlt
+                .insert(crate::adapter_tables::DltPep::new(
+                    crate::tc::Ip5TupleTc::new(crate::defs::FiveTuple::default()),
+                    None,
+                ))
+                .unwrap();
+            let egress = ForwardingEntry(local_actor, dlt_id);
+            let stream = asm
+                .peer_table
+                .get(zode)
+                .unwrap()
+                .pft
+                .insert(PftPep::new(egress.clone(), VISA_ID, expires))
+                .unwrap();
+            let binding = crate::visa_table::StreamBinding {
+                ingress: ForwardingEntry(zode, stream),
+                egress,
+            };
+            asm.visa_table
+                .write()
+                .unwrap()
+                .bind(VISA_ID, binding, before_the_expiry())
+                .unwrap();
+            (asm, egress_rx, hairpin_rx, dock, zode, dlt_id)
+        }
+
+        /// The per-flow management messages on the hairpin to the local
+        /// actor, as (link, type, stream). The hairpin delivers a packet as
+        /// received on the other end of the internal pair, so the link is
+        /// that end's.
+        fn messages_on_hairpin(rx: &mut HairpinRx) -> Vec<(LinkId, zdp::ZdpPacketType, StreamId)> {
+            let mut got = Vec::new();
+            while let Ok(pkt) = rx.try_recv() {
+                let (packet_type, stream) = per_flow_message(&pkt);
+                got.push((pkt.metadata().ingress_link_id, packet_type, stream));
+            }
+            got
+        }
+
+        /// The type and stream ID of the per-flow management packet `pkt`.
+        fn per_flow_message(pkt: &crate::packet::Packet) -> (zdp::ZdpPacketType, StreamId) {
+            let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
+            let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+            let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
+            (base_hdr.packet_type, per_flow_hdr.stream_id.into())
+        }
+
+        /// What a destination Zode sends when its binding is removed: one
+        /// Unbind Egress Stream Indication for `dlt_id` to its own adapter,
+        /// arriving on the dock link, and nothing on the substrate (F5).
+        fn assert_only_unbind(
+            hairpin_rx: &mut HairpinRx,
+            egress_rx: &mut packet_queue::Receiver<{ config::PACKET_BUFFER_SIZE }>,
+            dock: LinkId,
+            dlt_id: StreamId,
+        ) {
+            assert_eq!(
+                messages_on_hairpin(hairpin_rx),
+                vec![(
+                    dock,
+                    zdp::ZdpPacketType::UnbindEgressStreamIndication,
+                    dlt_id
+                )]
+            );
+            assert!(
+                try_recv_packet(egress_rx).is_none(),
+                "nothing on the substrate"
+            );
+        }
+
+        /// zl-zipline#283: a visa service revocation at a destination Zode
+        /// unbinds the stream's DLT entry from its own adapter.
+        #[tokio::test(flavor = "local")]
+        async fn test_revocation_unbinds_the_local_egress() {
+            let (asm, mut egress_rx, mut hairpin_rx, dock, _zode, dlt_id) =
+                setup_destination_zode(never_expires());
+
+            crate::visa_mgmt::handle_revocation(&asm, VISA_ID).unwrap();
+
+            assert_only_unbind(&mut hairpin_rx, &mut egress_rx, dock, dlt_id);
+        }
+
+        /// zl-zipline#283 with #274's D4: the stream enters over a Zode
+        /// link, so the expiry sweep keeps the visa, and its binding,
+        /// through the stream-ID grace and unbinds nothing; the sweep after
+        /// the grace frees the visa and unbinds its DLT entry.
+        #[tokio::test(flavor = "local")]
+        async fn test_expiry_sweep_unbinds_the_local_egress_after_the_grace() {
+            let expires = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+            let (asm, mut egress_rx, mut hairpin_rx, dock, _zode, dlt_id) =
+                setup_destination_zode(expires);
+
+            crate::visa_mgmt::sweep_expired_visas(&asm, expires);
+            assert!(asm.visa_table.read().unwrap().contains(VISA_ID));
+            assert_eq!(
+                messages_on_hairpin(&mut hairpin_rx),
+                vec![],
+                "nothing in the grace"
+            );
+
+            crate::visa_mgmt::sweep_expired_visas(&asm, expires + config::STREAM_ID_REUSE_GRACE);
+            assert!(!asm.visa_table.read().unwrap().contains(VISA_ID));
+            assert_only_unbind(&mut hairpin_rx, &mut egress_rx, dock, dlt_id);
+        }
+
+        /// zl-zipline#283: losing the Zode link the stream enters over
+        /// unbinds its DLT entry from this Zode's own adapter.
+        #[tokio::test(flavor = "local")]
+        async fn test_link_loss_unbinds_the_local_egress() {
+            let (asm, mut egress_rx, mut hairpin_rx, dock, zode, dlt_id) =
+                setup_destination_zode(never_expires());
+
+            asm.drop_peer(zode);
+
+            assert_only_unbind(&mut hairpin_rx, &mut egress_rx, dock, dlt_id);
+        }
+
+        /// zl-zipline#283 with #271: a match that ejects the expired visa
+        /// unbinds its DLT entry.
+        #[tokio::test(flavor = "local")]
+        async fn test_match_eject_unbinds_the_local_egress() {
+            let (asm, mut egress_rx, mut hairpin_rx, dock, _zode, dlt_id) =
+                setup_destination_zode(ALREADY_EXPIRED);
+            // The flow [new_vsapi_visa_tcp_default] admits.
+            let unspecified = net_defs::IpAddress::new_from_std(&Ipv4Addr::UNSPECIFIED.into());
+            let flow = crate::defs::FiveTuple {
+                src_address: unspecified,
+                dst_address: unspecified,
+                l3_type: zpr::packet_info::L3Type::Ipv4,
+                l4_protocol: net_defs::ip_number::TCP,
+                ..Default::default()
+            };
+
+            let matched = asm.update_visa_table_and_withdraw(|visa_table, peer_table| {
+                visa_table.match_traffic(peer_table, &flow)
+            });
+
+            assert_eq!(matched, None);
+            assert!(!asm.visa_table.read().unwrap().contains(VISA_ID));
+            assert_only_unbind(&mut hairpin_rx, &mut egress_rx, dock, dlt_id);
+        }
+
+        /// zl-zipline#283 with R16: connecting to the visa service as
+        /// `reset` revokes every visa but the VS-API pair, and unbinds the
+        /// DLT entries of their streams, as the VS worker does.
+        #[tokio::test(flavor = "local")]
+        async fn test_reset_unbinds_the_local_egress() {
+            let (asm, mut egress_rx, mut hairpin_rx, dock, _zode, dlt_id) =
+                setup_destination_zode(never_expires());
+            let node_addr: IpAddr = "fd5a:5052:8::1".parse().unwrap();
+
+            let withdrawn = asm
+                .visa_table
+                .write()
+                .unwrap()
+                .retain_vs_api_visas(&asm.peer_table, &node_addr);
+            asm.withdraw_streams(withdrawn, None);
+
+            assert!(!asm.visa_table.read().unwrap().contains(VISA_ID));
+            assert_only_unbind(&mut hairpin_rx, &mut egress_rx, dock, dlt_id);
+        }
+
+        /// zl-zipline#283 end to end: the Unbind Egress Stream Indication a
+        /// revocation sends, handled by this Zode's adapter as the hairpin
+        /// delivers it, removes the stream's entry from the DLT.
+        #[tokio::test(flavor = "local")]
+        async fn test_revocation_removes_the_dlt_entry() {
+            let (asm, _egress_rx, mut hairpin_rx, _dock, _zode, dlt_id) =
+                setup_destination_zode(never_expires());
+            assert!(asm.dlt.get(dlt_id).is_some());
+
+            crate::visa_mgmt::handle_revocation(&asm, VISA_ID).unwrap();
+            let pkt = hairpin_rx.try_recv().expect("an unbind to the adapter");
+            crate::mgmt_processor_worker::handle_packet(&asm, pkt)
+                .await
+                .unwrap();
+
+            assert!(asm.dlt.get(dlt_id).is_none());
+        }
+
+        /// F5 (zl-zipline#251) with zl-zipline#283: at the Zode where a flow
+        /// starts, the stream egresses over a Zode link. Its removal
+        /// withdraws the stream from the local actor and unbinds nothing,
+        /// on the Zode link or anywhere else.
+        #[tokio::test(flavor = "local")]
+        async fn test_a_zode_link_egress_is_not_unbound() {
+            let (asm, mut egress_rx, mut hairpin_rx, local_actor, dock) =
+                zode_with_local_actor(never_expires());
+            let zode = add_dummy_peer(&asm, LinkType::NodeToNode, 1);
+            let egress = ForwardingEntry(zode, 42);
+            let stream = asm
+                .peer_table
+                .get(local_actor)
+                .unwrap()
+                .pft
+                .insert(PftPep::new(egress.clone(), VISA_ID, never_expires()))
+                .unwrap();
+            let binding = crate::visa_table::StreamBinding {
+                ingress: ForwardingEntry(local_actor, stream),
+                egress,
+            };
+            asm.visa_table
+                .write()
+                .unwrap()
+                .bind(VISA_ID, binding, SystemTime::now())
+                .unwrap();
+
+            crate::visa_mgmt::handle_revocation(&asm, VISA_ID).unwrap();
+
+            assert_eq!(
+                messages_on_hairpin(&mut hairpin_rx),
+                vec![(dock, zdp::ZdpPacketType::StreamIdWithdrawal, stream)]
+            );
+            assert!(try_recv_packet(&mut egress_rx).is_none());
         }
 
         /// [setup_visa_on_links] on two internal links.
@@ -1438,26 +1759,11 @@ pub mod test {
             got
         }
 
-        /// The StreamIdWithdrawals on the hairpin to the local actor, as
-        /// (link, stream). The hairpin delivers a packet as received on the
-        /// other end of the internal pair, so the link is that end's.
-        fn withdrawals_on_hairpin(
-            rx: &mut tokio::sync::mpsc::Receiver<crate::packet::Packet>,
-        ) -> Vec<(LinkId, StreamId)> {
-            let mut got = Vec::new();
-            while let Ok(pkt) = rx.try_recv() {
-                got.push((pkt.metadata().ingress_link_id, withdrawn_stream(&pkt)));
-            }
-            got
-        }
-
         /// The stream `pkt`, which must be a StreamIdWithdrawal, withdraws.
         fn withdrawn_stream(pkt: &crate::packet::Packet) -> StreamId {
-            let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()).unwrap();
-            assert_eq!(base_hdr.packet_type, zdp::ZdpPacketType::StreamIdWithdrawal);
-            let (_mgmt_hdr, rest) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
-            let (per_flow_hdr, _rest) = zdp::ZdpPerFlowHeader::ref_from_prefix(rest).unwrap();
-            per_flow_hdr.stream_id.into()
+            let (packet_type, stream) = per_flow_message(pkt);
+            assert_eq!(packet_type, zdp::ZdpPacketType::StreamIdWithdrawal);
+            stream
         }
 
         /// F5 (zl-zipline#251): a revocation of a visa bound from this Zode's
@@ -1472,8 +1778,8 @@ pub mod test {
             crate::visa_mgmt::handle_revocation(&asm, VISA_ID).unwrap();
 
             assert_eq!(
-                withdrawals_on_hairpin(&mut hairpin_rx),
-                vec![(dock, actor_tether)]
+                messages_on_hairpin(&mut hairpin_rx),
+                vec![(dock, zdp::ZdpPacketType::StreamIdWithdrawal, actor_tether)]
             );
             assert_eq!(withdrawals_sent(&mut egress_rx), vec![]);
         }
@@ -1489,8 +1795,8 @@ pub mod test {
             asm.drop_peer(zodes[1].0);
 
             assert_eq!(
-                withdrawals_on_hairpin(&mut hairpin_rx),
-                vec![(dock, actor_tether)]
+                messages_on_hairpin(&mut hairpin_rx),
+                vec![(dock, zdp::ZdpPacketType::StreamIdWithdrawal, actor_tether)]
             );
             assert_eq!(withdrawals_sent(&mut egress_rx), vec![]);
         }

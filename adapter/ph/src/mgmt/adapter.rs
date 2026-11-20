@@ -16,10 +16,9 @@ use std::num::NonZero;
 
 /// Request to bind a stream which egresses from the local adapter.
 ///
-/// `dock_link_id` identifies the link of the dock making this request.
-/// (This is currently always [zpr::packet_info::DOCK_LINK_ID]; on adapters,
-/// this represents the remote dock; on nodes, this represents the internal
-/// dock.)
+/// `dock_link_id` identifies the link of the dock making this request:
+/// always [zpr::packet_info::DOCK_LINK_ID], the internal link on which this
+/// Zode's node half reaches its own adapter half.
 ///
 /// `txn_id` is used when issuing responses to the dock to link them to
 /// this request.
@@ -89,6 +88,9 @@ pub fn bind_egress_stream(
     }
 }
 
+/// Remove the stream `stream_id` from the DLT: the node no longer forwards
+/// to it (an Unbind Egress Stream Indication, zl-zipline#283). An id the
+/// DLT does not hold is ignored.
 pub fn unbind_stream(asm: &Arc<Assembly>, dock_link_id: NonZero<LinkId>, stream_id: StreamId) {
     debug!(
         target: FLOW_MGMT,

@@ -89,11 +89,14 @@ pub fn handle_revocation(
     asm: &Assembly,
     visa_id: VisaId,
 ) -> Result<(), visa_table::VisaTableError> {
-    // Revoke under the write lock, then withdraw each stream from the
-    // adapters still bound to it once the lock is released, as
-    // `Assembly::drop_peer` does (zipline#21, zipline#85). Zode links get
-    // no withdrawal (F5, zl-zipline#251): the visa service revokes the
-    // visa on every Zode on the path itself.
+    // Revoke under the write lock, then, once the lock is released, run the
+    // shared tail `Assembly::withdraw_streams` as `Assembly::drop_peer` does
+    // (zipline#21, zipline#85): it withdraws each stream from the actor and
+    // adapters still bound to it, and unbinds a local egress DLT entry by
+    // sending type 13 to this Zode's own adapter over
+    // `LOCAL_ACTOR_LINK_ID` (zl-zipline#283). Zode links get neither (F5,
+    // zl-zipline#251): the visa service revokes the visa on every Zode on
+    // the path itself.
     asm.update_visa_table_and_withdraw(|visa_table, peer_table| {
         match visa_table.revoke(peer_table, visa_id) {
             Ok(withdrawn) => (Ok(()), withdrawn),
@@ -121,6 +124,9 @@ pub fn sweep_expired_visas_if_due(asm: &Assembly) {
 /// Sweep the visas that have expired at `now` out of the visa table
 /// ([visa_table::VisaTable::handle_expirations]), and withdraw their
 /// streams from this Zode's own actor, so its next packet binds afresh.
+/// The shared tail `Assembly::withdraw_streams` also unbinds each removed
+/// binding's local egress DLT entry: type 13 to this Zode's own adapter
+/// over `LOCAL_ACTOR_LINK_ID` (zl-zipline#283).
 pub fn sweep_expired_visas(asm: &Assembly, now: std::time::SystemTime) {
     asm.update_visa_table_and_withdraw(|visa_table, peer_table| {
         ((), visa_table.handle_expirations(peer_table, now))

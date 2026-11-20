@@ -127,9 +127,10 @@ impl PftPep {
     }
 
     /// Move this entry onto `visa_id`, which expires at `expires`,
-    /// forwarding to `next_hop` (J11 commit). The only writer after
-    /// [PftPep::new]; the visa table calls it under its write lock, so
-    /// rebinds never overlap. The version is odd while the words change,
+    /// forwarding to `next_hop` (J11 commit). With `PftPep::tombstone`,
+    /// the only writer after [PftPep::new]; the visa table calls both
+    /// under its write lock, so writes never overlap. The version is odd
+    /// while the words change,
     /// so a reader never takes a mix of two bindings (see
     /// [PftPep::target]).
     pub fn rebind(&self, next_hop: ForwardingEntry, visa_id: VisaId, expires: SystemTime) {
@@ -251,7 +252,7 @@ impl PeerForwardingTable {
     /// Remove the stream `tether_id` and put its slot into quarantine
     /// until `now` + [STREAM_ID_REUSE_GRACE] (zl-zipline#282). From now on
     /// the stream forwards nothing and lookups do not find it
-    /// ([PftPep::tombstone]), but the slot stays occupied, so the ID is
+    /// (`PftPep::tombstone`), but the slot stays occupied, so the ID is
     /// not handed to a new stream before the grace has passed. Freed
     /// later by [Self::release_quarantined_at]. An ID with no entry, or
     /// one quarantined already, changes nothing.

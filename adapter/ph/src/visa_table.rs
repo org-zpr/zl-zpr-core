@@ -879,6 +879,10 @@ impl VisaTable {
     ///   ID is not handed to a new stream while the upstream may still send
     ///   on it.
     ///
+    /// Either way, a freed visa's PFT slots then go into quarantine for
+    /// [config::STREAM_ID_REUSE_GRACE] (zl-zipline#282), like those of
+    /// every other removal ([peer_table::PeerTable::remove_route]).
+    ///
     /// Returns the withdrawn forwarding entries. Expiry notifies no peer
     /// over a Zode link: every Zode on the path holds the same expiry and
     /// stops on its own clock ([crate::assembly::Assembly::withdraw_streams]
@@ -1013,8 +1017,9 @@ impl VisaTable {
     }
 
     /// Remove the visa `visa_id` and its bindings, and the PFT entry of each
-    /// binding. The only path that removes bindings: revocation, expiry and
-    /// link loss all come here.
+    /// binding, whose stream ID goes into quarantine (zl-zipline#282). The
+    /// only path that removes bindings: revocation, expiry and link loss
+    /// all come here.
     ///
     /// Returns each binding's ingress entry: the link the requestor bound
     /// over and the stream ID it sends with, which is all a withdrawal to

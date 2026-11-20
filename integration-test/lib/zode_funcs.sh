@@ -492,6 +492,28 @@ function wait_log_after() {
   fi
 }
 
+# Wait until the visa service's reconciler has gone quiet: log $1 gains no
+# new match for the sweep pattern $2 for 2 s running, or 20 s pass. A
+# login, logout or session replacement returns before its revocation pass
+# runs (zl-zipline#289), so a step that counts the next sweep takes its
+# baseline only after this, or an earlier pass's sweep could be taken for
+# its own.
+function settle_sweeps() {
+  local LAST N STABLE=0 I
+  LAST=$(log_count "$1" "$2")
+  for (( I = 0; I < 20; I++ )); do
+    sleep 1
+    N=$(log_count "$1" "$2")
+    if (( N == LAST )); then
+      (( ++STABLE >= 2 )) && return 0
+    else
+      STABLE=0
+      LAST=$N
+    fi
+  done
+  echo "warning: the visa service kept sweeping for 20 s; continuing"
+}
+
 # The number of lines of log $1 matching the extended regex $2.
 function log_count() {
   grep -cE -- "$2" "$1" || true
@@ -789,9 +811,10 @@ RENEWAL_FAILED='Zode login: silent renewal failed'
 EXPIRED='Zode login: expired without a renewal'
 POLICY_RENEWAL='Zode login: policy re-authentication answered with a renewal'
 REVOKED='Revoked visa [0-9]+'
-# The visa service's re-check after an attribute change (its visa sweep),
-# and one that revokes a visa.
-VS_SWEEP='visa sweep reason=AttributeChange '
+# The visa service's re-check of every live visa (its visa sweep: one per
+# reconciler pass, which an attribute change's revocation obligation starts;
+# zl-zipline#289), and one that revokes a visa.
+VS_SWEEP='visa sweep vinst=[0-9]+: '
 VS_SWEEP_REVOKED="$VS_SWEEP.* revoked=[1-9]"
 # A request to the fake IdP's authorization endpoint (an interactive login).
 AUTH_REQUEST='"GET /auth'

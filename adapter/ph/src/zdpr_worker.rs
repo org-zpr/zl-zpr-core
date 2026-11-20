@@ -7,7 +7,7 @@ use tokio::select;
 use tokio::time;
 
 /// The ZDP-R worker of the link `link_id`: resends what its peer has not
-/// acknowledged in time, until the peer leaves the peer table.
+/// acknowledged in time, until that peer leaves the peer table (`own_peer`).
 ///
 /// It takes a peer-table guard only for synchronous work, never across an
 /// `await`. With the default `rcu-crossbeam-epoch` backend a guard pins the
@@ -19,19 +19,28 @@ pub async fn launch(asm: Arc<Assembly>, link_id: LinkId) {
     let mut retry_interval = time::interval(config::DEFAULT_ZDPR_RETRY_TIMER);
     retry_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
+    // This worker's peer is the one at `link_id` now; it is told apart from
+    // a later peer that reuses the link ID by its retry-reset `Notify`.
+    let Some(retry_timer_reset) = asm
+        .peer_table
+        .get(link_id)
+        .map(|peer_state| peer_state.zdpr_retry_timer_reset.clone())
+    else {
+        return; // peer removed before we started
+    };
+
     loop {
-        let (retry_needed, retry_timer_reset) = {
-            let Some(peer_state) = asm.peer_table.get(link_id) else {
+        let retry_needed = {
+            let Some(peer_state) = own_peer(&asm, link_id, &retry_timer_reset) else {
                 // peer removed; we're done
                 break;
             };
-            let retry_needed = peer_state.zdpr_send.lock().unwrap().retry_needed();
-            (retry_needed, peer_state.zdpr_retry_timer_reset.clone())
+            peer_state.zdpr_send.lock().unwrap().retry_needed()
         };
 
         select! {
             _ = retry_interval.tick(), if retry_needed => {
-                let Some(peer_state) = asm.peer_table.get(link_id) else {
+                let Some(peer_state) = own_peer(&asm, link_id, &retry_timer_reset) else {
                     // peer removed while we waited; we're done
                     break;
                 };
@@ -52,6 +61,20 @@ pub async fn launch(asm: Arc<Assembly>, link_id: LinkId) {
             () = retry_timer_reset.notified() => retry_interval.reset(),
         };
     }
+}
+
+/// The peer at `link_id`, if it is still the one whose retry-reset
+/// `Notify` is `retry_timer_reset`. Once a worker's peer has left, its
+/// link ID can be reused by another peer, which has a worker of its own;
+/// the old worker gets `None` and stops (zl-zipline#283).
+fn own_peer<'a>(
+    asm: &'a Assembly,
+    link_id: LinkId,
+    retry_timer_reset: &Arc<tokio::sync::Notify>,
+) -> Option<crate::peer_table::PeerTableEntryGuard<'a>> {
+    asm.peer_table
+        .get(link_id)
+        .filter(|peer_state| Arc::ptr_eq(&peer_state.zdpr_retry_timer_reset, retry_timer_reset))
 }
 
 #[cfg(test)]

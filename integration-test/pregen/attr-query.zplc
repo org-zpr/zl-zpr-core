@@ -36,7 +36,7 @@ transit = true
 [nodes.relay.substrate_addrs]
 i0 = "10.2.0.1:5000"
 
-# No substrate_addrs for zb and zc (zl-zipline#255, W10): the visa service
+# No substrate_addrs for zb and zc (zl-zipline#255): the visa service
 # learns their addresses from what they report when they connect.
 [nodes.zb]
 provider = [ [ "device.zpr.adapter.cn", "zb" ] ]

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# Three Zodes in a line, zb - relay - zc (zl-zipline#254; Zodes plan W1
-# and W4), docs/ZODE_LINKS.md F1, F2 and F8.
+# Three Zodes in a line, zb - relay - zc (zl-zipline#254),
+# docs/ZODE_LINKS.md F1, F2 and F8. W1 (forward-only visas) and W4 (the
+# one-actor endpoint) below are work items of the retired plan in
+# org-zpr/zipline: `git show 0686fd8:docs/plans/2026-11-11-zodes.md`, §6.
 #
 # The relay is linked to zb and to zc, and zb and zc are not linked to each
 # other (pregen/zodes-pair.zplc), so their traffic crosses the relay. The

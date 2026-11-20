@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# A Zode whose certificate comes from another CA is refused (zl-zipline#254;
-# Zodes plan W2), docs/ZODE_LINKS.md rule 3 and SECURITY_MODEL.md.
+# A Zode whose certificate comes from another CA is refused (zl-zipline#254),
+# docs/ZODE_LINKS.md rule 3 and SECURITY_MODEL.md.
 #
 # zb and zc are both in the relay's topology (pregen/zodes-pair.zplc), each
 # with an initial link to the relay. zb's certificate is signed by the test

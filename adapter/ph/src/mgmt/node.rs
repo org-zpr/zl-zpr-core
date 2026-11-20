@@ -167,7 +167,8 @@ pub fn bind_actor_address(
 
     // Ensure the requesting actor owns this source address: one of its
     // authenticated addresses, or the link's AAA address (AAA kept unused
-    // in v1 (zodes plan §5.4)).
+    // in v1: zl-zpr-dev-context docs/ZODE_LINKS.md, Design decisions, "AAA
+    // kept, unused").
 
     if !peer_state.actor_auth.owns_address(&five_tuple.src_address)
         && peer_state.link_state_machine.aaa_address() != Some(five_tuple.src_address)

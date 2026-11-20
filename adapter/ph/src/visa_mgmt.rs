@@ -14,8 +14,9 @@ use zpr::vsapi_types;
 ///
 /// A forward-only visa makes this node carry other nodes' traffic. It is
 /// refused with [VisaTableError::ForwardingDisabled], and logged, unless the
-/// node's `forwarding` setting is on (zl-zipline#219, Zodes plan §5.9). The
-/// visa service's non-transit routing is the primary check; this one is
+/// node's `forwarding` setting is on (zl-zipline#219; zl-zpr-dev-context
+/// docs/SECURITY_MODEL.md, Design decisions, "Non-transit has two halves").
+/// The visa service's non-transit routing is the primary check; this one is
 /// defence in depth, and it catches a misconfigured relay early.
 ///
 /// This is the single entry point for visas from the visa service, pushed or
@@ -186,7 +187,8 @@ mod tests {
 
     /// With `forwarding` off, a forward-only visa from the visa service is
     /// refused and the table is left unchanged; with it on, the visa is
-    /// stored (zl-zipline#219, plan §5.9).
+    /// stored (zl-zipline#219; zl-zpr-dev-context docs/SECURITY_MODEL.md,
+    /// Design decisions, "Non-transit has two halves").
     #[test]
     fn test_insert_forward_only_visa_obeys_forwarding_setting() {
         use crate::visa_table::tests::{never_expires, new_vsapi_visa_forward_only};

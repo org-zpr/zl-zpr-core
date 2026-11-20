@@ -326,9 +326,9 @@ mod tests {
         }
     }
 
-    /// AAA kept unused in v1 (zodes plan §5.4): the visa service still
-    /// pushes `Configure([AAA_PREFIX])`, and the Zode fills its AAA pool
-    /// from it. A prefix that does not parse, or is longer than /88, is
+    /// AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    /// Design decisions, "AAA kept, unused"): the visa service still pushes
+    /// `Configure([AAA_PREFIX])`, and the Zode fills its AAA pool from it. A prefix that does not parse, or is longer than /88, is
     /// refused and leaves the pool as it was; so is a second AAA_PREFIX.
     #[test]
     fn test_configure_aaa_prefix_fills_the_pool_and_refuses_a_bad_one() {

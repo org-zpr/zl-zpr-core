@@ -297,6 +297,10 @@ fn skip_v6_option(
     body: &[u8],
     options: &ClassifierOptions,
 ) -> Result<ClassifierResult, &'static str> {
+    // The next-header and length bytes must be there before they are read.
+    if body.len() < 2 {
+        return Err("Packet length error");
+    }
     // Almost all Ipv6 options start with protocol and length
     let next_header = body[0];
     // The length for these options is in muliples of 8 bytes, not including the first 8
@@ -317,6 +321,10 @@ fn skip_auth_header(
     body: &[u8],
     options: &ClassifierOptions,
 ) -> Result<ClassifierResult, &'static str> {
+    // The next-header and length bytes must be there before they are read.
+    if body.len() < 2 {
+        return Err("Packet length error");
+    }
     let next_header = body[0];
     // AH header is legacy v4 and therefore uses 4 octet multiples instead
     let option_length = (usize::from(body[1]) + 2) * 4;
@@ -334,8 +342,11 @@ fn classify_frag(
     options: &ClassifierOptions,
 ) -> Result<ClassifierResult, &'static str> {
     // Frag options have no length field and are always 8 bytes
-    let next_header = body[0];
     let option_length: usize = 8;
+    if body.len() < option_length {
+        return Err("Packet length error");
+    }
+    let next_header = body[0];
 
     if is_option_length_error(body.len(), next_header, option_length) {
         return Err("Packet length error");
@@ -357,8 +368,9 @@ fn classify_icmp(
     body: &[u8],
     options: &ClassifierOptions,
 ) -> Result<ClassifierResult, &'static str> {
-    let icmp_bytes = &body[..size_of::<ICMPHeader>()];
-    let icmp_header = ICMPHeader::ref_from_bytes(icmp_bytes).unwrap();
+    let Ok((icmp_header, _)) = ICMPHeader::ref_from_prefix(body) else {
+        return Err("Packet length error");
+    };
     ft.set_src_port(icmp_header.icmp_type as u16);
     ft.set_dst_port(icmp_header.icmp_code as u16);
     // NOTE: we do not currently check ICMP length
@@ -376,8 +388,9 @@ fn classify_icmpv6(
     body: &[u8],
     options: &ClassifierOptions,
 ) -> Result<ClassifierResult, &'static str> {
-    let icmp_bytes = &body[..size_of::<ICMPv6Header>()];
-    let icmp_header = ICMPv6Header::ref_from_bytes(icmp_bytes).unwrap();
+    let Ok((icmp_header, _)) = ICMPv6Header::ref_from_prefix(body) else {
+        return Err("Packet length error");
+    };
     ft.set_src_port(icmp_header.icmp_type as u16);
     ft.set_dst_port(icmp_header.icmp_code as u16);
     // NOTE: we do not currently check ICMPv6 length

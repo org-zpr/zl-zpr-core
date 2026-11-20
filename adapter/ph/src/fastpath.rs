@@ -636,9 +636,15 @@ impl FastpathWorker {
         // expanded with the other flow's classifier and checked with its
         // key. That is safe: `expand` refuses a body too short for that
         // classifier (dropped as `BadStructure`), and a body it does expand
-        // fails the MICV check below, because the MICV covers the original
-        // flow's addresses and ports and is keyed with its A2A key. Either
-        // way the packet is dropped, never delivered to the wrong flow.
+        // fails the MICV check below unless it expands to exactly the
+        // original packet, because the MICV covers the original flow's
+        // addresses and ports and is keyed with its A2A key. A packet that
+        // passes both is then checked against the new flow's classifier,
+        // because compression does not rebuild everything a classifier
+        // names: an ICMP type or code stays in the body, so a stale ICMP
+        // packet for the same A2A peer and addresses expands unchanged and
+        // passes the MICV. Any failure drops the packet, so it is never
+        // delivered unless the new flow's classifier admits it.
         let Some(pep) = self.asm.dlt.get(tether_id) else {
             self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
             return;
@@ -663,6 +669,15 @@ impl FastpathWorker {
         if a2a_micv.as_bytes()[..a2a_mac_size] != a2a_mac[..a2a_mac_size] {
             drop(pep);
             return self.drop_and_count(pkt, FastpathCounterType::MicvFailure);
+        }
+
+        // Deliver only what this stream's classifier admits (see above).
+        if !pep
+            .tc
+            .classify_packet(pep.tc.five_tuple().l3_type, pkt.body())
+        {
+            drop(pep);
+            return self.drop_and_count(pkt, FastpathCounterType::ClassifierMismatch);
         }
 
         // queue decapsulated packet for send to actor

@@ -38,8 +38,8 @@
 #      restarted on the edited JSON — the reference server loads its data
 #      once at startup), then a TARGETED notify (user.sub=user-a) with a
 #      `Permission::Notify` key bound to the zipline service id (the
-#      zipline#79 V2 surface). The queued TrustedServiceChange event
-#      re-queries, the tag disappears, the visa is revoked, and a fresh
+#      zipline#79 V2 surface). The recorded revocation obligation's
+#      reconciler pass re-queries, the tag disappears, the visa is revoked, and a fresh
 #      connect attempt (ping) is denied, while the Zodes' device flows to
 #      the visa service still work.
 #   4. SKIP_NOTIFY=1 negative knob: skips ONLY the notify posts (both of

@@ -35,8 +35,8 @@
 #      code.
 #
 # Refresh cycles are driven deterministically through the admin API:
-# `vs-admin services --id happyfile --flush` records TrustedServiceChange,
-# whose handler reconciles stale or TTL-expired trusted attributes on
+# `vs-admin services --id happyfile --flush` records a revocation obligation,
+# whose reconciler pass reconciles stale or TTL-expired trusted attributes on
 # actors behind live visas (vs/src/event_mgr.rs). The final cycle first
 # waits out happyfile's expiration_seconds (90 s, chosen to exceed the
 # visa service's 60 s MIN_ATTRIBUTE_TTL while keeping this wait bounded),
@@ -128,14 +128,14 @@ function assert_user_actor() {
   return "$RESULT"
 }
 
-# What the visa service logs once a trusted-service change has reconciled
-# the actors behind live visas, and when it then re-checks the visas
-# (vs/src/event_mgr.rs, the visa sweep).
-ACTORS_REFRESHED='trusted service changed: actors refreshed=[1-9]'
-VISA_SWEEP='visa sweep reason=AttributeChange'
+# What the visa service logs once a reconciler pass has refreshed the
+# actors behind live visas, and when it then re-checks the visas
+# (vs/src/event_mgr.rs, the visa sweep; zl-zipline#289).
+ACTORS_REFRESHED='reconcile: actors refreshed=[1-9]'
+VISA_SWEEP='visa sweep vinst=[0-9]+: '
 
 # Drive one deterministic refresh cycle: flush happyfile's file store
-# (TrustedServiceChange: reconcile stale or TTL-expired attributes on
+# (a revocation obligation: reconcile stale or TTL-expired attributes on
 # actors behind live visas). Wait for the visa service to refresh an actor
 # and to re-check the visas, and assert that the re-check revoked none and
 # failed or skipped as unresolved none: the lazy visa survives the

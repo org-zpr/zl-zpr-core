@@ -789,9 +789,10 @@ RENEWAL_FAILED='Zode login: silent renewal failed'
 EXPIRED='Zode login: expired without a renewal'
 POLICY_RENEWAL='Zode login: policy re-authentication answered with a renewal'
 REVOKED='Revoked visa [0-9]+'
-# The visa service's re-check after an attribute change (its visa sweep),
-# and one that revokes a visa.
-VS_SWEEP='visa sweep reason=AttributeChange '
+# The visa service's re-check of every live visa (its visa sweep: one per
+# reconciler pass, which an attribute change's revocation obligation starts;
+# zl-zipline#289), and one that revokes a visa.
+VS_SWEEP='visa sweep vinst=[0-9]+: '
 VS_SWEEP_REVOKED="$VS_SWEEP.* revoked=[1-9]"
 # A request to the fake IdP's authorization endpoint (an interactive login).
 AUTH_REQUEST='"GET /auth'

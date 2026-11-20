@@ -425,7 +425,9 @@ if [[ "$PASS" == 0 ]]; then
     echo "== 2. untargeted notify (empty body: everything changed, data unchanged)"
     # zode_ping's warm-up would hide a revoked visa that zb simply asks
     # for again, so wait for the notify's sweep and count revocations on
-    # both sides too: none may happen.
+    # both sides too: none may happen. Earlier passes settle first, so their
+    # sweeps are not taken for the notify's.
+    settle_sweeps vs.log "$VS_SWEEP"
     LEG2_ALL_SWEEPS=$(log_count vs.log "$VS_SWEEP")
     LEG2_SWEEPS=$(log_count vs.log "$VS_SWEEP_REVOKED")
     LEG2_REVOCATIONS=$(log_count zb.log "$REVOKED")

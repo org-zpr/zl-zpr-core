@@ -142,6 +142,9 @@ VISA_SWEEP='visa sweep vinst=[0-9]+: '
 # refresh.
 function refresh_cycle() {
   local REFRESHES SWEEPS
+  # Let earlier reconciler passes (a login's) finish first, so their refresh
+  # and sweep lines are not taken for the flush's.
+  settle_sweeps vs.log "$VISA_SWEEP"
   REFRESHES=$(log_count vs.log "$ACTORS_REFRESHED")
   SWEEPS=$(log_count vs.log "$VISA_SWEEP")
   vs_admin services --id happyfile --flush

@@ -1506,6 +1506,110 @@ mod test {
         assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
     }
 
+    /// zl-zipline#283: DLT IDs have no quarantine, so a packet sent on a
+    /// stream whose DLT ID was unbound and reused can reach the new
+    /// binding. Here the new binding has the same A2A peer, so the same
+    /// MICV key, and the same addresses, but other ports: the packet
+    /// expands with the new binding's ports and fails the MICV check, so
+    /// it is dropped and counted as `MicvFailure`, never delivered. This
+    /// pins existing behaviour that the dev-context docs rely on.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_packet_on_a_reused_dlt_id_as_micv_failure() {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::tc::Ip5TupleTc;
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+        // The original flow's packet and its five-tuple.
+        let (_, body) = compress::tests::TEST_CASES
+            .iter()
+            .find(|(desc, _)| *desc == "TCP mid-stream (TLS)")
+            .unwrap();
+        let mut original = Packet::new(
+            Box::new([0u8; PACKET_BUFFER_SIZE]),
+            config::DEFAULT_MESSAGE_HEADROOM,
+        );
+        original.put(*body);
+        let (metadata, pkt_body) = original.metadata_mut_and_body_mut();
+        classifier::classify(metadata.five_tuple_mut(), pkt_body).unwrap();
+        let old_tuple = *original.metadata().five_tuple();
+
+        // Both bindings have the same A2A peer, so the same MICV key.
+        let peer = x25519_dalek::PublicKey::from(&x25519_dalek::ReusableSecret::random());
+        let old_pep = DltPep::new(
+            Ip5TupleTc::new(old_tuple),
+            Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+        );
+        let micv_key = old_pep.a2a_micv_key.unwrap();
+        let compression_mode = old_pep.tc.compression_mode();
+        let tether_id = asm.dlt.insert(old_pep).unwrap();
+
+        // The packet as the sending adapter seals it for the old binding
+        // (`actor_output_post_classify`): the MICV over the uncompressed
+        // packet, then compression, the MAC and the A2A header.
+        let sealed = || {
+            let mut pkt = Packet::new(
+                Box::new([0u8; PACKET_BUFFER_SIZE]),
+                config::DEFAULT_MESSAGE_HEADROOM,
+            );
+            pkt.put(*body);
+            let micv = blake3::keyed_hash(&micv_key, pkt.body());
+            compress::compress(
+                compression_mode,
+                old_tuple.l3_type,
+                old_tuple.l4_protocol,
+                &mut pkt,
+            );
+            pkt.put(&micv.as_bytes()[..zdp::ZDP_A2A_MAC_SIZE]);
+            pkt.alloc_zeroed_header::<zdp::ZdpA2aHeader>().a2a_said = 0;
+            pkt
+        };
+
+        // Control: on its own binding the packet is delivered.
+        let mut worker = test_worker(asm.clone());
+        worker.actor_input(tether_id, sealed());
+        assert_eq!(
+            worker.actor_input_q.len(),
+            1,
+            "delivered on its own binding"
+        );
+        worker.actor_input_q.clear();
+
+        // The old binding is unbound and its DLT ID reused for a binding
+        // with other ports. The slab frees a removed slot only once its
+        // RCU readers are gone, so when the ID comes back is not
+        // deterministic; `actor_input` sees only the PEP its ID names, so
+        // the old packet is sent to the new binding's ID instead.
+        asm.dlt.remove(tether_id);
+        let new_tuple = crate::defs::FiveTuple {
+            src_port: old_tuple.src_port.wrapping_add(1),
+            dst_port: old_tuple.dst_port.wrapping_add(1),
+            ..old_tuple
+        };
+        let new_pep = DltPep::new(
+            Ip5TupleTc::new(new_tuple),
+            Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+        );
+        assert_eq!(
+            new_pep.a2a_micv_key,
+            Some(micv_key),
+            "same A2A peer, same key"
+        );
+        let reused_id = asm.dlt.insert(new_pep).unwrap();
+
+        worker.actor_input(reused_id, sealed());
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+            1
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::BadStructure].get_count(),
+            0
+        );
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
     #[test]
     fn test_decrypt_null_rejects_short_packet() {
         for body in [&[][..], &[0u8][..], &[0u8, 0][..]] {

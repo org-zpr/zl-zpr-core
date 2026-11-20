@@ -369,7 +369,7 @@ pub fn expand(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::classifier;
     use crate::config;
@@ -500,7 +500,9 @@ mod tests {
         }
     }
 
-    const TEST_CASES: &[(&str, &[u8])] = &[
+    /// Uncompressed packets, by description; the fast path's tests use
+    /// them too.
+    pub(crate) const TEST_CASES: &[(&str, &[u8])] = &[
         (
             "ICMP Echo (ping) request",
             &[

@@ -38,3 +38,40 @@ pub async fn launch(asm: Arc<Assembly>, link_id: LinkId) {
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+
+    /// zl-zipline#283 (local Codex review): an idle worker must not hold a
+    /// peer-table RCU guard while it waits. With the default
+    /// `rcu-crossbeam-epoch` backend that guard pins the epoch of the
+    /// thread every `spawn_local` task runs on, so no RCU table frees what
+    /// it retired: an unbound DLT slot never comes back, and the DLT fills
+    /// up however often the node unbinds. Here a worker for the dock link
+    /// waits with nothing to retry, on this test's thread; the thread must
+    /// not be pinned. (The epoch is global, so whether retired slots are
+    /// reused also depends on every other thread, including other tests';
+    /// this thread's pin is the part a worker controls.)
+    #[cfg(feature = "rcu-crossbeam-epoch")]
+    #[tokio::test(flavor = "local")]
+    async fn test_an_idle_worker_does_not_pin_the_rcu_epoch() {
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let (_, dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+        assert!(
+            !crossbeam_epoch::is_pinned(),
+            "pinned before the worker runs"
+        );
+
+        tokio::task::spawn_local(launch(asm.clone(), dock.get()));
+        tokio::task::yield_now().await; // the worker now waits in `select!`
+
+        assert!(
+            !crossbeam_epoch::is_pinned(),
+            "an idle ZDP-R worker pins the RCU epoch, so retired DLT slots are never freed"
+        );
+    }
+}

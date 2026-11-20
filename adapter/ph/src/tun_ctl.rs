@@ -22,7 +22,8 @@ pub trait TunCtl: Sync {
     fn add_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()>;
 
     /// Add AAA as a valid but non-preferred source; authentication binds it explicitly.
-    // AAA kept unused in v1 (zodes plan §5.4)
+    // AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    // Design decisions, "AAA kept, unused")
     #[cfg_attr(not(test), allow(dead_code))]
     fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> Result<()>;
 

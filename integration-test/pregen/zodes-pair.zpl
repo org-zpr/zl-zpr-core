@@ -4,8 +4,7 @@
 # The relay docks the visa service; zb and zc join through it. Each Zode
 # may ping the visa service and the visa service each Zode. Between the
 # joiners only Zb -> PingableZc and Zc -> PingableZb are allowed, so a ping
-# reply between them shows the traffic carried the sender's own identity
-# (Zodes plan W4).
+# reply between them shows the traffic carried the sender's own identity.
 
 define zode as a device with zpr.adapter.cn.
 

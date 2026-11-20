@@ -233,7 +233,9 @@ pub struct Config {
     pub(crate) control_path_derived: bool,
 
     /// Node only — whether this node carries other nodes' traffic, that is,
-    /// accepts forward-only visas (zl-zipline#219, Zodes plan §5.7, §5.9).
+    /// accepts forward-only visas (zl-zipline#219; zl-zpr-dev-context
+    /// docs/SECURITY_MODEL.md, Design decisions, "Non-transit has two
+    /// halves").
     /// Off by default: with it off, a forward-only visa from the visa
     /// service is refused and logged. Configured via `forwarding` in the
     /// `[node]` config section or `ph zode --forwarding`.

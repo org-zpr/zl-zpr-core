@@ -950,7 +950,8 @@ mod test {
         }
     }
 
-    /// AAA kept unused in v1 (zodes plan §5.4): the AAA TLV round-trips. A
+    /// AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    /// Design decisions, "AAA kept, unused"): the AAA TLV round-trips. A
     /// HelloResponse that `send_hello_success_response` sends with an AAA
     /// address decodes, on a link that is not a Zode link (a Zode link
     /// refuses the TLV), to a ReceivedHelloResponse carrying that address.

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
-# Two Zodes join through the relay at once (zl-zipline#254; Zodes plan W3,
-# and W4 against the visa service), docs/ZODE_LINKS.md J1-J5 and J11.
+# Two Zodes join through the relay at once (zl-zipline#254),
+# docs/ZODE_LINKS.md J1-J5 and J11. W4 below is the one-actor endpoint, a
+# work item of the retired plan in org-zpr/zipline:
+# `git show 0686fd8:docs/plans/2026-11-11-zodes.md`, §6.
 #
 # A relay Zode (relay = true) hosts the visa service (zl-zipline#229).
 # Zodes zb and zc are both in the relay's topology (pregen/zodes-pair.zplc) and start together,

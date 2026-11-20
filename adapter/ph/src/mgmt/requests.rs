@@ -64,8 +64,9 @@ pub fn send_hello_request(
 
 /// Send a successful HelloResponse on `link_id`. A Zode answering a Zode
 /// link passes no AAA address and no identity providers (zl-zipline#250).
-/// The `aaa_address` parameter stays: AAA kept unused in v1 (zodes plan
-/// §5.4).
+/// The `aaa_address` parameter stays: AAA kept unused in v1
+/// (zl-zpr-dev-context docs/ZODE_LINKS.md, Design decisions, "AAA kept,
+/// unused").
 ///
 /// `oidc_idps` advertises off-net OIDC identity providers (one `OIDC_IDP` TLV
 /// each); empty when the visa service has none configured.

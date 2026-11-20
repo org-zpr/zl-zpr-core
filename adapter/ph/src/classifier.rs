@@ -511,6 +511,34 @@ mod tests {
         assert_eq!(0u8, metadata.get_l4_protocol());
     }
 
+    /// zl-zipline#283 (Copilot round 4): a body too short for the ICMP,
+    /// ICMPv6 or IPv6 extension header its protocol names is refused with
+    /// an error, never a panic. The receiving Zode classifies a packet a
+    /// peer chose, after its MICV has passed.
+    #[test]
+    fn test_truncated_l4_and_extension_headers_are_refused() {
+        // Each protocol and the length of the shortest header it parses.
+        for (protocol, header_len) in [
+            (ip_number::ICMP, size_of::<ICMPHeader>()),
+            (ip_number::IPV6_ICMP, size_of::<ICMPv6Header>()),
+            (ip_number::HOPOPT, 8),
+            (ip_number::IPV6_ROUTE, 8),
+            (ip_number::IPV6_OPTS, 8),
+            (ip_number::IPV6_FRAG, 8),
+            (ip_number::AH, 8),
+        ] {
+            for len in 0..header_len {
+                let body = vec![0u8; len];
+                let mut ft = FiveTuple::default();
+                assert!(
+                    classify_next_header(&mut ft, &body, protocol, &ClassifierOptions::default())
+                        .is_err(),
+                    "protocol {protocol}, {len} bytes"
+                );
+            }
+        }
+    }
+
     // Begin IPv4 tests
 
     #[test]

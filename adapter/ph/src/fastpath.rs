@@ -1677,6 +1677,87 @@ mod test {
         }
     }
 
+    /// zl-zipline#283 (Copilot round 4): the classifier check runs on a
+    /// packet whose MICV has passed, but the A2A peer that computed that
+    /// MICV chose the body. An ICMP or ICMPv6 body shorter than its 4-byte
+    /// header, sealed with a valid MICV, is dropped and counted as
+    /// `ClassifierMismatch`, never a panic.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_truncated_icmp_body_with_a_valid_micv() {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::tc::Ip5TupleTc;
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let peer = x25519_dalek::PublicKey::from(&x25519_dalek::ReusableSecret::random());
+        let packet_of = |bytes: &[u8]| {
+            let mut pkt = Packet::new(
+                Box::new([0u8; PACKET_BUFFER_SIZE]),
+                config::DEFAULT_MESSAGE_HEADROOM,
+            );
+            pkt.put(bytes);
+            pkt
+        };
+
+        for desc in ["ICMP Echo (ping) request", "ICMPv6 Neighbor Soliciation"] {
+            // The test packet, its five-tuple and a binding for it.
+            let (_, body) = compress::tests::TEST_CASES
+                .iter()
+                .find(|(d, _)| *d == desc)
+                .unwrap();
+            let mut pkt = packet_of(body);
+            let (metadata, pkt_body) = pkt.metadata_mut_and_body_mut();
+            classifier::classify(metadata.five_tuple_mut(), pkt_body).unwrap();
+            let tuple = *pkt.metadata().five_tuple();
+            let pep = DltPep::new(
+                Ip5TupleTc::new(tuple),
+                Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+            );
+            let micv_key = pep.a2a_micv_key.unwrap();
+            let compression_mode = pep.tc.compression_mode();
+            let tether_id = asm.dlt.insert(pep).unwrap();
+
+            // Compression keeps ICMP as is, so the ICMP header starts where
+            // the compressed packet has as many bytes left as the original
+            // has after its IP header.
+            let ip_header_len = match tuple.l3_type {
+                L3Type::Ipv4 => usize::from(body[0] & 0x0f) * 4,
+                _ => size_of::<IPv6Header>(),
+            };
+            compress::compress(compression_mode, tuple.l3_type, tuple.l4_protocol, &mut pkt);
+            let icmp_start = pkt.body().len() - (body.len() - ip_header_len);
+
+            let mut worker = test_worker(asm.clone());
+            for icmp_len in 0..4 {
+                let compressed = &pkt.body()[..icmp_start + icmp_len];
+                // The MICV over the packet as the receiver expands it, so
+                // it passes.
+                let mut expanded = packet_of(compressed);
+                compress::expand(compression_mode, &tuple, &mut expanded).unwrap();
+                let micv = blake3::keyed_hash(&micv_key, expanded.body());
+                let mut sealed = packet_of(compressed);
+                sealed.put(&micv.as_bytes()[..zdp::ZDP_A2A_MAC_SIZE]);
+                sealed.alloc_zeroed_header::<zdp::ZdpA2aHeader>().a2a_said = 0;
+
+                worker.actor_input(tether_id, sealed);
+            }
+
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::ClassifierMismatch].get_count(),
+                4,
+                "{desc}"
+            );
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+                0,
+                "{desc}: the MICV is valid"
+            );
+            assert!(
+                worker.actor_input_q.is_empty(),
+                "{desc}: nothing is delivered"
+            );
+        }
+    }
+
     #[test]
     fn test_decrypt_null_rejects_short_packet() {
         for body in [&[][..], &[0u8][..], &[0u8, 0][..]] {

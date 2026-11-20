@@ -1508,13 +1508,22 @@ mod test {
 
     /// zl-zipline#283: DLT IDs have no quarantine, so a packet sent on a
     /// stream whose DLT ID was unbound and reused can reach the new
-    /// binding. Here the new binding has the same A2A peer, so the same
-    /// MICV key, and the same addresses, but other ports: the packet
-    /// expands with the new binding's ports and fails the MICV check, so
-    /// it is dropped and counted as `MicvFailure`, never delivered. This
-    /// pins existing behaviour that the dev-context docs rely on.
-    #[tokio::test(flavor = "local")]
-    async fn test_actor_input_drops_a_packet_on_a_reused_dlt_id_as_micv_failure() {
+    /// binding. This seals the `desc` test packet for a binding whose
+    /// classifier is that packet's own five-tuple, checks that it is
+    /// delivered there (the control), then unbinds that binding and sends
+    /// the same packet to a new binding with the same A2A peer (so the
+    /// same MICV key) and the classifier `new_tuple` makes from the old
+    /// one. Returns the worker, so the caller can check what happened to
+    /// the second packet.
+    ///
+    /// The slab frees a removed slot only once its RCU readers are gone,
+    /// so when an ID comes back is not deterministic; `actor_input` sees
+    /// only the PEP its ID names, so the old packet is sent to the new
+    /// binding's ID instead.
+    fn send_on_reused_dlt_id(
+        desc: &str,
+        new_tuple: impl FnOnce(&crate::defs::FiveTuple) -> crate::defs::FiveTuple,
+    ) -> FastpathWorker {
         use crate::adapter_tables::DltPep;
         use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
         use crate::tc::Ip5TupleTc;
@@ -1523,7 +1532,7 @@ mod test {
         // The original flow's packet and its five-tuple.
         let (_, body) = compress::tests::TEST_CASES
             .iter()
-            .find(|(desc, _)| *desc == "TCP mid-stream (TLS)")
+            .find(|(d, _)| *d == desc)
             .unwrap();
         let mut original = Packet::new(
             Box::new([0u8; PACKET_BUFFER_SIZE]),
@@ -1571,23 +1580,14 @@ mod test {
         assert_eq!(
             worker.actor_input_q.len(),
             1,
-            "delivered on its own binding"
+            "{desc}: delivered on its own binding"
         );
         worker.actor_input_q.clear();
 
-        // The old binding is unbound and its DLT ID reused for a binding
-        // with other ports. The slab frees a removed slot only once its
-        // RCU readers are gone, so when the ID comes back is not
-        // deterministic; `actor_input` sees only the PEP its ID names, so
-        // the old packet is sent to the new binding's ID instead.
+        // The old binding is unbound and its DLT ID reused.
         asm.dlt.remove(tether_id);
-        let new_tuple = crate::defs::FiveTuple {
-            src_port: old_tuple.src_port.wrapping_add(1),
-            dst_port: old_tuple.dst_port.wrapping_add(1),
-            ..old_tuple
-        };
         let new_pep = DltPep::new(
-            Ip5TupleTc::new(new_tuple),
+            Ip5TupleTc::new(new_tuple(&old_tuple)),
             Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
         );
         assert_eq!(
@@ -1598,6 +1598,20 @@ mod test {
         let reused_id = asm.dlt.insert(new_pep).unwrap();
 
         worker.actor_input(reused_id, sealed());
+        worker
+    }
+
+    /// zl-zipline#283: a packet on a reused DLT ID whose new binding has
+    /// the same A2A peer and addresses but other ports expands with the
+    /// new binding's ports and fails the MICV check, so it is dropped and
+    /// counted as `MicvFailure`, never delivered.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_packet_on_a_reused_dlt_id_as_micv_failure() {
+        let worker = send_on_reused_dlt_id("TCP mid-stream (TLS)", |old| crate::defs::FiveTuple {
+            src_port: old.src_port.wrapping_add(1),
+            dst_port: old.dst_port.wrapping_add(1),
+            ..*old
+        });
 
         assert_eq!(
             worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
@@ -1608,6 +1622,44 @@ mod test {
             0
         );
         assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// zl-zipline#283: an ICMP or ICMPv6 classifier keeps the type in its
+    /// source port and the code in its destination port, but compression
+    /// leaves ICMP alone, so `expand` does not rebuild them and the MICV
+    /// still matches when a reused DLT ID's new binding has the same A2A
+    /// peer and addresses. The new binding's classifier must still refuse
+    /// a type it does not admit: the packet is dropped and counted as
+    /// `ClassifierMismatch`, never delivered.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_an_icmp_packet_the_reused_dlt_id_does_not_admit() {
+        // Echo Request (type 8) on a binding for Timestamp (type 13), and
+        // Neighbor Solicitation (type 135) on one for Neighbor
+        // Advertisement (type 136).
+        for (desc, new_type) in [
+            ("ICMP Echo (ping) request", 13),
+            ("ICMPv6 Neighbor Soliciation", 136),
+        ] {
+            let worker = send_on_reused_dlt_id(desc, |old| crate::defs::FiveTuple {
+                src_port: new_type,
+                ..*old
+            });
+
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::ClassifierMismatch].get_count(),
+                1,
+                "{desc}"
+            );
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+                0,
+                "{desc}: the MICV still matches"
+            );
+            assert!(
+                worker.actor_input_q.is_empty(),
+                "{desc}: nothing is delivered"
+            );
+        }
     }
 
     #[test]

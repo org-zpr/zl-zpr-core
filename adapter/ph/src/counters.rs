@@ -103,6 +103,7 @@ pub enum FastpathCounterType {
     EncryptionFailure,
     UnknownStreamId,
     BadStructure,
+    ClassifierMismatch, // the packet does not match its stream's classifier (zl-zipline#283)
     OtherError,
 
     TtlExpired,
@@ -202,6 +203,7 @@ impl FastpathCounterType {
             Self::EncryptionFailure => "Encryption Failure",
             Self::UnknownStreamId => "Unknown Stream ID",
             Self::BadStructure => "Fastpath Bad Structure",
+            Self::ClassifierMismatch => "Classifier Mismatch",
             Self::OtherError => "Fastpath Other Error",
 
             Self::TtlExpired => "TTL Reached 0",

@@ -364,13 +364,13 @@ impl VisaTable {
     /// binding would otherwise keep a dead session's visa current, and its
     /// expiry would leave the flow with no visa (removal never promotes an
     /// older visa). The fresh pair is then the only visa for those flows.
-    /// Returns the forwarding entries the revocation withdrew; the caller
-    /// handles them after it releases the visa-table lock (zipline#9).
+    /// Returns the bindings the revocation removed; the caller handles them
+    /// after it releases the visa-table lock (zipline#9).
     pub fn regrant_vs_visas(
         &mut self,
         peer_table: &peer_table::PeerTable,
         node_addr: &IpAddr,
-    ) -> Vec<ForwardingEntry> {
+    ) -> Vec<StreamBinding> {
         let withdrawn = self.revoke_by_vs_api_flow(peer_table, node_addr, true);
         for visa in self_granted_vs_visas(node_addr) {
             self.insert_visa(visa)
@@ -384,13 +384,13 @@ impl VisaTable {
     /// visa except those for its own VS-API flows, which carry the reset
     /// itself: nothing the visa service granted it earlier may stay usable
     /// here once the service no longer counts it as installed. Returns the
-    /// withdrawn forwarding entries; the caller handles them after it
-    /// releases the visa-table lock (zipline#9).
+    /// removed bindings; the caller handles them after it releases the
+    /// visa-table lock (zipline#9).
     pub fn retain_vs_api_visas(
         &mut self,
         peer_table: &peer_table::PeerTable,
         node_addr: &IpAddr,
-    ) -> Vec<ForwardingEntry> {
+    ) -> Vec<StreamBinding> {
         self.revoke_by_vs_api_flow(peer_table, node_addr, false)
     }
 
@@ -398,13 +398,13 @@ impl VisaTable {
     /// flows of the node at `node_addr` (`vs_api` true), or every visa whose
     /// five-tuple is not (`vs_api` false). The VS-API flows are those of
     /// [self_granted_vs_visas]; the bootstrap and J5a visas share them.
-    /// Returns the withdrawn forwarding entries.
+    /// Returns the removed bindings.
     fn revoke_by_vs_api_flow(
         &mut self,
         peer_table: &peer_table::PeerTable,
         node_addr: &IpAddr,
         vs_api: bool,
-    ) -> Vec<ForwardingEntry> {
+    ) -> Vec<StreamBinding> {
         let vs_api_flows: Vec<FlowKey> = self_granted_vs_visas(node_addr)
             .into_iter()
             .filter_map(|visa| Visa::new(visa).ok()?.ftuple.as_ref().map(FlowKey::from))
@@ -781,10 +781,10 @@ impl VisaTable {
     /// flow is handled exactly as if that visa had never been held: with
     /// no live match, the caller asks the visa service for a new visa.
     ///
-    /// Returns the match, and the ingress entries of the streams that were
-    /// bound under the visas it ejected: the caller withdraws them from
-    /// their adapters ([crate::assembly::Assembly::withdraw_streams]) once
-    /// it has released the visa-table lock.
+    /// Returns the match, and the bindings of the visas it ejected: the
+    /// caller withdraws their streams from this Zode's own actor and unbinds
+    /// their DLT entries ([crate::assembly::Assembly::withdraw_streams])
+    /// once it has released the visa-table lock.
     ///
     /// Security: a visa is the visa service's permission for a flow, and
     /// only for its lifetime. Matching an expired one would admit a new
@@ -796,7 +796,7 @@ impl VisaTable {
         &mut self,
         peer_table: &peer_table::PeerTable,
         five_tuple: &FiveTuple,
-    ) -> (Option<VisaId>, Vec<ForwardingEntry>) {
+    ) -> (Option<VisaId>, Vec<StreamBinding>) {
         let five_tuple = VsapiFiveTuple::from(*five_tuple);
         let mut withdrawn = Vec::new();
         // Each pass either returns or ejects one visa, so this ends.
@@ -805,7 +805,7 @@ impl VisaTable {
                 return (None, withdrawn);
             };
             match self.eject_if_expired(peer_table, visa_id) {
-                Some(entries) => withdrawn.extend(entries),
+                Some(bindings) => withdrawn.extend(bindings),
                 None => return (Some(visa_id), withdrawn),
             }
         }
@@ -813,12 +813,12 @@ impl VisaTable {
 
     /// If this Zode holds the visa `visa_id` and it has expired, eject it,
     /// with its bindings and their PFT entries, through the one removal
-    /// path ([VisaTable::revoke]). Returns the ingress entries of its
-    /// bindings if it did, for the caller to withdraw from their adapters:
-    /// on expiry a node tears down the tethers to its adapters, so their
-    /// next packet binds afresh (VISA_SERVICE.md). Zode links get no
-    /// withdrawal (F5): every Zode on the path stops the stream at the
-    /// same expiry, on its own clock.
+    /// path ([VisaTable::revoke]). Returns its bindings if it did, for the
+    /// caller to tear down at this Zode's own actor and adapter: on expiry
+    /// a node tears down the tethers to its adapters, so their next packet
+    /// binds afresh (VISA_SERVICE.md). Zode links get nothing (F5): every
+    /// Zode on the path stops the stream at the same expiry, on its own
+    /// clock.
     ///
     /// A match ejects at once, so a new flow never waits for the expiry
     /// sweep ([VisaTable::handle_expirations], zl-zipline#274), which frees
@@ -827,7 +827,7 @@ impl VisaTable {
         &mut self,
         peer_table: &peer_table::PeerTable,
         visa_id: VisaId,
-    ) -> Option<Vec<ForwardingEntry>> {
+    ) -> Option<Vec<StreamBinding>> {
         let now = SystemTime::now();
         let expired = self
             .table
@@ -843,13 +843,14 @@ impl VisaTable {
 
     /// Revoke (or otherwise remove) a visa.
     ///
-    /// Returns the withdrawn forwarding entries (empty if the visa was
-    /// already gone) so callers may notify affected peers.
+    /// Returns the removed bindings (empty if the visa was already gone) so
+    /// callers may tear their streams down at this Zode's own actor and
+    /// adapter ([crate::assembly::Assembly::withdraw_streams]).
     pub fn revoke(
         &mut self,
         peer_table: &peer_table::PeerTable,
         visa_id: VisaId,
-    ) -> Result<Vec<ForwardingEntry>, VisaTableError> {
+    ) -> Result<Vec<StreamBinding>, VisaTableError> {
         // The only error from `revoke_no_rebuild` is a HashMap::remove miss. If the visa
         // is gone we consider it "revoked".
         let withdrawn = self
@@ -871,8 +872,8 @@ impl VisaTable {
     /// - No stream enters over a Zode link (this Zode is the ingress, from
     ///   its own actor, or the visa has no stream left, such as a visa a
     ///   J11 commit moved its streams off): freed at its expiry. The
-    ///   returned ingress entries are withdrawn from the actor, so its next
-    ///   packet binds afresh, under a new visa or not at all.
+    ///   returned bindings' streams are withdrawn from the actor, so its
+    ///   next packet binds afresh, under a new visa or not at all.
     /// - A stream enters over a Zode link (transit, or egress from an
     ///   upstream Zode): freed only [config::STREAM_ID_REUSE_GRACE] after
     ///   its expiry. Until then its PFT slot stays occupied, so its stream
@@ -883,10 +884,12 @@ impl VisaTable {
     /// [config::STREAM_ID_REUSE_GRACE] (zl-zipline#282), like those of
     /// every other removal ([peer_table::PeerTable::remove_route]).
     ///
-    /// Returns the withdrawn forwarding entries. Expiry notifies no peer
-    /// over a Zode link: every Zode on the path holds the same expiry and
-    /// stops on its own clock ([crate::assembly::Assembly::withdraw_streams]
-    /// sends only to this Zode's own actor and dock).
+    /// Returns the removed bindings. Expiry notifies no peer over a Zode
+    /// link: every Zode on the path holds the same expiry and stops on its
+    /// own clock ([crate::assembly::Assembly::withdraw_streams] sends only
+    /// to this Zode's own actor and adapter). At a destination Zode the
+    /// stream enters over a Zode link, so its DLT entry is unbound when the
+    /// grace ends and the visa is freed (zl-zipline#283).
     ///
     /// The lookup table is rebuilt only if a visa was freed: this runs
     /// every [config::VISA_EXPIRY_SWEEP_INTERVAL].
@@ -894,7 +897,7 @@ impl VisaTable {
         &mut self,
         peer_table: &peer_table::PeerTable,
         now: SystemTime,
-    ) -> Vec<ForwardingEntry> {
+    ) -> Vec<StreamBinding> {
         let now_utc = DateTime::<Utc>::from(now);
         let mut withdrawn = Vec::new();
         let mut in_grace = Vec::new();
@@ -924,8 +927,8 @@ impl VisaTable {
                 continue;
             }
             info!(target: VISA_MGMT, "visa {} has expired: ejecting it", timeout_entry.id);
-            if let Ok(entries) = self.revoke_no_rebuild(peer_table, timeout_entry.id) {
-                withdrawn.extend(entries);
+            if let Ok(bindings) = self.revoke_no_rebuild(peer_table, timeout_entry.id) {
+                withdrawn.extend(bindings);
                 freed_any = true;
             }
         }
@@ -961,10 +964,11 @@ impl VisaTable {
     /// where a flow starts, the next packet then finds no visa and asks for
     /// one (F6).
     ///
-    /// Returns the ingress entries of every revoked binding (on surviving
-    /// links too) so the caller can withdraw those streams from adapters
-    /// (`Assembly::withdraw_streams`, which skips the lost link and Zode
-    /// links, F5). The caller sends OUTSIDE the visa-table lock: this runs
+    /// Returns every revoked binding (on surviving links too) so the caller
+    /// can withdraw those streams from this Zode's own actor and unbind
+    /// their DLT entries (`Assembly::withdraw_streams`, which skips the
+    /// lost link and Zode links, F5). The caller sends OUTSIDE the
+    /// visa-table lock: this runs
     /// under the table's write lock, and the send path takes the peer's
     /// `zdpr_send` mutex, which must never nest under it (zipline#9).
     ///
@@ -977,7 +981,7 @@ impl VisaTable {
         &mut self,
         link_id: LinkId,
         peer_table: &peer_table::PeerTable,
-    ) -> Vec<ForwardingEntry> {
+    ) -> Vec<StreamBinding> {
         let to_revoke: Vec<VisaId> = self
             .visas_bound_over(link_id)
             .into_iter()
@@ -987,8 +991,8 @@ impl VisaTable {
         if !to_revoke.is_empty() {
             info!(target: VISA_MGMT, "ejecting {} visa(s) for removed link {link_id}", to_revoke.len());
             for visa_id in to_revoke {
-                if let Ok(entries) = self.revoke_no_rebuild(peer_table, visa_id) {
-                    withdrawn.extend(entries);
+                if let Ok(bindings) = self.revoke_no_rebuild(peer_table, visa_id) {
+                    withdrawn.extend(bindings);
                 }
             }
             self.rebuild_lookup_table();
@@ -1021,27 +1025,23 @@ impl VisaTable {
     /// only path that removes bindings: revocation, expiry and link loss
     /// all come here.
     ///
-    /// Returns each binding's ingress entry: the link the requestor bound
-    /// over and the stream ID it sends with, which is all a withdrawal to
-    /// that requestor needs.
+    /// Returns the removed bindings, both sides of each: the ingress is
+    /// the link the requestor bound over and the stream ID it sends with,
+    /// which a withdrawal to that requestor needs; the egress, at a
+    /// destination Zode, is the DLT entry this Zode's own adapter granted,
+    /// which an unbind needs (zl-zipline#283).
     fn revoke_no_rebuild(
         &mut self,
         peer_table: &peer_table::PeerTable,
         visa_id: VisaId,
-    ) -> Result<Vec<ForwardingEntry>, VisaTableError> {
+    ) -> Result<Vec<StreamBinding>, VisaTableError> {
         let Some(visa) = self.table.remove(&visa_id) else {
             return Err(VisaTableError::NotFound(visa_id));
         };
         self.forget_supersede_state(visa_id, &visa);
-        let withdrawn: Vec<ForwardingEntry> = self
-            .bindings
-            .remove(&visa_id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|binding| binding.ingress)
-            .collect();
-        for entry in &withdrawn {
-            peer_table.remove_route(entry.clone());
+        let withdrawn = self.bindings.remove(&visa_id).unwrap_or_default();
+        for binding in &withdrawn {
+            peer_table.remove_route(binding.ingress.clone());
         }
         info!(target: VISA_MGMT, "Revoked visa {visa_id}");
         Ok(withdrawn)
@@ -1279,6 +1279,15 @@ pub mod tests {
         }
     }
 
+    /// The ingress entries of the removed `bindings`: the streams a
+    /// withdrawal names.
+    fn ingresses(bindings: Vec<StreamBinding>) -> Vec<ForwardingEntry> {
+        bindings
+            .into_iter()
+            .map(|binding| binding.ingress)
+            .collect()
+    }
+
     /// A ZPR address used as the next hop of forward-only visas in tests.
     fn next_hop_addr() -> IpAddr {
         "fd5a:5052:8::99".parse().unwrap()
@@ -1406,7 +1415,7 @@ pub mod tests {
         assert_eq!(peer_a.pft.len(), 3);
 
         // Revocation returns the withdrawn entry.
-        let withdrawn = visa_table.revoke(&asm.peer_table, 5001).unwrap();
+        let withdrawn = ingresses(visa_table.revoke(&asm.peer_table, 5001).unwrap());
         assert!(withdrawn == vec![ForwardingEntry(link_a, tether_revoked)]);
         assert!(!visa_table.table.contains_key(&5001));
         assert_eq!(
@@ -1766,7 +1775,7 @@ pub mod tests {
             .bind(visa_id, binding_on(link_b, tether_b), SystemTime::now())
             .unwrap();
 
-        let withdrawn = visa_table.revoke_for_link(link_a, &asm.peer_table);
+        let withdrawn = ingresses(visa_table.revoke_for_link(link_a, &asm.peer_table));
 
         assert_eq!(withdrawn.len(), 2);
         assert!(withdrawn.contains(&ForwardingEntry(link_a, tether_a)));
@@ -2060,7 +2069,7 @@ pub mod tests {
             ))
             .unwrap();
 
-        let withdrawn = visa_table.retain_vs_api_visas(&peer_table, &addr);
+        let withdrawn = ingresses(visa_table.retain_vs_api_visas(&peer_table, &addr));
         assert!(
             withdrawn == vec![ForwardingEntry(4, 9)],
             "the bound visa's stream is withdrawn"
@@ -2154,7 +2163,7 @@ pub mod tests {
             )
             .unwrap();
 
-        let withdrawn = visa_table.revoke_for_link(link_b, &asm.peer_table);
+        let withdrawn = ingresses(visa_table.revoke_for_link(link_b, &asm.peer_table));
 
         assert!(withdrawn == vec![ForwardingEntry(link_a, tether)]);
         assert!(!visa_table.contains(5300));
@@ -2287,7 +2296,7 @@ pub mod tests {
         let (matched, withdrawn) = visa_table.match_traffic(&asm.peer_table, &client_to_service());
         assert_eq!(matched, None);
         assert!(
-            withdrawn == vec![ForwardingEntry(link_a, tether)],
+            ingresses(withdrawn) == vec![ForwardingEntry(link_a, tether)],
             "the live stream is handed back, to be withdrawn from its adapter"
         );
         assert!(!visa_table.contains(7600));
@@ -3103,7 +3112,7 @@ pub mod tests {
         assert!(withdrawn.is_empty());
         assert!(visa_table.contains(7800), "held until its expiry");
 
-        let withdrawn = visa_table.handle_expirations(&asm.peer_table, expires);
+        let withdrawn = ingresses(visa_table.handle_expirations(&asm.peer_table, expires));
         assert!(withdrawn == vec![ForwardingEntry(link_a, tether)]);
         assert!(!visa_table.contains(7800));
         assert!(pft_entry(&asm, link_a, tether).is_none());
@@ -3169,7 +3178,7 @@ pub mod tests {
         assert_eq!(visa_table.timeout_queue.len(), 1, "looked at again");
 
         let after_the_grace = expires + config::STREAM_ID_REUSE_GRACE + Duration::from_secs(1);
-        let withdrawn = visa_table.handle_expirations(&asm.peer_table, after_the_grace);
+        let withdrawn = ingresses(visa_table.handle_expirations(&asm.peer_table, after_the_grace));
         assert!(withdrawn == vec![ingress]);
         assert!(!visa_table.contains(7810));
         assert!(pft_entry(&asm, upstream, tether).is_none());

@@ -456,3 +456,28 @@ pub fn send_stream_id_withdrawal<'a>(
         req,
     )
 }
+
+/// send an Unbind Egress Stream Indication message (ZdpPacketType 13)
+///
+/// Node -> its own adapter, per-flow, over the local actor link only:
+/// "this Zode no longer forwards to the stream id you granted; drop it from
+/// your DLT" (zl-zipline#283). `stream_id` is the DLT id the adapter
+/// granted for the binding. Never sent on a Zode link (F5): the caller,
+/// [crate::assembly::Assembly::unbind_local_egress], checks.
+pub fn send_unbind_egress_stream_indication<'a>(
+    asm: &'a Assembly,
+    link_id: LinkId,
+    stream_id: StreamId,
+) -> Sent<'a> {
+    debug!(target: ZDP, "{}: sending UnbindEgressStreamIndication", asm.formatted_link_id(link_id));
+
+    let req = core::new_heap_packet();
+
+    core::send_per_flow_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::UnbindEgressStreamIndication,
+        stream_id,
+        req,
+    )
+}

@@ -248,13 +248,6 @@ impl PeerForwardingTable {
         Ok(self.vacant_entry()?.insert(pep))
     }
 
-    pub fn remove(&self, tether_id: StreamId) {
-        let mut table = self.table.lock().unwrap();
-        let new_reader = table.remove((tether_id as usize).wrapping_sub(1));
-        std::mem::drop(table);
-        self.reader.write(new_reader);
-    }
-
     /// Remove the stream `tether_id` and put its slot into quarantine
     /// until `now` + [STREAM_ID_REUSE_GRACE] (zl-zipline#282). From now on
     /// the stream forwards nothing and lookups do not find it

@@ -2162,6 +2162,43 @@ pub mod tests {
         assert_eq!(peer_a.pft.len(), 0);
     }
 
+    /// zl-zipline#283: a revocation returns each removed binding whole. At
+    /// a destination Zode the egress is the DLT entry this Zode's own
+    /// adapter granted on the local actor link, which the caller unbinds,
+    /// so it must not be dropped here.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_revoke_returns_the_removed_bindings_egress() {
+        use zpr::packet_info::LOCAL_ACTOR_LINK_ID;
+
+        let mut builder = TestAssemblyBuilder::new();
+        builder.visa_table = Some(VisaTable::new());
+        let asm = Arc::new(create_assembly(builder));
+        let zode = add_dummy_peer_of_type(&asm, LinkType::NodeToNode, 1);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        visa_table
+            .insert_visa(new_vsapi_visa_tcp_default(5310, never_expires()))
+            .unwrap();
+        let egress = ForwardingEntry(LOCAL_ACTOR_LINK_ID, 42);
+        let stream = asm
+            .peer_table
+            .get(zode)
+            .unwrap()
+            .pft
+            .insert(PftPep::new(egress.clone(), 5310, never_expires()))
+            .unwrap();
+        let binding = StreamBinding {
+            ingress: ForwardingEntry(zode, stream),
+            egress,
+        };
+        visa_table
+            .bind(5310, binding.clone(), SystemTime::now())
+            .unwrap();
+
+        let removed = visa_table.revoke(&asm.peer_table, 5310).unwrap();
+
+        assert!(removed == vec![binding]);
+    }
+
     /// Revocation and expiry remove a visa's bindings with it, so a visa
     /// granted again later under the same ID starts with none.
     #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task

@@ -43,7 +43,10 @@ pub struct PeerState {
     /// Which ZDP-R session `zdpr_send` / `zdpr_recv` currently represent.
     /// Incremented by [PeerState::reset_zdpr_session].
     zdpr_generation: atomic::AtomicU64,
-    pub zdpr_retry_timer_reset: Notify,
+    /// Wakes this link's ZDP-R worker to reset its retry timer. Shared, so
+    /// the worker can wait on it without holding a peer-table guard
+    /// ([crate::zdpr_worker::launch]).
+    pub zdpr_retry_timer_reset: Arc<Notify>,
     pub txn_mgr: Arc<txn_mgr::TxnMgr>,
     km_state: PeerKmState,
     /// The bootstrap visas installed for this Zode link (zl-zipline#252,
@@ -122,7 +125,7 @@ impl PeerState {
                 config::DEFAULT_ZDPR_RECEIVE_WINDOW_SIZE,
             )),
             zdpr_generation: atomic::AtomicU64::new(0),
-            zdpr_retry_timer_reset: Notify::new(),
+            zdpr_retry_timer_reset: Arc::new(Notify::new()),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),
             bootstrap_handoff: Mutex::new(None),
@@ -595,7 +598,7 @@ pub mod test {
                 config::DEFAULT_ZDPR_RECEIVE_WINDOW_SIZE,
             )),
             zdpr_generation: atomic::AtomicU64::new(0),
-            zdpr_retry_timer_reset: Notify::new(),
+            zdpr_retry_timer_reset: Arc::new(Notify::new()),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),
             bootstrap_handoff: Mutex::new(None),

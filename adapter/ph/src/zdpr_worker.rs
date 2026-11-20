@@ -6,20 +6,35 @@ use crate::prelude::*;
 use tokio::select;
 use tokio::time;
 
+/// The ZDP-R worker of the link `link_id`: resends what its peer has not
+/// acknowledged in time, until the peer leaves the peer table.
+///
+/// It takes a peer-table guard only for synchronous work, never across an
+/// `await`. With the default `rcu-crossbeam-epoch` backend a guard pins the
+/// epoch of the thread every `spawn_local` task runs on, and a worker idles
+/// for as long as its link has nothing to retry: a guard held while it
+/// waits keeps every RCU table from freeing what it retired, so an unbound
+/// DLT slot would never come back (zl-zipline#283).
 pub async fn launch(asm: Arc<Assembly>, link_id: LinkId) {
     let mut retry_interval = time::interval(config::DEFAULT_ZDPR_RETRY_TIMER);
     retry_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
     loop {
-        let Some(peer_state) = asm.peer_table.get(link_id) else {
-            // peer removed; we're done
-            break;
+        let (retry_needed, retry_timer_reset) = {
+            let Some(peer_state) = asm.peer_table.get(link_id) else {
+                // peer removed; we're done
+                break;
+            };
+            let retry_needed = peer_state.zdpr_send.lock().unwrap().retry_needed();
+            (retry_needed, peer_state.zdpr_retry_timer_reset.clone())
         };
-
-        let retry_needed = peer_state.zdpr_send.lock().unwrap().retry_needed();
 
         select! {
             _ = retry_interval.tick(), if retry_needed => {
+                let Some(peer_state) = asm.peer_table.get(link_id) else {
+                    // peer removed while we waited; we're done
+                    break;
+                };
                 let mut zdpr_send = peer_state.zdpr_send.lock().unwrap();
                 let mut count = 0;
 
@@ -34,7 +49,7 @@ pub async fn launch(asm: Arc<Assembly>, link_id: LinkId) {
                 zdpr_send.retry_cancels().for_each(|sn| mgmt::core::send_cancel(&asm, link_id, sn));
             }
 
-            () = peer_state.zdpr_retry_timer_reset.notified() => retry_interval.reset(),
+            () = retry_timer_reset.notified() => retry_interval.reset(),
         };
     }
 }

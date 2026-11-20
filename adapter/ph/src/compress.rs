@@ -298,13 +298,23 @@ pub fn compress(
     }
 }
 
+/// A compressed packet that cannot be expanded: it is too short for the
+/// headers its classifier says it carries, or a header field is invalid.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MalformedPacket;
+
 /// Expand a packet.  Fills payload length from body length, so trailers (e.g. A2A MAC) must not be present.
-pub fn expand(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &mut Packet) {
+pub fn expand(
+    compression_mode: CompressionMode,
+    five_tuple: &FiveTuple,
+    pkt: &mut Packet,
+) -> Result<(), MalformedPacket> {
     match five_tuple.l3_type {
         L3Type::Ipv4 => expand_ipv4(compression_mode, five_tuple, pkt),
         L3Type::Ipv6 => expand_ipv6(compression_mode, five_tuple, pkt),
         _ => (), // no compression defined for non-IP packets
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,13 +350,102 @@ mod tests {
                 SOURCE_PORT_PRESENT | DESTINATION_PORT_PRESENT,
             ] {
                 compress(compression_mode, ft.l3_type, ft.l4_protocol, &mut pkt);
-                expand(compression_mode, &ft, &mut pkt);
+                expand(compression_mode, &ft, &mut pkt).unwrap();
                 assert_eq!(
                     pkt.body(),
                     body,
                     "{desc}; compression mode 0x{compression_mode:02x}",
                 );
             }
+        }
+    }
+
+    /// A packet holding `body`, with the headroom a received packet has.
+    fn packet_of(body: &[u8]) -> Packet {
+        let buf = Box::new([0u8; config::PACKET_BUFFER_SIZE]);
+        let mut pkt = Packet::new(buf, config::DEFAULT_MESSAGE_HEADROOM);
+        pkt.put(body);
+        pkt
+    }
+
+    /// zl-zipline#283: `expand` reads only what the packet holds. Every
+    /// test case is compressed, then cut short at each length inside its
+    /// compressed IP and TCP/UDP headers; each cut is refused with an
+    /// error, never a panic. The body comes from a peer, and the
+    /// classifier it is expanded with may belong to another flow (a reused
+    /// DLT id), so its length cannot be trusted. This covers truncated
+    /// IPv4, IPv6, TCP and UDP headers, in every compression mode.
+    #[test]
+    fn test_expand_rejects_truncated_headers() {
+        for &(desc, body) in TEST_CASES {
+            let mut pkt = packet_of(body);
+            let (metadata, pkt_body) = pkt.metadata_mut_and_body_mut();
+            classifier::classify(metadata.five_tuple_mut(), pkt_body).unwrap();
+            let ft = *pkt.metadata().five_tuple();
+
+            // The uncompressed header lengths, so that what follows them
+            // (TCP options and payload) is the part compression keeps as is.
+            let ip_header_len = match ft.l3_type {
+                L3Type::Ipv4 => std::mem::size_of::<classifier::IPv4Header>(),
+                _ => std::mem::size_of::<classifier::IPv6Header>(),
+            };
+            let l4_header_len = match ft.l4_protocol {
+                net_defs::ip_number::TCP => std::mem::size_of::<classifier::TCPHeader>(),
+                net_defs::ip_number::UDP => std::mem::size_of::<classifier::UDPHeader>(),
+                _ => 0, // not compressed
+            };
+            let kept_len = body.len() - ip_header_len - l4_header_len;
+
+            for compression_mode in [
+                CompressionMode::default(),
+                SOURCE_PORT_PRESENT,
+                DESTINATION_PORT_PRESENT,
+                SOURCE_PORT_PRESENT | DESTINATION_PORT_PRESENT,
+            ] {
+                let mut pkt = packet_of(body);
+                compress(compression_mode, ft.l3_type, ft.l4_protocol, &mut pkt);
+                let compressed = pkt.body().to_vec();
+                let headers_len = compressed.len() - kept_len;
+
+                for len in 0..headers_len {
+                    let mut pkt = packet_of(&compressed[..len]);
+                    assert_eq!(
+                        expand(compression_mode, &ft, &mut pkt),
+                        Err(MalformedPacket),
+                        "{desc}; compression mode 0x{compression_mode:02x}; \
+                         {len} of {headers_len} header bytes",
+                    );
+                }
+            }
+        }
+    }
+
+    /// zl-zipline#283: a compressed IPv4 header whose header length is
+    /// shorter than an IPv4 header, or longer than the expanded packet, is
+    /// refused (the checksum is computed over that length).
+    #[test]
+    fn test_expand_rejects_a_bad_ipv4_header_length() {
+        // "UDP (NTP)", the first test case with a UDP payload.
+        let (_, body) = TEST_CASES[3];
+        let mut pkt = packet_of(body);
+        let (metadata, pkt_body) = pkt.metadata_mut_and_body_mut();
+        classifier::classify(metadata.five_tuple_mut(), pkt_body).unwrap();
+        let ft = *pkt.metadata().five_tuple();
+        let mode = CompressionMode::default();
+        compress(mode, ft.l3_type, ft.l4_protocol, &mut pkt);
+        let compressed = pkt.body().to_vec();
+
+        for hl in [0u8, 4, 15] {
+            // Keep only the compressed headers (IPv4 5 bytes, UDP 6), so the
+            // expanded packet is 28 bytes, shorter than a 60-byte header.
+            let mut cut = compressed[..11].to_vec();
+            cut[0] = (hl << 4) | (cut[0] & 0x0f);
+            let mut pkt = packet_of(&cut);
+            assert_eq!(
+                expand(mode, &ft, &mut pkt),
+                Err(MalformedPacket),
+                "header length {hl}"
+            );
         }
     }
 

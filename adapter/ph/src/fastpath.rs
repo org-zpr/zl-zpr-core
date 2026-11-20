@@ -536,7 +536,9 @@ impl FastpathWorker {
             config::DEFAULT_MESSAGE_HEADROOM,
         );
         temp.put(compressed);
-        compress::expand(compression_mode, &five_tuple, &mut temp);
+        if compress::expand(compression_mode, &five_tuple, &mut temp).is_err() {
+            return; // not a well-formed packet; leave it alone
+        }
 
         // Locate the ICMP header in the expanded packet and pick the echo-request
         // type for this family. (IPv4 header length is variable; the IPv6 header
@@ -625,13 +627,27 @@ impl FastpathWorker {
         a2a_mac[..a2a_mac_size].copy_from_slice(&pkt.body()[pkt.body().len() - a2a_mac_size..]);
         pkt.shrink_by(a2a_mac_size);
 
-        // lookup PEP in DLT and expand compressed packet
+        // Look up the PEP in the DLT and expand the compressed packet.
+        //
+        // zl-zipline#283: the DLT ID can name another flow by now. `forward`
+        // copied it out of the PFT before this lookup, and in between the
+        // node can unbind the old stream (type 13) and a new bind can reuse
+        // the freed slot; DLT IDs have no quarantine. Then the packet is
+        // expanded with the other flow's classifier and checked with its
+        // key. That is safe: `expand` refuses a body too short for that
+        // classifier (dropped as `BadStructure`), and a body it does expand
+        // fails the MICV check below, because the MICV covers the original
+        // flow's addresses and ports and is keyed with its A2A key. Either
+        // way the packet is dropped, never delivered to the wrong flow.
         let Some(pep) = self.asm.dlt.get(tether_id) else {
             self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
             return;
         };
 
-        compress::expand(pep.tc.compression_mode(), &pep.tc.five_tuple(), &mut pkt);
+        if compress::expand(pep.tc.compression_mode(), &pep.tc.five_tuple(), &mut pkt).is_err() {
+            drop(pep);
+            return self.drop_and_count(pkt, FastpathCounterType::BadStructure);
+        }
 
         // check A2A MAC
         // TODO: use actual A2A SAID
@@ -1451,6 +1467,43 @@ mod test {
             0
         );
         assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+    }
+
+    /// zl-zipline#283: a compressed body too short for the headers its DLT
+    /// classifier says it carries is dropped and counted as
+    /// `BadStructure`, not a panic. A peer Zode can send one on a valid
+    /// stream, and a packet whose DLT ID was reused for another flow is
+    /// expanded with that flow's classifier.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_short_body_as_bad_structure() {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let tcp = crate::defs::FiveTuple {
+            l3_type: L3Type::Ipv4,
+            l4_protocol: net_defs::ip_number::TCP,
+            ..Default::default()
+        };
+        let tether_id = asm
+            .dlt
+            .insert(DltPep::new(crate::tc::Ip5TupleTc::new(tcp), None))
+            .unwrap();
+        let mut worker = test_worker(asm);
+
+        // An A2A header (SAID 0), a compressed IPv4 header (header length
+        // 5, no fragment info, TTL 64) and no TCP header, then the A2A MAC.
+        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
+        pkt.put(&[0u8][..]);
+        pkt.put(&[0x50u8, 0, 0, 0, 64][..]);
+        pkt.put(&[0u8; zdp::ZDP_A2A_MAC_SIZE][..]);
+
+        worker.actor_input(tether_id, pkt);
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::BadStructure].get_count(),
+            1
+        );
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
     }
 
     #[test]

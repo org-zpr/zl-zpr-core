@@ -7,7 +7,6 @@ use bytes::Buf;
 use ip4sum;
 use zerocopy::*;
 use zpr::packet_info::compression_mode::*;
-use zpr_ext::bytes::BufExt;
 use zpr_utils::net_defs;
 
 const ZDP_V4_FRAG_INFO_PRESENT: u8 = 0b00001000;
@@ -60,28 +59,31 @@ fn compress_ipv4(
     pkt.push_header(&[hl_zdpflags, dscp]);
 }
 
-fn expand_ipv4(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &mut Packet) {
-    let hl_zdpflags_tos = pkt.get_array::<2>();
-    let hl_zdpflags = hl_zdpflags_tos[0];
-    let tos = hl_zdpflags_tos[1];
+fn expand_ipv4(
+    compression_mode: CompressionMode,
+    five_tuple: &FiveTuple,
+    pkt: &mut Packet,
+) -> Result<(), MalformedPacket> {
+    let hl_zdpflags = pkt.try_get_u8()?;
+    let tos = pkt.try_get_u8()?;
 
     let hl = hl_zdpflags >> 4;
     let frag_info_present = (hl_zdpflags & ZDP_V4_FRAG_INFO_PRESENT) != 0;
     let frag_flags = hl_zdpflags & 0x07;
 
-    let frag_id = pkt.get_array::<2>();
+    let frag_id = pkt.try_get_u16()?.to_be_bytes();
 
     let mut frag_offset;
     if frag_info_present {
-        frag_offset = pkt.get_u16();
+        frag_offset = pkt.try_get_u16()?;
     } else {
         frag_offset = 0u16;
     }
     frag_offset |= (frag_flags as u16) << 13; // NOTE/TODO: spec deviation
 
-    let ttl = pkt.get_u8();
+    let ttl = pkt.try_get_u8()?;
 
-    expand_l4(compression_mode, five_tuple, pkt);
+    expand_l4(compression_mode, five_tuple, pkt)?;
 
     let body_len = pkt.body().len();
 
@@ -96,12 +98,18 @@ fn expand_ipv4(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &
     hdr.src_address = five_tuple.src_address.read_as_v4();
     hdr.dst_address = five_tuple.dst_address.read_as_v4();
 
+    // The header length comes from the peer; the checksum is computed over
+    // that many bytes, so it must cover a whole IPv4 header and no more
+    // than the expanded packet.
     let header_len = (hl as usize) << 2;
+    if header_len < std::mem::size_of::<classifier::IPv4Header>() || header_len > pkt.body().len() {
+        return Err(MalformedPacket);
+    }
     let csum = ip4sum::checksum(&pkt.body()[..header_len]).to_be_bytes();
-    classifier::IPv4Header::mut_from_prefix(pkt.body_mut())
-        .unwrap()
+    classifier::IPv4Header::mut_from_prefix(pkt.body_mut())?
         .0
         .header_checksum = csum;
+    Ok(())
 }
 
 fn compress_ipv6(
@@ -128,8 +136,12 @@ fn compress_ipv6(
     chdr.hop_limit = hop_limit;
 }
 
-fn expand_ipv6(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &mut Packet) {
-    let chdr = CompressedIPv6Header::ref_from_prefix(pkt.body()).unwrap().0;
+fn expand_ipv6(
+    compression_mode: CompressionMode,
+    five_tuple: &FiveTuple,
+    pkt: &mut Packet,
+) -> Result<(), MalformedPacket> {
+    let chdr = CompressedIPv6Header::ref_from_prefix(pkt.body())?.0;
     let version_and_tc_upper = chdr.version_and_tc_upper;
     let tc_lower_and_fl_upper = chdr.tc_lower_and_fl_upper;
     let fl_lower = chdr.fl_lower;
@@ -137,7 +149,7 @@ fn expand_ipv6(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &
 
     pkt.advance(std::mem::size_of::<CompressedIPv6Header>());
 
-    expand_l4(compression_mode, five_tuple, pkt);
+    expand_l4(compression_mode, five_tuple, pkt)?;
 
     let body_len = pkt.body().len();
 
@@ -150,6 +162,7 @@ fn expand_ipv6(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &
     hdr.hop_limit = hop_limit;
     hdr.src_address = five_tuple.src_address;
     hdr.dst_address = five_tuple.dst_address;
+    Ok(())
 }
 
 fn compress_l4(
@@ -164,7 +177,11 @@ fn compress_l4(
     }
 }
 
-fn expand_l4(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &mut Packet) {
+fn expand_l4(
+    compression_mode: CompressionMode,
+    five_tuple: &FiveTuple,
+    pkt: &mut Packet,
+) -> Result<(), MalformedPacket> {
     // NOTE: "PRESENT" CompressionMode bits indicate that the corresponding field
     // is present _in the traffic classifier_, which means it should be _absent_
     // in the compressed packet.  (Hence the checks herein look as if they are backward.)
@@ -172,7 +189,7 @@ fn expand_l4(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &mu
     match five_tuple.l4_protocol {
         net_defs::ip_number::TCP => expand_tcp(compression_mode, five_tuple, pkt),
         net_defs::ip_number::UDP => expand_udp(compression_mode, five_tuple, pkt),
-        _ => (), // no compression defined for other protocols
+        _ => Ok(()), // no compression defined for other protocols
     }
 }
 
@@ -198,18 +215,29 @@ fn compress_tcp(compression_mode: CompressionMode, pkt: &mut Packet) {
     }
 }
 
-fn expand_tcp(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &mut Packet) {
+fn expand_tcp(
+    compression_mode: CompressionMode,
+    five_tuple: &FiveTuple,
+    pkt: &mut Packet,
+) -> Result<(), MalformedPacket> {
     let src_port = if compression_mode & SOURCE_PORT_PRESENT != 0 {
         five_tuple.src_port
     } else {
-        pkt.get_u16()
+        pkt.try_get_u16()?
     };
 
     let dst_port = if compression_mode & DESTINATION_PORT_PRESENT != 0 {
         five_tuple.dst_port
     } else {
-        pkt.get_u16()
+        pkt.try_get_u16()?
     };
+
+    // The rest of the TCP header must be present: everything but the
+    // ports, read above, and the checksum, which compression removed.
+    let rest_of_header_len = std::mem::size_of::<classifier::TCPHeader>() - 4 - 2;
+    if pkt.body().len() < rest_of_header_len {
+        return Err(MalformedPacket);
+    }
 
     // make space for checksum
     pkt.alloc_zeroed_headroom(2);
@@ -222,8 +250,7 @@ fn expand_tcp(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &m
     pkt.push_u16(src_port);
 
     // zero out checksum for computation
-    classifier::TCPHeader::mut_from_prefix(pkt.body_mut())
-        .unwrap()
+    classifier::TCPHeader::mut_from_prefix(pkt.body_mut())?
         .0
         .checksum = [0u8; 2];
 
@@ -235,10 +262,10 @@ fn expand_tcp(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &m
         net_defs::ip_number::TCP,
         pkt.body(),
     );
-    classifier::TCPHeader::mut_from_prefix(pkt.body_mut())
-        .unwrap()
+    classifier::TCPHeader::mut_from_prefix(pkt.body_mut())?
         .0
         .checksum = csum;
+    Ok(())
 }
 
 fn compress_udp(compression_mode: CompressionMode, pkt: &mut Packet) {
@@ -262,26 +289,32 @@ fn compress_udp(compression_mode: CompressionMode, pkt: &mut Packet) {
     }
 }
 
-fn expand_udp(compression_mode: CompressionMode, five_tuple: &FiveTuple, pkt: &mut Packet) {
+fn expand_udp(
+    compression_mode: CompressionMode,
+    five_tuple: &FiveTuple,
+    pkt: &mut Packet,
+) -> Result<(), MalformedPacket> {
     let src_port = if compression_mode & SOURCE_PORT_PRESENT != 0 {
         five_tuple.src_port
     } else {
-        pkt.get_u16()
+        pkt.try_get_u16()?
     };
 
     let dst_port = if compression_mode & DESTINATION_PORT_PRESENT != 0 {
         five_tuple.dst_port
     } else {
-        pkt.get_u16()
+        pkt.try_get_u16()?
     };
 
     // leave checksum in place
 
-    let payload_len = pkt.body().len() - 2; // - 2 accounts for checksum
+    // - 2 accounts for the checksum, which must be present
+    let payload_len = pkt.body().len().checked_sub(2).ok_or(MalformedPacket)?;
 
     pkt.push_u16((payload_len + std::mem::size_of::<classifier::UDPHeader>()) as u16);
     pkt.push_u16(dst_port);
     pkt.push_u16(src_port);
+    Ok(())
 }
 
 /// Compress a packet.  Does not inspect payload length, so trailers (e.g. A2A MAC) may be present.
@@ -303,7 +336,26 @@ pub fn compress(
 #[derive(Debug, PartialEq, Eq)]
 pub struct MalformedPacket;
 
+/// A read past the end of the packet.
+impl From<bytes::TryGetError> for MalformedPacket {
+    fn from(_: bytes::TryGetError) -> Self {
+        MalformedPacket
+    }
+}
+
+/// A header that does not fit in what is left of the packet.
+impl<A, S, V> From<ConvertError<A, S, V>> for MalformedPacket {
+    fn from(_: ConvertError<A, S, V>) -> Self {
+        MalformedPacket
+    }
+}
+
 /// Expand a packet.  Fills payload length from body length, so trailers (e.g. A2A MAC) must not be present.
+///
+/// The packet comes from a peer, so every read is bounds-checked: a body too
+/// short for the headers `five_tuple` says it carries, or with an invalid
+/// IPv4 header length, is refused with [MalformedPacket], and the caller
+/// drops it. On error the packet's contents are unspecified.
 pub fn expand(
     compression_mode: CompressionMode,
     five_tuple: &FiveTuple,
@@ -312,9 +364,8 @@ pub fn expand(
     match five_tuple.l3_type {
         L3Type::Ipv4 => expand_ipv4(compression_mode, five_tuple, pkt),
         L3Type::Ipv6 => expand_ipv6(compression_mode, five_tuple, pkt),
-        _ => (), // no compression defined for non-IP packets
+        _ => Ok(()), // no compression defined for non-IP packets
     }
-    Ok(())
 }
 
 #[cfg(test)]

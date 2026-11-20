@@ -644,7 +644,7 @@ impl FastpathWorker {
             return;
         };
 
-        if compress::expand(pep.tc.compression_mode(), &pep.tc.five_tuple(), &mut pkt).is_err() {
+        if compress::expand(pep.tc.compression_mode(), pep.tc.five_tuple(), &mut pkt).is_err() {
             drop(pep);
             return self.drop_and_count(pkt, FastpathCounterType::BadStructure);
         }

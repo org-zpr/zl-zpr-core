@@ -824,11 +824,16 @@ pub fn rebind_stream(asm: &Assembly, old: VisaId, new: VisaId, ingress: Forwardi
 /// J11: the next hop granted `new_egress` for the rebind of the stream
 /// `ingress` from visa `old` onto visa `new`. Commit it: from the next
 /// packet the stream forwards to `new_egress` under `new`
-/// ([VisaTable::commit_supersede]).
+/// ([VisaTable::commit_supersede]). The egress the commit replaced is
+/// released: if it is this Zode's own adapter, its DLT entry is unbound
+/// (zl-zipline#283).
 ///
 /// If the commit is refused (the old binding or the successor is gone
 /// meanwhile), the stream stays as it is, and the stream the next hop just
-/// granted goes unused until `new` expires or is revoked there.
+/// granted goes unused: [install_tether] unbinds it if it is a DLT entry,
+/// and a next-hop Zode keeps it until `new` expires or is revoked there.
+///
+/// Returns whether the grant was used, that is, the commit was made.
 ///
 /// One refusal is no failure (zl-zipline#271, gate q5): a visa newer than
 /// `new` superseded it while the rebind was in flight. That newer visa's
@@ -840,7 +845,7 @@ fn rebind_granted(
     new: VisaId,
     ingress: ForwardingEntry,
     new_egress: ForwardingEntry,
-) {
+) -> bool {
     let mut visa_table = asm.visa_table.write().unwrap();
     let committed = visa_table.commit_supersede(
         &asm.peer_table,
@@ -854,13 +859,18 @@ fn rebind_granted(
     let newer = visa_table.successor_of(old);
     drop(visa_table);
     match (committed, newer) {
-        (Ok(()), _) => (),
+        (Ok(replaced), _) => {
+            // Outside the visa-table lock (zipline#9).
+            asm.unbind_local_egress(&replaced);
+            return true;
+        }
         (Err(VisaTableError::NotSuccessor(..)), Some(newer)) => {
             info!(target: FLOW_MGMT, "stream {} on {}: its rebind from visa {old} onto visa {new} is dropped, as visa {newer} superseded visa {new} meanwhile; the rebind onto visa {newer} moves it",
                 ingress.1, asm.formatted_link_id(ingress.0));
         }
         (Err(e), _) => rebind_failed(asm, old, new, &ingress, &e.to_string()),
     }
+    false
 }
 
 /// J11: the rebind of the stream `ingress` from visa `old` onto visa `new`
@@ -897,14 +907,18 @@ fn requested_visa_denied(asm: &Arc<Assembly>, ingress_link_id: NonZero<LinkId>, 
 /// in the egress link has already been cleaned up (which
 /// `resolve_next_hop_bind_originator` did, after checking that this bind
 /// request is the one the next-hop bind served).
+///
+/// Returns whether the grant was used, that is, the stream was bound. A
+/// refused or vanished bind leaves the grant to [install_tether], which
+/// releases it (zl-zipline#283).
 fn requested_tether_granted(
     asm: &Arc<Assembly>,
     ingress_link_id: NonZero<LinkId>,
     txn_id: TxnId,
     egress_tether_id: StreamId,
-) {
+) -> bool {
     let Some(ingress_peer_state) = asm.peer_table.get(ingress_link_id.get()) else {
-        return;
+        return false;
     };
 
     // Take the bind-request state out, to retrieve the associated egress
@@ -915,7 +929,7 @@ fn requested_tether_granted(
         .remove(&txn_id)
     else {
         error!(target: FLOW_MGMT, "requested_tether_granted() called when no request outstanding (txn_id={txn_id})");
-        return;
+        return false;
     };
     let BindRequestState::AwaitingNextHopBind {
         visa_id,
@@ -925,7 +939,7 @@ fn requested_tether_granted(
     else {
         // should never happen; resolve_next_hop_bind_originator checks this
         error!(target: FLOW_MGMT, "requested_tether_granted() called in wrong state (txn_id={txn_id})");
-        return;
+        return false;
     };
 
     // Reserve & lock a slot for (but do not yet insert) the ingress link's PFT.
@@ -936,7 +950,7 @@ fn requested_tether_granted(
         // PFT full; respond with error message
         // TODO: maybe tick a counter somewhere?
         bind_reject(asm, ingress_link_id, txn_id, "PFT full");
-        return;
+        return false;
     };
 
     // Under the visa-table write lock: read what the response needs from
@@ -984,7 +998,10 @@ fn requested_tether_granted(
 
     let (ingress_tether_id, tc, peer_a2a_dh_pubkey, successor) = match granted {
         Ok(granted) => granted,
-        Err(reason) => return bind_reject(asm, ingress_link_id, txn_id, reason),
+        Err(reason) => {
+            bind_reject(asm, ingress_link_id, txn_id, reason);
+            return false;
+        }
     };
 
     // Send a success response to the requestor with the tether ID.
@@ -1018,6 +1035,7 @@ fn requested_tether_granted(
             ForwardingEntry(ingress_link_id.get(), ingress_tether_id),
         );
     }
+    true
 }
 
 /// What the success response to the requestor on `ingress_link_id` carries
@@ -1265,6 +1283,11 @@ pub enum InstallTetherError {
 /// Completes the indicated transaction. A grant for a next-hop bind whose
 /// inbound bind is gone is ignored. A grant for a J11 rebind commits it.
 ///
+/// A grant that is not used (its bind was abandoned or refused, or its
+/// rebind's commit was refused) is released: if this Zode's own adapter
+/// granted it, its DLT entry is unbound (zl-zipline#283, gate g214 q4). A
+/// grant from a Zode is left alone (F5): it goes when its visa does there.
+///
 /// Returns an error only if the transaction is invalid.
 pub fn install_tether(
     asm: &Arc<Assembly>,
@@ -1272,7 +1295,8 @@ pub fn install_tether(
     egress_txn: &TxnHandle,
     egress_tether_id: StreamId,
 ) -> Result<(), InstallTetherError> {
-    match resolve_next_hop_bind_originator(asm, egress_link_id, egress_txn)? {
+    let granted = ForwardingEntry(egress_link_id.get(), egress_tether_id);
+    let used = match resolve_next_hop_bind_originator(asm, egress_link_id, egress_txn)? {
         NextHopBindOriginator::Bind(ingress_link_id, ingress_txn_id) => {
             requested_tether_granted(asm, ingress_link_id, ingress_txn_id, egress_tether_id)
         }
@@ -1286,9 +1310,12 @@ pub fn install_tether(
             old,
             new,
             ForwardingEntry(ingress_link_id.get(), ingress_stream_id),
-            ForwardingEntry(egress_link_id.get(), egress_tether_id),
+            granted.clone(),
         ),
-        NextHopBindOriginator::Abandoned => {}
+        NextHopBindOriginator::Abandoned => false,
+    };
+    if !used {
+        asm.unbind_local_egress(&granted);
     }
     Ok(())
 }

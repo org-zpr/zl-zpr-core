@@ -608,6 +608,10 @@ impl VisaTable {
     /// stream is never moved onto a visa that no longer admits it. It then
     /// stops at the old visa's expiry. A commit moves the PFT entry onto
     /// `new`'s expiry with its target, so the stream lives as long as `new`.
+    ///
+    /// Returns the egress the commit replaced, for the caller to release
+    /// once it has dropped the visa-table lock: if it is this Zode's own
+    /// adapter, its DLT entry is unbound (zl-zipline#283).
     pub fn commit_supersede(
         &mut self,
         peer_table: &peer_table::PeerTable,
@@ -616,7 +620,7 @@ impl VisaTable {
         ingress: ForwardingEntry,
         new_egress: ForwardingEntry,
         now: SystemTime,
-    ) -> Result<(), VisaTableError> {
+    ) -> Result<ForwardingEntry, VisaTableError> {
         if self.successor_of(old) != Some(new) {
             return Err(VisaTableError::NotSuccessor(old, new));
         }
@@ -660,7 +664,7 @@ impl VisaTable {
             .bindings
             .get_mut(&old)
             .expect("the binding was found above");
-        old_bindings.remove(position);
+        let replaced = old_bindings.remove(position).egress;
         if old_bindings.is_empty() {
             self.bindings.remove(&old);
         }
@@ -675,7 +679,7 @@ impl VisaTable {
             self.rebuild_lookup_table();
         }
         info!(target: VISA_MGMT, "rebound a stream from visa {old} onto visa {new}");
-        Ok(())
+        Ok(replaced)
     }
 
     /// The visa with ID `visa_id`, if this Zode holds it. Read-only: a

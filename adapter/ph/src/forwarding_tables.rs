@@ -4,11 +4,13 @@
 
 #![allow(dead_code)]
 
+use crate::config::STREAM_ID_REUSE_GRACE;
 use cslab::{RcuCslab, RcuCslabReader};
 use rcu::{RcuBox, RcuCslabEntryGuard};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering, fence};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering, fence};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use zpr::packet_info::{ForwardingEntry, LinkId, StreamId, VisaId};
 
 const PEER_FORWARDING_TABLE_SIZE: usize = 1 << 20; // 1 million
@@ -47,6 +49,11 @@ pub struct PftPep {
     /// The bound visa's expiry, in milliseconds since the UNIX epoch
     /// ([unix_ms]). From this instant on, the stream forwards nothing.
     expires: AtomicU64,
+    /// Set once, when the entry's stream is removed and its slot goes
+    /// into quarantine ([PeerForwardingTable::quarantine],
+    /// zl-zipline#282). A quarantined entry is invisible to lookups and
+    /// never set back.
+    quarantined: AtomicBool,
 }
 
 /// `time` in milliseconds since the UNIX epoch, the unit of a PFT entry's
@@ -79,6 +86,7 @@ impl PftPep {
             next_hop: AtomicU64::new(pack_forwarding_entry(next_hop)),
             visa_id: AtomicU64::new(visa_id),
             expires: AtomicU64::new(unix_ms(expires)),
+            quarantined: AtomicBool::new(false),
         }
     }
 
@@ -136,11 +144,52 @@ impl PftPep {
             .store(unix_ms(expires), AtomicOrdering::Relaxed);
         self.version.store(version + 2, AtomicOrdering::Release);
     }
+
+    /// Whether the entry's stream has been removed and its slot is in
+    /// quarantine (zl-zipline#282).
+    pub fn is_quarantined(&self) -> bool {
+        self.quarantined.load(AtomicOrdering::Acquire)
+    }
+
+    /// Mark the entry quarantined and make it forward nothing: under the
+    /// sequence lock, its visa ID becomes 0 and its expiry the UNIX epoch,
+    /// so a reader that found the entry just before it was quarantined
+    /// drops its packet as expired. Returns false, and changes nothing,
+    /// if the entry was quarantined already. Like [PftPep::rebind], called
+    /// only under the visa table's write lock.
+    fn tombstone(&self) -> bool {
+        if self.quarantined.swap(true, AtomicOrdering::AcqRel) {
+            return false;
+        }
+        let version = self.version.load(AtomicOrdering::Relaxed);
+        self.version.store(version + 1, AtomicOrdering::Relaxed);
+        // Keeps the stores below after the odd version.
+        fence(AtomicOrdering::Release);
+        self.visa_id.store(0, AtomicOrdering::Relaxed);
+        self.expires.store(0, AtomicOrdering::Relaxed);
+        self.version.store(version + 2, AtomicOrdering::Release);
+        true
+    }
 }
 
+/// The table of one link's streams: for each stream ID a peer sends with
+/// on that link, where the stream goes ([PftPep]).
+///
+/// A removed stream's ID is not handed out again at once: its slot goes
+/// into quarantine for [STREAM_ID_REUSE_GRACE] ([Self::quarantine],
+/// zl-zipline#282), because the peer may still send on the old ID for a
+/// while (it processes a withdrawal asynchronously, and an upstream
+/// Zode's clock may lag). Without the quarantine a new stream could get
+/// the ID and receive the old stream's late packets.
+///
+/// Lock order: `table`, then `quarantine`.
 pub struct PeerForwardingTable {
     table: Mutex<RcuCslab<PftPep>>,
     reader: RcuBox<RcuCslabReader<PftPep>>,
+    /// Quarantined stream IDs with the instant each may be freed, oldest
+    /// first. The grace is a constant, so the queue is sorted by release
+    /// instant.
+    quarantine: Mutex<VecDeque<(Instant, StreamId)>>,
 }
 
 pub type PftPepGuard<'a> = RcuCslabEntryGuard<'a, PftPep>;
@@ -153,9 +202,12 @@ impl PeerForwardingTable {
         Self {
             table: Mutex::new(table),
             reader: RcuBox::new(reader),
+            quarantine: Mutex::new(VecDeque::new()),
         }
     }
 
+    /// Run `inspector` on the live entry for `tether_id`. None if there is
+    /// no entry, or if it is quarantined: a quarantined stream is gone.
     pub fn inspect<T>(
         &self,
         tether_id: StreamId,
@@ -164,16 +216,24 @@ impl PeerForwardingTable {
         self.reader.inspect(|reader| {
             reader
                 .get((tether_id as usize).wrapping_sub(1))
+                .filter(|pep| !pep.is_quarantined())
                 .map(inspector)
         })
     }
 
+    /// The live entry for `tether_id`. None if there is no entry, or if it
+    /// is quarantined: a quarantined stream is gone.
     pub fn get(&self, tether_id: StreamId) -> Option<PftPepGuard<'_>> {
         self.reader
             .get_guarded((tether_id as usize).wrapping_sub(1))
+            .filter(|pep| !pep.is_quarantined())
     }
 
+    /// Reserve the slot of the next stream ID, after freeing the
+    /// quarantined slots whose grace has passed. The table stays locked
+    /// until the returned entry is filled or dropped.
     pub fn vacant_entry(&self) -> Result<VacantPeerForwardingTableEntry<'_>, ()> {
+        self.release_quarantined_at(Instant::now());
         let table_guard = self.table.lock().unwrap();
 
         if matches!(table_guard.vacant_key(), Err(_)) {
@@ -183,6 +243,7 @@ impl PeerForwardingTable {
         Ok(VacantPeerForwardingTableEntry { table_guard })
     }
 
+    /// Insert `pep` under the next stream ID ([Self::vacant_entry]).
     pub fn insert(&self, pep: PftPep) -> Result<StreamId, ()> {
         Ok(self.vacant_entry()?.insert(pep))
     }
@@ -194,8 +255,62 @@ impl PeerForwardingTable {
         self.reader.write(new_reader);
     }
 
+    /// Remove the stream `tether_id` and put its slot into quarantine
+    /// until `now` + [STREAM_ID_REUSE_GRACE] (zl-zipline#282). From now on
+    /// the stream forwards nothing and lookups do not find it
+    /// ([PftPep::tombstone]), but the slot stays occupied, so the ID is
+    /// not handed to a new stream before the grace has passed. Freed
+    /// later by [Self::release_quarantined_at]. An ID with no entry, or
+    /// one quarantined already, changes nothing.
+    pub fn quarantine(&self, tether_id: StreamId, now: Instant) {
+        let table = self.table.lock().unwrap();
+        let Some(pep) = table.get((tether_id as usize).wrapping_sub(1)) else {
+            return;
+        };
+        if pep.tombstone() {
+            self.quarantine
+                .lock()
+                .unwrap()
+                .push_back((now + STREAM_ID_REUSE_GRACE, tether_id));
+        }
+    }
+
+    /// Free the slot of every quarantined stream ID whose grace has
+    /// passed at `now`, so the slab can hand the ID out again. Called
+    /// before each allocation ([Self::vacant_entry]), so the quarantine
+    /// needs no timer of its own.
+    pub fn release_quarantined_at(&self, now: Instant) {
+        let mut table = self.table.lock().unwrap();
+        let mut released_any = false;
+        {
+            let mut quarantine = self.quarantine.lock().unwrap();
+            while let Some(&(release_at, tether_id)) = quarantine.front() {
+                if release_at > now {
+                    break;
+                }
+                quarantine.pop_front();
+                table.mark_removed((tether_id as usize).wrapping_sub(1));
+                released_any = true;
+            }
+        }
+        if !released_any {
+            return;
+        }
+        let new_reader = table.schedule_finalization();
+        std::mem::drop(table);
+        self.reader.write(new_reader);
+    }
+
+    /// The number of live entries: quarantined slots are not counted.
     pub fn len(&self) -> usize {
-        self.table.lock().unwrap().len()
+        let table = self.table.lock().unwrap();
+        let quarantined = self.quarantine.lock().unwrap().len();
+        table.len() - quarantined
+    }
+
+    /// The number of slots in quarantine (zl-zipline#282).
+    pub fn quarantined_len(&self) -> usize {
+        self.quarantine.lock().unwrap().len()
     }
 
     pub fn clear(&self) {
@@ -220,7 +335,8 @@ impl VacantPeerForwardingTableEntry<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use crate::config::STREAM_ID_REUSE_GRACE;
+    use std::time::{Duration, Instant};
 
     /// zl-zipline#274 (D5): a J11 rebind moves the entry onto the new
     /// visa's expiry together with its next hop and visa ID, so a renewed
@@ -269,6 +385,114 @@ mod tests {
                 );
             }
         });
+    }
+
+    // ---- Stream-ID quarantine (zl-zipline#282) ----
+
+    /// A PFT entry forwarding to stream 9 on link 2, under visa 7000,
+    /// which never expires within a test run.
+    fn live_pep() -> PftPep {
+        PftPep::new(
+            ForwardingEntry(2, 9),
+            7000,
+            SystemTime::now() + Duration::from_secs(3600),
+        )
+    }
+
+    /// zl-zipline#282: a quarantined stream ID is not handed out again
+    /// before the grace has passed. Its slot stays occupied, so no
+    /// vacant entry can get it, while lookups no longer find it.
+    #[test]
+    fn test_a_quarantined_id_is_not_handed_out_again() {
+        let pft = PeerForwardingTable::new();
+        let quarantined = pft.insert(live_pep()).unwrap();
+        let start = Instant::now();
+
+        pft.quarantine(quarantined, start);
+        pft.release_quarantined_at(start + STREAM_ID_REUSE_GRACE - Duration::from_millis(1));
+
+        assert_ne!(pft.vacant_entry().unwrap().key(), quarantined);
+        assert!(pft.get(quarantined).is_none(), "the stream is gone");
+        assert_eq!(pft.quarantined_len(), 1, "still in quarantine");
+    }
+
+    /// zl-zipline#282: once the grace has passed, the next release frees
+    /// the slot, and the slab hands the stream ID out again.
+    #[test]
+    fn test_a_quarantined_id_is_released_after_the_grace() {
+        let pft = PeerForwardingTable::new();
+        let quarantined = pft.insert(live_pep()).unwrap();
+        let start = Instant::now();
+        pft.quarantine(quarantined, start);
+
+        pft.release_quarantined_at(start + STREAM_ID_REUSE_GRACE);
+
+        assert_eq!(pft.quarantined_len(), 0);
+        assert_eq!(pft.len(), 0);
+        // The slab frees a slot once no reader of an older generation
+        // is left (RCU), so the ID comes back after some churn, not
+        // necessarily on the very next insert.
+        let mut reused = false;
+        for _ in 0..100_000 {
+            let other = pft.insert(live_pep()).unwrap();
+            if other == quarantined {
+                reused = true;
+                break;
+            }
+            pft.quarantine(other, start);
+            pft.release_quarantined_at(start + STREAM_ID_REUSE_GRACE);
+        }
+        assert!(reused, "stream ID {quarantined} is never handed out again");
+    }
+
+    /// zl-zipline#282: a quarantined entry forwards nothing. Lookups do
+    /// not find it, and a reader that already holds it reads an expiry
+    /// at the UNIX epoch, which the fast path drops.
+    #[test]
+    fn test_a_quarantined_entry_forwards_nothing() {
+        let pft = PeerForwardingTable::new();
+        let quarantined = pft.insert(live_pep()).unwrap();
+        let held = pft.get(quarantined).unwrap();
+
+        pft.quarantine(quarantined, Instant::now());
+
+        assert!(held.is_quarantined());
+        assert_eq!(held.target().0, 0, "expired since the epoch");
+        drop(held);
+        assert!(pft.get(quarantined).is_none());
+        assert!(pft.inspect(quarantined, |pep| pep.visa_id()).is_none());
+    }
+
+    /// zl-zipline#282: `len()` counts live entries only; a quarantined
+    /// slot is counted by `quarantined_len()`.
+    #[test]
+    fn test_len_counts_live_entries_only() {
+        let pft = PeerForwardingTable::new();
+        let quarantined = pft.insert(live_pep()).unwrap();
+        let _live = pft.insert(live_pep()).unwrap();
+
+        pft.quarantine(quarantined, Instant::now());
+
+        assert_eq!(pft.len(), 1);
+        assert_eq!(pft.quarantined_len(), 1);
+    }
+
+    /// zl-zipline#282: quarantining an ID twice, or an ID with no entry,
+    /// changes nothing: the slot is queued for release once only.
+    #[test]
+    fn test_a_second_quarantine_of_an_id_is_a_no_op() {
+        let pft = PeerForwardingTable::new();
+        let quarantined = pft.insert(live_pep()).unwrap();
+        let start = Instant::now();
+
+        pft.quarantine(quarantined, start);
+        pft.quarantine(quarantined, start);
+        pft.quarantine(quarantined + 100, start); // never allocated
+
+        assert_eq!(pft.quarantined_len(), 1);
+        pft.release_quarantined_at(start + STREAM_ID_REUSE_GRACE);
+        assert_eq!(pft.quarantined_len(), 0);
+        assert_eq!(pft.len(), 0);
     }
 
     /// An expiry before the UNIX epoch, which no granted visa has, counts

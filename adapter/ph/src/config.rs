@@ -123,11 +123,20 @@ pub const KEEP_ALIVE_MAX_MISSES: u32 = 3;
 /// [DEFAULT_KEEP_ALIVE_PERIOD]) once the interval has passed.
 pub const VISA_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long past its expiry a visa with a stream entering over a Zode link
-/// (transit, or egress from an upstream Zode) is kept, with that stream's
-/// PFT slot (zl-zipline#274, D4). The stream forwards nothing from the
-/// expiry on, but its ID is not handed to a new stream while the upstream,
-/// whose clock may lag, could still send on it.
+/// How long a removed stream's ID stays out of use (zl-zipline#282), and
+/// how long past its expiry a visa with a stream entering over a Zode link
+/// (transit, or egress from an upstream Zode) is kept (zl-zipline#274,
+/// D4).
+///
+/// Every removal of a stream (revocation, the expiry sweep, the match
+/// eject, link loss), on every link, puts its PFT slot into quarantine
+/// for this long ([crate::forwarding_tables::PeerForwardingTable::quarantine]):
+/// the peer may still send on the old ID, because an adapter processes a
+/// withdrawal asynchronously and an upstream Zode's clock may lag, so the
+/// ID is not handed to a new stream before the grace has passed. A transit
+/// visa's stream thus stays out of use for twice this long after its
+/// expiry: the visa is kept for the grace (it forwards nothing from the
+/// expiry on), then its slot is quarantined for the grace again.
 /// ponytail: a fixed bound on clock skew between Zodes; raise it if Zode
 /// clocks are not NTP-synced.
 pub const STREAM_ID_REUSE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);

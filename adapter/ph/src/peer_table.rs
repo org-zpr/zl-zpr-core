@@ -15,6 +15,7 @@ use std::future::Future;
 use std::num::NonZero;
 use std::sync::atomic::{self, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use strum;
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
@@ -496,13 +497,17 @@ impl PeerTable {
         entry.pft.clear();
     }
 
-    /// Remove a route from a peer forwarding table
+    /// Remove a route from a peer forwarding table. The route's stream ID
+    /// goes into quarantine and is not handed out again before
+    /// [crate::config::STREAM_ID_REUSE_GRACE] has passed (zl-zipline#282):
+    /// every visa removal path (revocation, the expiry sweep, the match
+    /// eject, link loss) comes here.
     pub fn remove_route(&self, route: ForwardingEntry) {
         let Some(entry) = self.get(route.0) else {
             // If the peer is gone, nothing to be done
             return;
         };
-        entry.pft.remove(route.1);
+        entry.pft.quarantine(route.1, Instant::now());
     }
 }
 

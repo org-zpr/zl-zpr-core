@@ -403,6 +403,17 @@ impl FastpathWorker {
             egress_link_id = next_hop.0;
             egress_stream_id = next_hop.1;
 
+            // A quarantined entry (zl-zipline#282) has an expiry at the
+            // UNIX epoch, which no granted visa has: its stream was
+            // removed while this packet looked it up, so it is unknown
+            // now, not expired.
+            if expires_ms == 0 {
+                drop(pep);
+                drop(ingress_peer_state);
+                self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
+                return;
+            }
+
             // Visa expiry, on every packet at every hop (zl-zipline#274):
             // a stream stops when its visa does, whenever it was bound.
             // Dropped silently, like an unknown stream ID.
@@ -1391,6 +1402,55 @@ mod test {
             0
         );
         assert_eq!(worker.substrate_egress_q.len(), 1, "forwarded to link B");
+    }
+
+    /// zl-zipline#282: a packet on a stream ID in quarantine (its stream
+    /// was removed, its slot is not reused yet) is dropped silently and
+    /// counted as `UnknownStreamId`: the stream does not exist anymore.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_packet_on_a_quarantined_stream_id_is_dropped_as_unknown() {
+        let expires = SystemTime::now() + Duration::from_secs(3600);
+        let (mut worker, link_a, stream) = worker_with_transit_stream(expires);
+        worker
+            .asm
+            .peer_table
+            .remove_route(ForwardingEntry(link_a, stream));
+
+        worker.forward(transit_packet(link_a, stream));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::UnknownStreamId].get_count(),
+            1
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::VisaExpired].get_count(),
+            0
+        );
+        assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// zl-zipline#282: a reader that found an entry just before it was
+    /// quarantined reads its tombstone, an expiry at the UNIX epoch,
+    /// which no granted visa has. Its packet is dropped as
+    /// `UnknownStreamId`, like any packet on a removed stream, not as
+    /// `VisaExpired`. Built here as an entry with that expiry, the state
+    /// such a reader sees.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_packet_on_a_tombstoned_entry_is_dropped_as_unknown() {
+        let (mut worker, link_a, stream) = worker_with_transit_stream(UNIX_EPOCH);
+
+        worker.forward(transit_packet(link_a, stream));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::UnknownStreamId].get_count(),
+            1
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::VisaExpired].get_count(),
+            0
+        );
+        assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
     }
 
     #[test]

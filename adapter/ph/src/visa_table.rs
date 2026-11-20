@@ -879,6 +879,10 @@ impl VisaTable {
     ///   ID is not handed to a new stream while the upstream may still send
     ///   on it.
     ///
+    /// Either way, a freed visa's PFT slots then go into quarantine for
+    /// [config::STREAM_ID_REUSE_GRACE] (zl-zipline#282), like those of
+    /// every other removal ([peer_table::PeerTable::remove_route]).
+    ///
     /// Returns the withdrawn forwarding entries. Expiry notifies no peer
     /// over a Zode link: every Zode on the path holds the same expiry and
     /// stops on its own clock ([crate::assembly::Assembly::withdraw_streams]
@@ -1013,8 +1017,9 @@ impl VisaTable {
     }
 
     /// Remove the visa `visa_id` and its bindings, and the PFT entry of each
-    /// binding. The only path that removes bindings: revocation, expiry and
-    /// link loss all come here.
+    /// binding, whose stream ID goes into quarantine (zl-zipline#282). The
+    /// only path that removes bindings: revocation, expiry and link loss
+    /// all come here.
     ///
     /// Returns each binding's ingress entry: the link the requestor bound
     /// over and the stream ID it sends with, which is all a withdrawal to
@@ -3169,6 +3174,102 @@ pub mod tests {
             Some(7821)
         );
         assert_eq!(visa_table.timeout_queue.len(), 1, "only the successor's");
+    }
+
+    // ---- Stream-ID quarantine on every removal path (zl-zipline#282) ----
+
+    /// zl-zipline#282: the stream `stream` on `link` was removed and its
+    /// slot is in quarantine: the stream is gone, its ID is the one slot
+    /// quarantined on the link, and the next stream bound on the link
+    /// gets another ID.
+    fn assert_quarantined(asm: &Assembly, link: LinkId, stream: StreamId) {
+        let peer = asm.peer_table.get(link).unwrap();
+        assert!(pft_entry(asm, link, stream).is_none(), "the stream is gone");
+        assert_eq!(peer.pft.quarantined_len(), 1, "its slot is quarantined");
+        assert_ne!(
+            peer.pft.vacant_entry().unwrap().key(),
+            stream,
+            "the ID is not handed out again"
+        );
+    }
+
+    /// zl-zipline#282: a revocation quarantines the stream's ID.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_revoke_quarantines_the_stream_id() {
+        let (asm, link_a, _link_b, tether) = bound_old_visa(7900);
+        let mut visa_table = asm.visa_table.write().unwrap();
+
+        visa_table.revoke(&asm.peer_table, 7900).unwrap();
+
+        assert_quarantined(&asm, link_a, tether);
+    }
+
+    /// zl-zipline#282: the match that finds a visa expired and ejects it
+    /// (zl-zipline#271) quarantines the stream's ID.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_the_match_eject_quarantines_the_stream_id() {
+        let mut expired = tcp_visa(7910, CLIENT, 0, SERVICE, 80);
+        expired.expires = ALREADY_EXPIRED;
+        let (asm, link_a, _link_b, tether) = bound_visa(expired);
+        let mut visa_table = asm.visa_table.write().unwrap();
+
+        let (matched, _withdrawn) = visa_table.match_traffic(&asm.peer_table, &client_to_service());
+
+        assert_eq!(matched, None);
+        assert_quarantined(&asm, link_a, tether);
+    }
+
+    /// zl-zipline#282: the expiry sweep frees a visa whose stream enters
+    /// from this Zode's own actor at its expiry (D3), and quarantines the
+    /// stream's ID.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_the_expiry_sweep_quarantines_the_stream_id() {
+        let (asm, link_a, _link_b, tether) = bound_old_visa(7920);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        let expires = held_expiry(&visa_table, 7920);
+
+        visa_table.handle_expirations(&asm.peer_table, expires);
+
+        assert!(!visa_table.contains(7920));
+        assert_quarantined(&asm, link_a, tether);
+    }
+
+    /// zl-zipline#282: losing one link revokes a visa with a stream on
+    /// another, surviving link (F3), and quarantines that stream's ID.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_revoke_for_link_quarantines_the_surviving_link_stream_id() {
+        let (asm, link_a, link_b, tether) = bound_old_visa(7930);
+        let mut visa_table = asm.visa_table.write().unwrap();
+
+        visa_table.revoke_for_link(link_b, &asm.peer_table);
+
+        assert!(!visa_table.contains(7930));
+        assert_quarantined(&asm, link_a, tether);
+    }
+
+    /// zl-zipline#282: a J11 rebind finds a stream through its binding,
+    /// and a removal drops the binding before it quarantines the entry,
+    /// so a quarantined entry is never rebound.
+    #[tokio::test] // tokio: create_dummy_peer_state spawns a dummy task
+    async fn test_a_quarantined_stream_is_never_rebound() {
+        let (asm, link_a, link_b, tether) = bound_old_visa(7940);
+        let mut visa_table = asm.visa_table.write().unwrap();
+        let mut new_visa = tcp_visa(7941, CLIENT, 0, SERVICE, 80);
+        new_visa.expires = held_expiry(&visa_table, 7940) + Duration::from_secs(3600);
+        visa_table.insert_visa(new_visa).unwrap();
+        visa_table.revoke(&asm.peer_table, 7940).unwrap();
+
+        let rebound = visa_table.commit_supersede(
+            &asm.peer_table,
+            7940,
+            7941,
+            ForwardingEntry(link_a, tether),
+            ForwardingEntry(link_b, 43),
+            SystemTime::now(),
+        );
+
+        assert!(rebound.is_err());
+        assert_quarantined(&asm, link_a, tether);
     }
 
     #[test]

@@ -3349,4 +3349,192 @@ mod tests {
             .unwrap();
         stream
     }
+
+    // ---- Unused and replaced DLT grants (zl-zipline#283) ----
+
+    /// The full visa a destination Zode holds for a flow from the Zode at
+    /// [PREV_HOP] to its own actor, which owns [NEXT_HOP].
+    const DEST_VISA: VisaId = VISA_ID + 400;
+
+    /// A destination Zode ([actor_middle_node], `actor_upstream` false)
+    /// holding [DEST_VISA], with a Stream ID Request for it from the
+    /// upstream Zode on link A waiting on the local actor's adapter, link
+    /// B, which has not answered yet. Every management message to the
+    /// local actor shows on the hairpin: its ZDP-R window is widened, and
+    /// the bind request already sent is drained.
+    ///
+    /// Returns (asm, egress queue, hairpin, link A, link B, the next-hop
+    /// bind's transaction on B).
+    fn destination_bind_in_flight() -> (
+        Arc<Assembly>,
+        EgressRx,
+        HairpinRx,
+        LinkId,
+        LinkId,
+        TxnHandle,
+    ) {
+        let (asm, mut egress_rx, mut hairpin_rx, link_a, link_b) = actor_middle_node(false);
+        widen_zdpr_window(&asm, link_b);
+        let mut visa =
+            crate::visa_table::tests::new_vsapi_visa_tcp_default(DEST_VISA, never_expires());
+        visa.fwd_pep = Some(zpr::vsapi_types::FwdPep {
+            next_hop: next_hop(),
+            style: zpr::vsapi_types::FwdPepStyle::OneWay,
+        });
+        visa.prev_hop = Some(prev_hop());
+        asm.visa_table.write().unwrap().insert_visa(visa).unwrap();
+
+        request_stream(&asm, NonZero::new(link_a).unwrap(), 7, DEST_VISA);
+        let req = hairpin_rx
+            .try_recv()
+            .expect("a bind request to the adapter");
+        assert_eq!(
+            decode_per_flow_txn(&req).packet_type,
+            zdp::ZdpPacketType::BindEgressStreamRequest
+        );
+        assert!(try_recv_packet(&mut egress_rx).is_none());
+        let txn = outstanding_next_hop_txn(&asm, link_b);
+        (asm, egress_rx, hairpin_rx, link_a, link_b, txn)
+    }
+
+    /// The per-flow messages on the hairpin to the local actor, as (type,
+    /// stream).
+    fn hairpin_messages(rx: &mut HairpinRx) -> Vec<(zdp::ZdpPacketType, StreamId)> {
+        let mut got = Vec::new();
+        while let Ok(pkt) = rx.try_recv() {
+            got.push(decode_per_flow(&pkt));
+        }
+        got
+    }
+
+    /// The one message this Zode's adapter gets for a grant of DLT entry
+    /// `dlt_id` that is not used: an Unbind Egress Stream Indication.
+    fn unbind_of(dlt_id: StreamId) -> Vec<(zdp::ZdpPacketType, StreamId)> {
+        vec![(zdp::ZdpPacketType::UnbindEgressStreamIndication, dlt_id)]
+    }
+
+    /// zl-zipline#283 (gate g214 q4): the adapter grants a DLT entry for a
+    /// next-hop bind whose requestor's link was lost meanwhile (rule 9
+    /// abandons it). The grant is ignored, and its DLT entry unbound.
+    #[tokio::test(flavor = "local")]
+    async fn test_an_abandoned_grant_is_unbound() {
+        let (asm, _egress_rx, mut hairpin_rx, link_a, link_b, txn) = destination_bind_in_flight();
+
+        asm.drop_peer(link_a);
+        install_tether(&asm, NonZero::new(link_b).unwrap(), &txn, 42).unwrap();
+
+        assert_eq!(hairpin_messages(&mut hairpin_rx), unbind_of(42));
+    }
+
+    /// zl-zipline#283 (gate g214 q4): the adapter grants a DLT entry, but
+    /// the visa was revoked meanwhile, so the bind is refused. The
+    /// requestor gets the refusal, and the DLT entry is unbound.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_grant_for_a_refused_bind_is_unbound() {
+        let (asm, mut egress_rx, mut hairpin_rx, link_a, link_b, txn) =
+            destination_bind_in_flight();
+
+        crate::visa_mgmt::handle_revocation(&asm, DEST_VISA).unwrap();
+        install_tether(&asm, NonZero::new(link_b).unwrap(), &txn, 42).unwrap();
+
+        assert_only_stream_id_error_response(&mut egress_rx, link_a);
+        assert_eq!(hairpin_messages(&mut hairpin_rx), unbind_of(42));
+    }
+
+    /// A grant that is bound sends no unbind: the destination Zode's bind
+    /// completes, and its adapter keeps the DLT entry.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_used_grant_is_not_unbound() {
+        let (asm, mut egress_rx, mut hairpin_rx, link_a, link_b, txn) =
+            destination_bind_in_flight();
+
+        install_tether(&asm, NonZero::new(link_b).unwrap(), &txn, 42).unwrap();
+
+        let rsp = try_recv_packet(&mut egress_rx).expect("a StreamIdResponse to A");
+        assert_eq!(rsp.metadata().egress_link_id, link_a);
+        assert_eq!(hairpin_messages(&mut hairpin_rx), vec![]);
+    }
+
+    /// A J11 rebind in flight whose old and new egress are both this
+    /// Zode's own adapter: the local actor's stream is bound under
+    /// [OLD_VISA] to DLT entry 42, [NEW_VISA] supersedes it, and the
+    /// rebind waits on the adapter. The F2 loop guard keeps such a binding
+    /// from being made today (a stream never egresses to the link it
+    /// entered by), so it is set up directly; it pins that a replaced or
+    /// unused local egress is unbound whatever the path.
+    ///
+    /// Returns (asm, hairpin, the local actor link, its stream, the
+    /// rebind's transaction).
+    fn local_rebind_in_flight() -> (Arc<Assembly>, HairpinRx, LinkId, StreamId, TxnHandle) {
+        let (asm, _egress_rx, hairpin_rx) = node_with_visa_and_hairpin();
+        let (actor, _dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+        let actor = actor.get();
+        widen_zdpr_window(&asm, actor);
+        let peer = asm.peer_table.get(actor).unwrap();
+        let old_egress = ForwardingEntry(actor, 42);
+        let stream = peer
+            .pft
+            .insert(forwarding_tables::PftPep::new(
+                old_egress.clone(),
+                OLD_VISA,
+                never_expires(),
+            ))
+            .unwrap();
+        {
+            let mut visa_table = asm.visa_table.write().unwrap();
+            visa_table.insert_visa(own_visa(OLD_VISA)).unwrap();
+            let binding = StreamBinding {
+                ingress: ForwardingEntry(actor, stream),
+                egress: old_egress,
+            };
+            visa_table
+                .bind(OLD_VISA, binding, SystemTime::now())
+                .unwrap();
+            visa_table.insert_visa(own_visa(NEW_VISA)).unwrap();
+        }
+        let txn = peer.txn_mgr.try_open().unwrap();
+        peer.node_state.awaiting_next_hop_bind_table.insert(
+            txn.clone(),
+            NextHopBindOriginator::Rebind {
+                old: OLD_VISA,
+                new: NEW_VISA,
+                ingress_link_id: NonZero::new(actor).unwrap(),
+                ingress_stream_id: stream,
+            },
+        );
+        drop(peer);
+        (asm, hairpin_rx, actor, stream, txn)
+    }
+
+    /// zl-zipline#283 with J11: a committed rebind replaces the stream's
+    /// egress, so the DLT entry it replaced is unbound, and only that one.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_rebind_unbinds_the_replaced_local_egress() {
+        let (asm, mut hairpin_rx, actor, stream, txn) = local_rebind_in_flight();
+
+        install_tether(&asm, NonZero::new(actor).unwrap(), &txn, 43).unwrap();
+
+        assert!(local_actor_entry(&asm, stream) == Some((ForwardingEntry(actor, 43), NEW_VISA)));
+        assert_eq!(hairpin_messages(&mut hairpin_rx), unbind_of(42));
+    }
+
+    /// zl-zipline#283 (gate g214 q4) with J11: a refused commit leaves the
+    /// stream on its old egress, so the DLT entry granted for the rebind
+    /// is unbound, and only that one.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_refused_rebind_unbinds_its_grant() {
+        let (asm, mut hairpin_rx, actor, stream, txn) = local_rebind_in_flight();
+        asm.visa_table
+            .write()
+            .unwrap()
+            .revoke(&asm.peer_table, NEW_VISA)
+            .unwrap();
+
+        install_tether(&asm, NonZero::new(actor).unwrap(), &txn, 43).unwrap();
+
+        assert!(local_actor_entry(&asm, stream) == Some((ForwardingEntry(actor, 42), OLD_VISA)));
+        assert_eq!(hairpin_messages(&mut hairpin_rx), unbind_of(43));
+    }
 }

@@ -69,6 +69,35 @@ mod tests {
     /// not be pinned. (The epoch is global, so whether retired slots are
     /// reused also depends on every other thread, including other tests';
     /// this thread's pin is the part a worker controls.)
+    /// zl-zipline#283 (Copilot review): a worker serves only the peer it
+    /// was started for. Once that peer leaves, its link ID can be reused
+    /// by another peer, which gets a worker of its own; the old worker
+    /// must stop rather than also resend for the new peer. A peer is
+    /// told apart by its retry-reset `Notify`, which no other peer shares.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_worker_serves_only_its_own_peer() {
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let (_, dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending::<()>());
+        let dock = dock.get();
+        let own = asm
+            .peer_table
+            .get(dock)
+            .unwrap()
+            .zdpr_retry_timer_reset
+            .clone();
+
+        assert!(own_peer(&asm, dock, &own).is_some(), "its own peer");
+        // Another peer now at this link ID has a `Notify` of its own.
+        let replacement = Arc::new(tokio::sync::Notify::new());
+        assert!(
+            own_peer(&asm, dock, &replacement).is_none(),
+            "a peer that reused the link ID"
+        );
+        assert!(own_peer(&asm, dock + 100, &own).is_none(), "no peer");
+    }
+
     #[cfg(feature = "rcu-crossbeam-epoch")]
     #[tokio::test(flavor = "local")]
     async fn test_an_idle_worker_does_not_pin_the_rcu_epoch() {

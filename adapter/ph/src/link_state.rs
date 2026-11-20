@@ -366,7 +366,8 @@ impl LinkStateWrapper {
     /// configured, or `None` when it has configured none. The caller hands
     /// it to [Self::install_aaa] or [Self::process_assigned_aaa], so that
     /// link cleanup gives it back.
-    // AAA kept unused in v1 (zodes plan §5.4)
+    // AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    // Design decisions, "AAA kept, unused")
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn allocate_aaa(asm: &Assembly) -> Option<IpAddress> {
         asm.address_pool.lock().unwrap().as_mut().map(|pool| {
@@ -411,7 +412,8 @@ impl LinkStateWrapper {
     /// address and remember it, so link cleanup clears it again. An address
     /// the interface already carried is not ours to clear, so
     /// `installed_aaa` is set only when this link added it.
-    // AAA kept unused in v1 (zodes plan §5.4)
+    // AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    // Design decisions, "AAA kept, unused")
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn install_aaa(
         &self,
@@ -674,7 +676,8 @@ impl LinkStateWrapper {
 
     /// Record `aaa_addr` as this link's AAA address, so that link cleanup
     /// gives it back to the pool. Does not generate an error.
-    // AAA kept unused in v1 (zodes plan §5.4)
+    // AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    // Design decisions, "AAA kept, unused")
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn process_assigned_aaa(
         &self,
@@ -1257,9 +1260,10 @@ mod tests {
         }
     }
 
-    /// AAA kept unused in v1 (zodes plan §5.4): `install_aaa` puts the AAA
-    /// on the TUN through `TunCtl::add_authentication_address`, the only
-    /// way [AaaTunCtl] accepts an address.
+    /// AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    /// Design decisions, "AAA kept, unused"): `install_aaa` puts the AAA on
+    /// the TUN through `TunCtl::add_authentication_address`, the only way
+    /// [AaaTunCtl] accepts an address.
     #[tokio::test(flavor = "local")]
     async fn install_aaa_adds_an_authentication_address() {
         let aaa_ip: std::net::IpAddr = "fd5a:5052:0:aaa::1".parse().unwrap();
@@ -1273,7 +1277,8 @@ mod tests {
         assert_eq!(*tun.lock().unwrap(), vec![aaa_ip]);
     }
 
-    /// AAA kept unused in v1 (zodes plan §5.4): `allocate_aaa` takes nothing
+    /// AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    /// Design decisions, "AAA kept, unused"): `allocate_aaa` takes nothing
     /// until the visa service has configured a pool. An AAA it takes and
     /// `process_assigned_aaa` records on a link goes back to the pool when
     /// link cleanup runs, whatever the link type: the pool holds no

@@ -2,8 +2,8 @@
 #
 # A direct Zode link drops and the flow re-routes through the relay, then
 # the link comes back and new flows go direct again: the netns version of
-# the Zodes demo (zl-zipline#231, plan "Demo"; #251's acceptance, run in
-# #254; Zodes plan W5), docs/ZODE_LINKS.md rules 9, 10, 13, 13a, 14 and 15,
+# the Zodes demo (zl-zipline#231; #251's acceptance, run in #254),
+# docs/ZODE_LINKS.md rules 9, 10, 13, 13a, 14 and 15,
 # and F3, F4 and F6. It also runs the visa service's bounded re-proposal of
 # a direct link reported down (zl-zipline#268, visaservice#71).
 #
@@ -44,8 +44,9 @@
 #      proposes the link again. zb dials zc, both report the link up, and
 #      the visa service routes over it. The restarted zc has no visa yet,
 #      so its flow to zb is new: its bulk transfer leaves the relay's
-#      received bytes flat again (Zodes plan 5.8: only new visas take the
-#      direct link).
+#      received bytes flat again (only new visas take the direct link:
+#      docs/ROUTING.md, Design decisions, "Link down revokes; link up does
+#      not").
 #   5. A blip heals by itself. The link is blocked until both ends report
 #      it down, then unblocked at once. With no policy install and no
 #      restart, the visa service proposes it again, zb dials zc within its

@@ -5,7 +5,7 @@
 #
 # A relay Zode (relay = true) hosts the visa service in its own namespace,
 # on its own TUN (zl-zipline#229). Zode zb has an initial link to the relay; zb is in the relay's topology. zb has no substrate
-# address in policy (zl-zipline#255, W10), and a Zode never reports its own
+# address in policy (zl-zipline#255), and a Zode never reports its own
 # (zl-zipline#264), so the visa service knows it only once the relay asks for
 # zb's bootstrap visas with the address it observes zb's link come from.
 # Zode zc has a

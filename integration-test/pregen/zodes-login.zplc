@@ -27,7 +27,7 @@ i0 = "10.2.0.1:5000"
 [nodes.zb]
 provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
 zpr_address = "zb.zpr"
-# No substrate_addrs for zb (zl-zipline#255, W10): the visa service learns
+# No substrate_addrs for zb (zl-zipline#255): the visa service learns
 # zb's address only from what zb reports when it connects.
 
 [links.relay-zb]

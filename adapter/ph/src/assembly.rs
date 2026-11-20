@@ -630,8 +630,9 @@ impl Assembly {
 
         // The internal links to this Zode's own actor own the actor
         // addresses they authenticated, and a link owns the AAA address it
-        // was given (AAA kept unused in v1 (zodes plan §5.4)). Zode links
-        // are left out here: see above.
+        // was given (AAA kept unused in v1: zl-zpr-dev-context
+        // docs/ZODE_LINKS.md, Design decisions, "AAA kept, unused"). Zode
+        // links are left out here: see above.
         let adapter = self
             .peer_table
             .find(|(_id, peer)| {

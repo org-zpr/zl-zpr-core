@@ -18,6 +18,7 @@ use tracing::*;
 use zpr_utils::rsa_sign::sign_rsa_key;
 
 use crate::error::VSApiError;
+use crate::keepalive;
 use crate::logging::targets::VS_RPC;
 
 use zpr::vsapi_types::{
@@ -35,11 +36,25 @@ type ConnectFn = Box<
 
 const LIFECYCLE_EVENT_BUFFER_SIZE: usize = 64;
 
+/// How long the run loop waits after an answered ping before it sends the
+/// next one.
 const VSAPI_PING_INTERVAL: Duration = Duration::from_secs(5);
-const VSAPI_MAX_PING_FAILURES: u32 = 2;
 
-/// Minimum (and initial) timeout for a ping RPC call.
-const PING_MIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a VS-API ping may go unanswered before it counts as a miss:
+/// the ZDP link keep-alive's echo timeout (ZODE_LINKS rule 9). The VS-API
+/// session is TCP carried over a ZDP link, so one TCP retransmit on a
+/// loaded link delays a ping by a second or more while the link itself is
+/// fine. A tighter budget (it used to be 1 s, then 2 s) turned that delay
+/// into a miss, and two such misses into a rejoin (zl-zipline#292).
+const VSAPI_PING_TIMEOUT: Duration = keepalive::DEFAULT_KEEP_ALIVE_TIMEOUT;
+
+/// Consecutive ping misses that end the VS-API session: the link
+/// keep-alive's miss count. As after a missed echo, the next ping goes out
+/// at once, so a visa service that stopped answering ends the session
+/// after the same budget a link gets (about 9 s). The VS-API check is not
+/// meant to be stricter than that: the ZDP keep-alive stays the authority
+/// on whether the link is alive (zl-zipline#292).
+const VSAPI_MAX_PING_MISSES: u32 = keepalive::KEEP_ALIVE_MAX_MISSES;
 
 /// Default timeout for a single Cap'n Proto RPC call.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -410,11 +425,15 @@ impl VSConn {
                 tokio::task::spawn_local(rpc_system);
 
                 self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopStarts);
-                //let mut ping_interval = tokio::time::interval(VSAPI_PING_INTERVAL);
 
-                let ping_timeout = tokio::time::sleep(VSAPI_PING_INTERVAL);
-                tokio::pin!(ping_timeout);
-                let mut ping_failures = 0;
+                // The liveness ping runs as a task of its own, so a command
+                // queued while a ping is in flight goes out at once rather
+                // than waiting for the ping's answer or timeout
+                // (zl-zipline#292). At most one ping is in flight.
+                let next_ping = tokio::time::sleep(VSAPI_PING_INTERVAL);
+                tokio::pin!(next_ping);
+                let mut ping_in_flight: Option<tokio::task::JoinHandle<VSPingResponse>> = None;
+                let mut ping_misses = 0;
 
                 // Then loop over commands and periodically ping.
                 loop {
@@ -436,31 +455,48 @@ impl VSConn {
                             }
                         }
 
-                        // If the ping interval elapses, do a ping (not implemented yet).
-                        () = &mut ping_timeout => {
-                            if !cmd_state.is_connected() {
+                        // Time for the next ping.
+                        () = &mut next_ping, if ping_in_flight.is_none() => {
+                            let Some(vs_h) = cmd_state.vs_handle.clone() else {
                                 // Not connected, just reset the ping timer.
-                                ping_timeout.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
-                                ping_failures = 0;
+                                next_ping.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
+                                ping_misses = 0;
+                                continue;
+                            };
+                            ping_in_flight = Some(tokio::task::spawn_local(async move {
+                                Self::do_ping(&vs_h, VSAPI_PING_TIMEOUT).await
+                            }));
+                        }
+
+                        // The in-flight ping was answered, failed or timed out.
+                        joined = async { ping_in_flight.as_mut().unwrap().await }, if ping_in_flight.is_some() => {
+                            ping_in_flight = None;
+                            if !cmd_state.is_connected() {
+                                // The session went away while the ping was out.
+                                next_ping.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
+                                ping_misses = 0;
                                 continue;
                             }
-                            // Back off a bit if we experienced an error last time.
-                            let next_ping_timeout = PING_MIN_TIMEOUT + Duration::from_secs(ping_failures as u64);
-                            match self.do_ping(cmd_state.vs_handle.as_ref().unwrap(), next_ping_timeout).await {
-                                Ok(_) => {
+                            // The task is never aborted, so a join error is a panic in it.
+                            let result = joined.unwrap_or_else(|e| {
+                                Err(VSApiError::CommandFailed(format!("ping task failed: {e}")))
+                            });
+                            match result {
+                                Ok(()) => {
                                     trace!(target: VS_RPC, "VSConn: ping successful");
-                                    ping_failures = 0;
-                                    ping_timeout.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
+                                    ping_misses = 0;
+                                    next_ping.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
                                 }
                                 Err(e) => {
-                                    ping_failures += 1;
-                                    warn!(target: VS_RPC, "VSConn: ping error (count = {ping_failures}): {:?}", e);
-                                    if ping_failures >= VSAPI_MAX_PING_FAILURES {
+                                    ping_misses += 1;
+                                    warn!(target: VS_RPC, "VSConn: ping error (count = {ping_misses} of {VSAPI_MAX_PING_MISSES}): {:?}", e);
+                                    if ping_misses >= VSAPI_MAX_PING_MISSES {
                                         error!(target: VS_RPC, "VSConn: maximum ping failures reached, exiting run loop");
                                         self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
-                                        return Err(VSApiError::Timeout("ping".to_string()).into());
+                                        return Err(VSApiError::Timeout("ping".to_string()));
                                     }
-                                    ping_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
+                                    // Like a missed link keep-alive echo: ping again at once.
+                                    next_ping.as_mut().reset(tokio::time::Instant::now());
                                 }
                             }
                         }
@@ -691,8 +727,7 @@ impl VSConn {
                         "not connected to VS-API".to_string(),
                     ))
                 } else {
-                    self.do_ping(cmd_state.vs_handle.as_ref().unwrap(), PING_MIN_TIMEOUT)
-                        .await
+                    Self::do_ping(cmd_state.vs_handle.as_ref().unwrap(), VSAPI_PING_TIMEOUT).await
                 };
                 if let Err(e) = resp_tx.send(resp) {
                     error!(target: VS_RPC, "failed to send ping response: {:?}", e);
@@ -1192,8 +1227,9 @@ impl VSConn {
         }
     }
 
+    /// Ping the visa service on `vs_h`, giving up after `with_timeout`.
+    /// It takes no `self`, so the run loop can run it as a task of its own.
     async fn do_ping(
-        &self,
         vs_h: &vsapi2::v_s_handle::Client,
         with_timeout: Duration,
     ) -> Result<(), VSApiError> {

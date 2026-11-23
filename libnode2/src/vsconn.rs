@@ -243,6 +243,9 @@ pub struct VSConnHandle {
 struct VSCommandState {
     vs_service: vsapi2::visa_service::Client,
     vs_handle: Option<vsapi2::v_s_handle::Client>,
+    /// Bumped every time `vs_handle` is set, so the run loop can tell that
+    /// a liveness probe still runs on a handle that has been replaced.
+    vs_handle_generation: u64,
 }
 
 impl VSCommandState {
@@ -250,7 +253,14 @@ impl VSCommandState {
         VSCommandState {
             vs_service,
             vs_handle: None,
+            vs_handle_generation: 0,
         }
+    }
+
+    /// Install a new VS handle (after connect, open or re-authentication).
+    fn set_vs_handle(&mut self, handle: vsapi2::v_s_handle::Client) {
+        self.vs_handle = Some(handle);
+        self.vs_handle_generation += 1;
     }
 
     /// This is used synchronously in the command handlers to check if
@@ -426,16 +436,18 @@ impl VSConn {
 
                 self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopStarts);
 
-                // The liveness ping runs as a task of its own, so a command
+                // The liveness probe runs as a task of its own, so a command
                 // queued while a ping is in flight goes out at once rather
                 // than waiting for the ping's answer or timeout
-                // (zl-zipline#292). At most one ping is in flight.
-                let next_ping = tokio::time::sleep(VSAPI_PING_INTERVAL);
-                tokio::pin!(next_ping);
-                let mut ping_in_flight: Option<tokio::task::JoinHandle<VSPingResponse>> = None;
-                let mut ping_misses = 0;
+                // (zl-zipline#292). At most one probe runs at a time. The
+                // probe keeps pinging while a command holds the loop; a
+                // probe that failed is acted on once that command returns,
+                // which its own RPC timeout bounds.
+                let next_probe = tokio::time::sleep(VSAPI_PING_INTERVAL);
+                tokio::pin!(next_probe);
+                let mut probe: Option<tokio::task::JoinHandle<VSPingResponse>> = None;
 
-                // Then loop over commands and periodically ping.
+                // Then loop over commands and periodically probe.
                 loop {
                     tokio::select! {
                         // If we get a command, handle it.
@@ -445,60 +457,49 @@ impl VSConn {
                                 break;
                             };
                             let is_stop_cmd = matches!(cmd, VS2Command::Stop);
+                            let generation = cmd_state.vs_handle_generation;
                             if let Err(e) = self.handle_command(&mut cmd_state, cmd).await {
                                 error!(target: VS_RPC, "VSConn: handle_command error: {:?}", e);
                                 self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
-                                return Err(e.into());
+                                return Err(e);
                             }
                             if is_stop_cmd {
                                 break;
                             }
-                        }
-
-                        // Time for the next ping.
-                        () = &mut next_ping, if ping_in_flight.is_none() => {
-                            let Some(vs_h) = cmd_state.vs_handle.clone() else {
-                                // Not connected, just reset the ping timer.
-                                next_ping.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
-                                ping_misses = 0;
-                                continue;
-                            };
-                            ping_in_flight = Some(tokio::task::spawn_local(async move {
-                                Self::do_ping(&vs_h, VSAPI_PING_TIMEOUT).await
-                            }));
-                        }
-
-                        // The in-flight ping was answered, failed or timed out.
-                        joined = async { ping_in_flight.as_mut().unwrap().await }, if ping_in_flight.is_some() => {
-                            ping_in_flight = None;
-                            if !cmd_state.is_connected() {
-                                // The session went away while the ping was out.
-                                next_ping.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
-                                ping_misses = 0;
-                                continue;
+                            if cmd_state.vs_handle_generation != generation {
+                                // A new handle: misses on the old one say
+                                // nothing about it, so start liveness afresh.
+                                if let Some(old_probe) = probe.take() {
+                                    old_probe.abort();
+                                }
+                                next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
                             }
-                            // The task is never aborted, so a join error is a panic in it.
+                        }
+
+                        // Time for the next probe.
+                        () = &mut next_probe, if probe.is_none() => {
+                            match cmd_state.vs_handle.clone() {
+                                Some(vs_h) => probe = Some(tokio::task::spawn_local(Self::probe_liveness(vs_h))),
+                                // Not connected, just reset the probe timer.
+                                None => next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL),
+                            }
+                        }
+
+                        // The probe finished: the VS answered, or every ping missed.
+                        joined = async { probe.as_mut().unwrap().await }, if probe.is_some() => {
+                            probe = None;
+                            // The probe is aborted only after it is taken
+                            // out of `probe`, so a join error is a panic in it.
                             let result = joined.unwrap_or_else(|e| {
-                                Err(VSApiError::CommandFailed(format!("ping task failed: {e}")))
+                                Err(VSApiError::CommandFailed(format!("liveness probe failed: {e}")))
                             });
-                            match result {
-                                Ok(()) => {
-                                    trace!(target: VS_RPC, "VSConn: ping successful");
-                                    ping_misses = 0;
-                                    next_ping.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
-                                }
-                                Err(e) => {
-                                    ping_misses += 1;
-                                    warn!(target: VS_RPC, "VSConn: ping error (count = {ping_misses} of {VSAPI_MAX_PING_MISSES}): {:?}", e);
-                                    if ping_misses >= VSAPI_MAX_PING_MISSES {
-                                        error!(target: VS_RPC, "VSConn: maximum ping failures reached, exiting run loop");
-                                        self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
-                                        return Err(VSApiError::Timeout("ping".to_string()));
-                                    }
-                                    // Like a missed link keep-alive echo: ping again at once.
-                                    next_ping.as_mut().reset(tokio::time::Instant::now());
-                                }
+                            if let Err(e) = result {
+                                error!(target: VS_RPC, "VSConn: maximum ping failures reached, exiting run loop: {:?}", e);
+                                self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
+                                return Err(VSApiError::Timeout("ping".to_string()));
                             }
+                            trace!(target: VS_RPC, "VSConn: ping successful");
+                            next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
                         }
                     }
                 }
@@ -553,7 +554,7 @@ impl VSConn {
                 let retval = match resp {
                     Ok(handle) => {
                         info!(target: VS_RPC, "VS API connect succeeded");
-                        cmd_state.vs_handle = Some(handle);
+                        cmd_state.set_vs_handle(handle);
                         self.send_lifecycle_event(VSConnLifecycleEvent::ConnectedToVsApi(
                             stateflag,
                         ));
@@ -585,7 +586,7 @@ impl VSConn {
                 let retval = match resp {
                     Ok(handle) => {
                         info!(target: VS_RPC, "VS API open succeeded");
-                        cmd_state.vs_handle = Some(handle);
+                        cmd_state.set_vs_handle(handle);
                         self.send_lifecycle_event(VSConnLifecycleEvent::ConnectedToVsApi(
                             stateflag,
                         ));
@@ -686,7 +687,7 @@ impl VSConn {
                     match self.do_connect(&cmd_state.vs_service, req).await {
                         Ok(handle) => {
                             info!(target: VS_RPC, "VS API reauthenticate succeeded; handle swapped");
-                            cmd_state.vs_handle = Some(handle);
+                            cmd_state.set_vs_handle(handle);
                             Ok(())
                         }
                         Err(e) => {
@@ -1227,8 +1228,32 @@ impl VSConn {
         }
     }
 
+    /// Probe the VS-API session's liveness on `vs_h` the way the ZDP link
+    /// keep-alive probes a link (ZODE_LINKS rule 9): up to
+    /// [VSAPI_MAX_PING_MISSES] pings, each given [VSAPI_PING_TIMEOUT], the
+    /// next sent as soon as one misses. A miss always takes the full
+    /// timeout, so pings refused at once use up the budget no faster than
+    /// silence would. Returns Ok on the first answered ping, or the last
+    /// error once every ping missed.
+    async fn probe_liveness(vs_h: vsapi2::v_s_handle::Client) -> VSPingResponse {
+        let mut misses = 0;
+        loop {
+            let miss_ends = tokio::time::Instant::now() + VSAPI_PING_TIMEOUT;
+            match Self::do_ping(&vs_h, VSAPI_PING_TIMEOUT).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    misses += 1;
+                    warn!(target: VS_RPC, "VSConn: ping error (count = {misses} of {VSAPI_MAX_PING_MISSES}): {:?}", e);
+                    tokio::time::sleep_until(miss_ends).await;
+                    if misses >= VSAPI_MAX_PING_MISSES {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     /// Ping the visa service on `vs_h`, giving up after `with_timeout`.
-    /// It takes no `self`, so the run loop can run it as a task of its own.
     async fn do_ping(
         vs_h: &vsapi2::v_s_handle::Client,
         with_timeout: Duration,
@@ -1939,6 +1964,12 @@ mod tests {
         ping_delay: Duration,
         /// How many `ping` calls have reached the fake, answered or not.
         pings_started: u32,
+        /// The id of a [FakeVsHandle] whose pings never answer, whatever
+        /// `ping_delay` says: a handle the VS stopped serving.
+        hung_ping_handle: Option<u32>,
+        /// When set, `ping` answers `authRequired` at once, as the VS does
+        /// for a handle it no longer serves.
+        refuse_pings: bool,
     }
 
     struct FakeVs {
@@ -2042,12 +2073,25 @@ mod tests {
             let delay = {
                 let mut st = self.state.borrow_mut();
                 st.pings_started += 1;
-                st.ping_delay
+                if st.hung_ping_handle == Some(self.id) {
+                    Duration::from_secs(3600)
+                } else {
+                    st.ping_delay
+                }
             };
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
             self.state.borrow_mut().last_ping_handle = Some(self.id);
+            if self.state.borrow().refuse_pings {
+                let mut err = results.get().init_res().init_error();
+                ApiResponseError::new_code_msg(
+                    zpr::vsapi_types::ErrorCode::AuthRequired,
+                    "fake ping refusal",
+                )
+                .write_to(&mut err);
+                return Ok(());
+            }
             results.get().init_res().set_ok(());
             Ok(())
         }
@@ -2190,6 +2234,8 @@ mod tests {
             disconnects: Vec::new(),
             ping_delay: Duration::ZERO,
             pings_started: 0,
+            hung_ping_handle: None,
+            refuse_pings: false,
         }));
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -2402,37 +2448,99 @@ mod tests {
             .await;
     }
 
+    /// Connect a VSConn to the fake VS, `configure` the fake's pings, and
+    /// assert the session ends after the link keep-alive budget, counted
+    /// from the first ping, and not before.
+    async fn assert_session_ends_after_the_link_budget(configure: impl FnOnce(&mut FakeVsState)) {
+        let (handle, mut lifecycle_rx, state, task) = running_vsconn_against_fake_vs().await;
+        wait_for_run_loop(&mut lifecycle_rx).await;
+        handle.connect(test_node_connect()).await.expect("connect");
+        configure(&mut state.borrow_mut());
+
+        wait_for_pings_started(&state, 1).await;
+        let first_ping = tokio::time::Instant::now();
+        let budget = link_keep_alive_budget();
+        tokio::time::timeout(budget + Duration::from_secs(3), async {
+            loop {
+                match lifecycle_rx.recv().await {
+                    Ok(VSConnLifecycleEvent::RunLoopExits) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("lifecycle channel died: {e:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the session must end within the budget");
+        let ended_after = first_ping.elapsed();
+        assert!(
+            ended_after + Duration::from_millis(500) >= budget,
+            "the session ended after {ended_after:?}, before the {budget:?} budget"
+        );
+
+        handle.stop().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
     /// zl-zipline#292: a VS that really stops answering pings still ends
     /// the session, after the link keep-alive budget and not before.
     #[tokio::test]
     async fn an_unanswering_vs_ends_the_session_after_the_link_budget() {
+        tokio::task::LocalSet::new()
+            .run_until(assert_session_ends_after_the_link_budget(|st| {
+                st.ping_delay = Duration::from_secs(3600);
+            }))
+            .await;
+    }
+
+    /// zl-zipline#292: pings refused at once use up the budget no faster
+    /// than silence: every miss takes a full ping timeout.
+    #[tokio::test]
+    async fn refused_pings_end_the_session_after_the_link_budget() {
+        tokio::task::LocalSet::new()
+            .run_until(assert_session_ends_after_the_link_budget(|st| {
+                st.refuse_pings = true;
+            }))
+            .await;
+    }
+
+    /// zl-zipline#292: misses on a VS handle that a re-authentication has
+    /// since replaced do not count against the new handle. Here the old
+    /// handle misses twice, then the node re-authenticates while the third
+    /// ping is out; the new handle answers, so the session stays up.
+    #[tokio::test]
+    async fn a_reauthentication_starts_liveness_afresh_on_the_new_handle() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let (handle, mut lifecycle_rx, state, task) =
                     running_vsconn_against_fake_vs().await;
                 wait_for_run_loop(&mut lifecycle_rx).await;
                 handle.connect(test_node_connect()).await.expect("connect");
-                state.borrow_mut().ping_delay = Duration::from_secs(3600);
+                state.borrow_mut().hung_ping_handle = Some(1);
 
-                wait_for_pings_started(&state, 1).await;
-                let first_ping = tokio::time::Instant::now();
-                let budget = link_keep_alive_budget();
-                tokio::time::timeout(budget + Duration::from_secs(3), async {
-                    loop {
-                        match lifecycle_rx.recv().await {
-                            Ok(VSConnLifecycleEvent::RunLoopExits) => break,
-                            Ok(_) => continue,
-                            Err(e) => panic!("lifecycle channel died: {e:?}"),
+                wait_for_pings_started(&state, crate::keepalive::KEEP_ALIVE_MAX_MISSES).await;
+                handle
+                    .reauthenticate(NodeConnect {
+                        zpr_addr: "10.1.1.1".parse().unwrap(),
+                        state: StateFlag::HasState,
+                        a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+                    })
+                    .await
+                    .expect("reauthenticate must succeed against the fake VS");
+
+                // Past the old handle's last ping timeout.
+                tokio::time::sleep(
+                    crate::keepalive::DEFAULT_KEEP_ALIVE_TIMEOUT + Duration::from_secs(1),
+                )
+                .await;
+                loop {
+                    match lifecycle_rx.try_recv() {
+                        Ok(VSConnLifecycleEvent::RunLoopExits) => {
+                            panic!("the old handle's misses ended the re-authenticated session")
                         }
+                        Ok(_) => continue,
+                        Err(_) => break,
                     }
-                })
-                .await
-                .expect("an unanswering VS must end the session within the budget");
-                let silent_for = first_ping.elapsed();
-                assert!(
-                    silent_for + Duration::from_millis(500) >= budget,
-                    "the session ended after {silent_for:?}, before the {budget:?} budget"
-                );
+                }
 
                 handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;

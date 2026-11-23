@@ -41,16 +41,17 @@ env:
   # (v0.21.2 sends no Link.peerCn, so it cannot drive Zode links). Re-cut
   # rule (docs/BUILD.md, zl-zipline#254): when the visa service changes in a
   # way core CI needs, cut the next v0.22.0-zodes.N pre-release from its
-  # feature/zodes and move this pin to it. v0.22.0-zodes.11 is cut from the
-  # head of visaservice#73 at 6b85e4e, before it merged (the p37
-  # precedent): the visa service records the substrate address the relay
-  # observed (observedAddr on requestBootstrapVisas) and refuses the removed
-  # substrate_addr connect parameter (zl-zipline#264), which this PR's ph
-  # needs. It carries v0.22.0-zodes.10's Zode departure removal
-  # (zl-zipline#284, zode-rejoin-test.sh) and v0.22.0-zodes.9's re-proposal
-  # of a direct link reported down (zl-zipline#268, zode-reroute-test.sh).
+  # feature/zodes and move this pin to it. v0.22.0-zodes.12 is cut from the
+  # head of visaservice#79 at b3da318, before it merged (the p37
+  # precedent): the visa service revokes through durable revocation
+  # obligations and one reconciler (zl-zipline#289), whose sweep and refresh
+  # log lines the integration scripts now match. It carries
+  # v0.22.0-zodes.11's observed substrate address (zl-zipline#264),
+  # v0.22.0-zodes.10's Zode departure removal (zl-zipline#284,
+  # zode-rejoin-test.sh) and v0.22.0-zodes.9's re-proposal of a direct link
+  # reported down (zl-zipline#268, zode-reroute-test.sh).
   # It loads only zplc 0.21.x policies.
-  VISA_SERVICE_RELEASE: v0.22.0-zodes.11
+  VISA_SERVICE_RELEASE: v0.22.0-zodes.12
 
 jobs:
   # Build and upload ph

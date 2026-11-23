@@ -38,8 +38,8 @@
 #      restarted on the edited JSON — the reference server loads its data
 #      once at startup), then a TARGETED notify (user.sub=user-a) with a
 #      `Permission::Notify` key bound to the zipline service id (the
-#      zipline#79 V2 surface). The queued TrustedServiceChange event
-#      re-queries, the tag disappears, the visa is revoked, and a fresh
+#      zipline#79 V2 surface). The recorded revocation obligation's
+#      reconciler pass re-queries, the tag disappears, the visa is revoked, and a fresh
 #      connect attempt (ping) is denied, while the Zodes' device flows to
 #      the visa service still work.
 #   4. SKIP_NOTIFY=1 negative knob: skips ONLY the notify posts (both of
@@ -425,7 +425,9 @@ if [[ "$PASS" == 0 ]]; then
     echo "== 2. untargeted notify (empty body: everything changed, data unchanged)"
     # zode_ping's warm-up would hide a revoked visa that zb simply asks
     # for again, so wait for the notify's sweep and count revocations on
-    # both sides too: none may happen.
+    # both sides too: none may happen. Earlier passes settle first, so their
+    # sweeps are not taken for the notify's.
+    settle_sweeps vs.log "$VS_SWEEP"
     LEG2_ALL_SWEEPS=$(log_count vs.log "$VS_SWEEP")
     LEG2_SWEEPS=$(log_count vs.log "$VS_SWEEP_REVOKED")
     LEG2_REVOCATIONS=$(log_count zb.log "$REVOKED")

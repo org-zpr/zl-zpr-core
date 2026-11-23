@@ -450,6 +450,37 @@ impl VSConn {
                 // Then loop over commands and periodically probe.
                 loop {
                     tokio::select! {
+                        // Biased, in this order: a finished probe is acted on
+                        // before any more work is dispatched, and a due probe
+                        // starts even while commands keep arriving.
+                        biased;
+
+                        // The probe finished: the VS answered, or every ping missed.
+                        joined = async { probe.as_mut().unwrap().await }, if probe.is_some() => {
+                            probe = None;
+                            // The probe is aborted only after it is taken
+                            // out of `probe`, so a join error is a panic in it.
+                            let result = joined.unwrap_or_else(|e| {
+                                Err(VSApiError::CommandFailed(format!("liveness probe failed: {e}")))
+                            });
+                            if let Err(e) = result {
+                                error!(target: VS_RPC, "VSConn: maximum ping failures reached, exiting run loop: {:?}", e);
+                                self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
+                                return Err(VSApiError::Timeout("ping".to_string()));
+                            }
+                            trace!(target: VS_RPC, "VSConn: ping successful");
+                            next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
+                        }
+
+                        // Time for the next probe.
+                        () = &mut next_probe, if probe.is_none() => {
+                            match cmd_state.vs_handle.clone() {
+                                Some(vs_h) => probe = Some(tokio::task::spawn_local(Self::probe_liveness(vs_h))),
+                                // Not connected, just reset the probe timer.
+                                None => next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL),
+                            }
+                        }
+
                         // If we get a command, handle it.
                         cmd = self.cmd_rx.recv() => {
                             let Some(cmd) = cmd else {
@@ -474,32 +505,6 @@ impl VSConn {
                                 }
                                 next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
                             }
-                        }
-
-                        // Time for the next probe.
-                        () = &mut next_probe, if probe.is_none() => {
-                            match cmd_state.vs_handle.clone() {
-                                Some(vs_h) => probe = Some(tokio::task::spawn_local(Self::probe_liveness(vs_h))),
-                                // Not connected, just reset the probe timer.
-                                None => next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL),
-                            }
-                        }
-
-                        // The probe finished: the VS answered, or every ping missed.
-                        joined = async { probe.as_mut().unwrap().await }, if probe.is_some() => {
-                            probe = None;
-                            // The probe is aborted only after it is taken
-                            // out of `probe`, so a join error is a panic in it.
-                            let result = joined.unwrap_or_else(|e| {
-                                Err(VSApiError::CommandFailed(format!("liveness probe failed: {e}")))
-                            });
-                            if let Err(e) = result {
-                                error!(target: VS_RPC, "VSConn: maximum ping failures reached, exiting run loop: {:?}", e);
-                                self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
-                                return Err(VSApiError::Timeout("ping".to_string()));
-                            }
-                            trace!(target: VS_RPC, "VSConn: ping successful");
-                            next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
                         }
                     }
                 }
@@ -2541,6 +2546,14 @@ mod tests {
                         Err(_) => break,
                     }
                 }
+                // Liveness resumes on the new handle.
+                tokio::time::timeout(VSAPI_PING_INTERVAL + Duration::from_secs(2), async {
+                    while state.borrow().last_ping_handle != Some(2) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the new handle must be pinged");
 
                 handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;

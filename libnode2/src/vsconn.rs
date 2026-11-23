@@ -1898,6 +1898,11 @@ mod tests {
         /// The reason of every `notifyDisconnect` the fake served, in order
         /// (zl-zipline#284).
         disconnects: Vec<zpr::vsapi_types::DisconnectReason>,
+        /// How long `ping` takes to answer (zl-zipline#292): zero answers at
+        /// once; an hour stands for a VS that stopped answering.
+        ping_delay: Duration,
+        /// How many `ping` calls have reached the fake, answered or not.
+        pings_started: u32,
     }
 
     struct FakeVs {
@@ -1998,6 +2003,14 @@ mod tests {
             _params: vsapi2::v_s_handle::PingParams,
             mut results: vsapi2::v_s_handle::PingResults,
         ) -> Result<(), capnp::Error> {
+            let delay = {
+                let mut st = self.state.borrow_mut();
+                st.pings_started += 1;
+                st.ping_delay
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             self.state.borrow_mut().last_ping_handle = Some(self.id);
             results.get().init_res().set_ok(());
             Ok(())
@@ -2139,6 +2152,8 @@ mod tests {
             reauth_requests: Vec::new(),
             connect_param_names: Vec::new(),
             disconnects: Vec::new(),
+            ping_delay: Duration::ZERO,
+            pings_started: 0,
         }));
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -2295,6 +2310,123 @@ mod tests {
                     .expect("the run loop stops")
                     .unwrap()
                     .unwrap();
+            })
+            .await;
+    }
+
+    // ------------------------------------------------------------------
+    // zl-zipline#292: the VS-API liveness check is sized to the ZDP link
+    // keep-alive budget, and a queued command never waits for a ping. These
+    // run on real time: the run loop's first ping goes out
+    // [VSAPI_PING_INTERVAL] after it starts.
+    // ------------------------------------------------------------------
+
+    /// The link keep-alive budget: how long a VS that stopped answering may
+    /// stay silent before the session ends.
+    fn link_keep_alive_budget() -> Duration {
+        crate::keepalive::DEFAULT_KEEP_ALIVE_TIMEOUT * crate::keepalive::KEEP_ALIVE_MAX_MISSES
+    }
+
+    /// Wait (at most 10 s past the ping interval) until the fake VS has
+    /// seen `n` pings.
+    async fn wait_for_pings_started(state: &Rc<RefCell<FakeVsState>>, n: u32) {
+        tokio::time::timeout(VSAPI_PING_INTERVAL + Duration::from_secs(10), async {
+            while state.borrow().pings_started < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the run loop never pinged the fake VS");
+    }
+
+    /// zl-zipline#292: a ping the VS answers after 1.5 s, as one TCP
+    /// retransmit on a loaded link delays it, is not a miss. A miss would
+    /// send the next ping at once; a success waits a full ping interval.
+    #[tokio::test]
+    async fn a_ping_answered_after_1500ms_is_not_a_miss() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                state.borrow_mut().ping_delay = Duration::from_millis(1500);
+
+                wait_for_pings_started(&state, 1).await;
+                // Long enough for an answer and for any retry a miss would
+                // send; short of the next regular ping.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                assert_eq!(
+                    state.borrow().pings_started,
+                    1,
+                    "a ping answered within the keep-alive timeout must not be retried as a miss"
+                );
+                assert!(!task.is_finished(), "the run loop must keep running");
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#292: a VS that really stops answering pings still ends
+    /// the session, after the link keep-alive budget and not before.
+    #[tokio::test]
+    async fn an_unanswering_vs_ends_the_session_after_the_link_budget() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, mut lifecycle_rx, state, task) =
+                    running_vsconn_against_fake_vs().await;
+                wait_for_run_loop(&mut lifecycle_rx).await;
+                handle.connect(test_node_connect()).await.expect("connect");
+                state.borrow_mut().ping_delay = Duration::from_secs(3600);
+
+                wait_for_pings_started(&state, 1).await;
+                let first_ping = tokio::time::Instant::now();
+                let budget = link_keep_alive_budget();
+                tokio::time::timeout(budget + Duration::from_secs(3), async {
+                    loop {
+                        match lifecycle_rx.recv().await {
+                            Ok(VSConnLifecycleEvent::RunLoopExits) => break,
+                            Ok(_) => continue,
+                            Err(e) => panic!("lifecycle channel died: {e:?}"),
+                        }
+                    }
+                })
+                .await
+                .expect("an unanswering VS must end the session within the budget");
+                let silent_for = first_ping.elapsed();
+                assert!(
+                    silent_for + Duration::from_millis(500) >= budget,
+                    "the session ended after {silent_for:?}, before the {budget:?} budget"
+                );
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#292: a command queued while a ping is in flight goes out
+    /// at once; it does not wait for the ping's answer or timeout.
+    #[tokio::test]
+    async fn a_queued_command_does_not_wait_for_an_in_flight_ping() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                state.borrow_mut().ping_delay = Duration::from_secs(3600);
+
+                wait_for_pings_started(&state, 1).await;
+                let queued = tokio::time::Instant::now();
+                handle
+                    .get_login_nonce()
+                    .await
+                    .expect("the VS answers the queued command");
+                let waited = queued.elapsed();
+                assert!(
+                    waited < Duration::from_millis(500),
+                    "the queued command waited {waited:?} for the in-flight ping"
+                );
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
     }

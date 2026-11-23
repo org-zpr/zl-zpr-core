@@ -104,13 +104,11 @@ const DEFAULT_WORKER_CONCURRENCY: usize = 4;
 #[cfg(any(target_os = "macos", windows))]
 const DEFAULT_WORKER_CONCURRENCY: usize = 1;
 
-pub const DEFAULT_KEEP_ALIVE_PERIOD: std::time::Duration = std::time::Duration::from_secs(3);
-pub const DEFAULT_KEEP_ALIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-/// Consecutive keep-alive (echo) misses tolerated on an Active link before
-/// the link is declared dead (zipline#113). A single dropped echo on the VS
-/// adapter link used to kill the whole run: with a 3 s period and 3 s
-/// timeout, 3 misses gives roughly 9-12 s of grace before teardown.
-pub const KEEP_ALIVE_MAX_MISSES: u32 = 3;
+/// The link keep-alive budget lives in libnode, so the VS-API liveness
+/// check can be sized from it too (zl-zipline#292).
+pub use libnode::keepalive::{
+    DEFAULT_KEEP_ALIVE_PERIOD, DEFAULT_KEEP_ALIVE_TIMEOUT, KEEP_ALIVE_MAX_MISSES,
+};
 
 /// How often, at most, the expiry sweep runs (zl-zipline#274,
 /// [crate::visa_mgmt::sweep_expired_visas_if_due]). The sweep enforces

@@ -1819,6 +1819,7 @@ mod windows_unbatched {
     use bytes::BufMut;
     use std::io::Result;
     use std::net::SocketAddr;
+    use windows_sys::Win32::System::Threading::SetEvent;
     use zpr_utils::net_defs::ScopedIpAddr;
 
     pub struct BatchIo {}
@@ -1878,7 +1879,9 @@ mod windows_unbatched {
         Ok(completed)
     }
 
-    /// Read one batch from a Wintun receive ring into `bufs`.
+    /// Read one batch from a Wintun receive ring into `bufs`, and re-arm
+    /// the ring's read-wait event if the batch may have left packets
+    /// behind (zl-zipline#292).
     ///
     /// `try_receive` copies the ring's next packet into the buffer and
     /// returns its length, or `None` when the ring is empty. An empty ring
@@ -1886,26 +1889,49 @@ mod windows_unbatched {
     /// all engines share). `read_event` is the ring's read-wait event, the
     /// handle the fastpath waits on for TUN readiness.
     ///
+    /// The read-wait event is auto-reset: the driver sets it once per ring
+    /// append, and the wake (or `WaitSet`'s zero-timeout probe) that led
+    /// here consumed it. The fastpath reads one batch per wake, so a batch
+    /// that ends without seeing the ring empty sets the event again; the
+    /// next wait then reports the TUN readable at once instead of when the
+    /// driver next appends. Fairness is unchanged: the other sources are
+    /// served between batches. A ring that held exactly one batch costs
+    /// one extra wake, which reads nothing.
+    ///
     /// The batch is factored out of [`BatchIo::try_read_buf_batch`] so a
     /// test can drive it with a fake ring and a real Event.
-    fn read_ring_batch<'a>(
+    fn read_ring_batch(
         mut try_receive: impl FnMut(&mut dyn BufMut) -> Result<Option<usize>>,
         read_event: WaitHandle<'_>,
-        bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+        bufs: &mut dyn Iterator<Item = &mut dyn BufMut>,
         results: &mut Vec<Result<usize>>,
     ) -> Result<usize> {
-        let _ = read_event;
-        do_tun_batch_op(
+        let mut ring_empty = false;
+        let completed = do_tun_batch_op(
             |buf: &mut dyn BufMut| match try_receive(buf)? {
                 Some(len) => Ok(len),
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "Wintun receive ring empty",
-                )),
+                None => {
+                    ring_empty = true;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Wintun receive ring empty",
+                    ))
+                }
             },
             bufs,
             results,
-        )
+        );
+        if !ring_empty {
+            // SAFETY: read_event names a live Event; its borrow keeps the
+            // owner (the Wintun session, or a test's Event) alive.
+            if unsafe { SetEvent(read_event.as_handle()) } == 0 {
+                panic!(
+                    "SetEvent on the TUN read-wait event failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        completed
     }
 
     impl BatchIoImpl for BatchIo {

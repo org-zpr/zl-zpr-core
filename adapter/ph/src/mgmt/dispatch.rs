@@ -3,7 +3,7 @@
 use super::core;
 use crate::counters::{ManagementCounterType, ManagementCounters};
 use crate::km_multiplexor;
-use crate::link_state::LinkType;
+use crate::link_state::{LinkType, ZodeEnd};
 use crate::prelude::*;
 use crate::queues;
 use crate::zdp;
@@ -27,22 +27,32 @@ pub fn dispatch_mgmt_packet_with_addr(
         Ok((base_hdr, _)) if base_hdr.packet_type == zdp::ZdpPacketType::KeyManagement => {
             pkt.advance(std::mem::size_of::<zdp::ZdpBaseHeader>());
 
-            // TODO: once we have multi-node, how do we know whether this is a link or a
-            // tether?
-
-            // It is possible we are processing a queue of messages and we have already set up a
-            // tether for this source.  So before trying to start a tether check if we already have one.
-
+            // It is possible we are processing a queue of messages and we
+            // have already set up a link for this source, so look it up first.
             let mut ingress_link_id = asm
                 .peer_table
                 .lookup_peer(&peer_sa, &interface_addr)
                 .unwrap_or_zero();
 
+            // A same-address Zode handshake whose established link has gone
+            // keeps reaching its own link (gate g78 q5).
             if ingress_link_id == LINK_ID_UNKNOWN {
-                let Some(i_link_id) = asm
-                    .start_tether(&peer_sa, &interface_addr, LinkType::NodeToAdapter, true)
-                    .ok()
-                else {
+                ingress_link_id =
+                    keying_zode_link_at(asm, &peer_sa, &interface_addr, None).unwrap_or_zero();
+            }
+
+            if ingress_link_id == LINK_ID_UNKNOWN {
+                // Only a Zode opens a link (zl-zipline#234), and a dialing
+                // Zode marks its first handshake message (zl-zipline#250).
+                // Anything else, an adapter's dock included, is refused.
+                let started =
+                    if crate::km_noise::starts_zode_handshake(km_noise_message(pkt.body())) {
+                        asm.start_zode_link(&peer_sa, &interface_addr, ZodeEnd::Answerer)
+                            .ok()
+                    } else {
+                        None
+                    };
+                let Some(i_link_id) = started else {
                     core::count_event(asm, ManagementCounterType::UnknownPeer);
                     return;
                 };
@@ -60,11 +70,84 @@ pub fn dispatch_mgmt_packet_with_addr(
     }
 }
 
+/// The Noise message carried in `km_body` (a KM header and its payload), or
+/// an empty slice if the header is malformed. Both the Noise and the null KM
+/// header carry a Noise handshake: `--km-impl null` only changes the label.
+fn km_noise_message(km_body: &[u8]) -> &[u8] {
+    match zdp::ZdpKeyManagementHeader::ref_from_prefix(km_body) {
+        Ok((hdr, rest)) if hdr.is_noise() || hdr.is_null() => {
+            &rest[..usize::from(hdr.message_length.get()).min(rest.len())]
+        }
+        _ => &[],
+    }
+}
+
+/// The link a key-management message that arrived on `link_id` belongs to
+/// (ZODE_LINKS.md rule 5, gate g78 q5).
+///
+/// An established Zode link never re-keys, so a handshake message arriving
+/// on one is a new handshake from the same address: the peer restarted on
+/// its fixed port and dialed again. A marked first message gets a link of
+/// its own ([Assembly::answer_zode_redial]) and later messages from that
+/// address go to it while it keys. Anything else stays on `link_id`.
+fn zode_handshake_link(asm: &Arc<Assembly>, link_id: LinkId, km_body: &[u8]) -> LinkId {
+    let Some((link_type, sa, iface)) = asm.peer_table.inspect(link_id, |p| {
+        (
+            p.link_state_machine.get_link_type(),
+            p.substrate_addr,
+            p.interface_addr,
+        )
+    }) else {
+        return link_id;
+    };
+    if link_type != LinkType::NodeToNode {
+        return link_id;
+    }
+    // A new handshake from this address already under way goes to its own
+    // link, whatever has become of `link_id` meanwhile (it may be closing).
+    if let Some(id) = keying_zode_link_at(asm, &sa, &iface, Some(link_id)) {
+        return id.get();
+    }
+    if !asm.peer_table.is_security_association_established(link_id) {
+        return link_id;
+    }
+    if !crate::km_noise::starts_zode_handshake(km_noise_message(km_body)) {
+        return link_id;
+    }
+    match asm.answer_zode_redial(link_id) {
+        Ok(id) => id.get(),
+        Err(e) => {
+            warn!(target: KEY_MGMT, "cannot answer a new Zode handshake on {}: {e}", asm.formatted_link_id(link_id));
+            link_id
+        }
+    }
+}
+
+/// A Zode link still keying at substrate address `sa` on interface `iface`,
+/// other than `except`: a same-address handshake keyed alongside an
+/// established link (gate g78 q5).
+fn keying_zode_link_at(
+    asm: &Assembly,
+    sa: &SubstrateAddr,
+    iface: &net_defs::ScopedIpAddr,
+    except: Option<LinkId>,
+) -> Option<std::num::NonZero<LinkId>> {
+    asm.peer_table
+        .find(|(id, p)| {
+            Some(id.get()) != except
+                && p.substrate_addr == *sa
+                && p.interface_addr == *iface
+                && p.link_state_machine.get_link_type() == LinkType::NodeToNode
+                && p.link_state_machine.get_state() == crate::link_state::LinkState::Keying
+        })
+        .map(|(id, _)| id)
+}
+
 /// Dispatch the given management packet.
 ///
 /// This function does not block, and does not perform significant processing.
 /// It merely dispatches the management packet to the correct queue.
-pub fn dispatch_mgmt_packet_with_link(asm: &Assembly, pkt: &mut Packet) {
+pub fn dispatch_mgmt_packet_with_link(asm: &Arc<Assembly>, pkt: &mut Packet) {
     let Ok((base_hdr, rest)) = zdp::ZdpBaseHeader::ref_from_prefix(pkt.body()) else {
         core::count_event(asm, ManagementCounterType::BadStructure);
         return;
@@ -73,6 +156,8 @@ pub fn dispatch_mgmt_packet_with_link(asm: &Assembly, pkt: &mut Packet) {
     match base_hdr.packet_type {
         zdp::ZdpPacketType::KeyManagement => {
             pkt.advance(std::mem::size_of::<zdp::ZdpBaseHeader>());
+            pkt.metadata_mut().ingress_link_id =
+                zode_handshake_link(asm, pkt.metadata().ingress_link_id, pkt.body());
             return handle_key_management(asm, pkt);
         }
 
@@ -314,6 +399,461 @@ mod test {
     use std::num::NonZero;
     use std::sync::Arc;
 
+    /// A key-management packet carrying the Noise message `km_msg`, as the
+    /// fastpath hands it to the dispatcher (ZDP base header first).
+    fn km_packet(km_msg: &[u8]) -> Packet {
+        let mut pkt = core::new_heap_packet();
+        let km_hdr = pkt.alloc_zeroed_header::<zdp::ZdpKeyManagementHeader>();
+        km_hdr.message_type = KM_ID_NOISE.into();
+        km_hdr.message_length = (km_msg.len() as u16).into();
+        pkt.put(km_msg);
+        pkt.alloc_zeroed_header::<zdp::ZdpBaseHeader>().packet_type =
+            zdp::ZdpPacketType::KeyManagement;
+        pkt
+    }
+
+    /// The first Noise message of a Zode's handshake and of an adapter's.
+    fn first_messages() -> (bytes::Bytes, bytes::Bytes) {
+        use crate::km::KeyManagerStateMachine;
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let (kp, certx) = crate::assembly::test::zode_link_keys(&ca, "a.zpr");
+        let mut zode =
+            crate::km_noise::KmNoise::new_zode(true, kp, crate::km::ZPIPair::new(1, 2), certx)
+                .unwrap();
+        let mut adapter = crate::km_noise::KmNoise::new(
+            true,
+            true,
+            None,
+            crate::km::ZPIPair::new(1, 2),
+            KmCertExchange::new(None, Some(ca.cert.clone())),
+        )
+        .unwrap();
+        (
+            zode.reset().unwrap().unwrap(),
+            adapter.reset().unwrap().unwrap(),
+        )
+    }
+
+    /// zl-zipline#250, #234: only a first handshake message that carries
+    /// the Zode marker opens a link; an adapter's unmarked handshake, and
+    /// a message that is not a handshake at all, open nothing.
+    #[test]
+    fn test_only_a_first_zode_handshake_message_is_marked() {
+        let (zode_msg0, adapter_msg0) = first_messages();
+        assert!(crate::km_noise::starts_zode_handshake(&zode_msg0));
+        assert!(!crate::km_noise::starts_zode_handshake(&adapter_msg0));
+        assert!(!crate::km_noise::starts_zode_handshake(&[]));
+    }
+
+    /// Review round 2: with `--km-impl null` the Noise handshake goes out
+    /// under a null KM header; the Zode marker is still recognised.
+    #[test]
+    fn test_zode_marker_is_found_under_a_null_km_header() {
+        let (zode_msg0, _) = first_messages();
+        let mut body = Vec::new();
+        body.extend_from_slice(&KM_ID_NULL.to_be_bytes());
+        body.extend_from_slice(&(zode_msg0.len() as u16).to_be_bytes());
+        body.extend_from_slice(&zode_msg0);
+        assert!(crate::km_noise::starts_zode_handshake(km_noise_message(
+            &body
+        )));
+    }
+
+    /// zl-zipline#250, #234: dispatching a marked first message from an
+    /// unknown address creates a NodeToNode link with this Zode as the
+    /// answerer. An unmarked one (an adapter's dock) is refused: no link is
+    /// created and the packet is counted as from an unknown peer.
+    #[tokio::test(flavor = "local")]
+    async fn test_unknown_peer_marked_handshake_creates_zode_link_unmarked_is_refused() {
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let (kp, certx) = crate::assembly::test::zode_link_keys(&ca, "relay.zpr");
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            self_noise_keypair: Some(kp),
+            certx: Some(certx),
+            ..TestAssemblyBuilder::new()
+        }));
+        let (zode_msg0, adapter_msg0) = first_messages();
+        let intf_addr = net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 1).into());
+        let zode_sa = SubstrateAddr::from(([127, 0, 0, 1], 4001));
+        let adapter_sa = SubstrateAddr::from(([127, 0, 0, 1], 4002));
+
+        dispatch_mgmt_packet_with_addr(&asm, zode_sa, intf_addr, &mut km_packet(&zode_msg0));
+        dispatch_mgmt_packet_with_addr(&asm, adapter_sa, intf_addr, &mut km_packet(&adapter_msg0));
+
+        let link_type_at = |sa| {
+            let id = asm.peer_table.lookup_peer(&sa, &intf_addr).unwrap();
+            asm.peer_table
+                .get(id.get())
+                .unwrap()
+                .link_state_machine
+                .get_link_type()
+        };
+        assert_eq!(link_type_at(zode_sa), LinkType::NodeToNode);
+        assert!(
+            asm.peer_table
+                .lookup_peer(&adapter_sa, &intf_addr)
+                .is_none()
+        );
+        assert_eq!(
+            asm.counters.management[ManagementCounterType::UnknownPeer].get_count(),
+            1
+        );
+        let id = asm.peer_table.lookup_peer(&zode_sa, &intf_addr).unwrap();
+        assert_eq!(
+            asm.peer_table
+                .get(id.get())
+                .unwrap()
+                .link_state_machine
+                .zode_end(),
+            Some(&crate::link_state::ZodeEnd::Answerer)
+        );
+    }
+
+    /// A Zode `a.zpr` at fd5a:5052::10 with CA-signed link keys and an
+    /// empty topology. Returns the assembly and the egress queue its links
+    /// send through.
+    fn zode_a() -> (
+        Arc<Assembly>,
+        crate::packet_queue::Receiver<{ PACKET_BUFFER_SIZE }>,
+    ) {
+        let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(64);
+        let ca = crate::pki::TestCa::new("zode-ca");
+        let (kp, certx) = crate::assembly::test::zode_link_keys(&ca, "a.zpr");
+        let mut cfg = crate::config::Config::default();
+        cfg.zpr_addr = vec!["fd5a:5052::10".parse().unwrap()];
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            self_noise_keypair: Some(kp),
+            certx: Some(certx),
+            config: Some(rcu::RcuBox::new(cfg)),
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        (asm, egress_rx)
+    }
+
+    /// [zode_a] with a topology in which `b.zpr` (fd5a:5052::9) owns its
+    /// link to this Zode, plus an established Active link from b.zpr.
+    /// Returns the assembly, the established link id and the egress queue
+    /// the links send through.
+    fn zode_with_established_link() -> (
+        Arc<Assembly>,
+        LinkId,
+        crate::packet_queue::Receiver<{ PACKET_BUFFER_SIZE }>,
+    ) {
+        let (asm, egress_rx) = zode_a();
+        *asm.topology.write().unwrap() = vec![crate::peer_table::test::topology_link("b.zpr")];
+        let old = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        {
+            let peer = asm.peer_table.get(old).unwrap();
+            peer.link_state_machine
+                .set_zode_end(ZodeEnd::Answerer)
+                .unwrap();
+            peer.link_state_machine.test_set_active();
+        }
+        (asm, old, egress_rx)
+    }
+
+    /// Deliver `km_msg` as a key-management packet that arrived on `link_id`.
+    fn deliver_km_on_link(asm: &Arc<Assembly>, link_id: LinkId, km_msg: &[u8]) {
+        let mut pkt = km_packet(km_msg);
+        pkt.metadata_mut().ingress_link_id = link_id;
+        dispatch_mgmt_packet_with_link(asm, &mut pkt);
+    }
+
+    /// The links whose substrate address is that of `link_id`, other than
+    /// `link_id` itself.
+    fn other_links_at_same_address(asm: &Assembly, link_id: LinkId) -> Vec<LinkId> {
+        let peer = asm.peer_table.get(link_id).unwrap();
+        let (sa, iface) = (peer.substrate_addr, peer.interface_addr);
+        drop(peer);
+        let mut ids = Vec::new();
+        asm.peer_table.for_each(|(id, p)| {
+            if id.get() != link_id && p.substrate_addr == sa && p.interface_addr == iface {
+                ids.push(id.get());
+            }
+        });
+        ids
+    }
+
+    /// Gate g78 q5 (ZODE_LINKS.md rule 5): the owner restarted on its fixed
+    /// address and dials again. The new handshake keys on a link of its own
+    /// while the established link stays untouched; once the new peer's CN
+    /// is verified, the new link takes over the address and the old one is
+    /// dropped.
+    #[tokio::test(start_paused = true)]
+    async fn test_same_address_redial_replaces_link_after_cn_check() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                let sa = asm.peer_table.get(old).unwrap().substrate_addr;
+                let iface = asm.peer_table.get(old).unwrap().interface_addr;
+                let (zode_msg0, _) = first_messages();
+
+                deliver_km_on_link(&asm, old, &zode_msg0);
+                let candidates = other_links_at_same_address(&asm, old);
+                assert_eq!(candidates.len(), 1, "the new handshake gets its own link");
+                let new = candidates[0];
+                let new_fsm = || {
+                    asm.peer_table
+                        .get(new)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state()
+                };
+                assert_eq!(new_fsm(), crate::link_state::LinkState::Keying);
+                assert_eq!(
+                    asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
+                    Some(old),
+                    "an unauthenticated packet must not move the address"
+                );
+                assert!(asm.is_link_ready(old), "the established link stays up");
+
+                // Later handshake messages from that address reach the new link.
+                deliver_km_on_link(&asm, old, &[0u8; 48]);
+                assert_eq!(other_links_at_same_address(&asm, old), vec![new]);
+
+                // Keying completes with b.zpr's verified certificate.
+                crate::peer_table::test::set_verified_peer_cn(&asm, new, "b.zpr");
+                asm.process_link_state_event(new, crate::link_state::LinkEvent::KeyingDone)
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(asm.peer_table.get(old).is_none(), "the old link is dropped");
+                assert_eq!(
+                    asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
+                    Some(new),
+                    "the new link owns the address"
+                );
+            })
+            .await
+    }
+
+    /// Review round 1: a same-address handshake accepted for a different
+    /// peer (also an owner in the topology) displaces the established link
+    /// from the address, so that link is dropped rather than left Active
+    /// with its packets going to the new link.
+    #[tokio::test(start_paused = true)]
+    async fn test_same_address_handshake_for_another_peer_drops_the_displaced_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                asm.topology
+                    .write()
+                    .unwrap()
+                    .push(crate::peer_table::test::topology_link("c.zpr"));
+                let sa = asm.peer_table.get(old).unwrap().substrate_addr;
+                let iface = asm.peer_table.get(old).unwrap().interface_addr;
+                let (zode_msg0, _) = first_messages();
+                deliver_km_on_link(&asm, old, &zode_msg0);
+                let new = other_links_at_same_address(&asm, old)[0];
+
+                crate::peer_table::test::set_verified_peer_cn(&asm, new, "c.zpr");
+                asm.process_link_state_event(new, crate::link_state::LinkEvent::KeyingDone)
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                assert!(
+                    asm.peer_table.get(old).is_none(),
+                    "the displaced link is dropped"
+                );
+                assert_eq!(
+                    asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
+                    Some(new)
+                );
+            })
+            .await
+    }
+
+    /// Review round 3 (core#105): the established link closing while the
+    /// new handshake from its address is still keying does not lose the
+    /// handshake. While the old link is closing (its SA cleared) and after
+    /// its peer entry is gone, messages from that address reach the keying
+    /// link; no adapter dock is created.
+    #[tokio::test(start_paused = true)]
+    async fn test_same_address_handshake_survives_the_old_link_closing() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                let sa = asm.peer_table.get(old).unwrap().substrate_addr;
+                let iface = asm.peer_table.get(old).unwrap().interface_addr;
+                let (zode_msg0, _) = first_messages();
+                deliver_km_on_link(&asm, old, &zode_msg0);
+                let new = other_links_at_same_address(&asm, old)[0];
+
+                // The old link starts closing: its SA is cleared first.
+                asm.peer_table.clear_security_association(old).unwrap();
+                deliver_km_on_link(&asm, old, &[0u8; 48]);
+                assert_eq!(other_links_at_same_address(&asm, old), vec![new]);
+
+                // Its peer entry goes; the address is unmapped.
+                asm.drop_peer(old);
+                assert!(asm.peer_table.lookup_peer(&sa, &iface).is_none());
+                let mut pkt = km_packet(&[0u8; 48]);
+                dispatch_mgmt_packet_with_addr(&asm, sa, iface, &mut pkt);
+                let mut at_address = Vec::new();
+                asm.peer_table.for_each(|(id, p)| {
+                    if p.substrate_addr == sa && p.interface_addr == iface {
+                        at_address.push(id.get());
+                    }
+                });
+                assert_eq!(at_address, vec![new], "no adapter dock appears");
+                assert_eq!(pkt.metadata().ingress_link_id, new);
+            })
+            .await
+    }
+
+    /// Gate g78 q5: a same-address handshake whose CN fails the acceptance
+    /// check is closed, and the established link keeps the address.
+    #[tokio::test(start_paused = true)]
+    async fn test_same_address_refused_handshake_leaves_established_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                let sa = asm.peer_table.get(old).unwrap().substrate_addr;
+                let iface = asm.peer_table.get(old).unwrap().interface_addr;
+                let (zode_msg0, _) = first_messages();
+                deliver_km_on_link(&asm, old, &zode_msg0);
+                let new = other_links_at_same_address(&asm, old)[0];
+
+                crate::peer_table::test::set_verified_peer_cn(&asm, new, "stranger.zpr");
+                asm.process_link_state_event(new, crate::link_state::LinkEvent::KeyingDone)
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                assert!(
+                    asm.peer_table.get(new).is_none(),
+                    "the refused link is dropped"
+                );
+                assert!(asm.is_link_ready(old));
+                assert_eq!(
+                    asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
+                    Some(old)
+                );
+            })
+            .await
+    }
+
+    /// Deliver `km_msg` as a key-management packet from substrate address
+    /// `sa` on `iface`, routed as the fastpath routes it: to the link the
+    /// address maps to, or as a packet from an unknown peer.
+    fn deliver_km_from(
+        asm: &Arc<Assembly>,
+        sa: SubstrateAddr,
+        iface: net_defs::ScopedIpAddr,
+        km_msg: &[u8],
+    ) {
+        match asm.peer_table.lookup_peer(&sa, &iface) {
+            Some(link_id) => deliver_km_on_link(asm, link_id.get(), km_msg),
+            None => dispatch_mgmt_packet_with_addr(asm, sa, iface, &mut km_packet(km_msg)),
+        }
+    }
+
+    /// Gate g120 (ZODE_LINKS.md rules 3 and 6): the owner b.zpr dials
+    /// before this Zode's topology names the link, so the link is refused
+    /// at KeyingDone. The refused link stays Closing until its Terminate
+    /// ack wait ends, and its cleanup clears its SA before its peer entry
+    /// goes. The owner's redial from the same address, in that window,
+    /// must start a link of its own rather than reach the dying link.
+    #[tokio::test(start_paused = true)]
+    async fn test_redial_after_refusal_starts_a_new_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, _egress) = zode_a();
+                let sa = SubstrateAddr::from(([127, 0, 0, 1], 4001));
+                let iface = net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+                let state_of = |id: LinkId| {
+                    asm.peer_table
+                        .get(id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state()
+                };
+
+                let (dial0, _) = first_messages();
+                deliver_km_from(&asm, sa, iface, &dial0);
+                let refused = asm.peer_table.lookup_peer(&sa, &iface).unwrap().get();
+                crate::peer_table::test::set_verified_peer_cn(&asm, refused, "b.zpr");
+                asm.process_link_state_event(refused, crate::link_state::LinkEvent::KeyingDone)
+                    .unwrap();
+                assert_eq!(state_of(refused), crate::link_state::LinkState::Closing);
+                asm.peer_table.clear_security_association(refused).unwrap();
+
+                // The topology now names the link, and b.zpr redials.
+                *asm.topology.write().unwrap() =
+                    vec![crate::peer_table::test::topology_link("b.zpr")];
+                let (redial0, _) = first_messages();
+                deliver_km_from(&asm, sa, iface, &redial0);
+                let redial = asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get());
+                assert_ne!(redial, Some(refused), "the redial reaches the refused link");
+                let redial = redial.expect("the redial starts a link");
+                assert_eq!(state_of(redial), crate::link_state::LinkState::Keying);
+            })
+            .await
+    }
+
+    /// zl-zipline#264 "No roaming": a link's peer substrate address is the
+    /// one it keyed with. A handshake from another source address, even one
+    /// for the same peer, does not move the established link there: it
+    /// starts a link of its own at the new address, which has to key and
+    /// pass its own CN check, and the established link keeps its address.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_packet_from_another_address_never_moves_a_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                let (sa, iface) = {
+                    let peer = asm.peer_table.get(old).unwrap();
+                    (peer.substrate_addr, peer.interface_addr)
+                };
+                let moved = SubstrateAddr::new(sa.ip(), sa.port() + 1);
+
+                let (zode_msg0, adapter_msg0) = first_messages();
+                deliver_km_from(&asm, moved, iface, &adapter_msg0);
+                assert!(
+                    asm.peer_table.lookup_peer(&moved, &iface).is_none(),
+                    "an unmarked message from the new address opens nothing"
+                );
+                deliver_km_from(&asm, moved, iface, &zode_msg0);
+                let new = asm
+                    .peer_table
+                    .lookup_peer(&moved, &iface)
+                    .expect("the new address gets a link of its own")
+                    .get();
+                assert_ne!(new, old);
+                assert_eq!(
+                    asm.peer_table
+                        .get(new)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    crate::link_state::LinkState::Keying
+                );
+
+                assert_eq!(asm.peer_table.get(old).unwrap().substrate_addr, sa);
+                assert_eq!(
+                    asm.peer_table.lookup_peer(&sa, &iface).map(|id| id.get()),
+                    Some(old),
+                    "the established link still owns its address"
+                );
+            })
+            .await
+    }
+
+    /// An unmarked key-management message on an established Zode link
+    /// opens no new handshake.
+    #[tokio::test(start_paused = true)]
+    async fn test_unmarked_km_on_established_zode_link_opens_nothing() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, old, _egress) = zode_with_established_link();
+                let (_, adapter_msg0) = first_messages();
+                deliver_km_on_link(&asm, old, &adapter_msg0);
+                assert!(other_links_at_same_address(&asm, old).is_empty());
+            })
+            .await
+    }
+
     // Ensure that this old issue is fixed:
     // https://github.com/org-zpr/zpr-core/issues/929
     #[tokio::test(flavor = "local")]
@@ -353,7 +893,7 @@ mod test {
         let mut tab = TestAssemblyBuilder::new();
         let (egress_send, mut egress_recv) = crate::packet_queue::packet_queue(1);
         tab.mgmt_substrate_egress = Some(crate::queues::MgmtSubstrateEgress::new(egress_send));
-        let asm = create_assembly(tab);
+        let asm = Arc::new(create_assembly(tab));
 
         let peer_sa = SubstrateAddr::from(([127, 0, 0, 1], 1234));
         let intf_addr = net_defs::ScopedIpAddr::V4(Ipv4Addr::new(127, 0, 0, 1).into());
@@ -361,7 +901,7 @@ mod test {
         let (mp_outq_out, mut mp_outq_in) = tokio::sync::oneshot::channel();
         let peer_state = PeerState::new(
             peer_entry.key(),
-            LinkType::NodeToAdapter,
+            LinkType::NodeToNode,
             peer_sa,
             intf_addr,
             move |q| {

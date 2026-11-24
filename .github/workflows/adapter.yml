@@ -36,7 +36,20 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_GIT_FETCH_WITH_CLI: true
-  VISA_SERVICE_RELEASE: v0.21.2
+  # The visa service the integration scripts run against: the plain release
+  # v0.22.0, cut from the head of visaservice#82 (fe653fa), which pins
+  # zl-zpr-common zl-v0.32.0 like this repository (zl-zipline#237). It is the
+  # first release that drives Zode links (v0.21.2 sends no Link.peerCn). It
+  # revokes through durable revocation obligations and one reconciler
+  # (zl-zipline#289, #290), whose sweep and refresh log lines the integration
+  # scripts match, grants visas atomically (zl-zipline#248), reports the
+  # observed substrate address (zl-zipline#264), removes a departed Zode
+  # (zl-zipline#284, zode-rejoin-test.sh) and re-proposes a direct link
+  # reported down (zl-zipline#268, zode-reroute-test.sh).
+  # It loads only zplc 0.21.x policies. When the visa service changes in a
+  # way core CI needs, cut its next release and move this pin to it
+  # (docs/BUILD.md).
+  VISA_SERVICE_RELEASE: v0.22.0
 
 jobs:
   # Build and upload ph
@@ -259,6 +272,9 @@ jobs:
     - name: Set env
       run: |
         echo "DEBUG_TARGETS=all=DEBUG" >> $GITHUB_ENV
+        # The ph under test is the debug build above; zode-ping-test.sh then
+        # requires its debug-only out-of-order counter to be present and 0.
+        echo "PH_DEBUG_BUILD=1" >> $GITHUB_ENV
 
     - name: Install valkey
       timeout-minutes: 5

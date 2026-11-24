@@ -1,0 +1,81 @@
+# -*- mode: toml -*-
+#
+# zodes-pair.zplc plus a direct zb-zc link (zl-zipline#254, #251's netns
+# acceptance), used by zode-reroute-test.sh. Compiles zodes-pair.zpl.
+#
+# zb and zc both have a substrate address here, so the visa service can
+# propose the zb-zc link (ZODE_LINKS.md rule 13b); zb, the lower ZPR
+# address, owns it and dials. While both ends report it up, zb-zc traffic
+# goes over it directly; when it drops, through the relay. Otherwise
+# identical to zodes-pair.zplc.
+#
+# All Zodes share one substrate segment (a bridge in the relay's
+# namespace); the addresses below match lib/zode_funcs.sh.
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+"zc.zpr" = "fd5a:5052::4"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[nodes.zb.substrate_addrs]
+i0 = "10.2.0.2:5000"
+
+[nodes.zc]
+provider = [ [ "device.zpr.adapter.cn", "zc" ] ]
+zpr_address = "zc.zpr"
+
+[nodes.zc.substrate_addrs]
+i0 = "10.2.0.3:5000"
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
+
+[links.relay-zc]
+peers = [ { node = "relay" }, { node = "zc" } ]
+
+[links.zb-zc]
+peers = [ { node = "zb" }, { node = "zc" } ]
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[visa_service]
+dock_node = "relay"
+
+[bootstrap]
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
+"zc" = "zc-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableRelay]
+protocol = "ping"
+
+[services.PingableZb]
+protocol = "ping"
+
+[services.PingableZc]
+protocol = "ping"

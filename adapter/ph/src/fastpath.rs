@@ -8,6 +8,7 @@ use crate::batch_io::BatchIoEngine;
 use crate::classifier::{self, ClassifierResult};
 use crate::counters::{Aggregate, FastpathCounterType, FastpathCounters};
 use crate::defs::Direction;
+use crate::forwarding_tables;
 use crate::km::{Codec, KmTransportSA};
 use crate::km_noise::NOISE_PADLEN;
 use crate::prelude::*;
@@ -24,16 +25,6 @@ use std::time::SystemTime;
 use zpr_ext::std::num::NonZeroExt;
 use zpr_ext::zerocopy::*;
 use zpr_utils::net_defs;
-
-/// Simple function used on an adapter to forward actor packets to the the tether and vice-versa.
-const fn adapter_next_hop_link(ingress_link_id: LinkId) -> LinkId {
-    // this optimization is checked by the static asserts below
-    // this allows us to avoid an unpredictable branch on every packet
-    (ingress_link_id % 2) + 1
-}
-
-const _: () = assert!(adapter_next_hop_link(LOCAL_ACTOR_LINK_ID) == DOCK_LINK_ID);
-const _: () = assert!(adapter_next_hop_link(DOCK_LINK_ID) == LOCAL_ACTOR_LINK_ID);
 
 #[cfg(debug_assertions)]
 /// This table is used to track whether a flow ever switches from one worker
@@ -80,6 +71,13 @@ pub struct FastpathWorker {
 
     pub actor_input_q: Vec<Packet>,
     pub substrate_egress_q: Vec<QueuedEgressPacket>,
+
+    /// The wall clock in milliseconds since the UNIX epoch
+    /// ([forwarding_tables::unix_ms]), read once per wakeup
+    /// ([FastpathWorker::refresh_clock]) for the per-packet visa-expiry
+    /// check (zl-zipline#274). The wall clock, as a visa's expiry is an
+    /// absolute time from the visa service.
+    pub now_ms: u64,
 }
 
 impl FastpathWorker {
@@ -112,7 +110,16 @@ impl FastpathWorker {
 
             actor_input_q: Vec::with_capacity(config.buffer_count),
             substrate_egress_q: Vec::with_capacity(config.buffer_count),
+
+            now_ms: forwarding_tables::unix_ms(SystemTime::now()),
         }
+    }
+
+    /// Read the wall clock into [FastpathWorker::now_ms]. Called once per
+    /// wakeup, so the clock is read once per batch, not once per packet;
+    /// the expiry check is late by at most one loop iteration.
+    pub fn refresh_clock(&mut self) {
+        self.now_ms = forwarding_tables::unix_ms(SystemTime::now());
     }
 
     /// Drop a packet and count the drop with the given reason.
@@ -300,12 +307,6 @@ impl FastpathWorker {
     pub fn actor_output_post_classify(&mut self, mut pkt: Packet, allow_bind_request: bool) {
         // lookup five tuple in ELT
         let five_tuple = *pkt.metadata().five_tuple(); // TODO: convince borrow checker we don't need to copy this out
-        if self.asm.ph_mode == crate::assembly::PhMode::Adapter
-            && !self.asm.adapter_owns_address(five_tuple.src_address)
-        {
-            self.drop_and_count(pkt, FastpathCounterType::OtherError);
-            return;
-        }
         let Some(entry) = self.asm.elt.get(&five_tuple) else {
             if !allow_bind_request {
                 // avoid the (all-but purely theoretical) chance of a packet loop,
@@ -379,46 +380,64 @@ impl FastpathWorker {
         let egress_link_id;
         let egress_stream_id;
 
-        match self.asm.ph_mode {
-            PhMode::Adapter => {
-                egress_link_id = adapter_next_hop_link(pkt.metadata().ingress_link_id);
-                egress_stream_id = pkt.metadata().ingress_stream_id;
+        // Scoped so the peer-table and stream-table guards are released
+        // before the packet moves on.
+        {
+            let Some(ingress_peer_state) = self.asm.peer_table.get(pkt.metadata().ingress_link_id)
+            else {
+                self.drop_and_count(pkt, FastpathCounterType::UnknownPeer);
+                return;
+            };
+
+            let Some(pep) = ingress_peer_state.pft.get(pkt.metadata().ingress_stream_id) else {
+                drop(ingress_peer_state);
+                self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
+                return;
+            };
+
+            // TODO: policy enforcement
+
+            // A J11 rebind may swap the entry's target at any moment:
+            // `target` reads the expiry and the next hop of one binding.
+            let (expires_ms, next_hop) = pep.target();
+            egress_link_id = next_hop.0;
+            egress_stream_id = next_hop.1;
+
+            // A quarantined entry (zl-zipline#282) has an expiry at the
+            // UNIX epoch, which no granted visa has: its stream was
+            // removed while this packet looked it up, so it is unknown
+            // now, not expired.
+            if expires_ms == 0 {
+                drop(pep);
+                drop(ingress_peer_state);
+                self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
+                return;
             }
 
-            PhMode::Node => {
-                let Some(ingress_peer_state) =
-                    self.asm.peer_table.get(pkt.metadata().ingress_link_id)
-                else {
-                    self.drop_and_count(pkt, FastpathCounterType::UnknownPeer);
-                    return;
-                };
+            // Visa expiry, on every packet at every hop (zl-zipline#274):
+            // a stream stops when its visa does, whenever it was bound.
+            // Dropped silently, like an unknown stream ID.
+            if self.now_ms >= expires_ms {
+                drop(pep);
+                drop(ingress_peer_state);
+                self.drop_and_count(pkt, FastpathCounterType::VisaExpired);
+                return;
+            }
 
-                let Some(pep) = ingress_peer_state.pft.get(pkt.metadata().ingress_stream_id) else {
-                    drop(ingress_peer_state);
-                    self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
-                    return;
-                };
-
-                // TODO: policy enforcement
-
-                egress_link_id = pep.next_hop.0;
-                egress_stream_id = pep.next_hop.1;
-
-                // Security Testing: if this is an adapter-to-adapter transit
-                // stream, corrupt forwarded ICMP echo requests to prove the A2A
-                // MICV catches a malicious node.
-                #[cfg(feature = "enable-security-testing")]
-                if self.config.mangle_forwarded_pings
-                    && matches!(
-                        ingress_peer_state.peer_type(),
-                        crate::peer_table::PeerType::Adapter
-                    )
-                    && self.asm.peer_table.get(egress_link_id).is_some_and(|p| {
-                        matches!(p.peer_type(), crate::peer_table::PeerType::Adapter)
-                    })
-                {
-                    self.security_testing_mangle_ping(&mut pkt, pep.visa_id);
-                }
+            // Security Testing: if this is a transit stream (in from one
+            // peer and out to another, neither of them this node's own
+            // actor), corrupt forwarded ICMP echo requests to prove the
+            // A2A MICV catches a malicious node. Both are Zode links.
+            #[cfg(feature = "enable-security-testing")]
+            if self.config.mangle_forwarded_pings
+                && !ingress_peer_state.is_internal()
+                && self
+                    .asm
+                    .peer_table
+                    .get(egress_link_id)
+                    .is_some_and(|p| !p.is_internal())
+            {
+                self.security_testing_mangle_ping(&mut pkt, pep.visa_id());
             }
         }
 
@@ -453,15 +472,46 @@ impl FastpathWorker {
         // public key out of the visa. (Either adapter's key would do.)
         let (five_tuple, compression_mode, peer_a2a_pubkey) = {
             let visa_table = self.asm.visa_table.read().unwrap();
-            let Some(visa) = visa_table.table.get(&visa_id) else {
+            let Some(visa) = visa_table.get(visa_id) else {
                 return;
             };
-            let tc = visa.get_tc();
-            (
-                *tc.five_tuple(),
-                tc.compression_mode(),
-                visa.get_egress_a2a_dh_pubkey(),
-            )
+            match visa.get_tc() {
+                Some(tc) => (
+                    *tc.five_tuple(),
+                    tc.compression_mode(),
+                    visa.get_egress_a2a_dh_pubkey(),
+                ),
+                // A forward-only visa (a Zode relay's) names no flow and no
+                // A2A key, so guess the flow as an attacker on the path
+                // could: a ping from the visa's previous hop to its next
+                // hop. That holds when both are the endpoint Zodes (zb -
+                // relay - zc); if the guess is wrong, the ping is left alone.
+                // ICMP has no port compression, so the mode is 0.
+                None => {
+                    let (Some(prev_hop), Ok(next_hop)) =
+                        (visa.prev_hop(), visa_table.get_visa_next_hop_addr(visa_id))
+                    else {
+                        return;
+                    };
+                    let l3_type = L3Type::new_from_addr(&prev_hop);
+                    let l4_protocol = match l3_type {
+                        L3Type::Ipv4 => net_defs::ip_number::ICMP,
+                        _ => net_defs::ip_number::IPV6_ICMP,
+                    };
+                    (
+                        crate::defs::FiveTuple::new(
+                            l3_type,
+                            prev_hop.into(),
+                            next_hop,
+                            l4_protocol,
+                            0,
+                            0,
+                        ),
+                        0,
+                        None,
+                    )
+                }
+            }
         };
 
         // We only handle ICMP echo requests (IPv4 or IPv6).
@@ -486,7 +536,9 @@ impl FastpathWorker {
             config::DEFAULT_MESSAGE_HEADROOM,
         );
         temp.put(compressed);
-        compress::expand(compression_mode, &five_tuple, &mut temp);
+        if compress::expand(compression_mode, &five_tuple, &mut temp).is_err() {
+            return; // not a well-formed packet; leave it alone
+        }
 
         // Locate the ICMP header in the expanded packet and pick the echo-request
         // type for this family. (IPv4 header length is variable; the IPv6 header
@@ -575,22 +627,33 @@ impl FastpathWorker {
         a2a_mac[..a2a_mac_size].copy_from_slice(&pkt.body()[pkt.body().len() - a2a_mac_size..]);
         pkt.shrink_by(a2a_mac_size);
 
-        // lookup PEP in DLT and expand compressed packet
+        // Look up the PEP in the DLT and expand the compressed packet.
+        //
+        // zl-zipline#283: the DLT ID can name another flow by now. `forward`
+        // copied it out of the PFT before this lookup, and in between the
+        // node can unbind the old stream (type 13) and a new bind can reuse
+        // the freed slot; DLT IDs have no quarantine. Then the packet is
+        // expanded with the other flow's classifier and checked with its
+        // key. That is safe: `expand` refuses a body too short for that
+        // classifier (dropped as `BadStructure`), and a body it does expand
+        // fails the MICV check below unless it expands to exactly the
+        // original packet, because the MICV covers the original flow's
+        // addresses and ports and is keyed with its A2A key. A packet that
+        // passes both is then checked against the new flow's classifier,
+        // because compression does not rebuild everything a classifier
+        // names: an ICMP type or code stays in the body, so a stale ICMP
+        // packet for the same A2A peer and addresses expands unchanged and
+        // passes the MICV. Any failure drops the packet, so it is never
+        // delivered unless the new flow's classifier admits it.
         let Some(pep) = self.asm.dlt.get(tether_id) else {
             self.drop_and_count(pkt, FastpathCounterType::UnknownStreamId);
             return;
         };
-        if self.asm.ph_mode == crate::assembly::PhMode::Adapter
-            && !self
-                .asm
-                .adapter_owns_address(pep.tc.five_tuple().dst_address)
-        {
-            drop(pep);
-            self.drop_and_count(pkt, FastpathCounterType::OtherError);
-            return;
-        }
 
-        compress::expand(pep.tc.compression_mode(), &pep.tc.five_tuple(), &mut pkt);
+        if compress::expand(pep.tc.compression_mode(), pep.tc.five_tuple(), &mut pkt).is_err() {
+            drop(pep);
+            return self.drop_and_count(pkt, FastpathCounterType::BadStructure);
+        }
 
         // check A2A MAC
         // TODO: use actual A2A SAID
@@ -606,6 +669,15 @@ impl FastpathWorker {
         if a2a_micv.as_bytes()[..a2a_mac_size] != a2a_mac[..a2a_mac_size] {
             drop(pep);
             return self.drop_and_count(pkt, FastpathCounterType::MicvFailure);
+        }
+
+        // Deliver only what this stream's classifier admits (see above).
+        if !pep
+            .tc
+            .classify_packet(pep.tc.five_tuple().l3_type, pkt.body())
+        {
+            drop(pep);
+            return self.drop_and_count(pkt, FastpathCounterType::ClassifierMismatch);
         }
 
         // queue decapsulated packet for send to actor
@@ -990,6 +1062,19 @@ fn decrypt(
         Some(state) => {
             match state.get_established_transport_association() {
                 Some(ref transport_sa) => {
+                    // A Zode link never re-keys, so ZPI 0 on an established
+                    // one can only be a new handshake from the same address:
+                    // the peer restarted on its fixed port (ZODE_LINKS.md
+                    // rule 5, zl-zipline#250). Let it through as a null
+                    // packet. ZPI 0 may carry only key management (checked
+                    // by the caller), and the dispatcher keys it on a link
+                    // of its own, leaving this one untouched.
+                    if zpi_hdr.zpi == ZPI_0
+                        && state.link_state_machine.get_link_type()
+                            == crate::link_state::LinkType::NodeToNode
+                    {
+                        return decrypt_null(pkt);
+                    }
                     // We've found a matching security association; use it to decrypt.
                     return decrypt_with_sa(asm, zpi_hdr, &transport_sa, pkt);
                 }
@@ -1162,6 +1247,7 @@ mod test {
 
     use super::*;
     use crate::config::PACKET_BUFFER_SIZE;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn test_encrypt_decrypt_null() {
@@ -1181,6 +1267,495 @@ mod test {
         assert!(res.is_ok());
 
         assert!(pkt.body().len() == orig_len); // did remove checksum
+    }
+
+    /// A ZPI 0 (null) packet arriving on `link_id`, as the fastpath sees it.
+    fn null_packet_on(link_id: LinkId) -> Packet {
+        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
+        pkt.put(&[ZPI_0][..]);
+        pkt.put(&b"a key-management message"[..]);
+        encrypt_null(&mut pkt);
+        pkt.metadata_mut().ingress_link_id = link_id;
+        pkt
+    }
+
+    /// zl-zipline#250, gate g78 q5: a Zode link never re-keys, so a ZPI 0
+    /// packet arriving on an established Zode link is a new handshake from
+    /// the same address and passes the fastpath (as a null packet, which
+    /// may only carry key management). On any other link with an SA (an
+    /// internal link here; no other link type exists), ZPI 0 is still
+    /// refused.
+    #[tokio::test(flavor = "local")]
+    async fn test_zpi_0_on_established_link_passes_only_for_zode_links() {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        let asm = create_assembly(TestAssemblyBuilder::new());
+        let zode = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        let other = crate::peer_table::test::insert_peer_with_verified_cn(
+            &asm,
+            crate::link_state::LinkType::Internal,
+            "c.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        let zpi = zdp::ZdpZpiHeader { zpi: ZPI_0 };
+
+        assert!(decrypt(&asm, zpi, &mut null_packet_on(zode)).is_ok());
+        assert!(matches!(
+            decrypt(&asm, zpi, &mut null_packet_on(other)),
+            Err(DecryptError::UnknownZpi)
+        ));
+    }
+
+    /// F7 (zl-zipline#251): a transit packet arriving on a Zode link with a
+    /// stream ID that has no PFT entry is dropped silently and counted as
+    /// `UnknownStreamId`. Nothing is forwarded, and nothing goes back
+    /// upstream: no `Destination Unreachable`, which would let a peer probe
+    /// which stream IDs are live.
+    #[tokio::test(flavor = "local")]
+    async fn test_unknown_stream_id_on_zode_link_is_dropped_silently() {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        let (mgmt_tx, mut mgmt_rx) = crate::packet_queue::packet_queue(8);
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(mgmt_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        let zode = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        let mut worker = test_worker(asm.clone());
+
+        worker.forward(transit_packet(zode, 77));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::UnknownStreamId].get_count(),
+            1
+        );
+        assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+        let buf = vec![0u8; PACKET_BUFFER_SIZE].into_boxed_slice();
+        assert!(
+            matches!(
+                mgmt_rx.try_recv(buf),
+                Err(crate::packet_queue::TryRecvError::Empty(_))
+            ),
+            "nothing is sent upstream"
+        );
+    }
+
+    /// A fastpath worker on `asm` with a few buffers and no security
+    /// testing.
+    fn test_worker(asm: Arc<Assembly>) -> FastpathWorker {
+        FastpathWorker::new(
+            FastpathWorkerConfig {
+                batch_io_engine: crate::batch_io::auto_select_engine(),
+                buffer_count: 4,
+                batch_size: 4,
+                #[cfg(feature = "enable-security-testing")]
+                mangle_forwarded_pings: false,
+                #[cfg(feature = "enable-security-testing")]
+                unkeyed_a2a_micv: false,
+                #[cfg(feature = "enable-security-testing")]
+                recompute_micvs: false,
+            },
+            0,
+            asm,
+        )
+    }
+
+    /// A worker on a fresh assembly with two up Zode links, A and B, and a
+    /// PFT entry on A forwarding to stream 9 on B under a visa expiring at
+    /// `expires`. Returns the worker, link A and the entry's stream ID.
+    fn worker_with_transit_stream(expires: SystemTime) -> (FastpathWorker, LinkId, StreamId) {
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::forwarding_tables::PftPep;
+        use crate::link_state::LinkState;
+        use crate::peer_table::test::insert_zode_peer_with_verified_cn;
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let link_a = insert_zode_peer_with_verified_cn(&asm, "a.zpr", LinkState::Active);
+        let link_b = insert_zode_peer_with_verified_cn(&asm, "b.zpr", LinkState::Active);
+        let stream = asm
+            .peer_table
+            .get(link_a)
+            .unwrap()
+            .pft
+            .insert(PftPep::new(ForwardingEntry(link_b, 9), 7000, expires))
+            .unwrap();
+        (test_worker(asm), link_a, stream)
+    }
+
+    /// A transit packet arriving on `link` with the stream ID `stream`.
+    fn transit_packet(link: LinkId, stream: StreamId) -> Packet {
+        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
+        pkt.put(&b"a transit payload"[..]);
+        pkt.metadata_mut().ingress_link_id = link;
+        pkt.metadata_mut().ingress_stream_id = stream;
+        pkt
+    }
+
+    /// zl-zipline#274 (D1): visa expiry is enforced on every packet. A
+    /// packet on a stream whose visa expired, by the worker's clock, is
+    /// dropped silently and counted as `VisaExpired`; nothing is forwarded.
+    /// This holds at every hop, as `forward` is the one path every bound
+    /// packet takes.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_packet_on_an_expired_stream_is_dropped_and_counted() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (mut worker, link_a, stream) = worker_with_transit_stream(expires);
+        worker.now_ms = 1_000_000; // the visa's expiry instant
+
+        worker.forward(transit_packet(link_a, stream));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::VisaExpired].get_count(),
+            1
+        );
+        assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// The other side of [test_a_packet_on_an_expired_stream_is_dropped_and_counted]:
+    /// the same stream, a millisecond before the expiry, forwards.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_packet_on_a_live_stream_is_forwarded() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (mut worker, link_a, stream) = worker_with_transit_stream(expires);
+        worker.now_ms = 999_999;
+
+        worker.forward(transit_packet(link_a, stream));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::VisaExpired].get_count(),
+            0
+        );
+        assert_eq!(worker.substrate_egress_q.len(), 1, "forwarded to link B");
+    }
+
+    /// zl-zipline#282: a packet on a stream ID in quarantine (its stream
+    /// was removed, its slot is not reused yet) is dropped silently and
+    /// counted as `UnknownStreamId`: the stream does not exist anymore.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_packet_on_a_quarantined_stream_id_is_dropped_as_unknown() {
+        let expires = SystemTime::now() + Duration::from_secs(3600);
+        let (mut worker, link_a, stream) = worker_with_transit_stream(expires);
+        worker
+            .asm
+            .peer_table
+            .remove_route(ForwardingEntry(link_a, stream));
+
+        worker.forward(transit_packet(link_a, stream));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::UnknownStreamId].get_count(),
+            1
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::VisaExpired].get_count(),
+            0
+        );
+        assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// zl-zipline#282: a reader that found an entry just before it was
+    /// quarantined reads its tombstone, an expiry at the UNIX epoch,
+    /// which no granted visa has. Its packet is dropped as
+    /// `UnknownStreamId`, like any packet on a removed stream, not as
+    /// `VisaExpired`. Built here as an entry with that expiry, the state
+    /// such a reader sees.
+    #[tokio::test(flavor = "local")]
+    async fn test_a_packet_on_a_tombstoned_entry_is_dropped_as_unknown() {
+        let (mut worker, link_a, stream) = worker_with_transit_stream(UNIX_EPOCH);
+
+        worker.forward(transit_packet(link_a, stream));
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::UnknownStreamId].get_count(),
+            1
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::VisaExpired].get_count(),
+            0
+        );
+        assert!(worker.substrate_egress_q.is_empty(), "nothing is forwarded");
+    }
+
+    /// zl-zipline#283: a compressed body too short for the headers its DLT
+    /// classifier says it carries is dropped and counted as
+    /// `BadStructure`, not a panic. A peer Zode can send one on a valid
+    /// stream, and a packet whose DLT ID was reused for another flow is
+    /// expanded with that flow's classifier.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_short_body_as_bad_structure() {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let tcp = crate::defs::FiveTuple {
+            l3_type: L3Type::Ipv4,
+            l4_protocol: net_defs::ip_number::TCP,
+            ..Default::default()
+        };
+        let tether_id = asm
+            .dlt
+            .insert(DltPep::new(crate::tc::Ip5TupleTc::new(tcp), None))
+            .unwrap();
+        let mut worker = test_worker(asm);
+
+        // An A2A header (SAID 0), a compressed IPv4 header (header length
+        // 5, no fragment info, TTL 64) and no TCP header, then the A2A MAC.
+        let mut pkt = Packet::new(Box::new([0u8; PACKET_BUFFER_SIZE]), 64);
+        pkt.put(&[0u8][..]);
+        pkt.put(&[0x50u8, 0, 0, 0, 64][..]);
+        pkt.put(&[0u8; zdp::ZDP_A2A_MAC_SIZE][..]);
+
+        worker.actor_input(tether_id, pkt);
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::BadStructure].get_count(),
+            1
+        );
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// zl-zipline#283: DLT IDs have no quarantine, so a packet sent on a
+    /// stream whose DLT ID was unbound and reused can reach the new
+    /// binding. This seals the `desc` test packet for a binding whose
+    /// classifier is that packet's own five-tuple, checks that it is
+    /// delivered there (the control), then unbinds that binding and sends
+    /// the same packet to a new binding with the same A2A peer (so the
+    /// same MICV key) and the classifier `new_tuple` makes from the old
+    /// one. Returns the worker, so the caller can check what happened to
+    /// the second packet.
+    ///
+    /// The slab frees a removed slot only once its RCU readers are gone,
+    /// so when an ID comes back is not deterministic; `actor_input` sees
+    /// only the PEP its ID names, so the old packet is sent to the new
+    /// binding's ID instead.
+    fn send_on_reused_dlt_id(
+        desc: &str,
+        new_tuple: impl FnOnce(&crate::defs::FiveTuple) -> crate::defs::FiveTuple,
+    ) -> FastpathWorker {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::tc::Ip5TupleTc;
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+
+        // The original flow's packet and its five-tuple.
+        let (_, body) = compress::tests::TEST_CASES
+            .iter()
+            .find(|(d, _)| *d == desc)
+            .unwrap();
+        let mut original = Packet::new(
+            Box::new([0u8; PACKET_BUFFER_SIZE]),
+            config::DEFAULT_MESSAGE_HEADROOM,
+        );
+        original.put(*body);
+        let (metadata, pkt_body) = original.metadata_mut_and_body_mut();
+        classifier::classify(metadata.five_tuple_mut(), pkt_body).unwrap();
+        let old_tuple = *original.metadata().five_tuple();
+
+        // Both bindings have the same A2A peer, so the same MICV key.
+        let peer = x25519_dalek::PublicKey::from(&x25519_dalek::ReusableSecret::random());
+        let old_pep = DltPep::new(
+            Ip5TupleTc::new(old_tuple),
+            Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+        );
+        let micv_key = old_pep.a2a_micv_key.unwrap();
+        let compression_mode = old_pep.tc.compression_mode();
+        let tether_id = asm.dlt.insert(old_pep).unwrap();
+
+        // The packet as the sending adapter seals it for the old binding
+        // (`actor_output_post_classify`): the MICV over the uncompressed
+        // packet, then compression, the MAC and the A2A header.
+        let sealed = || {
+            let mut pkt = Packet::new(
+                Box::new([0u8; PACKET_BUFFER_SIZE]),
+                config::DEFAULT_MESSAGE_HEADROOM,
+            );
+            pkt.put(*body);
+            let micv = blake3::keyed_hash(&micv_key, pkt.body());
+            compress::compress(
+                compression_mode,
+                old_tuple.l3_type,
+                old_tuple.l4_protocol,
+                &mut pkt,
+            );
+            pkt.put(&micv.as_bytes()[..zdp::ZDP_A2A_MAC_SIZE]);
+            pkt.alloc_zeroed_header::<zdp::ZdpA2aHeader>().a2a_said = 0;
+            pkt
+        };
+
+        // Control: on its own binding the packet is delivered.
+        let mut worker = test_worker(asm.clone());
+        worker.actor_input(tether_id, sealed());
+        assert_eq!(
+            worker.actor_input_q.len(),
+            1,
+            "{desc}: delivered on its own binding"
+        );
+        worker.actor_input_q.clear();
+
+        // The old binding is unbound and its DLT ID reused.
+        asm.dlt.remove(tether_id);
+        let new_pep = DltPep::new(
+            Ip5TupleTc::new(new_tuple(&old_tuple)),
+            Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+        );
+        assert_eq!(
+            new_pep.a2a_micv_key,
+            Some(micv_key),
+            "same A2A peer, same key"
+        );
+        let reused_id = asm.dlt.insert(new_pep).unwrap();
+
+        worker.actor_input(reused_id, sealed());
+        worker
+    }
+
+    /// zl-zipline#283: a packet on a reused DLT ID whose new binding has
+    /// the same A2A peer and addresses but other ports expands with the
+    /// new binding's ports and fails the MICV check, so it is dropped and
+    /// counted as `MicvFailure`, never delivered.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_packet_on_a_reused_dlt_id_as_micv_failure() {
+        let worker = send_on_reused_dlt_id("TCP mid-stream (TLS)", |old| crate::defs::FiveTuple {
+            src_port: old.src_port.wrapping_add(1),
+            dst_port: old.dst_port.wrapping_add(1),
+            ..*old
+        });
+
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+            1
+        );
+        assert_eq!(
+            worker.batch_counters[FastpathCounterType::BadStructure].get_count(),
+            0
+        );
+        assert!(worker.actor_input_q.is_empty(), "nothing is delivered");
+    }
+
+    /// zl-zipline#283: an ICMP or ICMPv6 classifier keeps the type in its
+    /// source port and the code in its destination port, but compression
+    /// leaves ICMP alone, so `expand` does not rebuild them and the MICV
+    /// still matches when a reused DLT ID's new binding has the same A2A
+    /// peer and addresses. The new binding's classifier must still refuse
+    /// a type it does not admit: the packet is dropped and counted as
+    /// `ClassifierMismatch`, never delivered.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_an_icmp_packet_the_reused_dlt_id_does_not_admit() {
+        // Echo Request (type 8) on a binding for Timestamp (type 13), and
+        // Neighbor Solicitation (type 135) on one for Neighbor
+        // Advertisement (type 136).
+        for (desc, new_type) in [
+            ("ICMP Echo (ping) request", 13),
+            ("ICMPv6 Neighbor Soliciation", 136),
+        ] {
+            let worker = send_on_reused_dlt_id(desc, |old| crate::defs::FiveTuple {
+                src_port: new_type,
+                ..*old
+            });
+
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::ClassifierMismatch].get_count(),
+                1,
+                "{desc}"
+            );
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+                0,
+                "{desc}: the MICV still matches"
+            );
+            assert!(
+                worker.actor_input_q.is_empty(),
+                "{desc}: nothing is delivered"
+            );
+        }
+    }
+
+    /// zl-zipline#283 (Copilot round 4): the classifier check runs on a
+    /// packet whose MICV has passed, but the A2A peer that computed that
+    /// MICV chose the body. An ICMP or ICMPv6 body shorter than its 4-byte
+    /// header, sealed with a valid MICV, is dropped and counted as
+    /// `ClassifierMismatch`, never a panic.
+    #[tokio::test(flavor = "local")]
+    async fn test_actor_input_drops_a_truncated_icmp_body_with_a_valid_micv() {
+        use crate::adapter_tables::DltPep;
+        use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+        use crate::tc::Ip5TupleTc;
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
+        let peer = x25519_dalek::PublicKey::from(&x25519_dalek::ReusableSecret::random());
+        let packet_of = |bytes: &[u8]| {
+            let mut pkt = Packet::new(
+                Box::new([0u8; PACKET_BUFFER_SIZE]),
+                config::DEFAULT_MESSAGE_HEADROOM,
+            );
+            pkt.put(bytes);
+            pkt
+        };
+
+        for desc in ["ICMP Echo (ping) request", "ICMPv6 Neighbor Soliciation"] {
+            // The test packet, its five-tuple and a binding for it.
+            let (_, body) = compress::tests::TEST_CASES
+                .iter()
+                .find(|(d, _)| *d == desc)
+                .unwrap();
+            let mut pkt = packet_of(body);
+            let (metadata, pkt_body) = pkt.metadata_mut_and_body_mut();
+            classifier::classify(metadata.five_tuple_mut(), pkt_body).unwrap();
+            let tuple = *pkt.metadata().five_tuple();
+            let pep = DltPep::new(
+                Ip5TupleTc::new(tuple),
+                Some(asm.a2a_dh_keypair.diffie_hellman(&peer)),
+            );
+            let micv_key = pep.a2a_micv_key.unwrap();
+            let compression_mode = pep.tc.compression_mode();
+            let tether_id = asm.dlt.insert(pep).unwrap();
+
+            // Compression keeps ICMP as is, so the ICMP header starts where
+            // the compressed packet has as many bytes left as the original
+            // has after its IP header.
+            let ip_header_len = match tuple.l3_type {
+                L3Type::Ipv4 => usize::from(body[0] & 0x0f) * 4,
+                _ => size_of::<IPv6Header>(),
+            };
+            compress::compress(compression_mode, tuple.l3_type, tuple.l4_protocol, &mut pkt);
+            let icmp_start = pkt.body().len() - (body.len() - ip_header_len);
+
+            let mut worker = test_worker(asm.clone());
+            for icmp_len in 0..4 {
+                let compressed = &pkt.body()[..icmp_start + icmp_len];
+                // The MICV over the packet as the receiver expands it, so
+                // it passes.
+                let mut expanded = packet_of(compressed);
+                compress::expand(compression_mode, &tuple, &mut expanded).unwrap();
+                let micv = blake3::keyed_hash(&micv_key, expanded.body());
+                let mut sealed = packet_of(compressed);
+                sealed.put(&micv.as_bytes()[..zdp::ZDP_A2A_MAC_SIZE]);
+                sealed.alloc_zeroed_header::<zdp::ZdpA2aHeader>().a2a_said = 0;
+
+                worker.actor_input(tether_id, sealed);
+            }
+
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::ClassifierMismatch].get_count(),
+                4,
+                "{desc}"
+            );
+            assert_eq!(
+                worker.batch_counters[FastpathCounterType::MicvFailure].get_count(),
+                0,
+                "{desc}: the MICV is valid"
+            );
+            assert!(
+                worker.actor_input_q.is_empty(),
+                "{desc}: nothing is delivered"
+            );
+        }
     }
 
     #[test]

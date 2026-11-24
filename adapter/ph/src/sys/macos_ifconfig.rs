@@ -19,7 +19,7 @@
 //! parsing the address token rather than substring-matching (which would
 //! also let `fd5a::1` match a line carrying `fd5a::10`).
 //!
-//! Platform-neutral on purpose, same pattern as `macos_route`: only
+//! Platform-neutral on purpose: only
 //! `sys::macos::zprtun` calls it at runtime, but compiling it on every OS
 //! keeps it unit-testable from a Linux build.
 

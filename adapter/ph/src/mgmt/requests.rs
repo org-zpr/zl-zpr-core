@@ -13,7 +13,6 @@ use crate::tlv;
 use crate::zdp;
 use crate::{assembly::Assembly, auth};
 use bytes::BufMut;
-use std::net::IpAddr;
 use zpr_ext::zerocopy::IntoBytesExt;
 use zpr_utils::net_defs::IpAddress;
 
@@ -63,8 +62,11 @@ pub fn send_hello_request(
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloRequest, pkt)
 }
 
-/// AAA address is optional, but will usually be specified.  Only is not specified if this node
-/// has not established a VSS connection with the visa service yet.
+/// Send a successful HelloResponse on `link_id`. A Zode answering a Zode
+/// link passes no AAA address and no identity providers (zl-zipline#250).
+/// The `aaa_address` parameter stays: AAA kept unused in v1
+/// (zl-zpr-dev-context docs/ZODE_LINKS.md, Design decisions, "AAA kept,
+/// unused").
 ///
 /// `oidc_idps` advertises off-net OIDC identity providers (one `OIDC_IDP` TLV
 /// each); empty when the visa service has none configured.
@@ -74,7 +76,6 @@ pub fn send_hello_success_response<'a>(
     policy_id: i64,
     oidc_idps: &[auth::OidcIdpInfo],
     aaa_address: Option<IpAddress>,
-    vs_bootstrap: bool,
 ) -> Sent<'a> {
     let mut pkt = core::new_heap_packet();
     let hdr = pkt.alloc_zeroed_header::<zdp::ZdpHelloResponseHeader>();
@@ -84,9 +85,6 @@ pub fn send_hello_success_response<'a>(
     tlv::TlvEncoding::new_policy_id(policy_id).put(&mut pkt);
     tlv::TlvEncoding::new_version(assembly::VERSION).put(&mut pkt);
     tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
-    if vs_bootstrap {
-        tlv::TlvEncoding::new_vs_bootstrap_link().put(&mut pkt);
-    }
 
     super::helpers::put_window_size_tlv(&asm, link_id, &mut pkt);
 
@@ -132,274 +130,6 @@ pub fn send_hello_error_response(
         .status = status;
     tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::HelloResponse, pkt)
-}
-
-pub fn send_start_authentication(asm: &Assembly, link_id: LinkId, txn: TxnId) -> Sent<'_> {
-    core::send_non_flow_txn_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::StartAuthentication,
-        txn,
-        core::new_heap_packet(),
-    )
-}
-
-pub fn send_abandon_authentication(asm: &Assembly, link_id: LinkId, txn: TxnId) -> Sent<'_> {
-    core::send_non_flow_txn_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::AbandonAuthenticationAttempt,
-        txn,
-        core::new_heap_packet(),
-    )
-}
-
-/// Send Init Authentication (NOT YET IN RFC 6)
-///
-/// Responds to the adapter's StartAuthentication transaction, not to Hello.
-///
-/// Message payload is ([auth::ZdpInitAuthenticationPayload]):
-///
-/// Blake 3 hash is used in keyed-hash mode. The peer_table keeps track of a 256-bit
-/// key on each link.  It in the future it may even change it from time to time.
-/// The nonce and hash are returned in the bootstrap authentication BLOB and
-/// are checked by the node before processing.
-///
-pub fn send_init_authentication_request<'a>(
-    asm: &'a Assembly,
-    link_id: LinkId,
-    txn: TxnId,
-    status: zdp::AuthenticationStatus,
-    flags: u8,
-    payload: auth::ZdpInitAuthenticationPayload,
-) -> Sent<'a> {
-    debug!(target: ZDP, "{}: sending InitAuthenticationRequest, flags: {flags:x?}", asm.formatted_link_id(link_id));
-
-    let mut req = core::new_heap_packet();
-
-    let hdr = zdp::ZdpInitAuthenticationRequestHeader {
-        status,
-        flags,
-        data_len: (size_of::<auth::ZdpInitAuthenticationPayload>() as u16).into(),
-    };
-    hdr.write_to_buf(&mut req).unwrap();
-    payload.write_to_buf(&mut req).unwrap();
-    // Upstream #1410 appends ASA TLVs here. Zipline removed the ASA TLV with
-    // the BAS/OAuthRsa client (zipline#15): OIDC IdPs are advertised in the
-    // HelloResponse instead, so Init carries no service offer.
-
-    core::send_non_flow_txn_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::InitAuthenticationRequest,
-        txn,
-        req,
-    )
-}
-
-/// Send a Renew Authentication request (zipline#66; NOT YET IN RFC 6)
-///
-/// Node → adapter on an Active link: the docked actor's authentication is
-/// nearing expiry, and this carries a fresh challenge (minted exactly as
-/// [send_init_authentication_request]'s) the renewed credential must bind to.
-pub fn send_renew_authentication_request(
-    asm: &Assembly,
-    link_id: LinkId,
-    payload: auth::ZdpInitAuthenticationPayload,
-) -> Sent<'_> {
-    debug!(target: ZDP, "{}: sending RenewAuthenticationRequest", asm.formatted_link_id(link_id));
-
-    let mut req = core::new_heap_packet();
-
-    let hdr = zdp::ZdpRenewAuthenticationRequestHeader {
-        data_len: (size_of::<auth::ZdpInitAuthenticationPayload>() as u16).into(),
-    };
-    hdr.write_to_buf(&mut req).unwrap();
-    payload.write_to_buf(&mut req).unwrap();
-
-    core::send_non_flow_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::RenewAuthenticationRequest,
-        req,
-    )
-}
-
-/// Send a Renew Authentication response (zipline#66; NOT YET IN RFC 6)
-///
-/// Adapter → node: on [zdp::AuthenticationStatus::Success] `blob` carries the
-/// renewed auth blob (base64-encoded JSON, same encoding as the acquire
-/// request's); on any other status it is empty. `challenge` echoes the
-/// request's challenge bytes on every response so the node can correlate
-/// it with the attempt it answers (PR #17 review).
-pub fn send_renew_authentication_response<'a>(
-    asm: &'a Assembly,
-    link_id: LinkId,
-    status_code: zdp::AuthenticationStatus,
-    challenge: &'_ [u8; 48],
-    blob: &'_ [u8],
-) -> Sent<'a> {
-    debug!(target: ZDP, "{}: sending RenewAuthenticationResponse, status: {status_code:?}", asm.formatted_link_id(link_id));
-
-    let mut rsp = core::new_heap_packet();
-
-    let hdr = zdp::ZdpRenewAuthenticationResponseHeader {
-        status_code,
-        blob_len: (blob.len() as u16).into(),
-        challenge: *challenge,
-    };
-    hdr.write_to_buf(&mut rsp).unwrap();
-    rsp.put_slice(blob);
-
-    core::send_non_flow_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::RenewAuthenticationResponse,
-        rsp,
-    )
-}
-
-/// Send an AcquireZPRAddressRequest (TODO: not yet in RFC 6)
-///
-/// The `actor_addrs` is a list of addresses that this sender is
-/// requesting.  It will be up to the visa service to determine
-/// the correct address(es) to grant.
-///
-/// The blob is actor authentication evidence. The actor controller enters
-/// AcquiringAddress before sending and awaits the matching transaction's grant.
-///
-/// ## Panics
-/// - Panics if all requested addresses are not the same IP version.
-pub fn send_acquire_zpr_address_request<'a>(
-    asm: &'a Assembly,
-    link_id: LinkId,
-    txn: TxnId,
-    actor_addrs: &'_ [IpAddr],
-    blob: Option<&'_ [u8]>,
-) -> Sent<'a> {
-    let blob = blob.unwrap_or_default();
-
-    let mut req = core::new_heap_packet();
-
-    let ip_version = if actor_addrs.is_empty() {
-        L3Type::Ipv6 // whatever, doesn't matter since count is zero.
-    } else {
-        actor_addrs[0].l3_type()
-    };
-    let hdr = zdp::ZdpAcquireZprAddressHeader {
-        blob_len: (blob.len() as u16).into(),
-        ip_version,
-        addr_count: actor_addrs.len() as u8,
-    };
-    hdr.write_to_buf(&mut req).unwrap();
-    req.put_slice(blob);
-    for addr in actor_addrs {
-        match addr {
-            IpAddr::V4(addr) => {
-                if ip_version != L3Type::Ipv4 {
-                    panic!(
-                        "attempt to send an IPv4 address with IPv6 type acquire zpr address packet"
-                    )
-                }
-                req.put(&addr.octets()[..])
-            }
-            IpAddr::V6(addr) => {
-                if ip_version != L3Type::Ipv6 {
-                    panic!(
-                        "attempt to send an IPv6 address with IPv4 type acquire zpr address packet"
-                    )
-                }
-                req.put(&addr.octets()[..])
-            }
-        }
-    }
-
-    core::send_non_flow_txn_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::AcquireZprAddress,
-        txn,
-        req,
-    )
-}
-
-pub fn validate_acquire_zpr_address_request(
-    addresses: &[IpAddr],
-    blob: &[u8],
-) -> Result<(), auth::AuthError> {
-    if addresses.len() > 1 {
-        return Err(auth::AuthError::Rejected(
-            "only one actor address can be requested".into(),
-        ));
-    }
-    let address_len = match addresses.first() {
-        Some(IpAddr::V4(_)) => 4,
-        Some(IpAddr::V6(_)) => 16,
-        None => 0,
-    };
-    let capacity = crate::packet::Packet::max_body_size_for(config::SMALL_PACKET_BUFFER_SIZE)
-        - config::DEFAULT_MESSAGE_HEADROOM;
-    let max_blob = capacity - size_of::<zdp::ZdpAcquireZprAddressHeader>() - address_len;
-    if blob.is_empty() || blob.len() > max_blob || blob.len() > u16::MAX as usize {
-        return Err(auth::AuthError::FormatError(
-            "actor authentication evidence does not fit an Acquire request".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Send an GrantZprAddressRequest (TODO: not yet in RFC 6)
-///
-/// All granted addresses must be same IP version.
-///
-/// Completes an actor transaction without changing the already-Active link.
-///
-/// ## Panics
-/// - Panics if all granted addresses are not the same IP version.
-pub fn send_grant_zpr_address_request<'a>(
-    asm: &'a Assembly,
-    link_id: LinkId,
-    txn: TxnId,
-    status_code: zdp::AuthenticationStatus,
-    actor_addrs: &'_ [IpAddr],
-) -> Sent<'a> {
-    debug!(target: ZDP, "{} - sending GrantZprAddressRequest, status: {status_code:?}", asm.formatted_link_id(link_id));
-
-    let mut req = core::new_heap_packet();
-
-    let ip_version = if actor_addrs.is_empty() {
-        L3Type::Ipv6 // whatever, doesn't matter since count is zero.
-    } else {
-        actor_addrs[0].l3_type()
-    };
-    let hdr = zdp::ZdpGrantZprAddressHeader {
-        status_code,
-        ip_version,
-        addr_count: actor_addrs.len() as u8,
-    };
-    hdr.write_to_buf(&mut req).unwrap();
-    for addr in actor_addrs {
-        match addr {
-            IpAddr::V4(addr) => {
-                if ip_version != L3Type::Ipv4 {
-                    panic!(
-                        "attempt to send an IPv4 address with IPv6 type grant zpr address packet"
-                    )
-                }
-                req.put(&addr.octets()[..])
-            }
-            IpAddr::V6(addr) => {
-                if ip_version != L3Type::Ipv6 {
-                    panic!(
-                        "attempt to send an IPv6 address with IPv4 type grant zpr address packet"
-                    )
-                }
-                req.put(&addr.octets()[..])
-            }
-        }
-    }
-
-    core::send_non_flow_txn_mgmt(asm, link_id, zdp::ZdpPacketType::GrantZprAddress, txn, req)
 }
 
 /// send a Terminate Link or Docking Session message (TODO: document)
@@ -705,24 +435,6 @@ pub fn send_report<'a>(asm: &'a Assembly, link_id: LinkId, report: &'_ str) -> S
     core::send_non_flow_mgmt(asm, link_id, zdp::ZdpPacketType::Report, pkt)
 }
 
-pub fn send_unbind_egress_stream_request<'a>(
-    asm: &'a Assembly,
-    link_id: LinkId,
-    stream_id: StreamId,
-) -> Sent<'a> {
-    debug!(target: ZDP, "{}: sending UnbindEgressStreamIndication", asm.formatted_link_id(link_id));
-
-    let req = core::new_heap_packet();
-
-    core::send_per_flow_mgmt(
-        asm,
-        link_id,
-        zdp::ZdpPacketType::UnbindEgressStreamIndication,
-        stream_id,
-        req,
-    )
-}
-
 /// send a Stream ID Withdrawal message (ZdpPacketType 5)
 ///
 /// Node -> peer adapter, per-flow: "the stream id you send with has been
@@ -741,6 +453,31 @@ pub fn send_stream_id_withdrawal<'a>(
         asm,
         link_id,
         zdp::ZdpPacketType::StreamIdWithdrawal,
+        stream_id,
+        req,
+    )
+}
+
+/// send an Unbind Egress Stream Indication message (ZdpPacketType 13)
+///
+/// Node -> its own adapter, per-flow, over the local actor link only:
+/// "this Zode no longer forwards to the stream id you granted; drop it from
+/// your DLT" (zl-zipline#283). `stream_id` is the DLT id the adapter
+/// granted for the binding. Never sent on a Zode link (F5): the caller,
+/// [crate::assembly::Assembly::unbind_local_egress], checks.
+pub fn send_unbind_egress_stream_indication<'a>(
+    asm: &'a Assembly,
+    link_id: LinkId,
+    stream_id: StreamId,
+) -> Sent<'a> {
+    debug!(target: ZDP, "{}: sending UnbindEgressStreamIndication", asm.formatted_link_id(link_id));
+
+    let req = core::new_heap_packet();
+
+    core::send_per_flow_mgmt(
+        asm,
+        link_id,
+        zdp::ZdpPacketType::UnbindEgressStreamIndication,
         stream_id,
         req,
     )

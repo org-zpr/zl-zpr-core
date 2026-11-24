@@ -3,8 +3,6 @@
 //! The main entry point is [crate::main_argparse::argparse] which will parse the command line arguments
 //! and any config file, returning a PH configuration.
 
-#[cfg(not(feature = "complete"))]
-use crate::auth::AuthError;
 use crate::batch_io;
 use crate::logging::{levels, targets};
 use clap::{Args, Parser, Subcommand};
@@ -28,27 +26,18 @@ pub enum ArgsError {
 
     #[error("{0}")]
     PathError(String),
-
-    #[error("bootstrap config error: {0}")]
-    AuthError(#[from] AuthError),
 }
 
 /// ZPR Packet Handler
 ///
-/// You can run the packet hander as a node or an adapter.  You can specify a configuration
+/// Runs a Zode: a ZPR node that carries its own actor. You can specify a configuration
 /// file and you can override configuration file settings with command line arguments.
 ///
-/// Eg, start a node:
-///    sudo ./ph node -c node_config.toml
+/// Eg, start a relay Zode:
+///    sudo ./ph zode -c relay_config.toml --relay true
 ///
-/// Eg, start an adapter:
-///    sudo ./ph adapter -c adapter_config.toml
-///
-/// Eg, start an adapter and point it at a specific node:
-///    sudo ./ph adapter -c adapter_config.toml --node-addr 10.1.0.8:12345
-///
-/// Eg, override the name of the node (which may or may not be also set in the config file):
-///    sudo ./ph node -c node_config.toml
+/// Eg, start a Zode that dials its relay:
+///    sudo ./ph zode -c zode_config.toml --initial-link relay.zpr@10.1.0.8:5000
 ///
 #[derive(Debug, Parser)]
 #[command(version = build_info::BUILD_VERSION, verbatim_doc_comment)]
@@ -71,9 +60,9 @@ pub struct CommonArgs {
     #[arg(long, value_name = "GROUP")]
     pub control_group: Option<String>,
 
-    /// For a node this is listen substrate address for dock,
-    /// for adapter it is best to leave this at its default setting (0.0.0.0:0)
-    ///
+    /// Substrate address the Zode's link sockets bind to: the address peers dial.
+    /// The default binds every IPv4 interface (0.0.0.0); port 0, the default,
+    /// becomes the default link port, 5000
     #[arg(short = 'a', long, value_name = "ADDR:PORT", value_parser = parse_socket_addr_or_scoped_ip_addr)]
     pub self_addr: Option<SocketAddr>,
 
@@ -97,7 +86,10 @@ pub struct CommonArgs {
     #[arg(long, short = 'i', value_name = "DEVICE")]
     pub tun_if: Option<String>,
 
-    /// ZPR address (no port) of the adapter (must match your TUN address if it has one)
+    /// ZPR address (no port) of the Zode, an address of its TUN. Repeatable. The
+    /// first is the Zode's own address and must be IPv6; a relay adds
+    /// fd5a:5052::1 (vs.zpr) after it, and no other Zode lists it. Replaces
+    /// the config file's whole zpr_addr list.
     #[arg(long, short = 'z')]
     pub zpr_addr: Option<Vec<IpAddr>>,
 
@@ -116,12 +108,18 @@ pub struct CommonArgs {
     /// to the DEBUG level, except zdp and link_state, which would be set to TRACE
     /// When setting the target 'all' you can also omit the target. i.e.
     /// --logging all=DEBUG zdp=TRACE is the same as --logging DEBUG zdp=TRACE
+    /// Any --logging replaces the config file's whole logging list: the
+    /// file's pairs are not merged with the command line's pairs.
     #[arg(long, short = 'l', value_delimiter = ' ', num_args = 1.., value_parser = parse_key_val, verbatim_doc_comment)]
     pub logging: Vec<(String, String)>,
 
-    /// Which packet I/O engine to use
-    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(std::iter::once(batch_io::AUTO_ENGINE_NAME).chain(batch_io::engine_names())), default_value_t = batch_io::AUTO_ENGINE_NAME.to_owned())]
-    pub io_engine: String,
+    /// Which packet I/O engine to use. Default: auto, unless the config
+    /// file sets io_engine
+    // No clap default: `None` lets a file's `io_engine` stand when the flag
+    // is absent (zl-zipline#278). [crate::config::Config::default] holds
+    // the `auto` default.
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(std::iter::once(batch_io::AUTO_ENGINE_NAME).chain(batch_io::engine_names())))]
+    pub io_engine: Option<String>,
 
     /// Current supported implementations: noise (default), null
     #[arg(long, default_value = "noise")]
@@ -133,7 +131,7 @@ pub struct CommonArgs {
     #[arg(long)]
     pub security_testing_mangle_forwarded_pings: bool,
 
-    /// Security Testing: fall back to old-style unkeyed A2A MICVs. Adapters
+    /// Security Testing: fall back to old-style unkeyed A2A MICVs. Zodes
     /// write and verify with the unkeyed hash; a malicious node forges with it.
     #[cfg(feature = "enable-security-testing")]
     #[arg(long)]
@@ -149,55 +147,39 @@ pub struct CommonArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Start the handler in adapter mode
-    #[command()]
-    Adapter {
-        /// Optional unless you are running an adapter without a manually configured noise key. In that
-        /// case this must be set to the desired link key CN value.
-        #[arg(long, value_name = "NAME")]
-        name: Option<String>,
-
-        /// Path to adapter configuration file (any options specified on command line will override configuration file)
-        #[arg(long, short = 'c', value_name = "PATH")]
-        config_file: Option<PathBuf>,
-
-        #[command(flatten)]
-        common: CommonArgs,
-
-        /// Substrate address of the node to connect to
-        #[arg(long, short = 'N', value_name = "ADDR:PORT", value_parser = parse_socket_addr_or_scoped_ip_addr)]
-        node_addr: Option<SocketAddr>,
-
-        /// PEM file holding the boostrap RSA private key
-        #[arg(long, value_name = "PATH")]
-        bootstrap_key: Option<PathBuf>,
-
-        /// Whether the adapter connects its tether on its own. The default
-        /// (true) is to start connecting at startup and to reconnect after a
-        /// drop. With --auto-connect=false the adapter idles until a
-        /// `ph-cli connect` (or `ph-cli link start`) starts the link, and a
-        /// dropped link waits for the next one instead of reconnecting.
-        /// Overrides the `auto_connect` key in the config file.
-        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
-        auto_connect: Option<bool>,
-    },
-    /// Start the handler in node mode
+    /// Start the Zode
     #[command(verbatim_doc_comment)]
-    Node {
-        /// Path to node configuration file (any options specified on command line will override configuration file)
+    Zode {
+        /// Path to the Zode configuration file (any options specified on command line will override configuration file)
         #[arg(long, short = 'c', value_name = "PATH")]
         config_file: Option<PathBuf>,
 
         /// RSA private key used for authentication with the visa service.
+        /// Overrides `auth_private_key` in the `[authentication]` section of
+        /// the config file.
         #[arg(long, value_name = "PATH")]
         auth_private_key: Option<PathBuf>,
 
-        /// Substrate address to advertise to the visa service, as a literal
-        /// IP:port (IPv6 in square brackets, e.g. [2001:db8::1]:5000). Required
-        /// when self_addr has an unspecified IP (e.g. 0.0.0.0), since a wildcard
-        /// address cannot be dialed by peers.
-        #[arg(long, value_name = "ADDR:PORT")]
-        advertised_substrate_addr: Option<String>,
+        /// Whether this node carries other nodes' traffic, i.e. accepts
+        /// forward-only visas. Off by default. Overrides the `forwarding`
+        /// key in the `[node]` section of the config file.
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        forwarding: Option<bool>,
+
+        /// This Zode's initial link: the relay it dials at startup, as
+        /// CN@IP:PORT (IPv6 in square brackets, e.g.
+        /// relay.zpr@[2001:db8::1]:5000). CN is the relay's certificate CN.
+        /// At most one. Overrides `[node.initial_link]` in the config file.
+        #[arg(long, value_name = "CN@IP:PORT")]
+        initial_link: Option<String>,
+
+        /// Whether this Zode is a relay: it never dials, and accepts a link
+        /// from any peer in its topology. Off by default. Overrides the
+        /// `relay` key in the `[node]` section of the config file. A relay
+        /// hosts the visa service: list fd5a:5052::1 in --zpr-addr after
+        /// the relay's own address.
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        relay: Option<bool>,
 
         #[command(flatten)]
         common: CommonArgs,

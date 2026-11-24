@@ -1,0 +1,85 @@
+# -*- mode: toml -*-
+#
+# Leg-3 variant of zodes-policy-reauth.zplc (zl-zipline#234): IDENTICAL
+# except that zb's bootstrap key is removed from [bootstrap]. Installing it
+# obliges every connected Zode to re-authenticate (zipline#123); zb, a
+# device-only Zode whose only credential is that key, cannot, and must be
+# disconnected by the re-authentication deadline. The ZPL, and so every
+# rule, is unchanged: the disconnection must come from the failed
+# re-authentication, not from a rule change.
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+"zc.zpr" = "fd5a:5052::4"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+# No substrate_addrs for zb and zc (zl-zipline#255): the visa service
+# learns their addresses from what they report when they connect.
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+
+[nodes.zc]
+provider = [ [ "device.zpr.adapter.cn", "zc" ] ]
+zpr_address = "zc.zpr"
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
+
+[links.relay-zc]
+peers = [ { node = "relay" }, { node = "zc" } ]
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[trusted_services.fake-idp]
+api             = "oidc"
+issuer          = "https://127.0.0.1:9000"
+jwks_uri        = "https://127.0.0.1:9000/jwks"
+client_id       = "zpr-test-client"
+scopes          = ["openid", "email", "profile"]
+allowed_domains = ["example.com"]
+seed_jwks       = "oidc-test-seed-jwks.json"
+
+# Long lifetime (see zodes-policy-reauth.zplc): no clock-driven renewal
+# during the run.
+expiration_seconds   = 3600
+max_auth_age_seconds = 43200
+allow_offline_access = true
+
+returns_attributes = [
+  "sub   -> user.oidc-subject",
+  "email -> user.email",
+  "hd    -> user.domain",
+]
+identity_attributes = ["sub"]
+
+[visa_service]
+dock_node = "relay"
+
+[bootstrap]
+"relay" = "node-rsa-pubkey.pem"
+"zc" = "zc-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableZb]
+protocol = "ping"

@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use crate::auth::AUTH_KEY_SIZE_BYTES;
 use crate::config;
 use crate::forwarding_tables::PeerForwardingTable;
 use crate::km::{KeyManager, KmTransportSA};
@@ -7,25 +6,23 @@ use crate::link_state::{LinkStateWrapper, LinkType};
 use crate::mgmt::{self, txn_mgr};
 use crate::prelude::*;
 use crate::queues;
-use crate::special_peers::*;
 use crate::zdpr;
 use bytes::Bytes;
 use cslab::{RcuCslab, RcuCslabReader};
 use dashmap::DashMap;
-use enum_map::EnumMap;
 use rcu::{RcuBox, RcuCslabEntryGuard, RcuOptionGuard};
-use std::default::Default;
 use std::future::Future;
 use std::num::NonZero;
 use std::sync::atomic::{self, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 use strum;
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc};
 use tokio::task;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use zpr::packet_info::{ForwardingEntry, LINK_ID_UNKNOWN, LinkId, SubstrateAddr};
+use zpr::packet_info::{ForwardingEntry, LinkId, SubstrateAddr};
 use zpr_utils::net_defs::{ScopedIpAddr, ScopedIpv6Addr};
 
 const PEER_TABLE_SIZE: usize = config::MAX_ACTIVE_LINKS;
@@ -40,16 +37,23 @@ pub struct PeerState {
     pub node_state: mgmt::node::NodePeerState,
     pub mgmt_processor: queues::MgmtProcessor,
     pub mgmt_processor_worker: task::JoinHandle<()>,
-    pub auth_key: [u8; 32], // set in ::new and never changed.
     pub a2a_dh_pubkey: RcuBox<Option<x25519_dalek::PublicKey>>,
     pub zdpr_send: Mutex<zdpr::Sender<crate::packet::Packet>>,
     pub zdpr_recv: Mutex<zdpr::Receiver>,
     /// Which ZDP-R session `zdpr_send` / `zdpr_recv` currently represent.
     /// Incremented by [PeerState::reset_zdpr_session].
     zdpr_generation: atomic::AtomicU64,
-    pub zdpr_retry_timer_reset: Notify,
+    /// Wakes this link's ZDP-R worker to reset its retry timer. Shared, so
+    /// the worker can wait on it without holding a peer-table guard
+    /// ([crate::zdpr_worker::launch]).
+    pub zdpr_retry_timer_reset: Arc<Notify>,
     pub txn_mgr: Arc<txn_mgr::TxnMgr>,
     km_state: PeerKmState,
+    /// The bootstrap visas installed for this Zode link (zl-zipline#252,
+    /// ZODE_LINKS.md J4): on a joiner, the ones its relay handed over; on a
+    /// relay, its own copies for the joiner. `Assembly::drop_peer` revokes
+    /// them with the link (rule 9). See [crate::bootstrap_handoff].
+    pub bootstrap_handoff: Mutex<Option<crate::bootstrap_handoff::HandoffRecord>>,
 }
 
 // Key Management state per peer.
@@ -106,33 +110,25 @@ impl PeerState {
 
         let mgmt_processor_worker = task::spawn_local(launch_mgmt_processor_worker(mp_outq));
 
-        let mut key = [0u8; AUTH_KEY_SIZE_BYTES];
-        if link_type == LinkType::NodeToAdapter {
-            aws_lc_rs::rand::fill(&mut key)
-                .expect("failed to generate random bytes for peer auth key");
-        }
         Self {
             substrate_addr,
             interface_addr,
             link_state_machine: LinkStateWrapper::new(link_id.get(), link_type),
-            actor_auth: Arc::new(crate::actor_auth::ActorAuthorization::new(
-                link_id.get(),
-                link_type,
-            )),
+            actor_auth: Arc::new(crate::actor_auth::ActorAuthorization::new(link_type)),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,
             mgmt_processor_worker,
-            auth_key: key,
             a2a_dh_pubkey: RcuBox::new(None),
             zdpr_send: Mutex::new(zdpr::Sender::new()),
             zdpr_recv: Mutex::new(zdpr::Receiver::new(
                 config::DEFAULT_ZDPR_RECEIVE_WINDOW_SIZE,
             )),
             zdpr_generation: atomic::AtomicU64::new(0),
-            zdpr_retry_timer_reset: Notify::new(),
+            zdpr_retry_timer_reset: Arc::new(Notify::new()),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),
+            bootstrap_handoff: Mutex::new(None),
         }
     }
 
@@ -163,6 +159,14 @@ impl PeerState {
     }
 
     /// Return a reference to the transport SA if there is an SA on the link, and if it is established.
+    /// The CN of the peer's certificate if keying verified it against our CA,
+    /// else `None` (zl-zipline#220).
+    pub fn verified_peer_cn(&self) -> Option<String> {
+        let sa = self.get_established_transport_association()?;
+        let cert = sa.peer_cert.as_ref().filter(|c| c.is_verified())?;
+        cert.common_name()
+    }
+
     pub fn get_established_transport_association(
         &self,
     ) -> Option<RcuOptionGuard<'_, KmTransportSA>> {
@@ -195,6 +199,12 @@ impl PeerState {
         self.link_state_machine.is_internal()
     }
 
+    /// Whether this peer's link is a Zode-to-Zode link (`NodeToNode`),
+    /// rather than an internal link to this Zode's own actor or dock.
+    pub fn is_zode_link(&self) -> bool {
+        self.link_state_machine.get_link_type() == LinkType::NodeToNode
+    }
+
     /// What type of peer is this.  Accounts for well-known internal links
     /// (local actor and dock).
     pub fn peer_type(&self) -> PeerType {
@@ -205,8 +215,6 @@ impl PeerState {
                 _ => PeerType::Unknown,
             },
 
-            LinkType::NodeToAdapter => PeerType::Adapter,
-            LinkType::AdapterToNode => PeerType::Dock,
             LinkType::NodeToNode => PeerType::Node,
         }
     }
@@ -219,8 +227,6 @@ pub struct PeerTable {
     peer_slab: Mutex<RcuCslab<PeerState>>,
     peer_slab_reader: RcuBox<RcuCslabReader<PeerState>>,
     sa_to_link: DashMap<(SubstrateAddr, ScopedIpAddr), NonZero<LinkId>>,
-    // TODO: it would be nice if this lived in the same RCU as peer_slab_reader
-    special_peers: RcuBox<EnumMap<SpecialPeerName, LinkId>>,
 }
 
 pub type PeerTableEntryGuard<'a> = RcuCslabEntryGuard<'a, PeerState>;
@@ -246,18 +252,7 @@ impl PeerTable {
             peer_slab: Mutex::new(peer_slab),
             peer_slab_reader,
             sa_to_link: DashMap::with_capacity(PEER_TABLE_SIZE),
-            special_peers: RcuBox::default(),
         }
-    }
-
-    /// Adds a "dummy" peer with the expected link ID for referencing internal links.
-    ///
-    /// Panics if there is no room in the table.  (This is intended to only be invoked
-    /// at startup, before dynamic entries have been added.)
-    pub fn insert_internal_peer(&self) -> NonZero<LinkId> {
-        let entry = self.vacant_entry().unwrap();
-        let peer = PeerState::new_internal_peer(entry.key(), None, |_| std::future::pending());
-        entry.insert(peer)
     }
 
     pub fn insert_internal_peer_pair<Worker>(
@@ -307,20 +302,10 @@ impl PeerTable {
         let Some(peer_state) = peer_slab.get((link_id as usize).wrapping_sub(1)) else {
             return;
         };
-        self.sa_to_link
-            .remove(&(peer_state.substrate_addr, peer_state.interface_addr));
-
-        self.special_peers
-            .update(|sp_ref| {
-                let mut new_sp = *sp_ref;
-                for (_name, peer_id_ref) in new_sp.iter_mut() {
-                    if *peer_id_ref == link_id {
-                        *peer_id_ref = LINK_ID_UNKNOWN;
-                    }
-                }
-                Some(new_sp)
-            })
-            .unwrap();
+        self.unmap_key(
+            &(peer_state.substrate_addr, peer_state.interface_addr),
+            link_id,
+        );
 
         let new_reader = peer_slab.remove((link_id as usize).wrapping_sub(1));
         // Keep writers serialized through publication so an older reader cannot win.
@@ -358,11 +343,36 @@ impl PeerTable {
         id
     }
 
-    pub fn lookup_special_peer(&self, name: SpecialPeerName) -> Option<NonZero<LinkId>> {
-        // synchronizes with the Release in VacantPeerTableEntry::insert();
-        // ensures anyone who reads from the slab following this sees the peer
-        // (assuming of course it hasn't been removed!)
-        NonZero::new(self.special_peers.get()[name])
+    /// Point `link_id`'s substrate address at `link_id`, taking it over from
+    /// any other link. Used when a Zode link keyed from the same address as
+    /// an established link replaces it (ZODE_LINKS.md rule 5, zl-zipline#250);
+    /// see [VacantPeerTableEntry::insert_unmapped].
+    pub fn map_substrate_addr(&self, link_id: LinkId) {
+        let Some(key) = self.inspect(link_id, |p| (p.substrate_addr, p.interface_addr)) else {
+            return;
+        };
+        if let Some(id) = NonZero::new(link_id) {
+            self.sa_to_link.insert(key, id);
+        }
+    }
+
+    /// Stop routing packets from `link_id`'s substrate address to
+    /// `link_id`, leaving the peer entry in place. A Zode link refused at
+    /// `KeyingDone` does this while it finishes closing, so its owner's
+    /// redial from the same address starts a new link (ZODE_LINKS.md rules
+    /// 3 and 6, gate g120).
+    pub fn unmap_substrate_addr(&self, link_id: LinkId) {
+        if let Some(key) = self.inspect(link_id, |p| (p.substrate_addr, p.interface_addr)) {
+            self.unmap_key(&key, link_id);
+        }
+    }
+
+    /// Remove the address mapping `key`, but only if it still leads to
+    /// `link_id`: a Zode link that replaced this one at the same address
+    /// may own it now (rule 5).
+    fn unmap_key(&self, key: &(SubstrateAddr, ScopedIpAddr), link_id: LinkId) {
+        self.sa_to_link
+            .remove_if(key, |_, mapped| mapped.get() == link_id);
     }
 
     pub fn inspect<T>(
@@ -481,26 +491,6 @@ impl PeerTable {
         handle.take()
     }
 
-    pub fn assign_special_name(
-        &self,
-        name: SpecialPeerName,
-        link_id: LinkId,
-    ) -> Result<(), PeerUpdateError> {
-        // FIXME: This can race peer removal; we ought to place
-        // `special_peers` and `peer_slab_reader` in the same RcuBox
-        self.special_peers
-            .update(|sp_ref| {
-                if sp_ref[name] == LINK_ID_UNKNOWN {
-                    let mut new_sp = *sp_ref;
-                    new_sp[name] = link_id;
-                    Some(new_sp)
-                } else {
-                    None
-                }
-            })
-            .map_err(|()| PeerUpdateError::NoAssociationForLink)
-    }
-
     /// Clear out peer state upon link close/reset
     /// This does not remove the peer, but it clears any relevant tables
     pub fn clear_peer_state(&self, link_id: LinkId) {
@@ -511,13 +501,17 @@ impl PeerTable {
         entry.pft.clear();
     }
 
-    /// Remove a route from a peer forwarding table
+    /// Remove a route from a peer forwarding table. The route's stream ID
+    /// goes into quarantine and is not handed out again before
+    /// [crate::config::STREAM_ID_REUSE_GRACE] has passed (zl-zipline#282):
+    /// every visa removal path (revocation, the expiry sweep, the match
+    /// eject, link loss) comes here.
     pub fn remove_route(&self, route: ForwardingEntry) {
         let Some(entry) = self.get(route.0) else {
             // If the peer is gone, nothing to be done
             return;
         };
-        entry.pft.remove(route.1);
+        entry.pft.quarantine(route.1, Instant::now());
     }
 }
 
@@ -531,7 +525,23 @@ impl VacantPeerTableEntry<'_> {
         NonZero::new((self.peer_slab_guard.vacant_key().unwrap() + 1) as LinkId).unwrap()
     }
 
-    pub fn insert(mut self, peer_state: PeerState) -> NonZero<LinkId> {
+    pub fn insert(self, peer_state: PeerState) -> NonZero<LinkId> {
+        self.insert_and_map(peer_state, true)
+    }
+
+    /// Insert a peer without mapping its substrate address, which already
+    /// leads to an established link. Only a second handshake from a Zode at
+    /// the same address does this (ZODE_LINKS.md rule 5, gate g78 q5): the
+    /// established link keeps the address until the new link's peer CN is
+    /// verified, so an unauthenticated packet cannot end a link. Inbound
+    /// packets reach the new link only by link id until
+    /// [PeerTable::map_substrate_addr].
+    pub fn insert_unmapped(self, peer_state: PeerState) -> NonZero<LinkId> {
+        self.insert_and_map(peer_state, false)
+    }
+
+    /// Insert `peer_state`, mapping its substrate address to it if `map`.
+    fn insert_and_map(mut self, peer_state: PeerState, map: bool) -> NonZero<LinkId> {
         let id = self.peer_slab_guard.insert(peer_state).unwrap();
         let peer_state_ref = self.peer_slab_guard.get(id).unwrap();
 
@@ -542,7 +552,7 @@ impl VacantPeerTableEntry<'_> {
         // the "reverse" table with Acquire ordering
         atomic::fence(Ordering::Release);
 
-        if !peer_state_ref.substrate_addr.ip().is_unspecified() {
+        if map && !peer_state_ref.substrate_addr.ip().is_unspecified() {
             if let Some(other) = self.sa_to_link_ref.insert(
                 (peer_state_ref.substrate_addr, peer_state_ref.interface_addr),
                 link_id,
@@ -612,24 +622,117 @@ pub mod test {
             substrate_addr,
             interface_addr,
             link_state_machine: LinkStateWrapper::new(link_id.get(), link_type),
-            actor_auth: Arc::new(crate::actor_auth::ActorAuthorization::new(
-                link_id.get(),
-                link_type,
-            )),
+            actor_auth: Arc::new(crate::actor_auth::ActorAuthorization::new(link_type)),
             pft: PeerForwardingTable::new(),
             node_state: mgmt::node::NodePeerState::new(),
             mgmt_processor,
             mgmt_processor_worker: task::spawn(async {}),
-            auth_key: [42u8; AUTH_KEY_SIZE_BYTES],
             a2a_dh_pubkey: RcuBox::new(None),
             zdpr_send: Mutex::new(zdpr::Sender::new()),
             zdpr_recv: Mutex::new(zdpr::Receiver::new(
                 config::DEFAULT_ZDPR_RECEIVE_WINDOW_SIZE,
             )),
             zdpr_generation: atomic::AtomicU64::new(0),
-            zdpr_retry_timer_reset: Notify::new(),
+            zdpr_retry_timer_reset: Arc::new(Notify::new()),
             txn_mgr: Arc::new(txn_mgr::TxnMgr::new()),
             km_state: PeerKmState::new(),
+            bootstrap_handoff: Mutex::new(None),
+        }
+    }
+
+    /// Insert a Zode-to-Zode (NodeToNode) peer whose established SA holds a
+    /// verified certificate with common name `cn`, with its link in `state`
+    /// (zl-zipline#220 tests).
+    #[allow(dead_code)]
+    pub fn insert_zode_peer_with_verified_cn(
+        asm: &crate::assembly::Assembly,
+        cn: &str,
+        state: crate::link_state::LinkState,
+    ) -> LinkId {
+        insert_peer_with_verified_cn(asm, LinkType::NodeToNode, cn, state)
+    }
+
+    /// [insert_zode_peer_with_verified_cn] for a peer of any `link_type`.
+    pub fn insert_peer_with_verified_cn(
+        asm: &crate::assembly::Assembly,
+        link_type: LinkType,
+        cn: &str,
+        state: crate::link_state::LinkState,
+    ) -> LinkId {
+        let entry = asm.peer_table.vacant_entry().unwrap();
+        let link_id = entry.key();
+        let peer = create_dummy_peer_state(
+            link_id,
+            link_type,
+            SubstrateAddr::from(([127, 0, 0, 1], 9700 + link_id.get() as u16)),
+            ScopedIpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+        );
+        let link_id = entry.insert(peer).get();
+        set_verified_peer_cn(asm, link_id, cn);
+        asm.peer_table
+            .get(link_id)
+            .unwrap()
+            .link_state_machine
+            .test_set_state(state);
+        link_id
+    }
+
+    /// A Zode link that is up to the Zode `cn` at topology ZPR address
+    /// `zpr_addr`, as F1 finds it (zl-zipline#251): an Active NodeToNode
+    /// peer whose verified CN is `cn`, a topology entry for `cn` at
+    /// `zpr_addr`, and an up link record for `cn` served by that peer.
+    /// Returns the peer's link ID.
+    #[allow(dead_code)]
+    pub fn insert_up_zode_link(
+        asm: &crate::assembly::Assembly,
+        cn: &str,
+        zpr_addr: std::net::IpAddr,
+    ) -> LinkId {
+        let link_id =
+            insert_zode_peer_with_verified_cn(asm, cn, crate::link_state::LinkState::Active);
+        asm.topology
+            .write()
+            .unwrap()
+            .push(topology_link_at(cn, zpr_addr));
+        asm.zode_links
+            .test_put(cn, crate::zode_link_record::RecordState::Up, Some(link_id));
+        link_id
+    }
+
+    /// Give `link_id` an established SA whose peer certificate is verified
+    /// and carries CN `cn`, as keying does.
+    pub fn set_verified_peer_cn(asm: &crate::assembly::Assembly, link_id: LinkId, cn: &str) {
+        use crate::km::{PeerCertificate, ZPIPair};
+        let keypair = crate::km_noise::NoiseKeypair::generate();
+        let cert = crate::pki::generate_self_signed_noise_cert(cn, &keypair).unwrap();
+        let mut sa = KmTransportSA::new_with_zpis(ZPIPair::new(1, 2), ZPIPair::new(3, 4));
+        sa.peer_cert = Some(PeerCertificate::Verified(cert));
+        asm.peer_table
+            .set_security_association(link_id, sa)
+            .unwrap();
+    }
+
+    /// A topology link to a peer Zode whose certificate must carry `peer_cn`,
+    /// at ZPR address `fd5a:5052::9`.
+    #[allow(dead_code)]
+    pub fn topology_link(peer_cn: &str) -> zpr::vsapi_types::Link {
+        topology_link_at(
+            peer_cn,
+            std::net::IpAddr::from([0xfd5a, 0x5052, 0, 0, 0, 0, 0, 9]),
+        )
+    }
+
+    /// A topology link to the peer Zode `peer_cn` at ZPR address `zpr_addr`.
+    pub fn topology_link_at(peer_cn: &str, zpr_addr: std::net::IpAddr) -> zpr::vsapi_types::Link {
+        zpr::vsapi_types::Link {
+            link_id: format!("link-{peer_cn}"),
+            peer: Some(zpr::vsapi_types::SockAddr {
+                addr: std::net::IpAddr::from([127, 0, 0, 9]),
+                port: 5000,
+            }),
+            role: zpr::vsapi_types::LinkRole::Active,
+            zpr_addr,
+            peer_cn: peer_cn.to_owned(),
         }
     }
 }

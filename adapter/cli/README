@@ -1,50 +1,54 @@
 How does a human log in, and keep the session alive?
 
-Two commands start a link and supply an OIDC credential. Use `auth-agent`
-for an interactive session and `connect` for scripts.
+On a Zode, `connect` and `auth-agent` log in YOU, the person at this
+machine (zl-zipline#233). The Zode's own actor (the machine) then carries
+your identity-provider attributes as well as its own, until you log out.
+One person is logged in per Zode at a time. Use `auth-agent` for an
+interactive session and `connect` for scripts.
 
-  Command                    Starts    Reports the    Stays resident
-                             the link  outcome
-  -------------------------  --------  -------------  --------------------
-  ph-cli auth-agent <id>     yes       no             yes - until
-                                                      interrupted
-  ph-cli connect <id>        yes       yes, with      no - returns as soon
-                                       exit codes     as the link is up
+  ph-cli auth-agent [--no-browser]   log in, stay resident, renew silently;
+                                     if the visa service drops the login (a
+                                     reconnect or restart) it asks you to log
+                                     in again
+  ph-cli connect [--no-browser]      log in and exit, with exit codes (2
+                                     declined, 3 timeout, 4 IdP unreachable,
+                                     5 visa service rejected the token,
+                                     6 policy denied); nothing renews the
+                                     login, so it ends at expiration_seconds
+  ph-cli login-status                state, identity provider, time left,
+                                     whether an agent is registered, and the
+                                     last failure
+  ph-cli logout                      drop your attributes; the machine stays
+                                     connected
 
-A resident `auth-agent` renews your authentication silently (zipline#66),
-so you log in once per session ceiling (`max_auth_age_seconds`) instead of
-once per `expiration_seconds`. The refresh token is held in this process's
-memory; when a renewal comes due, the packet handler asks the agent for a
-fresh credential and it is served non-interactively, with no browser. Run
-`auth-agent` and leave it resident.
+A resident `auth-agent` renews your login silently, so you log in once per
+session ceiling (`max_auth_age_seconds`) instead of once per
+`expiration_seconds`. The refresh token is held in this process's memory;
+when a renewal comes due, ph asks the agent for a fresh credential and it
+is served non-interactively, with no browser. Run `auth-agent` and leave it
+resident.
 
-So the interactive flow is TWO steps, not three:
+A second login while logged in is refused: log out first. When nothing
+renews the login, ph logs you out itself when it expires. Anyone who can
+reach the control socket (or, on Windows, the named pipe) can log in or out
+for the whole machine.
 
-  1. ph (the adapter) running          - daemon, systemd
-  2. ph-cli auth-agent <id>            - starts the link, the browser opens
-                                         once, the process stays resident
-
-`ph-cli connect` is redundant there. It keeps its value for CI and scripts,
-where the blocking outcome report and the exit-code contract (2 declined,
-3 timeout, 4 IdP unreachable, 5 visa service rejected the token, 6 policy
-denied, 7 device blob rejected) are the point.
-
-Does step 2 need sudo? ph needs root for the tun interface, but since
+Does it need sudo? ph needs root for the tun interface, but since
 zipline#39 the control socket is handed off after bind
 (`adapter/ph/src/socket_access.rs`, `adapter/admin-api/src/socket_owner.rs`),
 so whether ph-cli needs privilege depends only on how ph was started:
 
 * ph started via sudo or pkexec: the socket is chowned to the invoking
   user at /var/run/zpr/<uid>/control.sock, mode 0600. Run
-  `ph-cli auth-agent <id>` as yourself - no sudo, and the browser opens
+  `ph-cli auth-agent` as yourself - no sudo, and the browser opens
   normally.
 * ph started by systemd (or a direct root login) on a host that has a
   "zpr" group: the shared socket is group zpr, mode 0660. Members of that
-  group run `ph-cli auth-agent <id>` unprivileged, browser as normal.
+  group run `ph-cli auth-agent` unprivileged, browser as normal.
 * Residual case - no recorded owner AND no "zpr" group: the socket stays
   root-only, and the documented form is
 
-    sudo ph-cli auth-agent <id> --no-browser
+    sudo ph-cli auth-agent --no-browser
 
   In this case only, `--no-browser` is the norm, not a workaround: a root
   process cannot usefully open the user's browser, and `xdg-open` fails
@@ -58,17 +62,14 @@ so whether ph-cli needs privilege depends only on how ph was started:
 How ph-cli finds the right socket for each of these deployments is the
 "Which socket does ph-cli talk to?" section below.
 
-Do NOT run `connect` after `auth-agent` on the same link. Both register as
-the link's authentication agent and the second registration OVERWRITES the
-first, so a `connect` run "just to check" replaces a live resident agent
-with one that is about to exit -- silently, with nothing logged. Use
-`ph-cli link show <id>` to check on a link instead; it reports the
-authentication expiry and the last authentication failure.
+Run ph-cli without sudo so it can open your browser. On Windows, under the
+`zipline` service ph runs as LocalSystem: your account needs to be in the
+configured `control_group` to reach the pipe.
 
 Which socket does ph-cli talk to?
 
 ph-cli needs no sudo except in the residual case above (no recorded owner
-and no "zpr" group - see the login flow section). By default it searches
+and no "zpr" group - see the login section). By default it searches
 for the packet handler's control socket in this order (zipline#39):
 
 1. The per-user socket for your uid: /var/run/zpr/<uid>/control.sock.
@@ -87,10 +88,9 @@ live server at the other path.
 An explicit -p (control socket) always wins and short-circuits the search.
 
 Security note: reaching the control socket means being able to start and
-stop links and register an AuthAgent — i.e. to supply and observe user
-credentials for this adapter, and to receive the IdP client_secret in a
-HelloResponse. Socket access is adapter control; the zpr group is not a
-low-privilege convenience.
+stop links and to log a user in or out through an AuthAgent - i.e. to
+supply and observe user credentials for this Zode. Socket access is Zode
+control; the zpr group is not a low-privilege convenience.
 
 How to generate Bash completion script 
 

@@ -18,33 +18,55 @@ use tracing::*;
 use zpr_utils::rsa_sign::sign_rsa_key;
 
 use crate::error::VSApiError;
+use crate::keepalive;
 use crate::logging::targets::VS_RPC;
 
 use zpr::vsapi_types::{
-    ConnectRequest, ConnectType, Connection, DisconnectNotice, Param, ReauthRequest,
+    AuthBlob, BootstrapVisas, ChallengeAlg, ConnectRequest, ConnectType, Connection,
+    DisconnectNotice, LinkStateReport, LoginNonce, OidcBlob, Param, ReauthRequest, SelfSignedBlob,
     VSConnectRequest, Visa, VisaDecision, VisaOp, VisaRequest, VisaResponse, pname,
 };
 use zpr::write_to::WriteTo;
 
 /// Boxed async connect factory: given a SocketAddr, returns a future that resolves to a TcpStream.
-/// The default implementation calls `tokio::net::TcpStream::connect`; tests may inject a stub.
+/// The default implementation is [connect_from] with the node's own address; tests may inject a stub.
 type ConnectFn = Box<
     dyn Fn(SocketAddr) -> Pin<Box<dyn Future<Output = std::io::Result<tokio::net::TcpStream>>>>,
 >;
 
 const LIFECYCLE_EVENT_BUFFER_SIZE: usize = 64;
 
+/// How long the run loop waits after an answered ping before it sends the
+/// next one.
 const VSAPI_PING_INTERVAL: Duration = Duration::from_secs(5);
-const VSAPI_MAX_PING_FAILURES: u32 = 2;
 
-/// Minimum (and initial) timeout for a ping RPC call.
-const PING_MIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a VS-API ping may go unanswered before it counts as a miss:
+/// the ZDP link keep-alive's echo timeout (ZODE_LINKS rule 9). The VS-API
+/// session is TCP carried over a ZDP link, so one TCP retransmit on a
+/// loaded link delays a ping by a second or more while the link itself is
+/// fine. A tighter budget (it used to be 1 s, then 2 s) turned that delay
+/// into a miss, and two such misses into a rejoin (zl-zipline#292).
+const VSAPI_PING_TIMEOUT: Duration = keepalive::DEFAULT_KEEP_ALIVE_TIMEOUT;
+
+/// Consecutive ping misses that end the VS-API session: the link
+/// keep-alive's miss count. As after a missed echo, the next ping goes out
+/// at once, so a visa service that stopped answering ends the session
+/// after the same budget a link gets (about 9 s). The VS-API check is not
+/// meant to be stricter than that: the ZDP keep-alive stays the authority
+/// on whether the link is alive (zl-zipline#292).
+const VSAPI_MAX_PING_MISSES: u32 = keepalive::KEEP_ALIVE_MAX_MISSES;
 
 /// Default timeout for a single Cap'n Proto RPC call.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for connect/challenge/authenticate — longer due to crypto.
 const DEFAULT_CONNECT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a `requestBootstrapVisas` call may take (zl-zipline#252, J7):
+/// the relay closes the joiner's link if no answer comes by then. The RPC
+/// itself is bounded by it, so an unanswered request holds the serial
+/// command loop no longer than the relay waits for it.
+pub const BOOTSTRAP_VISAS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 4 no error if call to VSAPI authenticate was successful.
 type VSVisaResponse = Result<VisaDecision, VSApiError>;
@@ -55,6 +77,13 @@ type VSNotifyDisconnectResponse = Result<(), VSApiError>;
 type VSPingResponse = Result<(), VSApiError>;
 type VSVisaIdsResponse = Result<Vec<u64>, VSApiError>;
 type VSVisaByIdResponse = Result<Vec<Visa>, VSApiError>;
+type VSReportLinkStatesResponse = Result<(), VSApiError>;
+type VSBootstrapVisasResponse = Result<BootstrapVisas, VSApiError>;
+type VSLoginNonceResponse = Result<LoginNonce, VSApiError>;
+
+/// Length of the random challenge the node signs into the device leg of a
+/// `reauthorize` of its own actor (zl-zipline#233).
+const DEVICE_LEG_CHALLENGE_LEN: usize = 32;
 
 #[derive(Debug)]
 pub struct NodeConnect {
@@ -82,8 +111,10 @@ pub enum StateFlag {
 // The async "commands" that can be sent into the running visa service client.
 #[derive(Debug)]
 enum VS2Command {
-    /// Stop the local vs-api run loop, optionally de-register from the visa service first.
-    Stop(bool),
+    /// Stop the local vs-api run loop. It does not deregister: a caller
+    /// leaving the visa service sends [VSConnHandle::notify_disconnect]
+    /// first (zl-zipline#284).
+    Stop,
 
     /// Recycle the current run loop: exit it (emitting
     /// [VSConnLifecycleEvent::RunLoopExits]) so [VSConn::run_with_reconnect]
@@ -135,6 +166,38 @@ enum VS2Command {
     VisaIdsRequest(oneshot::Sender<VSVisaIdsResponse>),
 
     VisaByIdsRequest(Vec<u64>, oneshot::Sender<VSVisaByIdResponse>),
+
+    /// Send this node's link-state snapshot, `VSHandle.reportLinkStates`
+    /// (zl-zipline#250, ZODE_LINKS.md "Reporting summary").
+    ReportLinkStates(
+        Vec<LinkStateReport>,
+        oneshot::Sender<VSReportLinkStatesResponse>,
+    ),
+
+    /// Ask for a joining Zode's bootstrap visas on its behalf,
+    /// `VSHandle.requestBootstrapVisas` (zl-zipline#252, ZODE_LINKS.md J2).
+    /// The `String` is the joiner's link-verified certificate CN; the
+    /// `SocketAddr` is the source address this relay's substrate socket sees
+    /// that joiner's initial link come from (zl-zipline#264).
+    RequestBootstrapVisas(
+        String,
+        SocketAddr,
+        oneshot::Sender<VSBootstrapVisasResponse>,
+    ),
+
+    /// Ask for a login nonce for this node's own OIDC login,
+    /// `VSHandle.getLoginNonce` (zl-zipline#233, OIDC.md "A Zode's own login").
+    GetLoginNonce(oneshot::Sender<VSLoginNonceResponse>),
+
+    /// `reauthorize` this node's OWN actor at the given address
+    /// (zl-zipline#233): the run loop signs the mandatory device leg with the
+    /// node key, so the key never leaves [VSConn]. With an OIDC blob this is a
+    /// login or a renewal; without one it is a logout.
+    ReauthorizeOwnActor(
+        IpAddr,
+        Option<OidcBlob>,
+        oneshot::Sender<VSAuthorizeConnectResponse>,
+    ),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,15 +220,10 @@ pub struct VSConn {
     node_private_key: RsaKeyPair,
     life_tx: broadcast::Sender<VSConnLifecycleEvent>,
     connect_fn: ConnectFn,
-    /// The substrate address this node advertises to the VS (operator config;
-    /// the address peers dial, which may differ from the bind address behind
-    /// NAT). Sent as the `substrate_addr` param on both `connect` and `open`
-    /// (the VS requires it on both). Callers must resolve a concrete,
-    /// reachable address before constructing a [VSConn]: the node may have
-    /// several local IPs (a wildcard bind covers all of them, present and
-    /// future) but only one can be advertised, so the choice belongs to the
-    /// operator, not to a socket-derived guess.
-    substrate_addr: SocketAddr,
+    /// The local address the VS-API connection is bound to before it dials
+    /// (zl-zipline#229): the node's own ZPR address, `zpr_addr[0]`. Only the
+    /// default `connect_fn` uses it; see [connect_from].
+    local_addr: IpAddr,
 }
 
 /// Handle for sending commands to a running [VSConn].
@@ -185,6 +243,9 @@ pub struct VSConnHandle {
 struct VSCommandState {
     vs_service: vsapi2::visa_service::Client,
     vs_handle: Option<vsapi2::v_s_handle::Client>,
+    /// Bumped every time `vs_handle` is set, so the run loop can tell that
+    /// a liveness probe still runs on a handle that has been replaced.
+    vs_handle_generation: u64,
 }
 
 impl VSCommandState {
@@ -192,7 +253,14 @@ impl VSCommandState {
         VSCommandState {
             vs_service,
             vs_handle: None,
+            vs_handle_generation: 0,
         }
+    }
+
+    /// Install a new VS handle (after connect, open or re-authentication).
+    fn set_vs_handle(&mut self, handle: vsapi2::v_s_handle::Client) {
+        self.vs_handle = Some(handle);
+        self.vs_handle_generation += 1;
     }
 
     /// This is used synchronously in the command handlers to check if
@@ -229,15 +297,19 @@ impl VSConn {
     /// `buffer_size` determines how many commands can be buffered to send to the run loop before
     /// [VSConnHandle] starts blocking.
     ///
-    /// `substrate_addr` is the substrate address this node advertises to the VS — the
-    /// address peers dial (see the field docs). It must be concrete and reachable;
-    /// there is deliberately no auto-derivation fallback.
+    /// A node never tells the VS its own substrate address (zl-zipline#264):
+    /// the VS takes it from policy, or from what the node's relay observed
+    /// when the node's initial link came up (`requestBootstrapVisas`).
+    ///
+    /// `local_addr` is the node's own ZPR address. Every dial binds it as the
+    /// source of the VS-API connection (see [connect_from]); a dial that cannot
+    /// bind it fails, and [VSConn::run_with_reconnect] retries.
     pub fn new(
         buffer_size: usize,
         vs_addr: SocketAddr,
         node_cn: String,
         node_private_key: RsaKeyPair,
-        substrate_addr: SocketAddr,
+        local_addr: IpAddr,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(buffer_size);
         let (life_tx, _) = broadcast::channel(LIFECYCLE_EVENT_BUFFER_SIZE);
@@ -248,8 +320,8 @@ impl VSConn {
             node_cn,
             node_private_key,
             life_tx,
-            connect_fn: Box::new(|addr| Box::pin(tokio::net::TcpStream::connect(addr))),
-            substrate_addr,
+            connect_fn: Box::new(move |addr| Box::pin(connect_from(local_addr, addr))),
+            local_addr,
         }
     }
 
@@ -295,7 +367,7 @@ impl VSConn {
                             biased; // in case of tie this bias here means we prioritize Stop (first branch) if we get it.
 
                             cmd = self.cmd_rx.recv() => match cmd {
-                                Some(VS2Command::Stop(_)) | None => {
+                                Some(VS2Command::Stop) | None => {
                                     info!(target: VS_RPC, "VSConn: stop received during reconnect delay, exiting");
                                     return Ok(());
                                 }
@@ -314,6 +386,7 @@ impl VSConn {
     pub async fn run(&mut self) -> Result<(), VSApiError> {
         // First spin up a connection to the Capn Proto service on the VS.
         info!(target: VS_RPC, "VS RPC service connecting to {} (capnp)", self.vs_addr);
+        debug!(target: VS_RPC, "VS RPC connection source address {}", self.local_addr);
 
         // Interruptible TCP connect: poll cmd_rx alongside the connect future so that a Stop
         // command received while blocked in connect (e.g. during a 2-minute TCP ETIMEDOUT) causes
@@ -324,7 +397,7 @@ impl VSConn {
                 tokio::select! {
                     result = &mut connect_fut => break result?,
                     cmd = self.cmd_rx.recv() => match cmd {
-                        Some(VS2Command::Stop(_)) | None => {
+                        Some(VS2Command::Stop) | None => {
                             info!(target: VS_RPC, "VSConn: stop received during TCP connect, exiting cleanly");
                             self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
                             return Ok(());
@@ -337,11 +410,6 @@ impl VSConn {
             }
         };
         sock.set_nodelay(true)?;
-
-        debug!(
-            target: VS_RPC,
-            "advertising substrate address {} to the VS", self.substrate_addr
-        );
 
         let connector = tls_connect();
         let tls = connector.connect(self.vs_addr.ip().into(), sock).await?;
@@ -367,58 +435,75 @@ impl VSConn {
                 tokio::task::spawn_local(rpc_system);
 
                 self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopStarts);
-                //let mut ping_interval = tokio::time::interval(VSAPI_PING_INTERVAL);
 
-                let ping_timeout = tokio::time::sleep(VSAPI_PING_INTERVAL);
-                tokio::pin!(ping_timeout);
-                let mut ping_failures = 0;
+                // The liveness probe runs as a task of its own, so a command
+                // queued while a ping is in flight goes out at once rather
+                // than waiting for the ping's answer or timeout
+                // (zl-zipline#292). At most one probe runs at a time. The
+                // probe keeps pinging while a command holds the loop; a
+                // probe that failed is acted on once that command returns,
+                // which its own RPC timeout bounds.
+                let next_probe = tokio::time::sleep(VSAPI_PING_INTERVAL);
+                tokio::pin!(next_probe);
+                let mut probe: Option<tokio::task::JoinHandle<VSPingResponse>> = None;
 
-                // Then loop over commands and periodically ping.
+                // Then loop over commands and periodically probe.
                 loop {
                     tokio::select! {
+                        // Biased, in this order: a finished probe is acted on
+                        // before any more work is dispatched, and a due probe
+                        // starts even while commands keep arriving.
+                        biased;
+
+                        // The probe finished: the VS answered, or every ping missed.
+                        joined = async { probe.as_mut().unwrap().await }, if probe.is_some() => {
+                            probe = None;
+                            // The probe is aborted only after it is taken
+                            // out of `probe`, so a join error is a panic in it.
+                            let result = joined.unwrap_or_else(|e| {
+                                Err(VSApiError::CommandFailed(format!("liveness probe failed: {e}")))
+                            });
+                            if let Err(e) = result {
+                                error!(target: VS_RPC, "VSConn: maximum ping failures reached, exiting run loop: {:?}", e);
+                                self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
+                                return Err(VSApiError::Timeout("ping".to_string()));
+                            }
+                            trace!(target: VS_RPC, "VSConn: ping successful");
+                            next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
+                        }
+
+                        // Time for the next probe.
+                        () = &mut next_probe, if probe.is_none() => {
+                            match cmd_state.vs_handle.clone() {
+                                Some(vs_h) => probe = Some(tokio::task::spawn_local(Self::probe_liveness(vs_h))),
+                                // Not connected, just reset the probe timer.
+                                None => next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL),
+                            }
+                        }
+
                         // If we get a command, handle it.
                         cmd = self.cmd_rx.recv() => {
                             let Some(cmd) = cmd else {
                                 info!(target: VS_RPC, "VSConn: command channel closed, exiting run loop");
                                 break;
                             };
-                            let is_stop_cmd = matches!(cmd, VS2Command::Stop(_));
+                            let is_stop_cmd = matches!(cmd, VS2Command::Stop);
+                            let generation = cmd_state.vs_handle_generation;
                             if let Err(e) = self.handle_command(&mut cmd_state, cmd).await {
                                 error!(target: VS_RPC, "VSConn: handle_command error: {:?}", e);
                                 self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
-                                return Err(e.into());
+                                return Err(e);
                             }
                             if is_stop_cmd {
                                 break;
                             }
-                        }
-
-                        // If the ping interval elapses, do a ping (not implemented yet).
-                        () = &mut ping_timeout => {
-                            if !cmd_state.is_connected() {
-                                // Not connected, just reset the ping timer.
-                                ping_timeout.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
-                                ping_failures = 0;
-                                continue;
-                            }
-                            // Back off a bit if we experienced an error last time.
-                            let next_ping_timeout = PING_MIN_TIMEOUT + Duration::from_secs(ping_failures as u64);
-                            match self.do_ping(cmd_state.vs_handle.as_ref().unwrap(), next_ping_timeout).await {
-                                Ok(_) => {
-                                    trace!(target: VS_RPC, "VSConn: ping successful");
-                                    ping_failures = 0;
-                                    ping_timeout.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
+                            if cmd_state.vs_handle_generation != generation {
+                                // A new handle: misses on the old one say
+                                // nothing about it, so start liveness afresh.
+                                if let Some(old_probe) = probe.take() {
+                                    old_probe.abort();
                                 }
-                                Err(e) => {
-                                    ping_failures += 1;
-                                    warn!(target: VS_RPC, "VSConn: ping error (count = {ping_failures}): {:?}", e);
-                                    if ping_failures >= VSAPI_MAX_PING_FAILURES {
-                                        error!(target: VS_RPC, "VSConn: maximum ping failures reached, exiting run loop");
-                                        self.send_lifecycle_event(VSConnLifecycleEvent::RunLoopExits);
-                                        return Err(VSApiError::Timeout("ping".to_string()).into());
-                                    }
-                                    ping_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(1));
-                                }
+                                next_probe.as_mut().reset(tokio::time::Instant::now() + VSAPI_PING_INTERVAL);
                             }
                         }
                     }
@@ -443,40 +528,8 @@ impl VSConn {
         cmd: VS2Command,
     ) -> Result<(), VSApiError> {
         match cmd {
-            VS2Command::Stop(deregister) => {
+            VS2Command::Stop => {
                 debug!(target: VS_RPC, "VSConn: stop");
-                if deregister && let Some(ref handle) = cmd_state.vs_handle {
-                    let mut disconnect_request = handle.notify_disconnect_request();
-                    let mut dnotice_bldr = disconnect_request.get().init_req();
-
-                    // We are disconnecting "self" so we do not set a ZPR addr.
-
-                    dnotice_bldr.set_reason_code(vsapi2::DisconnectReason::NodeShutdown);
-
-                    debug!(target: VS_RPC, "VS-API -> notify_disconnect");
-                    let disconnect_request_response = rpc_with_timeout(
-                        "notify_disconnect",
-                        DEFAULT_RPC_TIMEOUT,
-                        disconnect_request.send().promise,
-                    )
-                    .await?;
-                    let ok_or_err = disconnect_request_response.get()?.get_res()?;
-                    match ok_or_err.which()? {
-                        vsapi2::ok_or_error::Which::Ok(_) => {
-                            info!(target: VS_RPC, "VS API notify_disconnect succeeded");
-                        }
-                        vsapi2::ok_or_error::Which::Error(err_obj) => {
-                            let err_obj = err_obj?;
-                            let err = ApiResponseError::try_from(err_obj);
-
-                            // There is no back channel for the Stop command so we just log the error.
-                            error!(
-                                target: VS_RPC,
-                                "VS API notify_disconnect failed: {:?}", err
-                            );
-                        }
-                    }
-                }
                 Ok(())
             }
 
@@ -506,7 +559,7 @@ impl VSConn {
                 let retval = match resp {
                     Ok(handle) => {
                         info!(target: VS_RPC, "VS API connect succeeded");
-                        cmd_state.vs_handle = Some(handle);
+                        cmd_state.set_vs_handle(handle);
                         self.send_lifecycle_event(VSConnLifecycleEvent::ConnectedToVsApi(
                             stateflag,
                         ));
@@ -538,7 +591,7 @@ impl VSConn {
                 let retval = match resp {
                     Ok(handle) => {
                         info!(target: VS_RPC, "VS API open succeeded");
-                        cmd_state.vs_handle = Some(handle);
+                        cmd_state.set_vs_handle(handle);
                         self.send_lifecycle_event(VSConnLifecycleEvent::ConnectedToVsApi(
                             stateflag,
                         ));
@@ -639,7 +692,7 @@ impl VSConn {
                     match self.do_connect(&cmd_state.vs_service, req).await {
                         Ok(handle) => {
                             info!(target: VS_RPC, "VS API reauthenticate succeeded; handle swapped");
-                            cmd_state.vs_handle = Some(handle);
+                            cmd_state.set_vs_handle(handle);
                             Ok(())
                         }
                         Err(e) => {
@@ -680,8 +733,7 @@ impl VSConn {
                         "not connected to VS-API".to_string(),
                     ))
                 } else {
-                    self.do_ping(cmd_state.vs_handle.as_ref().unwrap(), PING_MIN_TIMEOUT)
-                        .await
+                    Self::do_ping(cmd_state.vs_handle.as_ref().unwrap(), VSAPI_PING_TIMEOUT).await
                 };
                 if let Err(e) = resp_tx.send(resp) {
                     error!(target: VS_RPC, "failed to send ping response: {:?}", e);
@@ -718,15 +770,102 @@ impl VSConn {
                 }
                 Ok(())
             }
+
+            VS2Command::ReportLinkStates(reports, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: report_link_states ({} links)", reports.len());
+                let resp = if !cmd_state.is_connected() {
+                    Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    ))
+                } else {
+                    self.do_report_link_states(cmd_state.vs_handle.as_ref().unwrap(), reports)
+                        .await
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send report_link_states response: {:?}", e);
+                }
+                Ok(())
+            }
+
+            VS2Command::RequestBootstrapVisas(peer_cn, observed_addr, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: request_bootstrap_visas for {peer_cn} observed at {observed_addr}");
+                if resp_tx.is_closed() {
+                    // The relay gave up waiting (J7) and closed the link:
+                    // asking now would only delay the commands behind it.
+                    debug!(target: VS_RPC, "VSConn: request_bootstrap_visas for {peer_cn} abandoned by its caller; not sent");
+                    return Ok(());
+                }
+                let resp = if !cmd_state.is_connected() {
+                    Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    ))
+                } else {
+                    self.do_request_bootstrap_visas(
+                        cmd_state.vs_handle.as_ref().unwrap(),
+                        &peer_cn,
+                        observed_addr,
+                    )
+                    .await
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send request_bootstrap_visas response: {:?}", e);
+                }
+                Ok(())
+            }
+
+            VS2Command::GetLoginNonce(resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: get_login_nonce");
+                let resp = match cmd_state.vs_handle.as_ref() {
+                    None => Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    )),
+                    Some(vs_h) => self.do_get_login_nonce(vs_h).await,
+                };
+                if resp_tx.send(resp).is_err() {
+                    error!(target: VS_RPC, "failed to send get_login_nonce response");
+                }
+                Ok(())
+            }
+
+            VS2Command::ReauthorizeOwnActor(zpr_addr, oidc, resp_tx) => {
+                debug!(target: VS_RPC, "VSConn: reauthorize own actor (with OIDC: {})", oidc.is_some());
+                let resp = match cmd_state.vs_handle.as_ref() {
+                    None => Err(VSApiError::CommandFailed(
+                        "not connected to VS-API".to_string(),
+                    )),
+                    Some(vs_h) => {
+                        let mut blobs = vec![AuthBlob::SS(self.device_leg())];
+                        blobs.extend(oidc.map(AuthBlob::Oidc));
+                        self.do_reauthorize(vs_h, ReauthRequest { zpr_addr, blobs })
+                            .await
+                    }
+                };
+                if let Err(e) = resp_tx.send(resp) {
+                    error!(target: VS_RPC, "failed to send reauthorize (own actor) response: {:?}", e);
+                }
+                Ok(())
+            }
         }
     }
 
-    /// The `substrate_addr` param the VS requires on both `connect` and `open`.
-    fn substrate_addr_param(&self) -> Param {
-        Param::new_str(
-            pname::SUBSTRATE_ADDR.into(),
-            self.substrate_addr.to_string(),
-        )
+    /// The device leg of a `reauthorize` of this node's own actor
+    /// (zl-zipline#233): a self-signed blob over a fresh random challenge,
+    /// signed with the node key exactly as the `authenticate` answer is
+    /// (`ts || cn || challenge`, [sign_payload]). The visa service checks it
+    /// against the policy's bootstrap key for this CN, and checks the
+    /// timestamp's skew; the challenge only makes each signature unique.
+    fn device_leg(&self) -> SelfSignedBlob {
+        let mut challenge = vec![0u8; DEVICE_LEG_CHALLENGE_LEN];
+        aws_lc_rs::rand::fill(&mut challenge).expect("the system RNG failed");
+        let timestamp = unix_ts();
+        let signature = sign_payload(timestamp, &self.node_cn, &challenge, &self.node_private_key);
+        SelfSignedBlob {
+            alg: ChallengeAlg::RsaSha256Pkcs1v15,
+            challenge,
+            cn: self.node_cn.clone(),
+            timestamp,
+            signature,
+        }
     }
 
     async fn do_connect(
@@ -739,7 +878,6 @@ impl VSConn {
             ctype: req.connect_type(),
             params: Some(vec![
                 Param::new_ip(pname::ZPR_ADDR.into(), req.zpr_addr),
-                self.substrate_addr_param(),
                 // adding node's own public key as param
                 Param::new_x25519_pubkey(pname::A2A_DH_PUBKEY.into(), req.a2a_dh_pubkey),
             ]),
@@ -834,7 +972,9 @@ impl VSConn {
         let req = VSConnectRequest {
             cn: self.node_cn.clone(),
             ctype: oreq.connect_type(),
-            params: Some(vec![self.substrate_addr_param()]),
+            // `open` carries no params: the VS already knows this node, and
+            // its substrate address never comes from the node (zl-zipline#264).
+            params: None,
         };
 
         let mut vs_request = vs_service.open_request();
@@ -948,6 +1088,85 @@ impl VSConn {
         }
     }
 
+    /// Ask for a login nonce with `VSHandle.getLoginNonce` (zl-zipline#233).
+    async fn do_get_login_nonce(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+    ) -> Result<LoginNonce, VSApiError> {
+        let request = vs_h.get_login_nonce_request();
+        debug!(target: VS_RPC, "VS-API -> get_login_nonce");
+        let response = rpc_with_timeout(
+            "get_login_nonce",
+            DEFAULT_RPC_TIMEOUT,
+            request.send().promise,
+        )
+        .await?;
+        match response.get()?.get_res()?.which()? {
+            vsapi2::result::Which::Ok(nonce) => Ok(LoginNonce::try_from(nonce?)?),
+            vsapi2::result::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
+        }
+    }
+
+    /// Send `reports`, this node's whole link-state snapshot, with
+    /// `VSHandle.reportLinkStates` (zl-zipline#250).
+    async fn do_report_link_states(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+        reports: Vec<LinkStateReport>,
+    ) -> Result<(), VSApiError> {
+        let mut request = vs_h.report_link_states_request();
+        write_link_state_reports(&reports, request.get())?;
+        debug!(target: VS_RPC, "VS-API -> report_link_states");
+        let response = rpc_with_timeout(
+            "report_link_states",
+            DEFAULT_RPC_TIMEOUT,
+            request.send().promise,
+        )
+        .await?;
+        match response.get()?.get_res()?.which()? {
+            vsapi2::ok_or_error::Which::Ok(_) => Ok(()),
+            vsapi2::ok_or_error::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
+        }
+    }
+
+    /// Ask for the bootstrap visas of the joining Zode whose link-verified CN
+    /// is `peer_cn`, with `VSHandle.requestBootstrapVisas` (zl-zipline#252,
+    /// ZODE_LINKS.md J2), passing `observed_addr`, the source address this
+    /// relay saw the joiner's initial link come from: the VS records it as the
+    /// joiner's substrate address unless policy declares one (zl-zipline#264).
+    /// The decoder already refuses any answer that is not exactly two `peer`
+    /// and two `relay` visas.
+    async fn do_request_bootstrap_visas(
+        &self,
+        vs_h: &vsapi2::v_s_handle::Client,
+        peer_cn: &str,
+        observed_addr: SocketAddr,
+    ) -> Result<BootstrapVisas, VSApiError> {
+        let mut request = vs_h.request_bootstrap_visas_request();
+        request.get().set_peer_cn(peer_cn);
+        write_sock_addr(observed_addr, request.get().init_observed_addr());
+        debug!(target: VS_RPC, "VS-API -> request_bootstrap_visas");
+        let response = rpc_with_timeout(
+            "request_bootstrap_visas",
+            BOOTSTRAP_VISAS_TIMEOUT,
+            request.send().promise,
+        )
+        .await?;
+        match response.get()?.get_res()?.which()? {
+            vsapi2::result::Which::Ok(visas) => Ok(BootstrapVisas::try_from(visas?)?),
+            vsapi2::result::Which::Error(err_obj) => {
+                let err_obj = err_obj?;
+                Err(ApiResponseError::try_from(err_obj)?.into())
+            }
+        }
+    }
+
     async fn do_notify_disconnect(
         &self,
         vs_h: &vsapi2::v_s_handle::Client,
@@ -986,11 +1205,7 @@ impl VSConn {
         saddr: SocketAddr,
     ) -> Result<Vec<VisaOp>, VSApiError> {
         let mut rvs_request = vs_h.register_vss_request();
-        let mut saddr_bldr = rvs_request.get().init_addr();
-        saddr_bldr.set_port(saddr.port());
-
-        let mut ip_bldr = saddr_bldr.init_addr();
-        saddr.ip().write_to(&mut ip_bldr);
+        write_sock_addr(saddr, rvs_request.get().init_addr());
 
         let rvs_response = rpc_with_timeout(
             "register_vss",
@@ -1018,8 +1233,33 @@ impl VSConn {
         }
     }
 
+    /// Probe the VS-API session's liveness on `vs_h` the way the ZDP link
+    /// keep-alive probes a link (ZODE_LINKS rule 9): up to
+    /// [VSAPI_MAX_PING_MISSES] pings, each given [VSAPI_PING_TIMEOUT], the
+    /// next sent as soon as one misses. A miss always takes the full
+    /// timeout, so pings refused at once use up the budget no faster than
+    /// silence would. Returns Ok on the first answered ping, or the last
+    /// error once every ping missed.
+    async fn probe_liveness(vs_h: vsapi2::v_s_handle::Client) -> VSPingResponse {
+        let mut misses = 0;
+        loop {
+            let miss_ends = tokio::time::Instant::now() + VSAPI_PING_TIMEOUT;
+            match Self::do_ping(&vs_h, VSAPI_PING_TIMEOUT).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    misses += 1;
+                    warn!(target: VS_RPC, "VSConn: ping error (count = {misses} of {VSAPI_MAX_PING_MISSES}): {:?}", e);
+                    tokio::time::sleep_until(miss_ends).await;
+                    if misses >= VSAPI_MAX_PING_MISSES {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ping the visa service on `vs_h`, giving up after `with_timeout`.
     async fn do_ping(
-        &self,
         vs_h: &vsapi2::v_s_handle::Client,
         with_timeout: Duration,
     ) -> Result<(), VSApiError> {
@@ -1118,9 +1358,10 @@ impl VSConnHandle {
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
 
-    pub async fn stop(&self, deregister: bool) -> Result<(), VSApiError> {
-        let cmd = VS2Command::Stop(deregister);
-        self.send_command(cmd).await
+    /// Stop the run loop and its reconnect manager. This does not tell the
+    /// visa service: send [VSConnHandle::notify_disconnect] first to leave.
+    pub async fn stop(&self) -> Result<(), VSApiError> {
+        self.send_command(VS2Command::Stop).await
     }
 
     /// Recycle the current run loop without terminating the reconnect
@@ -1208,6 +1449,87 @@ impl VSConnHandle {
         self.send_command(cmd).await?;
         resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
     }
+
+    /// Report this node's link states to the visa service (zl-zipline#250).
+    /// `reports` is the whole snapshot: a link it leaves out is one the node
+    /// has nothing to say about.
+    pub async fn report_link_states(
+        &self,
+        reports: Vec<LinkStateReport>,
+    ) -> Result<(), VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::ReportLinkStates(reports, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
+    /// Ask the visa service for a nonce for this node's own OIDC login
+    /// (zl-zipline#233). The visa service binds it to this node's actor and
+    /// VS-API session; it is single-use and expires at
+    /// [LoginNonce::expires_at]. Its refusals (`authRequired`,
+    /// `quotaExceeded`) come back as [VSApiError::CodedError].
+    pub async fn get_login_nonce(&self) -> Result<LoginNonce, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.send_command(VS2Command::GetLoginNonce(resp_tx))
+            .await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
+    /// `reauthorize` this node's own actor at `zpr_addr` (zl-zipline#233).
+    /// The run loop adds the device leg, signed with the node key. With
+    /// `oidc` the request is `[device, OIDC]`: a login (its nonce from
+    /// [Self::get_login_nonce]) or a renewal of one. Without it the request
+    /// is `[device]` alone, which drops any user login (a logout).
+    pub async fn reauthorize_own_actor(
+        &self,
+        zpr_addr: IpAddr,
+        oidc: Option<OidcBlob>,
+    ) -> Result<Connection, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.send_command(VS2Command::ReauthorizeOwnActor(zpr_addr, oidc, resp_tx))
+            .await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+
+    /// Ask the visa service for the bootstrap visas of a joining Zode whose
+    /// link-verified certificate CN is `peer_cn` (zl-zipline#252, J2), and
+    /// whose initial link this node's substrate socket sees coming from
+    /// `observed_addr` (zl-zipline#264). Only the node the visa service docks
+    /// on may ask. The answer holds exactly two visas for the joiner (`peer`)
+    /// and two for this node (`relay`).
+    pub async fn request_bootstrap_visas(
+        &self,
+        peer_cn: String,
+        observed_addr: SocketAddr,
+    ) -> Result<BootstrapVisas, VSApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = VS2Command::RequestBootstrapVisas(peer_cn, observed_addr, resp_tx);
+        self.send_command(cmd).await?;
+        resp_rx.await.map_err(|_| VSApiError::ConnClosed)?
+    }
+}
+
+/// Write `addr` into a VS-API `SockAddr`: `registerVss`'s address and
+/// `requestBootstrapVisas`'s `observedAddr`.
+fn write_sock_addr(addr: SocketAddr, mut bldr: vsapi2::sock_addr::Builder<'_>) {
+    bldr.set_port(addr.port());
+    addr.ip().write_to(&mut bldr.init_addr());
+}
+
+/// Write `reports` into a `reportLinkStates` request's parameters.
+fn write_link_state_reports(
+    reports: &[LinkStateReport],
+    params: vsapi2::v_s_handle::report_link_states_params::Builder<'_>,
+) -> Result<(), VSApiError> {
+    let len = u32::try_from(reports.len())
+        .map_err(|_| VSApiError::CommandFailed("too many link-state reports".to_string()))?;
+    let mut list = params.init_links(len);
+    for (i, report) in reports.iter().enumerate() {
+        let mut entry = list.reborrow().get(i as u32);
+        entry.set_peer_cn(report.peer_cn.as_str());
+        entry.set_state(report.state.into());
+    }
+    Ok(())
 }
 
 /// Get a unix timestamp in seconds.
@@ -1304,6 +1626,37 @@ impl ServerCertVerifier for NoVerification {
     }
 }
 
+/// Open a TCP connection to `remote` from the local address `local`.
+///
+/// The node must originate its VS-API connection from its own ZPR address
+/// (zl-zipline#229): the visa service refuses a `connect` whose source is not
+/// the claimed node address, and `open` takes the node address from the
+/// source. On a relay whose TUN also carries `vs.zpr`, the kernel would pick
+/// `vs.zpr` as the source of a connection to `vs.zpr` (RFC 6724 rule 1, "prefer
+/// the same address"). Binding first removes the choice. This mirrors the
+/// visa service's own VSS dial (zl-zipline#228).
+///
+/// A `local` that is not a local address, or of a different family than
+/// `remote`, is an error that names the bind. There is no fallback to a
+/// kernel-chosen source: the caller's reconnect loop retries.
+pub(crate) async fn connect_from(
+    local: IpAddr,
+    remote: SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let sock = if local.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    sock.bind(SocketAddr::new(local, 0)).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot bind VS-API source address {local}: {e}"),
+        )
+    })?;
+    sock.connect(remote).await
+}
+
 // Create a dangerous connector - the verifier will always approve
 // TODO decide if we want to use an actual certificate
 fn tls_connect() -> TlsConnector {
@@ -1340,9 +1693,74 @@ mod tests {
                 node_private_key,
                 life_tx,
                 connect_fn,
-                substrate_addr: "127.0.0.1:5000".parse().unwrap(),
+                local_addr: std::net::Ipv4Addr::LOCALHOST.into(),
             }
         }
+    }
+
+    /// zl-zipline#250: a link-state snapshot round-trips through the
+    /// `reportLinkStates` parameters exactly as `do_report_link_states`
+    /// writes them.
+    #[test]
+    fn report_link_states_capnp_builder_round_trip() {
+        use zpr::vsapi_types::LinkState;
+        let reports = vec![
+            LinkStateReport {
+                peer_cn: "a.zpr".to_string(),
+                state: LinkState::Up,
+            },
+            LinkStateReport {
+                peer_cn: "b.zpr".to_string(),
+                state: LinkState::Failed,
+            },
+            LinkStateReport {
+                peer_cn: "c.zpr".to_string(),
+                state: LinkState::Down,
+            },
+        ];
+        let mut msg = capnp::message::Builder::new_default();
+        let params = msg.init_root::<vsapi2::v_s_handle::report_link_states_params::Builder>();
+        write_link_state_reports(&reports, params).unwrap();
+        let reader = msg
+            .get_root_as_reader::<vsapi2::v_s_handle::report_link_states_params::Reader>()
+            .unwrap();
+        let decoded: Vec<LinkStateReport> = reader
+            .get_links()
+            .unwrap()
+            .iter()
+            .map(|r| LinkStateReport::try_from(r).unwrap())
+            .collect();
+        assert_eq!(decoded, reports);
+    }
+
+    /// A visa service that implements nothing: enough to build a command
+    /// state that has no VS-API session.
+    struct NoSessionVs;
+    impl vsapi2::visa_service::Server for NoSessionVs {}
+
+    /// With no VS-API session (the run loop is up, but `vs_handle` is
+    /// unset), the run loop refuses a report locally with `CommandFailed`
+    /// and sends nothing (zl-zipline#250).
+    #[tokio::test]
+    async fn report_link_states_without_session_is_refused_locally() {
+        let mut conn = VSConn::new_for_test(
+            "127.0.0.1:1".parse().unwrap(),
+            "node".to_string(),
+            test_key(),
+            refusing_connect_fn(),
+        );
+        let mut cmd_state = VSCommandState::new(capnp_rpc::new_client(NoSessionVs));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        conn.handle_command(
+            &mut cmd_state,
+            VS2Command::ReportLinkStates(Vec::new(), resp_tx),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
     }
 
     /// C3 (zipline#45): the zpr v0.27.0 `ReauthRequest` wrapper round-trips
@@ -1494,7 +1912,7 @@ mod tests {
                 );
 
                 // Clean exit still works from the reconnected loop.
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 tokio::time::timeout(Duration::from_secs(2), task)
                     .await
                     .expect("run loop failed to stop")
@@ -1531,6 +1949,32 @@ mod tests {
         /// Handle ids are 1-based in `authenticate` order, so after a
         /// successful re-auth a ping must arrive on id 2.
         last_ping_handle: Option<u32>,
+        /// The `peerCn` and `observedAddr` of every `requestBootstrapVisas`
+        /// the fake served, in order (zl-zipline#252, #264).
+        bootstrap_requests: Vec<(String, SocketAddr)>,
+        /// The DER public key of the node key the VSConn under test signs
+        /// with, so a test can verify the device leg (zl-zipline#233).
+        node_public_key: Vec<u8>,
+        /// When set, `getLoginNonce` fails with this code.
+        login_nonce_error: Option<zpr::vsapi_types::ErrorCode>,
+        /// Every `reauthorize` request the fake served, in order.
+        reauth_requests: Vec<ReauthRequest>,
+        /// The param names of every `connect` the fake served, in order.
+        connect_param_names: Vec<Vec<String>>,
+        /// The reason of every `notifyDisconnect` the fake served, in order
+        /// (zl-zipline#284).
+        disconnects: Vec<zpr::vsapi_types::DisconnectReason>,
+        /// How long `ping` takes to answer (zl-zipline#292): zero answers at
+        /// once; an hour stands for a VS that stopped answering.
+        ping_delay: Duration,
+        /// How many `ping` calls have reached the fake, answered or not.
+        pings_started: u32,
+        /// The id of a [FakeVsHandle] whose pings never answer, whatever
+        /// `ping_delay` says: a handle the VS stopped serving.
+        hung_ping_handle: Option<u32>,
+        /// When set, `ping` answers `authRequired` at once, as the VS does
+        /// for a handle it no longer serves.
+        refuse_pings: bool,
     }
 
     struct FakeVs {
@@ -1552,9 +1996,18 @@ mod tests {
     impl vsapi2::visa_service::Server for FakeVs {
         async fn connect(
             self: Rc<Self>,
-            _params: vsapi2::visa_service::ConnectParams,
+            params: vsapi2::visa_service::ConnectParams,
             mut results: vsapi2::visa_service::ConnectResults,
         ) -> Result<(), capnp::Error> {
+            let req = VSConnectRequest::try_from(params.get()?.get_req()?)
+                .map_err(|e| capnp::Error::failed(format!("bad connect request: {e:?}")))?;
+            let names = req
+                .params
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| p.name)
+                .collect();
+            self.state.borrow_mut().connect_param_names.push(names);
             let gate: vsapi2::v_s_gate::Client = capnp_rpc::new_client(FakeVsGate {
                 state: self.state.clone(),
             });
@@ -1605,14 +2058,167 @@ mod tests {
     }
 
     impl vsapi2::v_s_handle::Server for FakeVsHandle {
+        /// Record the reason and answer Ok (zl-zipline#284).
+        async fn notify_disconnect(
+            self: Rc<Self>,
+            params: vsapi2::v_s_handle::NotifyDisconnectParams,
+            mut results: vsapi2::v_s_handle::NotifyDisconnectResults,
+        ) -> Result<(), capnp::Error> {
+            let reason = params.get()?.get_req()?.get_reason_code()?;
+            self.state.borrow_mut().disconnects.push(reason.into());
+            results.get().init_res().set_ok(());
+            Ok(())
+        }
+
         async fn ping(
             self: Rc<Self>,
             _params: vsapi2::v_s_handle::PingParams,
             mut results: vsapi2::v_s_handle::PingResults,
         ) -> Result<(), capnp::Error> {
+            let delay = {
+                let mut st = self.state.borrow_mut();
+                st.pings_started += 1;
+                if st.hung_ping_handle == Some(self.id) {
+                    Duration::from_secs(3600)
+                } else {
+                    st.ping_delay
+                }
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             self.state.borrow_mut().last_ping_handle = Some(self.id);
+            if self.state.borrow().refuse_pings {
+                let mut err = results.get().init_res().init_error();
+                ApiResponseError::new_code_msg(
+                    zpr::vsapi_types::ErrorCode::AuthRequired,
+                    "fake ping refusal",
+                )
+                .write_to(&mut err);
+                return Ok(());
+            }
             results.get().init_res().set_ok(());
             Ok(())
+        }
+
+        /// Mint [FAKE_LOGIN_NONCE], or fail with the configured code
+        /// (zl-zipline#233).
+        async fn get_login_nonce(
+            self: Rc<Self>,
+            _params: vsapi2::v_s_handle::GetLoginNonceParams,
+            mut results: vsapi2::v_s_handle::GetLoginNonceResults,
+        ) -> Result<(), capnp::Error> {
+            if let Some(code) = self.state.borrow().login_nonce_error.clone() {
+                let mut err = results.get().init_res().init_error();
+                ApiResponseError::new_code_msg(code, "no nonce for you").write_to(&mut err);
+                return Ok(());
+            }
+            zpr::vsapi_types::LoginNonce {
+                nonce: FAKE_LOGIN_NONCE.to_string(),
+                expires_at: UNIX_EPOCH + Duration::from_secs(FAKE_NONCE_EXPIRES),
+            }
+            .write_to(&mut results.get().init_res().init_ok());
+            Ok(())
+        }
+
+        /// Record the request and answer with [FAKE_AUTH_EXPIRES]
+        /// (zl-zipline#233).
+        async fn reauthorize(
+            self: Rc<Self>,
+            params: vsapi2::v_s_handle::ReauthorizeParams,
+            mut results: vsapi2::v_s_handle::ReauthorizeResults,
+        ) -> Result<(), capnp::Error> {
+            let req = ReauthRequest::try_from(params.get()?.get_req()?)
+                .map_err(|e| capnp::Error::failed(format!("{e:?}")))?;
+            let zpr_addr = req.zpr_addr;
+            self.state.borrow_mut().reauth_requests.push(req);
+            Connection {
+                zpr_addr,
+                auth_expires: FAKE_AUTH_EXPIRES,
+            }
+            .write_to(&mut results.get().init_resp().init_ok());
+            Ok(())
+        }
+
+        /// Answer for [FAKE_JOINER_CN] with [fake_bootstrap_visas]; refuse any
+        /// other CN with `notFound`, as the real visa service does for a CN
+        /// that is not a peer in the caller's topology (zl-zipline#252 J3).
+        async fn request_bootstrap_visas(
+            self: Rc<Self>,
+            params: vsapi2::v_s_handle::RequestBootstrapVisasParams,
+            mut results: vsapi2::v_s_handle::RequestBootstrapVisasResults,
+        ) -> Result<(), capnp::Error> {
+            let peer_cn = params.get()?.get_peer_cn()?.to_string()?;
+            let observed: SocketAddr =
+                zpr::vsapi_types::SockAddr::try_from(params.get()?.get_observed_addr()?)
+                    .map_err(|e| capnp::Error::failed(format!("bad observedAddr: {e:?}")))?
+                    .into();
+            self.state
+                .borrow_mut()
+                .bootstrap_requests
+                .push((peer_cn.clone(), observed));
+            if peer_cn == SLOW_JOINER_CN {
+                // Never answers within a test: the caller's bound decides.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            if peer_cn == FAKE_JOINER_CN {
+                fake_bootstrap_visas().write_to(&mut results.get().init_res().init_ok());
+            } else {
+                let mut err = results.get().init_res().init_error();
+                ApiResponseError::new_code_msg(
+                    zpr::vsapi_types::ErrorCode::NotFound,
+                    "no such peer",
+                )
+                .write_to(&mut err);
+            }
+            Ok(())
+        }
+    }
+
+    /// A joiner's observed substrate address, for the bootstrap tests that
+    /// do not look at it.
+    fn observed_addr() -> SocketAddr {
+        "192.0.2.7:5000".parse().unwrap()
+    }
+
+    /// The CN the fake visa service mints bootstrap visas for.
+    const FAKE_JOINER_CN: &str = "joiner.zpr";
+
+    /// A CN the fake visa service takes a minute to answer for.
+    const SLOW_JOINER_CN: &str = "slow.zpr";
+
+    /// The login nonce the fake visa service mints (zl-zipline#233).
+    const FAKE_LOGIN_NONCE: &str = "vs-minted-nonce";
+
+    /// When [FAKE_LOGIN_NONCE] expires, in unix seconds.
+    const FAKE_NONCE_EXPIRES: u64 = 1_800_000_000;
+
+    /// The `authExpires` the fake visa service answers `reauthorize` with.
+    const FAKE_AUTH_EXPIRES: u64 = 1_800_000_600;
+
+    /// The answer the fake visa service gives for [FAKE_JOINER_CN]: two
+    /// distinct visas in each list, so a test can check the order survives.
+    fn fake_bootstrap_visas() -> BootstrapVisas {
+        use zpr::vsapi_types::{DockPepType, EndpointT, KeySet, TcpUdpPep};
+        let visa = |id: u64| {
+            Visa::new(
+                id,
+                0,
+                UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                "10.1.1.9".parse().unwrap(),
+                "10.1.1.1".parse().unwrap(),
+                DockPepType::TCP(TcpUdpPep {
+                    source_port: 0,
+                    dest_port: 5002,
+                    endpoint: EndpointT::Client,
+                }),
+                KeySet::default(),
+                None,
+            )
+        };
+        BootstrapVisas {
+            peer: vec![visa(101), visa(102)],
+            relay: vec![visa(101), visa(102)],
         }
     }
 
@@ -1625,6 +2231,16 @@ mod tests {
             auth_calls: 0,
             fail_next_auth: false,
             last_ping_handle: None,
+            bootstrap_requests: Vec::new(),
+            node_public_key: Vec::new(),
+            login_nonce_error: None,
+            reauth_requests: Vec::new(),
+            connect_param_names: Vec::new(),
+            disconnects: Vec::new(),
+            ping_delay: Duration::ZERO,
+            pings_started: 0,
+            hung_ping_handle: None,
+            refuse_pings: false,
         }));
 
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -1670,21 +2286,47 @@ mod tests {
         Rc<RefCell<FakeVsState>>,
         tokio::task::JoinHandle<Result<(), VSApiError>>,
     ) {
+        let (handle, mut lifecycle_rx, state, task) = running_vsconn_against_fake_vs().await;
+        wait_for_run_loop(&mut lifecycle_rx).await;
+        handle
+            .connect(test_node_connect())
+            .await
+            .expect("initial connect against the fake VS failed");
+
+        (handle, state, task)
+    }
+
+    /// Start a real VSConn against the fake VS, without connecting:
+    /// (handle, lifecycle events, state, run-loop task).
+    async fn running_vsconn_against_fake_vs() -> (
+        VSConnHandle,
+        broadcast::Receiver<VSConnLifecycleEvent>,
+        Rc<RefCell<FakeVsState>>,
+        tokio::task::JoinHandle<Result<(), VSApiError>>,
+    ) {
         let (vs_addr, state) = spawn_fake_vs().await;
+        let key = test_key();
+        {
+            use aws_lc_rs::signature::KeyPair;
+            state.borrow_mut().node_public_key = key.public_key().as_ref().to_vec();
+        }
         let mut vsconn = VSConn::new(
             16,
             vs_addr,
             "test-node".to_string(),
-            test_key(),
-            "127.0.0.1:5000".parse().unwrap(),
+            key,
+            std::net::Ipv4Addr::LOCALHOST.into(),
         );
-        let mut lifecycle_rx = vsconn.subscribe_lifecycle_events();
+        let lifecycle_rx = vsconn.subscribe_lifecycle_events();
         let handle = vsconn.handle();
         let task = tokio::task::spawn_local(async move {
             vsconn.run_with_reconnect(Duration::from_millis(100)).await
         });
+        (handle, lifecycle_rx, state, task)
+    }
 
-        // Wait for the run loop, then bootstrap-connect.
+    /// Wait (at most 5 s) for the VSConn's next `RunLoopStarts`.
+    async fn wait_for_run_loop(lifecycle_rx: &mut broadcast::Receiver<VSConnLifecycleEvent>) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match lifecycle_rx.recv().await {
@@ -1696,17 +2338,254 @@ mod tests {
         })
         .await
         .expect("run loop never started against the fake VS");
+    }
 
-        handle
-            .connect(NodeConnect {
-                zpr_addr: "10.1.1.1".parse().unwrap(),
-                state: StateFlag::NoState,
-                a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+    /// The `connect` request the tests send: a fresh node.
+    fn test_node_connect() -> NodeConnect {
+        NodeConnect {
+            zpr_addr: "10.1.1.1".parse().unwrap(),
+            state: StateFlag::NoState,
+            a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+        }
+    }
+
+    /// zl-zipline#264: a node never reports its own substrate address.
+    /// `connect` carries its ZPR address and its A2A key, and nothing else.
+    #[tokio::test]
+    async fn connect_reports_no_substrate_addr() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+
+                assert_eq!(
+                    state.borrow().connect_param_names,
+                    vec![vec![
+                        pname::ZPR_ADDR.to_string(),
+                        pname::A2A_DH_PUBKEY.to_string()
+                    ]],
+                );
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
-            .await
-            .expect("initial connect against the fake VS failed");
+            .await;
+    }
 
-        (handle, state, task)
+    /// zl-zipline#284: the debug CLI's stop still deregisters the node,
+    /// through the one deregistration path, `notify_disconnect`
+    /// (`NodeShutdown`), and then stops the run loop. The CLI exists only
+    /// with the `build-lnt` feature, which libnode's CI builds.
+    #[cfg(feature = "build-lnt")]
+    #[tokio::test]
+    async fn cli_stop_deregisters_through_notify_disconnect() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, mut lifecycle_rx, state, task) =
+                    running_vsconn_against_fake_vs().await;
+                wait_for_run_loop(&mut lifecycle_rx).await;
+                handle.connect(test_node_connect()).await.expect("connect");
+
+                let (output_tx, _output_rx) = mpsc::unbounded_channel();
+                crate::cli::handler::deregister_and_stop(&handle, true, &output_tx).await;
+
+                assert_eq!(
+                    state.borrow().disconnects,
+                    vec![zpr::vsapi_types::DisconnectReason::NodeShutdown]
+                );
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .expect("the run loop stops")
+                    .unwrap()
+                    .unwrap();
+            })
+            .await;
+    }
+
+    // ------------------------------------------------------------------
+    // zl-zipline#292: the VS-API liveness check is sized to the ZDP link
+    // keep-alive budget, and a queued command never waits for a ping. These
+    // run on real time: the run loop's first ping goes out
+    // [VSAPI_PING_INTERVAL] after it starts.
+    // ------------------------------------------------------------------
+
+    /// The link keep-alive budget: how long a VS that stopped answering may
+    /// stay silent before the session ends.
+    fn link_keep_alive_budget() -> Duration {
+        crate::keepalive::DEFAULT_KEEP_ALIVE_TIMEOUT * crate::keepalive::KEEP_ALIVE_MAX_MISSES
+    }
+
+    /// Wait (at most 10 s past the ping interval) until the fake VS has
+    /// seen `n` pings.
+    async fn wait_for_pings_started(state: &Rc<RefCell<FakeVsState>>, n: u32) {
+        tokio::time::timeout(VSAPI_PING_INTERVAL + Duration::from_secs(10), async {
+            while state.borrow().pings_started < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the run loop never pinged the fake VS");
+    }
+
+    /// zl-zipline#292: a ping the VS answers after 1.5 s, as one TCP
+    /// retransmit on a loaded link delays it, is not a miss. A miss would
+    /// send the next ping at once; a success waits a full ping interval.
+    #[tokio::test]
+    async fn a_ping_answered_after_1500ms_is_not_a_miss() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                state.borrow_mut().ping_delay = Duration::from_millis(1500);
+
+                wait_for_pings_started(&state, 1).await;
+                // Long enough for an answer and for any retry a miss would
+                // send; short of the next regular ping.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                assert_eq!(
+                    state.borrow().pings_started,
+                    1,
+                    "a ping answered within the keep-alive timeout must not be retried as a miss"
+                );
+                assert!(!task.is_finished(), "the run loop must keep running");
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// Connect a VSConn to the fake VS, `configure` the fake's pings, and
+    /// assert the session ends after the link keep-alive budget, counted
+    /// from the first ping, and not before.
+    async fn assert_session_ends_after_the_link_budget(configure: impl FnOnce(&mut FakeVsState)) {
+        let (handle, mut lifecycle_rx, state, task) = running_vsconn_against_fake_vs().await;
+        wait_for_run_loop(&mut lifecycle_rx).await;
+        handle.connect(test_node_connect()).await.expect("connect");
+        configure(&mut state.borrow_mut());
+
+        wait_for_pings_started(&state, 1).await;
+        let first_ping = tokio::time::Instant::now();
+        let budget = link_keep_alive_budget();
+        tokio::time::timeout(budget + Duration::from_secs(3), async {
+            loop {
+                match lifecycle_rx.recv().await {
+                    Ok(VSConnLifecycleEvent::RunLoopExits) => break,
+                    Ok(_) => continue,
+                    Err(e) => panic!("lifecycle channel died: {e:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the session must end within the budget");
+        let ended_after = first_ping.elapsed();
+        assert!(
+            ended_after + Duration::from_millis(500) >= budget,
+            "the session ended after {ended_after:?}, before the {budget:?} budget"
+        );
+
+        handle.stop().await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    /// zl-zipline#292: a VS that really stops answering pings still ends
+    /// the session, after the link keep-alive budget and not before.
+    #[tokio::test]
+    async fn an_unanswering_vs_ends_the_session_after_the_link_budget() {
+        tokio::task::LocalSet::new()
+            .run_until(assert_session_ends_after_the_link_budget(|st| {
+                st.ping_delay = Duration::from_secs(3600);
+            }))
+            .await;
+    }
+
+    /// zl-zipline#292: pings refused at once use up the budget no faster
+    /// than silence: every miss takes a full ping timeout.
+    #[tokio::test]
+    async fn refused_pings_end_the_session_after_the_link_budget() {
+        tokio::task::LocalSet::new()
+            .run_until(assert_session_ends_after_the_link_budget(|st| {
+                st.refuse_pings = true;
+            }))
+            .await;
+    }
+
+    /// zl-zipline#292: misses on a VS handle that a re-authentication has
+    /// since replaced do not count against the new handle. Here the old
+    /// handle misses twice, then the node re-authenticates while the third
+    /// ping is out; the new handle answers, so the session stays up.
+    #[tokio::test]
+    async fn a_reauthentication_starts_liveness_afresh_on_the_new_handle() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, mut lifecycle_rx, state, task) =
+                    running_vsconn_against_fake_vs().await;
+                wait_for_run_loop(&mut lifecycle_rx).await;
+                handle.connect(test_node_connect()).await.expect("connect");
+                state.borrow_mut().hung_ping_handle = Some(1);
+
+                wait_for_pings_started(&state, crate::keepalive::KEEP_ALIVE_MAX_MISSES).await;
+                handle
+                    .reauthenticate(NodeConnect {
+                        zpr_addr: "10.1.1.1".parse().unwrap(),
+                        state: StateFlag::HasState,
+                        a2a_dh_pubkey: x25519_dalek::PublicKey::from([7u8; 32]),
+                    })
+                    .await
+                    .expect("reauthenticate must succeed against the fake VS");
+
+                // Past the old handle's last ping timeout.
+                tokio::time::sleep(
+                    crate::keepalive::DEFAULT_KEEP_ALIVE_TIMEOUT + Duration::from_secs(1),
+                )
+                .await;
+                loop {
+                    match lifecycle_rx.try_recv() {
+                        Ok(VSConnLifecycleEvent::RunLoopExits) => {
+                            panic!("the old handle's misses ended the re-authenticated session")
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                // Liveness resumes on the new handle.
+                tokio::time::timeout(VSAPI_PING_INTERVAL + Duration::from_secs(2), async {
+                    while state.borrow().last_ping_handle != Some(2) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("the new handle must be pinged");
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#292: a command queued while a ping is in flight goes out
+    /// at once; it does not wait for the ping's answer or timeout.
+    #[tokio::test]
+    async fn a_queued_command_does_not_wait_for_an_in_flight_ping() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                state.borrow_mut().ping_delay = Duration::from_secs(3600);
+
+                wait_for_pings_started(&state, 1).await;
+                let queued = tokio::time::Instant::now();
+                handle
+                    .get_login_nonce()
+                    .await
+                    .expect("the VS answers the queued command");
+                let waited = queued.elapsed();
+                assert!(
+                    waited < Duration::from_millis(500),
+                    "the queued command waited {waited:?} for the in-flight ping"
+                );
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
     }
 
     /// zipline#121 K2: a successful `Reauthenticate` re-runs the
@@ -1744,7 +2623,7 @@ mod tests {
                     "after a successful re-auth the NEW handle must serve calls"
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
@@ -1784,15 +2663,327 @@ mod tests {
                     "after a failed re-auth the OLD handle must still serve calls"
                 );
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
                 let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
             })
             .await;
     }
 
+    /// zl-zipline#252 (t205), #264: `request_bootstrap_visas` sends the CN
+    /// and the observed address as given, and returns the visa service's
+    /// answer, both lists in order.
+    #[tokio::test]
+    async fn request_bootstrap_visas_returns_the_answer() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+
+                let observed: SocketAddr = "[2001:db8::7]:6000".parse().unwrap();
+                let answer = handle
+                    .request_bootstrap_visas(FAKE_JOINER_CN.to_string(), observed)
+                    .await
+                    .expect("the fake VS mints for its joiner CN");
+                assert_eq!(answer, fake_bootstrap_visas());
+                assert_eq!(
+                    state.borrow().bootstrap_requests,
+                    vec![(FAKE_JOINER_CN.to_string(), observed)]
+                );
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#252 (J7): a bootstrap-visa request the visa service does
+    /// not answer fails after [BOOTSTRAP_VISAS_TIMEOUT], not the default RPC
+    /// timeout, so it holds the serial command loop no longer than the relay
+    /// waits for it.
+    #[tokio::test]
+    async fn request_bootstrap_visas_is_bounded_by_its_own_timeout() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, _state, task) = connected_vsconn_against_fake_vs().await;
+
+                let started = tokio::time::Instant::now();
+                let err = handle
+                    .request_bootstrap_visas(SLOW_JOINER_CN.to_string(), observed_addr())
+                    .await
+                    .expect_err("the fake VS does not answer in time");
+                assert!(matches!(err, VSApiError::Timeout(_)), "got {err:?}");
+                assert!(
+                    started.elapsed() < BOOTSTRAP_VISAS_TIMEOUT + Duration::from_secs(2),
+                    "bounded by BOOTSTRAP_VISAS_TIMEOUT, took {:?}",
+                    started.elapsed()
+                );
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#252 (J7): a bootstrap-visa request whose caller has
+    /// already given up (its answer would be dropped) is not sent: a stale
+    /// request never delays the ones behind it.
+    #[tokio::test]
+    async fn request_bootstrap_visas_skips_an_abandoned_request() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+
+                let (resp_tx, resp_rx) = oneshot::channel();
+                drop(resp_rx);
+                handle
+                    .send_command(VS2Command::RequestBootstrapVisas(
+                        SLOW_JOINER_CN.to_string(),
+                        observed_addr(),
+                        resp_tx,
+                    ))
+                    .await
+                    .unwrap();
+                handle
+                    .request_bootstrap_visas(FAKE_JOINER_CN.to_string(), observed_addr())
+                    .await
+                    .expect("the request behind the abandoned one is answered");
+                assert_eq!(
+                    state.borrow().bootstrap_requests,
+                    vec![(FAKE_JOINER_CN.to_string(), observed_addr())]
+                );
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#252 (t205): a visa-service refusal comes back as the coded
+    /// error, so the relay can log the code and close the link (J7).
+    #[tokio::test]
+    async fn request_bootstrap_visas_maps_a_refusal_to_its_code() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, _state, task) = connected_vsconn_against_fake_vs().await;
+
+                let err = handle
+                    .request_bootstrap_visas("stranger.zpr".to_string(), observed_addr())
+                    .await
+                    .expect_err("the fake VS refuses an unknown CN");
+                assert!(
+                    matches!(
+                        &err,
+                        VSApiError::CodedError(e) if e.code == zpr::vsapi_types::ErrorCode::NotFound
+                    ),
+                    "expected notFound, got {err:?}"
+                );
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#252 (t205): with no VS-API session the run loop refuses a
+    /// bootstrap-visa request locally and sends nothing.
+    #[tokio::test]
+    async fn request_bootstrap_visas_without_session_is_refused_locally() {
+        let mut conn = VSConn::new_for_test(
+            "127.0.0.1:1".parse().unwrap(),
+            "node".to_string(),
+            test_key(),
+            refusing_connect_fn(),
+        );
+        let mut cmd_state = VSCommandState::new(capnp_rpc::new_client(NoSessionVs));
+        let (resp_tx, resp_rx) = oneshot::channel();
+        conn.handle_command(
+            &mut cmd_state,
+            VS2Command::RequestBootstrapVisas(FAKE_JOINER_CN.to_string(), observed_addr(), resp_tx),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
+    }
+
     /// Before fix: run_with_reconnect blocks in tokio::time::sleep(reconnect_after) even when a
     /// Stop command is already in the channel, causing a full 30-second delay.
     /// After fix: the select! between the sleep and cmd_rx delivers Stop immediately.
+    /// zl-zipline#233: `get_login_nonce` returns the nonce and expiry the
+    /// visa service minted.
+    #[tokio::test]
+    async fn get_login_nonce_returns_the_minted_nonce() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, _state, task) = connected_vsconn_against_fake_vs().await;
+
+                let nonce = handle.get_login_nonce().await.expect("the fake VS mints");
+                assert_eq!(nonce.nonce, FAKE_LOGIN_NONCE);
+                assert_eq!(nonce.expires_at_secs(), FAKE_NONCE_EXPIRES);
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#233: a `quotaExceeded` refusal comes back as that coded
+    /// error.
+    #[tokio::test]
+    async fn get_login_nonce_maps_quota_exceeded_to_its_code() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                state.borrow_mut().login_nonce_error =
+                    Some(zpr::vsapi_types::ErrorCode::QuotaExceeded);
+
+                match handle.get_login_nonce().await {
+                    Err(VSApiError::CodedError(err)) => {
+                        assert_eq!(err.code, zpr::vsapi_types::ErrorCode::QuotaExceeded)
+                    }
+                    other => panic!("expected a quotaExceeded CodedError, got {other:?}"),
+                }
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// Check that `ss` is a device leg the visa service accepts for
+    /// `test-node`: its CN, a fresh timestamp, a 32-byte challenge, and an
+    /// RSA-SHA256 signature over `ts || cn || challenge` (the layout of the
+    /// visa service's `verify_ss_blob_signature`) by `public_key`.
+    fn assert_valid_device_leg(ss: &zpr::vsapi_types::SelfSignedBlob, public_key: &[u8]) {
+        use aws_lc_rs::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
+        assert_eq!(ss.cn, "test-node");
+        assert_eq!(ss.challenge.len(), 32);
+        assert!(
+            unix_ts().abs_diff(ss.timestamp) <= 5,
+            "the timestamp must be now, got {}",
+            ss.timestamp
+        );
+        let mut signed = ss.timestamp.to_be_bytes().to_vec();
+        signed.extend_from_slice(ss.cn.as_bytes());
+        signed.extend_from_slice(&ss.challenge);
+        UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key)
+            .verify(&signed, &ss.signature)
+            .expect("the device leg must verify with the node's public key");
+    }
+
+    /// zl-zipline#233: a logout (`None`) sends exactly one blob, a device
+    /// leg signed with the node's key, for the given address, and returns
+    /// the visa service's `Connection`.
+    #[tokio::test]
+    async fn reauthorize_own_actor_without_oidc_sends_only_the_device_leg() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                let addr: IpAddr = "10.1.1.1".parse().unwrap();
+
+                let conn = handle
+                    .reauthorize_own_actor(addr, None)
+                    .await
+                    .expect("the fake VS accepts");
+                assert_eq!(conn.auth_expires, FAKE_AUTH_EXPIRES);
+
+                let st = state.borrow();
+                let [req] = &st.reauth_requests[..] else {
+                    panic!("expected one reauthorize, got {:?}", st.reauth_requests);
+                };
+                assert_eq!(req.zpr_addr, addr);
+                let [zpr::vsapi_types::AuthBlob::SS(ss)] = &req.blobs[..] else {
+                    panic!("expected exactly one SS blob, got {:?}", req.blobs);
+                };
+                assert_valid_device_leg(ss, &st.node_public_key);
+                drop(st);
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#233: a login or renewal (`Some(oidc)`) sends the device
+    /// leg first and the OIDC blob second, unchanged. Each call signs a
+    /// fresh challenge.
+    #[tokio::test]
+    async fn reauthorize_own_actor_with_oidc_sends_device_then_oidc() {
+        use zpr::vsapi_types::{AuthBlob, OidcBlob};
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (handle, state, task) = connected_vsconn_against_fake_vs().await;
+                let addr: IpAddr = "10.1.1.1".parse().unwrap();
+                let oidc = OidcBlob {
+                    issuer: "https://idp.test".to_string(),
+                    id_token: "FAKE.JWT.TOKEN".to_string(),
+                    nonce: FAKE_LOGIN_NONCE.to_string(),
+                };
+
+                for _ in 0..2 {
+                    handle
+                        .reauthorize_own_actor(addr, Some(oidc.clone()))
+                        .await
+                        .expect("the fake VS accepts");
+                }
+
+                let st = state.borrow();
+                assert_eq!(st.reauth_requests.len(), 2);
+                let mut challenges = Vec::new();
+                for req in &st.reauth_requests {
+                    let [AuthBlob::SS(ss), AuthBlob::Oidc(sent)] = &req.blobs[..] else {
+                        panic!("expected [SS, OIDC], got {:?}", req.blobs);
+                    };
+                    assert_valid_device_leg(ss, &st.node_public_key);
+                    assert_eq!(sent.issuer, oidc.issuer);
+                    assert_eq!(sent.id_token, oidc.id_token);
+                    assert_eq!(sent.nonce, oidc.nonce);
+                    challenges.push(ss.challenge.clone());
+                }
+                assert_ne!(
+                    challenges[0], challenges[1],
+                    "each device leg needs a fresh challenge"
+                );
+                drop(st);
+
+                handle.stop().await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+            })
+            .await;
+    }
+
+    /// zl-zipline#233: without a VS-API session both calls are refused
+    /// locally, without reaching the visa service.
+    #[tokio::test]
+    async fn login_calls_without_session_are_refused_locally() {
+        let mut vsconn = test_vsconn(refusing_connect_fn());
+        let mut cmd_state = VSCommandState::new(capnp_rpc::new_client(NoSessionVs));
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        vsconn
+            .handle_command(&mut cmd_state, VS2Command::GetLoginNonce(resp_tx))
+            .await
+            .expect("a refused command must not stop the run loop");
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        vsconn
+            .handle_command(
+                &mut cmd_state,
+                VS2Command::ReauthorizeOwnActor("10.1.1.1".parse().unwrap(), None, resp_tx),
+            )
+            .await
+            .expect("a refused command must not stop the run loop");
+        assert!(matches!(
+            resp_rx.await.unwrap(),
+            Err(VSApiError::CommandFailed(_))
+        ));
+    }
+
     #[tokio::test]
     async fn stop_during_reconnect_delay_exits_promptly() {
         tokio::task::LocalSet::new()
@@ -1807,7 +2998,7 @@ mod tests {
                 // Wait for the first failed connect and entry into the reconnect sleep.
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
 
                 tokio::time::timeout(Duration::from_secs(2), task)
                     .await
@@ -1837,7 +3028,7 @@ mod tests {
                 // Give the connect a moment to start.
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
-                handle.stop(false).await.unwrap();
+                handle.stop().await.unwrap();
 
                 tokio::time::timeout(Duration::from_secs(2), task)
                     .await
@@ -1846,5 +3037,69 @@ mod tests {
                     .expect("run_with_reconnect returned an error");
             })
             .await;
+    }
+
+    /// Build a [VSConn] with the **default** `connect_fn`, whose VS-API
+    /// source is `local_addr`. The VS address is irrelevant: the tests call
+    /// `connect_fn` directly with their own listener's address.
+    fn vsconn_from(local_addr: IpAddr) -> VSConn {
+        VSConn::new(
+            4,
+            "127.0.0.1:1".parse().unwrap(),
+            "test-node".to_string(),
+            test_key(),
+            local_addr,
+        )
+    }
+
+    /// zl-zipline#229: the VS-API connection leaves from the node's own
+    /// address, not from one the kernel picks. On a relay whose TUN also
+    /// carries `vs.zpr`, the kernel would pick `vs.zpr` (RFC 6724 rule 1),
+    /// and the visa service refuses a `connect` whose source is not the
+    /// claimed node address. 127.0.0.2 stands in for the node address and
+    /// 127.0.0.1 for the kernel's choice: both are on `lo` on Linux.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn vs_api_connection_originates_from_local_addr() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let node_addr: IpAddr = "127.0.0.2".parse().unwrap();
+
+        let vsconn = vsconn_from(node_addr);
+        let _sock = tokio::time::timeout(Duration::from_secs(5), (vsconn.connect_fn)(listen_addr))
+            .await
+            .expect("dial hung")
+            .expect("dial from a local address must succeed");
+
+        let (_peer_sock, peer) = listener.accept().await.unwrap();
+        assert_eq!(
+            peer.ip(),
+            node_addr,
+            "the VS-API connection must originate from the node's own address"
+        );
+    }
+
+    /// zl-zipline#229: a source address that cannot be bound fails the dial;
+    /// there is no fallback to an unbound connect. The error names the bind,
+    /// and the listener never sees a connection.
+    #[tokio::test]
+    async fn vs_api_dial_fails_when_local_addr_cannot_be_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737): never assigned to a host.
+        let not_local: IpAddr = "192.0.2.1".parse().unwrap();
+
+        let vsconn = vsconn_from(not_local);
+        let res = tokio::time::timeout(Duration::from_secs(5), (vsconn.connect_fn)(listen_addr))
+            .await
+            .expect("dial hung");
+        let err = res.expect_err("binding a non-local source must fail the dial");
+        assert!(
+            err.to_string().contains("bind"),
+            "the error must name the bind, got: {err}"
+        );
+
+        let accepted = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(accepted.is_err(), "no connection may reach the listener");
     }
 }

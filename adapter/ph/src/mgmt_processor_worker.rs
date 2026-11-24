@@ -51,7 +51,10 @@ pub async fn launch(
     }
 }
 
-async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
+/// Parse the ZDP headers of the management packet `pkt` and hand it to
+/// the handler for its type. Crate-visible so tests can feed a packet
+/// through the same dispatch the worker uses.
+pub(crate) async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
     let Ok(base_hdr) = ZdpBaseHeader::read_from_buf(&mut pkt) else {
         return Err(HandleMgmtError::BadStructure);
     };
@@ -157,36 +160,6 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
             packet_type => Err(HandleMgmtError::UnknownType(packet_type.0)),
         }
     } else {
-        if matches!(
-            base_hdr.packet_type,
-            ZdpPacketType::StartAuthentication
-                | ZdpPacketType::AbandonAuthenticationAttempt
-                | ZdpPacketType::InitAuthenticationRequest
-                | ZdpPacketType::AcquireZprAddress
-                | ZdpPacketType::GrantZprAddress
-        ) {
-            let hdr = ZdpTransactionHeader::read_from_buf(&mut pkt)
-                .map_err(|_| HandleMgmtError::BadStructure)?;
-            let txn = hdr.transaction_id.get();
-            return match base_hdr.packet_type {
-                ZdpPacketType::StartAuthentication => {
-                    handlers::handle_start_authentication(asm, txn, pkt).await
-                }
-                ZdpPacketType::AbandonAuthenticationAttempt => {
-                    handlers::handle_abandon_authentication(asm, txn, pkt).await
-                }
-                ZdpPacketType::InitAuthenticationRequest => {
-                    handlers::handle_init_authentication_request(asm, txn, pkt).await
-                }
-                ZdpPacketType::AcquireZprAddress => {
-                    handlers::handle_acquire_zpr_address_request(asm, txn, pkt).await
-                }
-                ZdpPacketType::GrantZprAddress => {
-                    handlers::handle_grant_zpr_address_request(asm, txn, pkt).await
-                }
-                _ => unreachable!(),
-            };
-        }
         match base_hdr.packet_type {
             ZdpPacketType::Report => handlers::handle_report(asm, pkt).await,
 
@@ -206,15 +179,7 @@ async fn handle_packet(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult
 
             ZdpPacketType::HelloResponse => handlers::handle_hello_response(asm, pkt).await,
 
-            // Zipline renewal messages (zipline#66) are not transactions:
-            // each response echoes its request's challenge for correlation.
-            ZdpPacketType::RenewAuthenticationRequest => {
-                handlers::handle_renew_authentication_request(asm, pkt).await
-            }
-
-            ZdpPacketType::RenewAuthenticationResponse => {
-                handlers::handle_renew_authentication_response(asm, pkt).await
-            }
+            ZdpPacketType::BootstrapVisas => handlers::handle_bootstrap_visas(asm, pkt).await,
 
             packet_type => {
                 warn!("unhandled mgmt packet type {:?}", packet_type);

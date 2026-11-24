@@ -4,7 +4,7 @@ use itertools::izip;
 use km_cert_exchange::KmCertExchange;
 use std::default::Default;
 use std::fs;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::process;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::*;
 
-mod actor_activation;
 mod actor_auth;
 mod actor_renewal;
 mod adapter_manager_worker;
@@ -23,6 +22,7 @@ mod assembly;
 mod auth;
 mod auth_agent;
 mod batch_io;
+mod bootstrap_handoff;
 mod capture_worker;
 mod classifier;
 mod compress;
@@ -55,7 +55,6 @@ mod prelude;
 mod queues;
 mod sample_ring;
 mod signal_worker;
-mod special_peers;
 mod sys;
 mod tc;
 mod test_packet;
@@ -70,12 +69,18 @@ mod zdp;
 mod zdp_ll;
 mod zdpr;
 mod zdpr_worker;
+mod zode_link_record;
+mod zode_links;
+mod zode_login;
 mod zprtun;
 
 #[cfg(test)]
 mod km_testdata;
 
-use assembly::{Assembly, PhMode, SelfAddressError};
+#[cfg(test)]
+mod fake_vs;
+
+use assembly::{Assembly, SelfAddressError};
 use capture_worker::CaptureWorker;
 use fastpath::FastpathWorkerConfig;
 use flow_control::FlowControl;
@@ -86,14 +91,16 @@ use pki::load_cert;
 use queues::*;
 use sys::ZprTun;
 use tun_ctl::TunCtl;
-use zpr_utils::net_defs::SocketAddrExt;
 
-use zpr::addrs::{
-    DEFAULT_TETHER_PORT, VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPR_INTERNAL_NETWORK,
-    ZPRNET_PREFIX_LEN,
-};
+use zpr::addrs::{VISA_SERVICE_ADDR, VISA_SERVICE_PORT, ZPRNET_PREFIX_LEN};
+
 use zpr::packet_info::{DOCK_LINK_ID, LOCAL_ACTOR_LINK_ID};
 use zpr::vsapi_types::AuthServicesList;
+
+/// The UDP port a Zode listens on for its links when `--self-addr` names
+/// none. zl-zpr-common still calls it the tether port, from when adapters
+/// tethered to nodes; there are no tethers any more (zl-zipline#234).
+const DEFAULT_LINK_PORT: u16 = zpr::addrs::DEFAULT_TETHER_PORT;
 
 fn main() -> ExitCode {
     let system_start_time = std::time::Instant::now();
@@ -102,8 +109,8 @@ fn main() -> ExitCode {
     // parse configuration from command line
     //
 
-    let (ph_mode, mut config) = match main_argparse::argparse(None) {
-        Ok((ph_mode, config)) => (ph_mode, config),
+    let mut config = match main_argparse::argparse(None) {
+        Ok(config) => config,
         Err(e) => {
             eprintln!("failed to parse command line arguments: {:?}", e);
             eprintln!("try `ph --help` for help");
@@ -148,7 +155,6 @@ fn main() -> ExitCode {
     // read key material
     //
 
-    let self_noise_keypair;
     let certx;
 
     let maybe_private_key = match config.get_noise_private_key_data() {
@@ -162,27 +168,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if ph_mode == PhMode::Node {
-        // In node mode a private key is required -- since client adapters use the public key to verify the node.
-        let Some(private_key) = maybe_private_key else {
-            // Note that this is already checked in the config code, so this should be redundant.
-            error!(target: STARTUP, "nodes require a noise private key to be specified");
-            return ExitCode::FAILURE;
-        };
-        self_noise_keypair = NoiseKeypair::new(private_key);
-    } else {
-        self_noise_keypair = match maybe_private_key {
-            Some(private_key) => NoiseKeypair::new(private_key),
-            None => NoiseKeypair::generate(),
-        };
-    }
+    // A Zode needs its private key: its peers verify the matching public key
+    // in its certificate.
+    let Some(private_key) = maybe_private_key else {
+        // Note that this is already checked in the config code, so this should be redundant.
+        error!(target: STARTUP, "a Zode requires a noise private key to be specified");
+        return ExitCode::FAILURE;
+    };
+    let self_noise_keypair = NoiseKeypair::new(private_key);
 
-    // Set up key exchange.
-    //
-    // If we have a signed certificate, use it during keying. Otherwise none is
-    // sent: nodes do not verify the certificates of non-special adapters, so an
-    // adapter without one simply presents no name (the Noise handshake still
-    // authenticates its static key).
+    // Set up key exchange: the Zode presents its signed certificate during
+    // keying ([config::Config::check_valid] requires one).
 
     let self_cert = match config.certificate_file.as_ref() {
         None => None,
@@ -290,41 +286,9 @@ fn main() -> ExitCode {
     };
     let tun_ctl = Box::new(tun_ctl::TunCtlImpl::new(tun_devs[0].clone()));
 
-    // zipline#101: only one adapter per host can own fd5a:5052::/32. A
-    // second adapter would dock, activate, and then silently receive no
-    // traffic — its route loses to the first adapter's. Refuse to start
-    // when the internal-network route already resolves to another live
-    // interface (a route on our own TUN — the pre-provisioned tun_if case —
-    // or on a linkdown persistent TUN passes). Read-only route query, so
-    // unprivileged instances can still run it.
-    if ph_mode == PhMode::Adapter {
-        match tun_ctl.route_owner_conflict(IpAddr::V6(ZPR_INTERNAL_NETWORK), ZPRNET_PREFIX_LEN) {
-            Ok(None) => {}
-            Ok(Some(owner_if)) => {
-                error!(
-                    target: STARTUP,
-                    "refusing to start: {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} already \
-                     routes to interface {owner_if} — another ZPR adapter or tool already \
-                     owns ZPR traffic on this host. Stop it (or remove its route) and try \
-                     again; running two adapters on one host is not supported."
-                );
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                // Could not read the routing table at all: unknown, not a
-                // conflict. Do not block startup on a failed probe.
-                warn!(
-                    target: STARTUP,
-                    "could not check whether {ZPR_INTERNAL_NETWORK}/{ZPRNET_PREFIX_LEN} is \
-                     already routed to another interface: {e}; continuing"
-                );
-            }
-        }
-    }
-
-    // Node must be set ON (adapter will be turned on as part of finishing hello)
+    // A Zode's TUN carrier is on from the start.
     // TODO: There is more subtlety here, see issue ( https://github.com/org-zpr/zpr-core/issues/937 )
-    tun_ctl.set_carrier(ph_mode == PhMode::Node).unwrap();
+    tun_ctl.set_carrier(true).unwrap();
 
     let mut actor_requeue_inqs = Vec::new();
     let mut actor_requeue_outqs = Vec::new();
@@ -338,65 +302,28 @@ fn main() -> ExitCode {
     // open substrate sockets and mgmt substrate injection socket
     //
 
-    match ph_mode {
-        PhMode::Node => {
-            if config.self_addr.port() == 0 {
-                config.self_addr.set_port(DEFAULT_TETHER_PORT);
-                info!(target: STARTUP, "listening on default tether port {}", config.self_addr.port());
-            }
-        }
-
-        PhMode::Adapter => {
-            let node_addr = config.node_addr.as_mut().unwrap();
-            if node_addr.port() == 0 {
-                node_addr.set_port(DEFAULT_TETHER_PORT);
-                info!(target: STARTUP, "connecting to default tether port {}", node_addr.port());
-            }
-        }
-    }
-
-    // An adapter (it has a remote node address) without a specified self
-    // address: ask the OS which local address routes to the node, and use
-    // it as our self address so that every substrate socket binds the same
-    // concrete address. Done once, with a throwaway probe socket, before
-    // any substrate socket exists (zipline#175). The probe binds our
-    // configured port, so the route is chosen for the 5-tuple the
-    // substrate sockets will actually use; if no port was configured, we
-    // adopt the one the OS gave the probe, for the same reason.
-    if let Some(node_addr) = config.node_addr {
-        if config.self_addr.ip().is_unspecified() {
-            let local = sys::substrate::resolve_local_addr(config.self_addr, node_addr)
-                .unwrap_or_else(|e| panic!("unable to connect to node_addr ({node_addr}): {e}"));
-            config.self_addr.set_scoped_ip(local.scoped_ip());
-            info!(target: STARTUP, "assigned substrate address {}", local.scoped_ip());
-            if config.self_addr.port() == 0 {
-                // ponytail: the port is free between the probe's drop and
-                // the first bind below; another process grabbing that exact
-                // ephemeral port in that window fails the bind (a startup
-                // panic, not misrouting). Hold the probe open across the
-                // bind with SO_REUSEPORT if that is ever seen.
-                config.self_addr.set_port(local.port());
-                info!(target: STARTUP, "assigned substrate UDP port {}", local.port());
-            }
-        }
+    if config.self_addr.port() == 0 {
+        config.self_addr.set_port(DEFAULT_LINK_PORT);
+        info!(target: STARTUP, "listening on default link port {}", config.self_addr.port());
     }
 
     let mut substrate_sockets: Vec<std::net::UdpSocket> = Vec::new();
 
     for _i in 0..topology_config.fastpath_concurrency {
         // Create, configure and bind one substrate socket; the platform
-        // differences (pktinfo and SO_REUSEPORT on unix, the wildcard
-        // bind check and SIO_UDP_CONNRESET on Windows) live behind
+        // differences (SO_REUSEPORT on unix, SIO_UDP_CONNRESET on
+        // Windows, and when pktinfo is enabled) live behind
         // `sys::substrate::open` (zipline#176). Any failure — including
-        // the bind, and Windows' wildcard-bind rejection — is a logged
-        // error and a clean exit, not a panic (zipline#160): a
-        // misconfigured node must fail with the message that names the
-        // fix, like the ZPR-address check below.
+        // the bind — is a logged error and a clean exit, not a panic
+        // (zipline#160): a misconfigured node must fail with the message
+        // that names the fix, like the ZPR-address check below.
         //
         // The bind is to our self address. If the port is unspecified,
         // one is selected by the OS. (The IP address may also be
         // unspecified -- a node with a wildcard self_addr -- in which
-        // case the socket receives on every local address.)
+        // case the socket receives on every local address, and pktinfo
+        // reports each datagram's real destination, on every OS since
+        // zipline#150.)
         let socket = match sys::substrate::open(config.self_addr) {
             Ok(socket) => socket,
             Err(err) => {
@@ -421,17 +348,12 @@ fn main() -> ExitCode {
         substrate_sockets.push(socket.into());
     }
 
-    let node_zpr_addr: IpAddr;
-    if ph_mode == PhMode::Node {
-        info!(
-            target: STARTUP,
-            "dock listening on {}",
-            substrate_sockets[0].local_addr().unwrap()
-        );
-        node_zpr_addr = config.zpr_addr[0].clone();
-    } else {
-        node_zpr_addr = Ipv6Addr::UNSPECIFIED.into(); // only node uses this.
-    }
+    info!(
+        target: STARTUP,
+        "dock listening on {}",
+        substrate_sockets[0].local_addr().unwrap()
+    );
+    let node_zpr_addr: IpAddr = config.zpr_addr[0];
 
     let (mgmt_substrate_inq, mgmt_substrate_outq) =
         packet_queue::packet_queue(topology_config.mgmt_datapath_queue_size);
@@ -451,13 +373,11 @@ fn main() -> ExitCode {
     }
 
     //
-    // instantiate (but don't launch yet) Visa Service connection manager if we're a node
+    // instantiate (but don't launch yet) the Visa Service connection manager
     //
 
-    let mut vsconn;
-
-    if ph_mode == PhMode::Node {
-        // config parsing ensures that IF node THEN certificate_file is set.
+    let vsconn = {
+        // config parsing ensures that certificate_file is set.
         let node_name = config
             .get_noise_cn()
             .expect("unable to determine node name: cannot parse CN");
@@ -474,64 +394,41 @@ fn main() -> ExitCode {
         let auth_private_key = zpr_utils::rsa_sign::load_rsa_key(auth_key_pem.as_bytes())
             .unwrap_or_else(|e| panic!("failed to parse auth_private_key {auth_key_path:?}: {e}"));
 
-        // Advertised substrate address resolution, in order:
-        //   1. advertised_substrate_addr config, if set.
-        //   2. self_addr, if its IP is specified (common LAN/single-host case).
-        // A wildcard self_addr with no configured advertised address is a startup
-        // error: a wildcard binds every local IP (including ones added later), of
-        // which the machine may have several, but we can advertise only one —
-        // there is no sound way to pick it automatically, so the operator must
-        // choose via advertised_substrate_addr.
-        let advertised_substrate = config
-            .advertised_substrate_addr
-            .or_else(|| {
-                if config.self_addr.ip().is_unspecified() {
-                    None
-                } else {
-                    Some(config.self_addr)
-                }
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "cannot determine an advertised substrate address: self_addr {} \
-                     has an unspecified IP; set advertised_substrate_addr in the \
-                     [node] config section",
-                    config.self_addr
-                )
-            });
-        info!(
-            target: STARTUP,
-            "advertising substrate address {advertised_substrate} to the visa service"
-        );
-
-        vsconn = Some(libnode::vsconn::VSConn::new(
+        libnode::vsconn::VSConn::new(
             topology_config.vs_queue_size,
             SocketAddr::new(VISA_SERVICE_ADDR, VISA_SERVICE_PORT),
             node_name,
             auth_private_key,
-            advertised_substrate,
-        ));
-    } else {
-        vsconn = None;
-    }
+            // The VS-API connection leaves from the node's own address
+            // (zl-zipline#229): on a relay that hosts the visa service the
+            // kernel would otherwise pick vs.zpr as the source.
+            node_zpr_addr,
+        )
+    };
 
     //
     // create system assembly
     //
 
     let asm = Arc::new(Assembly {
-        actor_rejected: std::sync::atomic::AtomicBool::new(false),
-        ph_mode,
         topology_config,
         mgmt_substrate_egress: MgmtSubstrateEgress::new(mgmt_substrate_inq),
         actor_output_requeue: ActorOutputRequeue::new(actor_requeue_inqs),
-        vsconn: vsconn.as_ref().map(|c| c.handle()),
-        visa_table: std::sync::RwLock::new(visa_table::VisaTable::new_with_vs_visas(
+        vsconn: Some(vsconn.handle()),
+        // J1 (zl-zipline#252): a joiner starts with no visas at all.
+        visa_table: std::sync::RwLock::new(visa_table::VisaTable::initial_for_node(
             &node_zpr_addr,
+            config.initial_link.is_some(),
         )),
+        topology: Default::default(),
+        zode_links: Default::default(),
+        zode_login: Default::default(),
         vs_auth_services: std::sync::RwLock::new(AuthServicesList::default()),
-        deferred_vs_connect: Mutex::new(None),
         self_reauth_in_flight: std::sync::atomic::AtomicBool::new(false),
+        vs_session_up: std::sync::atomic::AtomicBool::new(false),
+        bootstrap_handoff: Default::default(),
+        relay_named_by_topology: std::sync::atomic::AtomicBool::new(false),
+        last_visa_sweep: std::sync::Mutex::new(None),
         capture_queue: cap_inq,
         capture_worker: CaptureWorker::new(),
         flow_control: FlowControl::new(),
@@ -549,10 +446,7 @@ fn main() -> ExitCode {
         certx: Some(certx),
         system_start_time,
         address_pool: std::sync::Mutex::new(None),
-        configured_zpr_addr_demand: config.zpr_addr.clone(),
         config: rcu::RcuBox::new(config),
-        fatal_error: Mutex::new(None),
-        fatal_notify: tokio::sync::Notify::new(),
         logging: Mutex::new(logging_map),
         reload_handle,
     });
@@ -570,166 +464,89 @@ fn main() -> ExitCode {
     // NOTE: must occur before we start any other workers!
     //
 
-    match ph_mode {
-        PhMode::Adapter => {
-            // instantiate the "fake" local actor link
-            assert_eq!(
-                asm.peer_table.insert_internal_peer().get(),
-                LOCAL_ACTOR_LINK_ID
-            );
+    // instantiate the "fake" local actor and dock links
 
-            // instantiate tether
-            let auto_connect = asm.config.get().auto_connect;
-            let dsid = asm
-                .start_tether(
-                    asm.config.get().node_addr.as_ref().unwrap(),
-                    &asm.config.get().self_addr.scoped_ip(),
-                    link_state::LinkType::AdapterToNode,
-                    auto_connect,
-                )
-                .unwrap();
+    let (lalid, dlid) = asm.peer_table.insert_internal_peer_pair(|link_id, q| {
+        mgmt_processor_worker::launch(mgmt_processor_worker::Config { link_id }, asm.clone(), q)
+    });
+    assert_eq!(lalid.get(), LOCAL_ACTOR_LINK_ID);
+    assert_eq!(dlid.get(), DOCK_LINK_ID);
 
-            assert_eq!(dsid.get(), DOCK_LINK_ID);
-        }
+    // For now, we use ZDPR for flow control on internal mgmt links.
+    tokio::task::spawn_local(zdpr_worker::launch(asm.clone(), lalid.get()));
+    tokio::task::spawn_local(zdpr_worker::launch(asm.clone(), dlid.get()));
 
-        PhMode::Node => {
-            // instantiate the "fake" local actor and dock links
-
-            let (lalid, dlid) = asm.peer_table.insert_internal_peer_pair(|link_id, q| {
-                mgmt_processor_worker::launch(
-                    mgmt_processor_worker::Config { link_id },
-                    asm.clone(),
-                    q,
-                )
-            });
-            assert_eq!(lalid.get(), LOCAL_ACTOR_LINK_ID);
-            assert_eq!(dlid.get(), DOCK_LINK_ID);
-
-            // For now, we use ZDPR for flow control on internal mgmt links.
-            tokio::task::spawn_local(zdpr_worker::launch(asm.clone(), lalid.get()));
-            tokio::task::spawn_local(zdpr_worker::launch(asm.clone(), dlid.get()));
-
-            // Nodes use the local actor link as the source of bind requests from the
-            // internal adapter, which require that the originator has a valid
-            // actor address (which matches the requested source address).
-            for addr in &asm.config.get().zpr_addr {
-                asm.peer_table
-                    .get(LOCAL_ACTOR_LINK_ID)
-                    .unwrap()
-                    .actor_auth
-                    .add_internal_address(addr.into());
-            }
-
-            // Those are the only source addresses the node will accept from
-            // itself, and the addresses it binds its own services to. Apply
-            // them to the TUN device ourselves (zipline#159, N3): on Linux a
-            // hand-configured or script-configured device already carries
-            // them and nothing is called; on macOS and Windows nobody else
-            // addresses a node's TUN at all. On Windows this also installs
-            // the /128 visa-service host route, because `netsh add address`
-            // ignores the prefix and the address alone makes nothing
-            // on-link. Failure means the node cannot reach the visa service
-            // and every symptom would appear somewhere other than here, so
-            // refuse to start — naming the manual command that matches what
-            // actually failed (PR #61 review): an address failure gets the
-            // add-address command, a route failure the add-route command,
-            // and a route owned by another live interface means a second
-            // ZPR instance on this host already carries visa-service
-            // traffic, which is a conflict to resolve, not a command to run.
-            if let Err(e) = asm.ensure_local_zpr_addrs_on_tun() {
-                let ifname = asm
-                    .config
-                    .get()
-                    .tun_if
-                    .clone()
-                    .unwrap_or_else(|| "<TUN device>".to_string());
-                match &e {
-                    SelfAddressError::Address { addr, .. } => {
-                        error!(
-                            target: STARTUP,
-                            "{e}; configure it manually with: {}",
-                            sys::addr_hint::manual_add_address_hint(
-                                addr,
-                                ZPRNET_PREFIX_LEN as usize,
-                                &ifname
-                            )
-                        );
-                    }
-                    SelfAddressError::VsRoute { .. } => {
-                        // Only Windows has a manual command for this
-                        // (zipline#177): manual_add_route_hint is None on
-                        // Linux and macOS, where the message stands alone.
-                        match sys::addr_hint::manual_add_route_hint(&VISA_SERVICE_ADDR, &ifname) {
-                            Some(hint) => {
-                                error!(target: STARTUP, "{e}; configure it manually with: {hint}")
-                            }
-                            None => error!(target: STARTUP, "{e}"),
-                        }
-                    }
-                    SelfAddressError::VsRouteConflict { .. } => {
-                        error!(
-                            target: STARTUP,
-                            "{e}; stop the other instance, or remove its route, before \
-                             starting this node on {ifname}"
-                        );
-                    }
-                }
-                return ExitCode::FAILURE;
-            }
-
-            // The self-addressing above is best-effort only for addresses
-            // the platform cannot inspect -- so confirm the device actually
-            // has them; this check stays the hard stop.
-            let missing = asm.local_zpr_addrs_missing_from_tun();
-            if !missing.is_empty() {
-                let ifname = asm
-                    .config
-                    .get()
-                    .tun_if
-                    .clone()
-                    .unwrap_or_else(|| "<TUN device>".to_string());
-                for addr in &missing {
-                    error!(
-                        target: STARTUP,
-                        "node ZPR address {addr} is not configured on {ifname}; \
-                         configure it with: {}",
-                        sys::addr_hint::manual_add_address_hint(
-                            addr,
-                            ZPRNET_PREFIX_LEN as usize,
-                            &ifname
-                        )
-                    );
-                }
-                return ExitCode::FAILURE;
-            }
-        }
+    // Nodes use the local actor link as the source of bind requests from the
+    // internal adapter, which require that the originator has a valid
+    // actor address (which matches the requested source address).
+    for addr in &asm.config.get().zpr_addr {
+        asm.peer_table
+            .get(LOCAL_ACTOR_LINK_ID)
+            .unwrap()
+            .actor_auth
+            .add_internal_address(addr.into());
     }
+
+    // Those are the only source addresses the node will accept from
+    // itself, and the addresses it binds its own services to. Apply
+    // them to the TUN device ourselves (zipline#159, N3): on Linux a
+    // hand-configured or script-configured device already carries
+    // them and nothing is called; on macOS and Windows nobody else
+    // addresses a node's TUN at all. Failure means the node cannot
+    // reach the visa service and every symptom would appear somewhere
+    // other than here, so refuse to start, naming the manual
+    // add-address command.
+    if let Err(e) = asm.ensure_local_zpr_addrs_on_tun() {
+        let ifname = asm
+            .config
+            .get()
+            .tun_if
+            .clone()
+            .unwrap_or_else(|| "<TUN device>".to_string());
+        let SelfAddressError::Address { addr, .. } = &e;
+        error!(
+            target: STARTUP,
+            "{e}; configure it manually with: {}",
+            sys::addr_hint::manual_add_address_hint(addr, ZPRNET_PREFIX_LEN, &ifname)
+        );
+        return ExitCode::FAILURE;
+    }
+
+    // The self-addressing above is best-effort only for addresses
+    // the platform cannot inspect -- so confirm the device actually
+    // has them; this check stays the hard stop.
+    let missing = asm.local_zpr_addrs_missing_from_tun();
+    if !missing.is_empty() {
+        let ifname = asm
+            .config
+            .get()
+            .tun_if
+            .clone()
+            .unwrap_or_else(|| "<TUN device>".to_string());
+        for addr in &missing {
+            error!(
+                target: STARTUP,
+                "node ZPR address {addr} is not configured on {ifname}; \
+                 configure it with: {}",
+                sys::addr_hint::manual_add_address_hint(
+                    addr,
+                    ZPRNET_PREFIX_LEN,
+                    &ifname
+                )
+            );
+        }
+        return ExitCode::FAILURE;
+    }
+
+    // Dial the configured initial link (zl-zipline#250): the relay
+    // this Zode reaches the network through.
+    crate::zode_links::start_initial_link(&asm);
 
     //
     // start mgmt workers
     //
 
     let mut js = JoinSet::new();
-
-    // zipline#83: a worker can declare the process dead (e.g. the fabric
-    // granted a ZPR address differing from the configured --zpr-addr).
-    // Exit non-zero with the message on stderr — a misaddressed adapter
-    // must not keep running looking healthy.
-    {
-        let asm = asm.clone();
-        js.spawn_local(async move {
-            asm.fatal_notify.notified().await;
-            let msg = asm
-                .get_fatal_error()
-                .unwrap_or_else(|| "unspecified fatal error".to_string());
-            error!(target: STARTUP, "fatal: {msg}");
-            eprintln!("ph: fatal: {msg}");
-            // Give the link teardown a moment to put the Terminate on the
-            // wire, then exit hard: this is unrecoverable by design.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            process::exit(1);
-        });
-    }
 
     js.spawn_local(signal_worker::launch(asm.clone()));
     js.spawn_local(mgmt_dispatch_worker::launch(asm.clone(), md_outq, mhd_outq));
@@ -803,70 +620,58 @@ fn main() -> ExitCode {
         cap_outq,
     ));
 
-    if ph_mode == PhMode::Node {
-        asm.tun_ctl.set_carrier(true).unwrap();
-    }
-
     //
-    // TEMP HACK: bring up tether if we're an adapter
-    //
-
-    if ph_mode == PhMode::Adapter {
-        local_set.block_on(&runtime, async {
-            let dsid = DOCK_LINK_ID;
-            debug!(target: STARTUP, "waiting on security association establishment on {}", asm.formatted_link_id(dsid));
-            while !asm.peer_table.is_security_association_established(dsid) {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            debug!(target: STARTUP, "security association established successfully on {}", asm.formatted_link_id(dsid));
-        });
-    }
-
-    //
-    // start Visa Support Service, Visa Service connection manager, and their workers, if we're a node
+    // start Visa Support Service, Visa Service connection manager, and their workers
     //
     // TODO: More thought needed here about lifecycle. It's possible the connection to the visa service
     // may fail (ie, the visa service may go down momentarily), and in that case we would normally want
     // to restart it, which may also require restarting the vss -- both while the node (ph) remains up.
     //
 
-    if ph_mode == PhMode::Node {
-        let (vss_inq, vss_outq) = mpsc::channel(asm.topology_config.vss_queue_size);
+    let (vss_inq, vss_outq) = mpsc::channel(asm.topology_config.vss_queue_size);
 
-        let vss_addr =
-            std::net::SocketAddr::new(asm.get_local_dock_addr(), config::DEFAULT_VSS_PORT);
+    let vss_addr = std::net::SocketAddr::new(asm.get_local_dock_addr(), config::DEFAULT_VSS_PORT);
 
-        // Launch VSS server (requires local set). This expects an inbound connection from the VS.
-        js.spawn_local(async move {
-            if let Err(e) = libnode::vss::launch_vss(&vss_addr, vss_inq).await {
-                error!(target: STARTUP, "VSS server terminated: {e:?}");
-                // TODO: If the VSS goes down we would normally want to restart it.
-            }
-        });
+    // Launch VSS server (requires local set). This expects an inbound connection from the VS.
+    js.spawn_local(async move {
+        if let Err(e) = libnode::vss::launch_vss(&vss_addr, vss_inq).await {
+            error!(target: STARTUP, "VSS server terminated: {e:?}");
+            // TODO: If the VSS goes down we would normally want to restart it.
+        }
+    });
 
-        // Launch VSConn run loop (sets up its own local set). The VSConn handles reconnects.
-        // Send the "stop" command to cause it to exit cleanly.
-        let mut vsconn_instance = vsconn.take().unwrap();
-        let vsconn_lifecycle_rx = vsconn_instance.subscribe_lifecycle_events();
-        js.spawn_local(async move {
-            let res = vsconn_instance
-                .run_with_reconnect(config::VSCONN_RETRY_WAIT)
-                .await;
-            error!(target: STARTUP, "visa service connection manager terminated: {res:?}");
-        });
+    // Launch VSConn run loop (sets up its own local set). The VSConn handles reconnects.
+    // Send the "stop" command to cause it to exit cleanly.
+    let mut vsconn_instance = vsconn;
+    let vsconn_lifecycle_rx = vsconn_instance.subscribe_lifecycle_events();
+    js.spawn_local(async move {
+        let res = vsconn_instance
+            .run_with_reconnect(config::VSCONN_RETRY_WAIT)
+            .await;
+        error!(target: STARTUP, "visa service connection manager terminated: {res:?}");
+    });
 
-        let vs_handle = asm.vsconn.as_ref().unwrap().clone();
+    let vs_handle = asm.vsconn.as_ref().unwrap().clone();
 
-        js.spawn_local(vs_worker::launch(
-            asm.clone(),
-            node_zpr_addr,
-            vss_addr,
-            vs_handle,
-            vsconn_lifecycle_rx,
-        ));
+    js.spawn_local(vs_worker::launch(
+        asm.clone(),
+        node_zpr_addr,
+        vss_addr,
+        vs_handle,
+        vsconn_lifecycle_rx,
+    ));
 
-        js.spawn_local(vss_worker::launch(asm.clone(), vss_outq));
-    }
+    js.spawn_local(vss_worker::launch(asm.clone(), vss_outq));
+
+    // Report Zode link states to the visa service (zl-zipline#250).
+    let report_handle = asm.vsconn.as_ref().unwrap().clone();
+    js.spawn_local(crate::zode_links::run_link_state_reporter(
+        asm.clone(),
+        move |reports| {
+            let handle = report_handle.clone();
+            async move { handle.report_link_states(reports).await }
+        },
+    ));
 
     //
     // drive the local set, and handle worker termination

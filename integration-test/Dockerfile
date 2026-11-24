@@ -16,13 +16,13 @@
 ARG BASE_IMAGE=ubuntu:26.04
 FROM ${BASE_IMAGE}
 
-# iproute2         ip link / ip netns (remote-node-host-env.sh) / tc
+# iproute2         ip link / ip netns / tc
 # util-linux       unshare / nsenter (already in the base image; listed so
 #                  dropping it is a visible decision)
 # iputils-ping     ping_test
 # psmisc, procps   pstree (get_descendants), pkill / pgrep
 # jq curl openssl  OIDC and attribute-service assertions
-# tcpdump          capture-test.sh
+# tcpdump          a2a-pubkey-test.sh
 # python3          lib/fake-idp.py
 # valkey-server    backing store for the visa service
 # libssl3t64 libzstd1 zlib1g   linked by vs, vs-admin, zpdump

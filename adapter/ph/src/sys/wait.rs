@@ -284,11 +284,15 @@ impl<'a> WaitSet<'a> {
 /// it is not passed to the kernel — the unix arm gets the same effect from
 /// an empty `PollFlags`). `WaitForMultipleObjects` reports only the
 /// lowest-index signaled handle, so after it returns, every *other* armed
-/// handle is probed with a zero-timeout `WaitForSingleObject`. The sources
-/// here are level-signaled — manual-reset Events ([`super::notify::Notify`],
-/// `WSAEventSelect` events, Wintun's read-wait event) stay signaled until
-/// explicitly consumed — so a still-pending source is seen by the probe,
-/// giving `poll(2)`'s report-everything semantics.
+/// handle is probed with a zero-timeout `WaitForSingleObject`. The
+/// manual-reset Events ([`super::notify::Notify`], `WSAEventSelect` events)
+/// stay signaled until explicitly consumed, so a still-pending source is
+/// seen by the probe, giving `poll(2)`'s report-everything semantics.
+/// Wintun's read-wait event is the exception: it is auto-reset, so the
+/// wait or the probe that reports it also consumes it, and it signals per
+/// ring append rather than while the ring is non-empty. Its reader
+/// re-arms it after a batch that may have left packets in the ring
+/// (`batch_io::windows_unbatched::read_ring_batch`, zl-zipline#292).
 ///
 /// A signaled entry is reported under the interest(s) it registered:
 /// `WaitForMultipleObjects` itself carries no read/write distinction — the
@@ -376,7 +380,8 @@ impl<'a> WaitSet<'a> {
         let first = (rc - WAIT_OBJECT_0) as usize;
 
         // Report every signaled entry, not just the lowest: probe the rest
-        // with a zero timeout (level-signaled sources stay signaled).
+        // with a zero timeout (manual-reset sources stay signaled; an
+        // auto-reset one is consumed here, as by the wait itself).
         for (pos, (&handle, &index)) in handles.iter().zip(indices.iter()).enumerate() {
             let signaled = if pos == first {
                 true

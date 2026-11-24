@@ -1,6 +1,11 @@
 @0xdd33f90089b3556f;
 
-interface CmdLineInter {
+# The explicit interface ID changes whenever methods are removed and the
+# later ordinals renumbered (zl-zipline#234: getNodeInfo, then
+# configureLink and startLink's authAgent): ph and ph-cli ship together
+# with no compatibility, and a new ID makes a mismatched client fail at the
+# call instead of reaching the method that now holds its old ordinal.
+interface CmdLineInter @0xb4710198e6a4bf99 {
     echo                 @0 () -> ();
     resetCounters        @1 () -> ();
     counters             @2 () -> (counts: Counters);
@@ -12,19 +17,22 @@ interface CmdLineInter {
     perfSample           @8 (duration_secs: UInt64, frequency_per_sec: UInt64) -> (result: Text); # Currently unsupported in PH
     showLinkSummary      @9 () -> (summary: List(Text));
     showLink             @10 (id: UInt32) -> (result: Text);
-    configureLink        @11 (id: UInt32) -> (); # Currently unsupported in PH
-    startLink            @12 (id: UInt32, authAgent: AuthAgent) -> (result: SuccessOrError); # authAgent is optional (null): a link started without one is device-only
-    stopLink             @13 (id: UInt32) -> (result: SuccessOrError);
-    resetLink            @14 (id: UInt32) -> ();
-    changeLogging        @15 (logs: List(Log)) -> (result: LogsApplied);
-    getNodeInfo          @16 () -> (result: SuccessOrError);
-    getTunInfo           @17 () -> (result: SuccessOrError, info: TunInfo); # zipline#202: `ph-cli tun`
+    startLink            @11 (id: UInt32) -> (result: SuccessOrError);
+    stopLink             @12 (id: UInt32) -> (result: SuccessOrError);
+    resetLink            @13 (id: UInt32) -> ();
+    changeLogging        @14 (logs: List(Log)) -> (result: LogsApplied);
+    getTunInfo           @15 () -> (result: SuccessOrError, info: TunInfo); # zipline#202: `ph-cli tun`
+    # zl-zipline#233: a Zode's own login. `login` registers authAgent for
+    # this connection and returns when the login finishes; its error text is
+    # the AuthFailureReason Debug spelling.
+    login                @16 (authAgent: AuthAgent) -> (result: SuccessOrError);
+    logout               @17 () -> (result: SuccessOrError);
+    showLogin            @18 () -> (result: Text);
 }
 
 # The TUN interface ph opened (zipline#202). `zprAddrs` lists only the
-# local ZPR addresses ph confirmed on that interface: empty on an adapter
-# before its address is granted, and an address the platform cannot
-# inspect is left out rather than guessed.
+# local ZPR addresses ph confirmed on that interface; an address the
+# platform cannot inspect is left out rather than guessed.
 struct TunInfo {
     ifName   @0 :Text;
     zprAddrs @1 :List(IpAddr);
@@ -55,7 +63,6 @@ struct SuccessOrError {
 
 struct SuccessValue {
     none @0 :Void;
-    sockAddr @1 :SockAddr;
 }
 
 struct ErrorValue {
@@ -105,9 +112,4 @@ struct IpAddr {
     v4 @0 :Data;
     v6 @1 :Data;
   }
-}
-
-struct SockAddr {
-  addr @0 :IpAddr;
-  port @1 :UInt16;
 }

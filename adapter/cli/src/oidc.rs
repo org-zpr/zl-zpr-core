@@ -822,67 +822,11 @@ fn open_in_browser(url: &str) -> Result<(), OidcCliError> {
         .map_err(|e| OidcCliError::Browser(format!("{program}: {e}")))
 }
 
-/// What one `showLink` snapshot says about a starting link.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LinkOutcome {
-    /// `Actor state: Authorized` — the actor holds its ZPR address.
-    Up,
-    /// Authentication failed; carries the Debug spelling of ph's
-    /// `AuthFailureReason` from the `Last auth failure:` line (empty if the
-    /// link failed with none recorded). See [`parse_show_link_state`].
-    Failed(String),
-    /// Anything else — keep polling.
-    Pending,
-}
-
-/// Parse the text `showLink` returns. ph prints the link's
-/// `  State: {:?} (for {:?})` (Display for LinkStateMachine in
-/// adapter/ph/src/link_state.rs) and the actor's `  Actor state: {:?}` and,
-/// when a failure was recorded, `  Last auth failure: {:?}` (Display for
-/// ActorAuthorization in adapter/ph/src/actor_auth.rs).
-///
-/// Since #1410 the link is Active once Hello completes and the actor is
-/// authorized afterwards, so success is the *actor* reaching `Authorized`.
-/// ph clears the recorded failure when `connect` starts the link, so a
-/// visible `Last auth failure:` always belongs to this attempt: it is the
-/// outcome unless the actor is visibly mid-attempt (a retry with backoff
-/// after a transient failure only starts after the reason is recorded, so
-/// `connect` reports the first failure, as it did before #1410). A link in
-/// `Error` with no recorded reason also ends the wait.
-pub fn parse_show_link_state(text: &str) -> LinkOutcome {
-    let mut link_state = None;
-    let mut actor_state = None;
-    let mut reason = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("State: ") {
-            // "Active (for 1.2s)" -> "Active"; Disconnecting(..) has no
-            // space before its parenthesis, so split on " (" only.
-            link_state = Some(rest.split(" (").next().unwrap_or(rest).to_string());
-        } else if let Some(rest) = line.strip_prefix("Actor state: ") {
-            actor_state = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("Last auth failure: ") {
-            reason = Some(rest.to_string());
-        }
-    }
-    // Actor states in which an authentication attempt is under way.
-    let attempting = matches!(
-        actor_state.as_deref(),
-        Some("RequestingAuthentication") | Some("Authenticating") | Some("AcquiringAddress")
-    );
-    match (actor_state.as_deref(), reason) {
-        (Some("Authorized"), _) => LinkOutcome::Up,
-        (_, Some(reason)) if !attempting => LinkOutcome::Failed(reason),
-        _ if link_state.as_deref() == Some("Error") => LinkOutcome::Failed(String::new()),
-        _ => LinkOutcome::Pending,
-    }
-}
-
-/// Map the Debug spelling of ph's `AuthFailureReason` (as printed by
-/// `showLink`'s `Last auth failure:` line) to the `connect` exit-code
-/// contract: 2 user declined, 3 timeout, 4 IdP unreachable, 5 visa service
-/// rejected the token, 6 policy denied, 7 device blob rejected, 1 anything
-/// else (NoAgent, AgentError, AuthUnavailable, unrecognized).
+/// Map the Debug spelling of ph's `AuthFailureReason` (the error text of a
+/// failed `login`) to the `connect` exit-code contract: 2 user declined,
+/// 3 timeout, 4 IdP unreachable, 5 visa service rejected the token,
+/// 6 policy denied, 1 anything else (NoAgent, AgentError, AuthUnavailable,
+/// unrecognized).
 pub fn exit_code_for_auth_failure(reason: &str) -> i32 {
     if reason.starts_with("UserDeclined") {
         2
@@ -894,68 +838,8 @@ pub fn exit_code_for_auth_failure(reason: &str) -> i32 {
         5
     } else if reason.starts_with("PolicyDenied") {
         6
-    } else if reason.starts_with("DeviceBlobRejected") {
-        7
     } else {
         1
-    }
-}
-
-/// Whether a `startLink` error means agent registration failed.
-///
-/// ph registers the AuthAgent capability *before* firing the Start event
-/// (admin_worker.rs::start_link), and starting a non-Inactive link answers
-/// with an `UnexpectedTransition` error after the registration already
-/// happened — so for `auth-agent` that error is benign: the agent is
-/// registered on the running link and must keep serving. Anything else
-/// (e.g. `NotFound`: no such link, so nothing was registered) is fatal.
-pub fn start_link_error_is_fatal(msg: &str) -> bool {
-    !msg.contains("UnexpectedTransition")
-}
-
-/// What a `startLink` error means to `connect`. ph only accepts Start from
-/// Inactive, and registers the agent before firing Start, so every
-/// `UnexpectedTransition` left our agent on the link.
-#[derive(Debug, PartialEq)]
-pub enum StartLinkError {
-    /// The link is tearing down (Closing, Resetting, Disconnecting, Error)
-    /// and will be Inactive shortly: retry Start.
-    TearingDown,
-    /// An attempt is already in flight. It reads the agent at InitAuth, so
-    /// it now authenticates with ours: judge its outcome rather than start
-    /// another attempt, which would prompt the user a second time.
-    InFlight,
-    /// The link is already up.
-    AlreadyActive,
-    /// No agent was registered (e.g. `NotFound`): give up.
-    Fatal,
-}
-
-/// Classify a `startLink` error text for `connect` (zipline#111) by the
-/// state ph reports in `UnexpectedTransition(<state>, "Start")`.
-pub fn classify_start_link_error(msg: &str) -> StartLinkError {
-    let Some((_, state)) = msg.split_once("UnexpectedTransition(") else {
-        return StartLinkError::Fatal;
-    };
-    const TEARDOWN_STATES: [&str; 4] = ["Closing", "Resetting", "Disconnecting", "Error"];
-    if state.starts_with("Active,") {
-        StartLinkError::AlreadyActive
-    } else if TEARDOWN_STATES.iter().any(|s| state.starts_with(s)) {
-        StartLinkError::TearingDown
-    } else {
-        StartLinkError::InFlight
-    }
-}
-
-/// Exit code when `connect` gives up on a `startLink` error instead of
-/// retrying (the deadline expired, or the error class is not retryable).
-pub fn exit_code_for_start_link_giveup(class: &StartLinkError) -> i32 {
-    match class {
-        // The link sat in a teardown state until the deadline expired — the
-        // wedged link CONNECT_DEADLINE exists to catch — so this is the
-        // documented timeout outcome, same as the polling loop's deadline.
-        StartLinkError::TearingDown => 3,
-        _ => 1,
     }
 }
 
@@ -1399,10 +1283,9 @@ mod tests {
         }
     }
 
-    /// The seven `connect` failure classes map onto exit codes 2-7 (and 1
+    /// The five `connect` failure classes map onto exit codes 2-6 (and 1
     /// for anything unrecognized), keyed on the Debug spellings of ph's
-    /// `AuthFailureReason` as printed by `showLink`'s "Last auth failure:"
-    /// line (adapter/ph/src/link_state.rs).
+    /// `AuthFailureReason`, the error text of a failed `login`.
     #[test]
     fn test_reason_to_exit_code() {
         assert_eq!(exit_code_for_auth_failure("UserDeclined"), 2);
@@ -1416,21 +1299,12 @@ mod tests {
             5
         );
         assert_eq!(exit_code_for_auth_failure("PolicyDenied"), 6);
-        assert_eq!(exit_code_for_auth_failure("DeviceBlobRejected"), 7);
-        // Not one of the seven contract classes:
+        // Not one of the five contract classes (DeviceBlobRejected is no
+        // longer a reason ph reports):
+        assert_eq!(exit_code_for_auth_failure("DeviceBlobRejected"), 1);
         assert_eq!(exit_code_for_auth_failure("NoAgent"), 1);
         assert_eq!(exit_code_for_auth_failure("AgentError(\"x\")"), 1);
         assert_eq!(exit_code_for_auth_failure("AuthUnavailable"), 1);
-        // zipline#157: a fatal local activation failure is reported with
-        // its full text ("connect failed: ActivationFailed(...)" names the
-        // failed step) and the generic exit code — it is a host problem,
-        // not one of the authentication outcomes the 2-7 contract covers.
-        assert_eq!(
-            exit_code_for_auth_failure(
-                "ActivationFailed(\"failed to set ZPR address fd5a::1: EPERM\")"
-            ),
-            1
-        );
         assert_eq!(exit_code_for_auth_failure("something else"), 1);
 
         assert_eq!(
@@ -1503,179 +1377,6 @@ mod tests {
             rpc_error_text(&OidcCliError::StateMismatch),
             "state parameter mismatch in authorization redirect"
         );
-    }
-
-    /// `auth-agent` registers by calling startLink; on an already-started
-    /// link ph answers with an UnexpectedTransition error *after* the agent
-    /// was registered, so that error must not be fatal — the task keeps
-    /// serving. Genuinely broken registrations (no such link) are fatal.
-    #[test]
-    fn test_auth_agent_tolerates_already_started_link() {
-        assert!(!start_link_error_is_fatal(
-            "Failed to start link 3: UnexpectedTransition(Keying, \"Start\")\n"
-        ));
-        assert!(!start_link_error_is_fatal(
-            "Failed to start link 3: UnexpectedTransition(Active, \"Start\")\n"
-        ));
-        assert!(start_link_error_is_fatal(
-            "Failed to start link 9: NotFound(9)\n"
-        ));
-        assert!(start_link_error_is_fatal("something unexpected"));
-    }
-
-    /// zipline#111: `connect` fired startLink while the agentless dock link
-    /// was tearing down after a NoAgent failure and exited 1 on the
-    /// UnexpectedTransition. A link tearing down must be retried; an attempt
-    /// already in flight picks up the just-registered agent, so it is judged
-    /// rather than restarted (restarting it would prompt for a second login);
-    /// an already-Active link and a missing link are neither.
-    #[test]
-    fn test_classify_start_link_error() {
-        let classify = |state: &str| {
-            classify_start_link_error(&format!(
-                "Failed to start link 2: UnexpectedTransition({state}, \"Start\")\n"
-            ))
-        };
-        for state in ["Closing", "Resetting", "Disconnecting(Reset)", "Error"] {
-            assert_eq!(classify(state), StartLinkError::TearingDown, "{state}");
-        }
-        for state in [
-            "Keying",
-            "Helloing",
-            "WaitForInitAuth",
-            "RegisterAA",
-            "WaitForAcquireZprAddress",
-            "WaitForUserAuth",
-        ] {
-            assert_eq!(classify(state), StartLinkError::InFlight, "{state}");
-        }
-        assert_eq!(classify("Active"), StartLinkError::AlreadyActive);
-        assert_eq!(
-            classify_start_link_error("Failed to start link 9: NotFound(9)\n"),
-            StartLinkError::Fatal
-        );
-        assert_eq!(
-            classify_start_link_error("something unexpected"),
-            StartLinkError::Fatal
-        );
-    }
-
-    /// PR #38 review (Codex P2): a link that stays in a teardown state until
-    /// `CONNECT_DEADLINE` expires is exactly the wedged-link condition the
-    /// deadline exists to catch, so giving up on `TearingDown` must exit with
-    /// the documented timeout code 3 — the same outcome as the polling loop's
-    /// deadline — not the generic failure code 1. Every other class that
-    /// reaches the give-up path (Fatal, first-call AlreadyActive) stays 1.
-    #[test]
-    fn test_exit_code_for_start_link_giveup() {
-        assert_eq!(
-            exit_code_for_start_link_giveup(&StartLinkError::TearingDown),
-            3
-        );
-        for class in [
-            StartLinkError::InFlight,
-            StartLinkError::AlreadyActive,
-            StartLinkError::Fatal,
-        ] {
-            assert_eq!(exit_code_for_start_link_giveup(&class), 1, "{class:?}");
-        }
-    }
-
-    /// Pure parser over the `showLink` result text, matching what ph's
-    /// Display impls actually print: the link's `  State: {:?} (for {:?})`,
-    /// the actor's `  Actor state: {:?}` and, when set,
-    /// `  Last auth failure: {:?}`.
-    #[test]
-    fn test_parse_show_link_state() {
-        // Success is the actor being authorized, not the link being Active.
-        assert_eq!(
-            parse_show_link_state(
-                "  Type: AdapterToNode\n  State: Active (for 1.2s)\n  Actor state: Authorized\n"
-            ),
-            LinkOutcome::Up
-        );
-        for actor in [
-            "WaitingForLink",
-            "RequestingAuthentication",
-            "Authenticating",
-            "AcquiringAddress",
-        ] {
-            assert_eq!(
-                parse_show_link_state(&format!(
-                    "  State: Active (for 1.2s)\n  Actor state: {actor}\n"
-                )),
-                LinkOutcome::Pending,
-                "{actor}"
-            );
-        }
-        assert_eq!(
-            parse_show_link_state(
-                "  State: Active (for 1s)\n  Actor state: Rejected\n  Last auth failure: InteractionTimeout\n"
-            ),
-            LinkOutcome::Failed("InteractionTimeout".to_string())
-        );
-        assert_eq!(
-            parse_show_link_state(
-                "  State: Active (for 1s)\n  Actor state: RetryBackoff\n  Last auth failure: IdpUnreachable(\"conn refused\")\n"
-            ),
-            LinkOutcome::Failed("IdpUnreachable(\"conn refused\")".to_string())
-        );
-        // A link in Error with no recorded reason still terminates the wait.
-        assert_eq!(
-            parse_show_link_state("  State: Error (for 3ms)\n  Actor state: WaitingForLink\n"),
-            LinkOutcome::Failed(String::new())
-        );
-        assert_eq!(
-            parse_show_link_state("  State: Keying (for 10ms)\n  Actor state: WaitingForLink\n"),
-            LinkOutcome::Pending
-        );
-    }
-
-    /// Link teardown resets the actor to WaitingForLink but keeps the
-    /// recorded failure, which ph clears only when `connect` starts the link
-    /// again; so a teardown with a reason is this attempt's terminal outcome,
-    /// and one without is an ordinary stop/restart.
-    #[test]
-    fn test_parse_show_link_state_teardown_with_reason_is_terminal() {
-        for state in ["Closing", "Inactive", "Resetting", "Disconnecting(Other)"] {
-            assert_eq!(
-                parse_show_link_state(&format!(
-                    "  State: {state} (for 3ms)\n  Actor state: WaitingForLink\n  Last auth failure: ActivationFailed(\"x\")\n"
-                )),
-                LinkOutcome::Failed("ActivationFailed(\"x\")".to_string()),
-                "teardown state {state} with a recorded failure must be terminal"
-            );
-        }
-        assert_eq!(
-            parse_show_link_state("  State: Closing (for 3ms)\n  Actor state: WaitingForLink\n"),
-            LinkOutcome::Pending
-        );
-        // A reason next to an attempt in progress is not an outcome
-        // (defense in depth: ph clears it when connect starts the link).
-        assert_eq!(
-            parse_show_link_state(
-                "  State: Active (for 10s)\n  Actor state: Authenticating\n  Last auth failure: NoAgent\n"
-            ),
-            LinkOutcome::Pending
-        );
-    }
-
-    /// With auto-connect off, ph records `LinkFailed(..)` when a manually
-    /// started link dies before authentication (e.g. a Helloing timeout), so
-    /// the permanently Inactive link reads as this attempt's terminal
-    /// failure — not Pending, which would leave `connect` polling a link
-    /// that will never recover. Exit code is the generic 1.
-    #[test]
-    fn test_parse_show_link_state_manual_pre_auth_failure_is_terminal() {
-        let reason =
-            "LinkFailed(\"link failed before authentication completed (RequestTimedOut)\")";
-        assert_eq!(
-            parse_show_link_state(&format!(
-                "  State: Inactive (for 3ms)\n  Actor state: WaitingForLink\n  Last auth failure: {reason}\n"
-            )),
-            LinkOutcome::Failed(reason.to_string())
-        );
-        assert_eq!(exit_code_for_auth_failure(reason), 1);
     }
 
     /// Build an in-process Cap'n Proto client for [CliAuthAgent] with a

@@ -37,7 +37,7 @@
 use crate::km::*;
 use crate::km_cert_exchange::KmCertExchange;
 use crate::logging::targets::KEY_MGMT;
-use crate::pki::NOISE_KEY_LEN;
+use crate::pki::{self, NOISE_KEY_LEN};
 use crate::prelude::*;
 use base64::prelude::*;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -53,6 +53,23 @@ const MSG_BUF_SIZE: usize = 4096;
 /// Will transition to error state if we are handshake initator and do not get
 /// a handshake response within this time.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The plaintext payload a dialing Zode puts in the first Noise XX message of
+/// a Zode link (zl-zipline#250). The node it reaches reads it before any link
+/// exists, so it can create a Zode link instead of an adapter dock (see
+/// `mgmt::dispatch`). Noise mixes the payload into the handshake hash, so a
+/// marker changed in transit makes the handshake fail. Adding the marker gains
+/// an attacker nothing: a Zode link then demands a CA-signed certificate
+/// whose CN passes the acceptance rules.
+pub const ZODE_HANDSHAKE_MARKER: &[u8] = b"ZODE1";
+
+/// Whether `noise_msg` is the first message of a Zode handshake. The first
+/// Noise XX message is the initiator's ephemeral public key followed by its
+/// plaintext payload, which for a Zode is exactly [ZODE_HANDSHAKE_MARKER].
+pub fn starts_zode_handshake(noise_msg: &[u8]) -> bool {
+    noise_msg.len() == NOISE_KEY_LEN + ZODE_HANDSHAKE_MARKER.len()
+        && noise_msg.ends_with(ZODE_HANDSHAKE_MARKER)
+}
 
 const NOISE_NONCE_LEN: usize = 8;
 pub const NOISE_PADLEN: usize = 16 + NOISE_NONCE_LEN; // 16 byte tag + 8 byte nonce
@@ -75,6 +92,9 @@ pub struct KmNoise {
     /// Should we abort if we cannot verify the certificate received from the peer?
     /// (Has no effect if the KmCertificateExchange is not configured for validation.)
     verify_cert: bool,
+    /// Zode link (zl-zipline#220): the peer must present a certificate signed
+    /// by our CA, whichever end we are. Set only by [KmNoise::new_zode].
+    strict: bool,
     local_keypair: NoiseKeypair,
     hs_sent_t: Option<Instant>,
     hs_state: Option<snow::HandshakeState>,
@@ -216,6 +236,7 @@ impl KmNoise {
             msg_nr: 0,
             initiate,
             verify_cert,
+            strict: false,
             local_keypair: kp,
             hs_sent_t: None,
             hs_state: None,
@@ -248,6 +269,9 @@ impl KmNoise {
                     return Err(KmError::CertExchangeError);
                 }
             };
+        } else if self.msg_nr == 0 && self.strict && self.initiate {
+            // A dialing Zode announces a Zode link (zl-zipline#250).
+            payload_buf.put_slice(ZODE_HANDSHAKE_MARKER);
         }
 
         let mut buf = BytesMut::zeroed(MSG_BUF_SIZE);
@@ -262,6 +286,47 @@ impl KmNoise {
                 Err(KmError::HandshakeError)
             }
         }
+    }
+
+    /// Create the Noise KeyManager for a Zode-to-Zode link (zl-zipline#220).
+    ///
+    /// Both ends verify: the handshake aborts unless the peer presents a
+    /// certificate signed by our CA whose key is the peer's Noise static key.
+    /// A Zode without a CA certificate cannot link at all, so this returns
+    /// [KmError::ConfigurationError] when `certx` has no authority certificate.
+    pub fn new_zode(
+        initiate: bool,
+        local_keypair: NoiseKeypair,
+        zpis: ZPIPair,
+        certx: KmCertExchange,
+    ) -> Result<Self, KmError> {
+        if !certx.requires_verification() {
+            error!(target: KEY_MGMT, "noise: no CA certificate configured; refusing to start a Zode link");
+            return Err(KmError::ConfigurationError);
+        }
+        let mut noise = KmNoise::new(initiate, true, Some(local_keypair), zpis, certx)?;
+        noise.strict = true;
+        Ok(noise)
+    }
+
+    /// Check the certificate the peer presented during the handshake.
+    /// Returns the reason for refusing it, if any.
+    fn check_peer_cert(&self) -> Result<(), &'static str> {
+        let verified = self.peer_cert.as_ref().is_some_and(|c| c.is_verified());
+        if self.strict {
+            return match &self.peer_cert {
+                None => Err("peer presented no certificate, which a Zode link requires"),
+                Some(_) if !verified => Err("peer certificate is not signed by our CA"),
+                Some(c) if !pki::is_valid_at(c.get_cert(), std::time::SystemTime::now()) => {
+                    Err("peer certificate is outside its validity period")
+                }
+                Some(_) => Ok(()),
+            };
+        }
+        if self.verify_cert && self.certx.requires_verification() && !verified {
+            return Err("unable to verify remote certificate");
+        }
+        Ok(())
     }
 
     fn parse_km_payload(&mut self, payload: &[u8], peer_public_key: &[u8]) -> KmResult<()> {
@@ -523,21 +588,21 @@ impl KeyManagerStateMachine for KmNoise {
                     };
                     match self.parse_km_payload(&payload[..len], peer_pubkey) {
                         Ok(_) => {
-                            if self.verify_cert
-                                && self.certx.requires_verification()
-                                && !self.peer_cert.as_ref().is_some_and(|c| c.is_verified())
-                            {
-                                error!(target: KEY_MGMT, "noise: unable to verify remote certificate; aborting handshake");
+                            if let Err(reason) = self.check_peer_cert() {
+                                error!(target: KEY_MGMT, "noise: {reason}; aborting handshake");
                                 self.state = KmSMState::Error;
                                 self.hs_state = Some(hs);
                                 return Err(KmError::CertExchangeError);
                             }
                         }
 
-                        Err(_) => {
+                        // A certificate problem (e.g. its key is not the peer's
+                        // static key) stays a CertExchangeError so callers can
+                        // tell it from a malformed handshake.
+                        Err(e) => {
                             self.state = KmSMState::Error;
                             self.hs_state = Some(hs);
-                            return Err(KmError::HandshakeError);
+                            return Err(e);
                         }
                     }
                 }
@@ -1269,5 +1334,285 @@ mod test {
 
         assert_eq!(len.unwrap(), 32);
         assert_eq!(message, payload);
+    }
+
+    // ---- Zode links (zl-zipline#220): both ends verify the peer certificate. ----
+    //
+    // The checked-in km_testdata certificates have expired, and Zode links
+    // refuse expired certificates, so these tests issue certificates from a
+    // throwaway CA (pki::TestCa).
+
+    use x509_cert::time::{Time, Validity};
+
+    /// A validity window from `start` to `end`, each an offset from now
+    /// (negative = in the past).
+    fn validity(start_secs: i64, end_secs: i64) -> Validity {
+        let at = |offset: i64| {
+            let now = std::time::SystemTime::now();
+            let t = if offset < 0 {
+                now - Duration::from_secs(offset.unsigned_abs())
+            } else {
+                now + Duration::from_secs(offset as u64)
+            };
+            Time::try_from(t).unwrap()
+        };
+        Validity::new(at(start_secs), at(end_secs))
+    }
+
+    /// A day-long window around now.
+    fn valid_now() -> Validity {
+        validity(-3600, 86400)
+    }
+
+    /// A Zode's certificate exchange: a certificate for `kp` named `cn`,
+    /// issued by `issuer` over `window`, trusting `trusted` as its CA.
+    fn zode_certx(
+        issuer: &pki::TestCa,
+        trusted: &pki::TestCa,
+        cn: &str,
+        kp: &NoiseKeypair,
+        window: Validity,
+    ) -> KmCertExchange {
+        KmCertExchange::new(
+            Some(issuer.issue(cn, kp, window)),
+            Some(trusted.cert.clone()),
+        )
+    }
+
+    /// A Zode link end with a certificate from `issuer`, trusting `trusted`.
+    fn zode_end(
+        initiate: bool,
+        issuer: &pki::TestCa,
+        trusted: &pki::TestCa,
+        cn: &str,
+        window: Validity,
+    ) -> KmNoise {
+        let kp = NoiseKeypair::generate();
+        let certx = zode_certx(issuer, trusted, cn, &kp, window);
+        let zpis = if initiate {
+            ZPIPair::new(1, 2)
+        } else {
+            ZPIPair::new(3, 4)
+        };
+        KmNoise::new_zode(initiate, kp, zpis, certx).unwrap()
+    }
+
+    /// Which end of a Zode handshake refused, if any.
+    #[derive(Debug, PartialEq)]
+    enum ZodeHandshakeOutcome {
+        Completed,
+        /// The initiator refused message 1 (the responder's certificate).
+        InitiatorRefused,
+        /// The responder refused message 2 (the initiator's certificate).
+        ResponderRefused,
+    }
+
+    /// Drive the three Noise XX messages between `initiator` and `responder`
+    /// and report which end, if any, aborted with `CertExchangeError`.
+    fn run_zode_handshake(
+        initiator: &mut KmNoise,
+        responder: &mut KmNoise,
+    ) -> ZodeHandshakeOutcome {
+        let msg0 = initiator.reset().unwrap().unwrap();
+        assert!(responder.reset().unwrap().is_none());
+        let msg1 = responder
+            .handle_message(&msg0, KM_ID_NOISE)
+            .unwrap()
+            .unwrap();
+        let msg2 = match initiator.handle_message(&msg1, KM_ID_NOISE) {
+            Ok(m) => m.unwrap(),
+            Err(KmError::CertExchangeError) => {
+                assert_eq!(initiator.get_state(), KmSMState::Error);
+                return ZodeHandshakeOutcome::InitiatorRefused;
+            }
+            Err(e) => panic!("initiator failed with unexpected error {e:?}"),
+        };
+        match responder.handle_message(&msg2, KM_ID_NOISE) {
+            Ok(None) => ZodeHandshakeOutcome::Completed,
+            Ok(Some(_)) => panic!("responder sent an unexpected 4th message"),
+            Err(KmError::CertExchangeError) => {
+                assert_eq!(responder.get_state(), KmSMState::Error);
+                ZodeHandshakeOutcome::ResponderRefused
+            }
+            Err(e) => panic!("responder failed with unexpected error {e:?}"),
+        }
+    }
+
+    /// Two Zodes with certificates from the network CA link, and each holds
+    /// the other's verified certificate.
+    #[test]
+    fn test_zode_handshake_both_ends_verified() {
+        let ca = pki::TestCa::new("zode-ca");
+        let mut initiator = zode_end(true, &ca, &ca, "a.zpr", valid_now());
+        let mut responder = zode_end(false, &ca, &ca, "b.zpr", valid_now());
+        assert_eq!(
+            run_zode_handshake(&mut initiator, &mut responder),
+            ZodeHandshakeOutcome::Completed
+        );
+        let (KmSMState::Transport(i), KmSMState::Transport(r)) =
+            (initiator.get_state(), responder.get_state())
+        else {
+            panic!("both ends should be in transport state");
+        };
+        assert_eq!(
+            i.peer_cert.and_then(|c| c.common_name()).as_deref(),
+            Some("b.zpr")
+        );
+        assert!(r.peer_cert.is_some_and(|c| c.is_verified()));
+    }
+
+    /// A dialing Zode marks the first message of its handshake, so the
+    /// node it reaches can tell a Zode link from an adapter dock before
+    /// keying (zl-zipline#250).
+    #[test]
+    fn test_zode_initiator_marks_first_message() {
+        let ca = pki::TestCa::new("zode-ca");
+        let mut initiator = zode_end(true, &ca, &ca, "a.zpr", valid_now());
+        let msg0 = initiator.reset().unwrap().unwrap();
+        assert!(starts_zode_handshake(&msg0));
+    }
+
+    /// An adapter's first handshake message carries no marker, and empty
+    /// or short input is never a Zode handshake.
+    #[test]
+    fn test_unmarked_first_messages_are_not_zode_handshakes() {
+        let ca = pki::TestCa::new("zode-ca");
+        let mut adapter = KmNoise::new(
+            true,
+            true,
+            None,
+            ZPIPair::new(1, 2),
+            KmCertExchange::new(None, Some(ca.cert.clone())),
+        )
+        .unwrap();
+        let msg0 = adapter.reset().unwrap().unwrap();
+        assert!(!starts_zode_handshake(&msg0));
+        assert!(!starts_zode_handshake(&[]));
+        assert!(!starts_zode_handshake(ZODE_HANDSHAKE_MARKER));
+        assert!(!starts_zode_handshake(&msg0[..NOISE_KEY_LEN]));
+    }
+
+    /// The marker is part of the handshake hash: a responder that reads a
+    /// first message whose marker was changed in transit cannot complete
+    /// the handshake with the initiator.
+    #[test]
+    fn test_changed_marker_breaks_the_handshake() {
+        let ca = pki::TestCa::new("zode-ca");
+        let mut initiator = zode_end(true, &ca, &ca, "a.zpr", valid_now());
+        let mut responder = zode_end(false, &ca, &ca, "b.zpr", valid_now());
+        let mut msg0 = initiator.reset().unwrap().unwrap().to_vec();
+        *msg0.last_mut().unwrap() ^= 0x01;
+        assert!(responder.reset().unwrap().is_none());
+        let msg1 = responder
+            .handle_message(&msg0, KM_ID_NOISE)
+            .unwrap()
+            .unwrap();
+        assert!(initiator.handle_message(&msg1, KM_ID_NOISE).is_err());
+    }
+
+    /// The responder refuses an initiator that presents no certificate.
+    #[test]
+    fn test_zode_responder_refuses_certless_initiator() {
+        let ca = pki::TestCa::new("zode-ca");
+        // A peer with the CA but no certificate of its own (sends an empty payload).
+        let mut initiator = KmNoise::new(
+            true,
+            true,
+            None,
+            ZPIPair::new(1, 2),
+            KmCertExchange::new(None, Some(ca.cert.clone())),
+        )
+        .unwrap();
+        let mut responder = zode_end(false, &ca, &ca, "b.zpr", valid_now());
+        assert_eq!(
+            run_zode_handshake(&mut initiator, &mut responder),
+            ZodeHandshakeOutcome::ResponderRefused
+        );
+    }
+
+    /// The responder refuses a certificate that our CA did not sign.
+    #[test]
+    fn test_zode_responder_refuses_other_ca() {
+        let ca = pki::TestCa::new("zode-ca");
+        let other = pki::TestCa::new("other-ca");
+        // Signed by another CA, but trusting ours: our responder refuses it.
+        let mut initiator = zode_end(true, &other, &ca, "intruder.zpr", valid_now());
+        let mut responder = zode_end(false, &ca, &ca, "b.zpr", valid_now());
+        assert_eq!(
+            run_zode_handshake(&mut initiator, &mut responder),
+            ZodeHandshakeOutcome::ResponderRefused
+        );
+    }
+
+    /// The initiator refuses a responder certificate that our CA did not sign.
+    #[test]
+    fn test_zode_initiator_refuses_other_ca() {
+        let ca = pki::TestCa::new("zode-ca");
+        let other = pki::TestCa::new("other-ca");
+        let mut initiator = zode_end(true, &ca, &ca, "a.zpr", valid_now());
+        let mut responder = zode_end(false, &other, &ca, "intruder.zpr", valid_now());
+        assert_eq!(
+            run_zode_handshake(&mut initiator, &mut responder),
+            ZodeHandshakeOutcome::InitiatorRefused
+        );
+    }
+
+    /// A certificate whose key is not the peer's Noise static key is refused.
+    #[test]
+    fn test_zode_responder_refuses_key_mismatch() {
+        let ca = pki::TestCa::new("zode-ca");
+        // A valid certificate for one key, presented with a different static key.
+        let certx = zode_certx(&ca, &ca, "a.zpr", &NoiseKeypair::generate(), valid_now());
+        let mut initiator =
+            KmNoise::new_zode(true, NoiseKeypair::generate(), ZPIPair::new(1, 2), certx).unwrap();
+        let mut responder = zode_end(false, &ca, &ca, "b.zpr", valid_now());
+        assert_eq!(
+            run_zode_handshake(&mut initiator, &mut responder),
+            ZodeHandshakeOutcome::ResponderRefused
+        );
+    }
+
+    /// A CA-signed certificate outside its validity window is refused,
+    /// whether it has expired or is not valid yet (core#102 review).
+    #[test]
+    fn test_zode_refuses_certificate_outside_validity() {
+        let ca = pki::TestCa::new("zode-ca");
+        for (label, window) in [
+            ("expired", validity(-86400, -60)),
+            ("not yet valid", validity(3600, 86400)),
+        ] {
+            let mut initiator = zode_end(true, &ca, &ca, "a.zpr", window);
+            let mut responder = zode_end(false, &ca, &ca, "b.zpr", valid_now());
+            assert_eq!(
+                run_zode_handshake(&mut initiator, &mut responder),
+                ZodeHandshakeOutcome::ResponderRefused,
+                "{label} initiator certificate"
+            );
+        }
+        let mut initiator = zode_end(true, &ca, &ca, "a.zpr", valid_now());
+        let mut responder = zode_end(false, &ca, &ca, "b.zpr", validity(-86400, -60));
+        assert_eq!(
+            run_zode_handshake(&mut initiator, &mut responder),
+            ZodeHandshakeOutcome::InitiatorRefused,
+            "expired responder certificate"
+        );
+    }
+
+    /// A Zode without a CA certificate cannot start a Zode link at all.
+    #[test]
+    fn test_zode_link_requires_local_ca() {
+        let ca = pki::TestCa::new("zode-ca");
+        let kp = NoiseKeypair::generate();
+        let own_cert = ca.issue("b.zpr", &kp, valid_now());
+        match KmNoise::new_zode(
+            false,
+            kp,
+            ZPIPair::new(3, 4),
+            KmCertExchange::new(Some(own_cert), None),
+        ) {
+            Err(KmError::ConfigurationError) => {}
+            Ok(_) => panic!("a Zode link without a CA must be refused"),
+            Err(e) => panic!("expected ConfigurationError, got {e:?}"),
+        }
     }
 }

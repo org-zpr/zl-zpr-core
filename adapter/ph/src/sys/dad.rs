@@ -1,5 +1,5 @@
 //! Waiting out IPv6 duplicate-address detection on a freshly added address
-//! (zipline#162, checklist item 1 of `integration-test/windows-node-test.md`).
+//! (zipline#162, checklist item 1 of `integration-test/windows-zode-test.md`).
 //!
 //! Windows runs DAD on the Wintun adapter: an address added with `netsh`
 //! sits in the *tentative* state for about a second (`DadTransmits` = 1,
@@ -11,7 +11,7 @@
 //!
 //! This module is the platform-neutral half: the DAD-state model and the
 //! polling loop. It is compiled on every OS so it stays unit-testable from
-//! Linux builds (same pattern as `macos_route`); only Windows calls it at
+//! Linux builds (same pattern as `macos_ifconfig`); only Windows calls it at
 //! runtime, supplying a probe that reads the state through IP Helper.
 
 use std::io::{Error, ErrorKind, Result};

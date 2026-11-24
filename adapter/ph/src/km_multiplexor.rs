@@ -189,50 +189,24 @@ pub async fn launch_message_worker(
     }
 }
 
-/// Creates a new KeyManager for the link from an adapter to a node and starts its state machine.  An adapter link will
-/// initiate the KM exchange with its peer.
+/// Creates a new KeyManager for a link between two Zodes and starts its state machine (zl-zipline#220).
 ///
+/// Both ends verify: each requires the
+/// peer to present a certificate signed by our CA whose key is the peer's
+/// Noise static key. A Zode without a CA certificate cannot start the link.
 ///
-/// - `link_id` is the link to the peer, in this case better be a link to a node.
-///
-/// Note that the link must already have a peer_table entry.
-///
-/// TODO the functionr requires local_noise_key and peer_noise_key
-/// even if the system is running with the null km
-pub fn add_adapter_link(
+/// - `link_id` is the link to the peer Zode; it must already have a peer_table entry.
+/// - `initiate` is true on the end that dialed the link.
+pub fn add_zode_link(
     asm: &Assembly,
     link_id: LinkId,
+    initiate: bool,
     recv_zpis: ZPIPair,
     local_noise_key: NoiseKeypair,
     certx: KmCertExchange,
 ) -> Result<(), KmSetupError> {
-    let noise = match KmNoise::new(true, true, Some(local_noise_key), recv_zpis, certx) {
-        Ok(n) => n,
-        Err(e) => {
-            return Err(KmSetupError::InitializationError(e));
-        }
-    };
-    add_noise_link(asm, link_id, noise)
-}
-
-/// Creates a new KeyManager for the link from a node to an adapter and starts its state machine.  A node link waits for a
-/// KM initiator.
-///
-/// - `link_id` is the link to the peer, in this case better be a link to an adapter.
-/// - `local_noise_key` is the local noise key for the dock (public part of this key must be shared out of band with adapters).
-///
-/// Note that the link must already have a peer_table entry.
-pub fn add_node_link(
-    asm: &Assembly,
-    link_id: LinkId,
-    recv_zpis: ZPIPair,
-    local_noise_key: NoiseKeypair,
-    certx: KmCertExchange,
-) -> Result<(), KmSetupError> {
-    let noise = match KmNoise::new(false, false, Some(local_noise_key), recv_zpis, certx) {
-        Ok(n) => n,
-        Err(e) => return Err(KmSetupError::InitializationError(e)),
-    };
+    let noise = KmNoise::new_zode(initiate, local_noise_key, recv_zpis, certx)
+        .map_err(KmSetupError::InitializationError)?;
     add_noise_link(asm, link_id, noise)
 }
 
@@ -329,11 +303,9 @@ mod test {
 
     use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
     use crate::km::KmLinkMsg;
-    use crate::km_testdata::test::*;
     use crate::link_state::LinkType;
     use crate::mgmt_processor_worker;
     use crate::peer_table;
-    use base64::prelude::*;
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
     use tokio::task::{self, yield_now};
@@ -343,25 +315,10 @@ mod test {
 
     #[tokio::test]
     async fn test_km_multiplexor_updates_assembly_state() {
-        let adapter_kp = NoiseKeypair::new(
-            BASE64_STANDARD
-                .decode(ADAPTER_NOISE_KEY)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
-
-        let node_kp = NoiseKeypair::new(
-            BASE64_STANDARD
-                .decode(NODE_NOISE_KEY)
-                .unwrap()
-                .try_into()
-                .unwrap(),
-        );
-
-        let adapter_exchanger =
-            KmCertExchange::new_from_pem(ADAPTER_CERT_DATA, CA_CERT_DATA).unwrap();
-        let node_exchanger = KmCertExchange::new_from_pem(NODE_CERT_DATA, CA_CERT_DATA).unwrap();
+        // Both Zodes hold CA-signed link keys, as a Zode link requires.
+        let ca = crate::pki::TestCa::new("km-ca");
+        let (dialer_kp, dialer_exchanger) = crate::assembly::test::zode_link_keys(&ca, "a.zpr");
+        let (node_kp, node_exchanger) = crate::assembly::test::zode_link_keys(&ca, "b.zpr");
 
         let (km_sig_tx, km_sig_rx) = mpsc::channel(4);
         let (km_tx, mut km_rx) = mpsc::channel(4);
@@ -380,8 +337,8 @@ mod test {
         let local = task::LocalSet::new();
         local
             .run_until(async move {
-                // add a fake adapter.
-                let adapter_link_id: LinkId;
+                // add a Zode link that this Zode dials.
+                let dialer_link_id: LinkId;
                 {
                     let entry = asm.peer_table.vacant_entry().unwrap();
 
@@ -395,22 +352,23 @@ mod test {
 
                     let peer_state = peer_table::PeerState::new(
                         entry.key(),
-                        LinkType::NodeToAdapter,
+                        LinkType::NodeToNode,
                         fake_sa,
                         fake_intf_addr,
                         |q| mgmt_processor_worker::launch(worker_config, asm.clone(), q),
                     );
 
-                    adapter_link_id = entry.insert(peer_state).get();
+                    dialer_link_id = entry.insert(peer_state).get();
                 }
 
                 // Adding a link starts a KM
-                add_adapter_link(
+                add_zode_link(
                     &asm,
-                    adapter_link_id,
+                    dialer_link_id,
+                    true,
                     ZPIPair::new(1, 2),
-                    adapter_kp,
-                    adapter_exchanger,
+                    dialer_kp,
+                    dialer_exchanger,
                 )
                 .unwrap();
 
@@ -420,13 +378,13 @@ mod test {
                 tokio::spawn(launch_signal_worker(asm.clone(), km_sig_rx));
                 yield_now().await;
 
-                // An adapter should send a KM message over link 1.
+                // The dialer should send a KM message over link 1.
                 let handshake_req: Bytes;
                 match timeout(Duration::from_secs(2), km_rx.recv()).await {
                     Ok(resp) => match resp {
                         Some(KmLinkMsg { link_id, msg }) => {
-                            assert_eq!(link_id, adapter_link_id);
-                            assert_eq!(msg.len(), 32);
+                            assert_eq!(link_id, dialer_link_id);
+                            assert!(!msg.is_empty()); // handshake message 1
                             handshake_req = msg;
                         }
                         None => panic!("Expected KMLinkMessage message"),
@@ -438,19 +396,13 @@ mod test {
                 {
                     assert!(
                         !asm.peer_table
-                            .is_security_association_established(adapter_link_id)
+                            .is_security_association_established(dialer_link_id)
                     )
                 }
 
-                // Pretend to be a node and send back a valid reply.
-                let mut responder = KmNoise::new(
-                    false,
-                    false,
-                    Some(node_kp),
-                    ZPIPair::new(3, 4),
-                    node_exchanger,
-                )
-                .unwrap();
+                // Pretend to be the answering Zode and send back a valid reply.
+                let mut responder =
+                    KmNoise::new_zode(false, node_kp, ZPIPair::new(3, 4), node_exchanger).unwrap();
                 match responder.reset() {
                     Ok(Some(_m)) => panic!("unexpected message from responder.reset!"),
                     Ok(None) => {} // good
@@ -471,17 +423,17 @@ mod test {
                 };
 
                 // Now send the reply back into our link.
-                handle_inbound_km_msg(&asm, adapter_link_id, &handshake_reply).unwrap();
+                handle_inbound_km_msg(&asm, dialer_link_id, &handshake_reply).unwrap();
 
                 yield_now().await;
 
-                // The adapter should now reply.
+                // The dialer should now reply.
                 let handshake_req2: Bytes;
                 match timeout(Duration::from_secs(2), km_rx.recv()).await {
                     Ok(resp) => match resp {
                         Some(KmLinkMsg { link_id, msg }) => {
-                            assert_eq!(link_id, adapter_link_id);
-                            assert_eq!(msg.len(), 881); // should be a KM payload
+                            assert_eq!(link_id, dialer_link_id);
+                            assert!(!msg.is_empty()); // handshake message 2
                             handshake_req2 = msg;
                         }
                         None => panic!("Expected KMLinkMessage message"),
@@ -503,11 +455,11 @@ mod test {
                 {
                     assert!(
                         asm.peer_table
-                            .is_security_association_established(adapter_link_id)
+                            .is_security_association_established(dialer_link_id)
                     )
                 }
 
-                drop_link(&asm, adapter_link_id).await;
+                drop_link(&asm, dialer_link_id).await;
             })
             .await;
     }

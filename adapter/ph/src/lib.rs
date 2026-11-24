@@ -9,7 +9,6 @@ pub mod packet;
 pub mod queues;
 
 // Public modules
-pub mod actor_activation;
 pub mod actor_auth;
 pub mod actor_renewal;
 pub mod adapter_manager_worker;
@@ -18,6 +17,7 @@ pub mod address_pool;
 pub mod admin_worker;
 pub mod auth;
 pub mod auth_agent;
+pub mod bootstrap_handoff;
 pub mod capture_worker;
 pub mod classifier;
 pub mod compress;
@@ -45,7 +45,6 @@ pub mod pki;
 pub mod prelude;
 pub mod sample_ring;
 pub mod signal_worker;
-pub mod special_peers;
 pub mod sys;
 pub mod tc;
 pub mod test_packet;
@@ -60,10 +59,16 @@ pub mod zdp;
 pub mod zdp_ll;
 pub mod zdpr;
 pub mod zdpr_worker;
+pub mod zode_link_record;
+pub mod zode_links;
+pub mod zode_login;
 pub mod zprtun;
 
 #[cfg(test)]
 mod km_testdata;
+
+#[cfg(test)]
+mod fake_vs;
 
 /// Re-export test modules for fuzzing when feature is enabled
 #[cfg(feature = "fuzzing")]

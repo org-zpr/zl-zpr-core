@@ -8,115 +8,66 @@ use clap::Parser;
 use std::io::Read;
 use std::path::{self, Path};
 
-use crate::assembly::PhMode;
 use crate::main_args::{ArgsError, Command, Control};
 
-use crate::config::{AdapterConfig, Config, NodeConfig};
+use crate::config::{Config, NodeConfig};
 
 /// Parse the program arguments, may also parse a configuration file if that has been
-/// specified in the arguments.  If all goes well this returns a valid configuration
-/// and "mode" for the program.
+/// specified in the arguments.  If all goes well this returns a valid Zode
+/// configuration.
 ///
-/// The configuration returned will have the correct contents for the [PhMode], but
-/// additional checking is still necessary.  For example, file paths specified
+/// Additional checking is still necessary.  For example, file paths specified
 /// may not actually exist.
 ///
 /// # Arguments
 ///
 /// `args` - Optional vector of strings representing the command line arguments.
 /// If None we parse from `std::env::args_os()`.
-pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config), ArgsError> {
-    let mut config: Config;
-    let ph_mode: PhMode;
+pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<Config, ArgsError> {
     let control = match args {
         Some(args) => Control::parse_from(args),
         None => Control::parse(),
     };
 
-    match control.command {
-        Command::Adapter {
-            name,
-            config_file,
-            common,
-            node_addr,
-            bootstrap_key,
-            auto_connect,
-        } => {
-            ph_mode = PhMode::Adapter;
-            let config_file: Option<AdapterConfig> = match config_file {
-                Some(p) => match load_config::<AdapterConfig>(&p) {
-                    Ok(mut ac) => {
-                        ac.config_path = path::absolute(&p).or_else(|e| {
-                            Err(ArgsError::PathError(format!(
-                                "path error for config file: {:?}",
-                                e
-                            )))
-                        })?;
-                        Some(ac)
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
-                },
-                None => None,
-            };
+    // `zode` is the only subcommand (zl-zipline#234).
+    let Command::Zode {
+        config_file,
+        auth_private_key,
+        forwarding,
+        initial_link,
+        relay,
+        common,
+    } = control.command;
 
-            config = Config::new_for_adapter(config_file, &common)?;
-
-            // fold in the optional, adapter specific command line args:
-            if let Some(cn) = name {
-                config.name = cn;
-            }
-            if let Some(node_addr) = node_addr {
-                config.node_addr = Some(node_addr);
-            }
-            if let Some(bootstrap_key) = bootstrap_key {
-                config.bootstrap_key_path = Some(path::absolute(bootstrap_key).or_else(|e| {
-                    Err(ArgsError::PathError(format!(
-                        "path error for bootstrap key: {:?}",
-                        e
-                    )))
-                })?);
-            }
-            // Command line overrides the config file; an omitted flag
-            // preserves the config file value (or the default, true).
-            if let Some(auto_connect) = auto_connect {
-                config.auto_connect = auto_connect;
-            }
+    let config_file: Option<NodeConfig> = match config_file {
+        Some(p) => {
+            let mut nc = load_config::<NodeConfig>(&p)?;
+            nc.config_path = path::absolute(&p).or_else(|e| {
+                Err(ArgsError::PathError(format!(
+                    "path error for config file: {:?}",
+                    e
+                )))
+            })?;
+            // A flag below replaces this file value, so new_for_node
+            // must not validate it (zl-zipline#278 review).
+            nc.drop_node_values_replaced_by_flags(initial_link.is_some());
+            Some(nc)
         }
-
-        Command::Node {
-            config_file,
-            auth_private_key,
-            advertised_substrate_addr,
-            common,
-        } => {
-            ph_mode = PhMode::Node;
-            let config_file: Option<NodeConfig> = match config_file {
-                Some(p) => match load_config::<NodeConfig>(&p) {
-                    Ok(mut ac) => {
-                        ac.config_path = path::absolute(&p).or_else(|e| {
-                            Err(ArgsError::PathError(format!(
-                                "path error for config file: {:?}",
-                                e
-                            )))
-                        })?;
-                        Some(ac)
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
-                },
-                None => None,
-            };
-            config = Config::new_for_node(config_file, auth_private_key, &common)?;
-            // Command line overrides the config file.
-            if let Some(advertised) = advertised_substrate_addr {
-                config.set_advertised_substrate_addr(&advertised)?;
-            }
-        }
+        None => None,
+    };
+    let mut config = Config::new_for_node(config_file, auth_private_key, &common)?;
+    // Command line overrides the config file.
+    // An omitted flag preserves the config file value (or the
+    // default, false).
+    if let Some(forwarding) = forwarding {
+        config.forwarding = forwarding;
     }
-    config.finalize()?;
+    if let Some(spec) = initial_link {
+        config.initial_link = Some(crate::config::InitialLink::parse_cli(&spec)?);
+    }
+    if let Some(relay) = relay {
+        config.relay = relay;
+    }
     // zipline#39: resolve the invoking user (sudo/pkexec), fold it into the
     // config (derived socket paths become per-uid) and create the per-owner
     // socket directories before validation, so check_valid's parent-directory
@@ -126,13 +77,11 @@ pub fn argparse(args: Option<Vec<&str>>) -> std::result::Result<(PhMode, Config)
     }));
     #[cfg(unix)]
     config.prepare_socket_dirs()?;
-    if let Err(e) = config.check_valid(ph_mode) {
-        return Err(e);
-    }
-    Ok((ph_mode, config))
+    config.check_valid()?;
+    Ok(config)
 }
 
-// Load a config, either adapter or node, from a TOML file.
+// Load a Zode config from a TOML file.
 fn load_config<T>(path: &Path) -> Result<T, ArgsError>
 where
     T: serde::de::DeserializeOwned,
@@ -232,68 +181,6 @@ mod test {
     }
 
     #[test]
-    fn test_main_args_load_config_adapter() {
-        let tomltxt = r#"
-        [global]
-        control_path = "/var/run/zpr/control.sock"
-        self_addr = "192.168.0.1:12345"
-        ca_file = "tests/ca.pem"
-        certificate_file = "tests/certificate.pem"
-        private_key_file = "tests/private_key.pem"
-        tun_if = "tun23"
-        zpr_addr = [ "10.0.0.1" ]
-        logging = [ ["zdp", "INFO"] ]
-
-
-        [adapter]
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-
-        let config: AdapterConfig = load_config(tmpfile.get_path()).unwrap();
-
-        assert_eq!(
-            config.global.control_path,
-            Some(PathBuf::from("/var/run/zpr/control.sock"))
-        );
-        assert_eq!(
-            config.global.self_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 1)),
-                12345
-            ))
-        );
-        assert_eq!(config.global.ca_file, Some(PathBuf::from("tests/ca.pem")));
-        assert_eq!(
-            config.global.certificate_file,
-            Some(PathBuf::from("tests/certificate.pem"))
-        );
-        assert_eq!(
-            config.global.private_key_file,
-            Some(PathBuf::from("tests/private_key.pem"))
-        );
-        assert_eq!(config.global.tun_if, Some("tun23".to_string()));
-        assert_eq!(
-            config.global.logging,
-            Some(Vec::from([("zdp".to_string(), "INFO".to_string())]))
-        );
-        assert_eq!(
-            config.adapter.node_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 2)),
-                5000
-            ))
-        );
-        assert_eq!(
-            config.global.zpr_addr,
-            Some(Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(
-                10, 0, 0, 1
-            ))]))
-        );
-    }
-
-    #[test]
     fn test_main_args_load_config_node() {
         let tomltxt = r#"
         [global]
@@ -340,371 +227,6 @@ mod test {
 
     #[test]
     #[parallel(env)]
-    fn test_main_args_argparse_adapter_config() {
-        let mut tomltxt = r#"
-        [global]
-        control_path = '$CONTROLFILE'
-        self_addr = "192.168.0.1:12345"
-        ca_file = '$CAFILE'
-        certificate_file = '$CERTFILE'
-        private_key_file = '$PKFILE'
-        tun_if = "tun23"
-        zpr_addr = [ "10.0.0.1" ]
-        logging = [ ["link_state", "DEBUG"] ]
-
-
-        [adapter]
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let ca_file = TempFile::touch();
-        let control_file = TempFile::touch();
-        let cert_file = TempFile::touch();
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt
-            .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
-            .replace("$CONTROLFILE", control_file.get_path().to_str().unwrap())
-            .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
-            .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-
-        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
-
-        let (pmode, config) = argparse(Some(args)).unwrap();
-
-        assert_eq!(pmode, PhMode::Adapter);
-
-        assert_eq!(config.control_path, control_file.get_path());
-        assert_eq!(
-            config.self_addr,
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 1)), 12345)
-        );
-        assert_eq!(config.ca_file, Some(ca_file.get_path().into()));
-        assert_eq!(config.certificate_file, Some(cert_file.get_path().into()));
-        assert_eq!(
-            config.noise_private_key_source(),
-            format!("file://{}", pk_file.get_path().display())
-        );
-        assert_eq!(config.tun_if, Some("tun23".to_string()));
-        assert_eq!(
-            config.logging,
-            Vec::from([("link_state".to_string(), "DEBUG".to_string())])
-        );
-
-        assert_eq!(
-            config.node_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 2)),
-                5000
-            ))
-        );
-        assert_eq!(
-            config.zpr_addr,
-            Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
-        );
-    }
-
-    #[test]
-    #[parallel(env)]
-    fn test_main_args_adapter_config_requires_adapter_section() {
-        let tomltxt = r#"
-        [global]
-        control_path = "/var/run/zpr/control.sock"
-        self_addr = "192.168.0.1:12345"
-        ca_file = "tests/ca.pem"
-        certificate_file = "tests/certificate.pem"
-        private_key_file = "tests/private_key.pem"
-        tun_if = "tun23"
-        "#;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-
-        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
-        match argparse(Some(args)) {
-            Err(ArgsError::ParseError(_)) => {}
-            _ => panic!("Expected ParseError"),
-        }
-    }
-
-    // You can leave the adapter section blank and provide the details on
-    // the command line.
-    #[test]
-    #[parallel(env)]
-    fn test_main_args_adapter_config_blank_adapter() {
-        let mut tomltxt = r#"
-        [global]
-        control_path = "/tmp/control.sock"
-        self_addr = "192.168.0.1:12345"
-        ca_file = '$CAFILE'
-        certificate_file = '$CERTFILE'
-        private_key_file = '$PKFILE'
-        tun_if = "tun23"
-
-        [adapter]
-        "#;
-
-        let cert_file = TempFile::touch();
-        let pk_file = TempFile::touch();
-        let ca_file = TempFile::touch();
-
-        let tmp = tomltxt
-            .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
-            .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
-            .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            tmpfile.get_path().to_str().unwrap(),
-            "--node-addr",
-            "192.168.0.2:5000",
-            "--zpr-addr",
-            "10.0.0.1",
-        ];
-
-        let (pmode, config) = argparse(Some(args)).unwrap();
-
-        assert_eq!(pmode, PhMode::Adapter);
-
-        assert_eq!(
-            config.node_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 2)),
-                5000
-            ))
-        );
-        assert_eq!(
-            config.zpr_addr,
-            Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
-        );
-    }
-
-    // Leave out some stuff in the config file, but specify on command line.
-    #[test]
-    #[parallel(env)]
-    fn test_main_args_argparse_adapter_config_override_globs() {
-        let mut tomltxt = r#"
-        [global]
-        control_path = '$CONTROLFILE'
-        ca_file = '$CAFILE'
-        certificate_file = '$CERTFILE'
-        private_key_file = '$PKFILE'
-        zpr_addr = [ "10.0.0.1" ]
-
-        [adapter]
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let ca_file = TempFile::touch();
-        let cert_file = TempFile::touch();
-        let control_file = TempFile::touch();
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt
-            .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
-            .replace("$CONTROLFILE", control_file.get_path().to_str().unwrap())
-            .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
-            .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            tmpfile.get_path().to_str().unwrap(),
-            "--self-addr",
-            "192.168.0.1:12345",
-            "--tun-if",
-            "tun23",
-            "-l",
-            "peer_mgmt=DEBUG zdp=TRACE",
-        ];
-
-        let (pmode, config) = argparse(Some(args)).unwrap();
-
-        assert_eq!(pmode, PhMode::Adapter);
-
-        assert_eq!(config.control_path, control_file.get_path());
-        assert_eq!(
-            config.self_addr,
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 1)), 12345)
-        );
-        assert_eq!(config.ca_file, Some(ca_file.get_path().into()));
-        assert_eq!(config.certificate_file, Some(cert_file.get_path().into()));
-        assert_eq!(
-            config.noise_private_key_source(),
-            format!("file://{}", pk_file.get_path().display())
-        );
-        assert_eq!(config.tun_if, Some("tun23".to_string()));
-        assert_eq!(
-            config.logging,
-            Vec::from([
-                ("peer_mgmt".to_string(), "DEBUG".to_string()),
-                ("zdp".to_string(), "TRACE".to_string())
-            ])
-        );
-
-        assert_eq!(
-            config.node_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 2)),
-                5000
-            ))
-        );
-        assert_eq!(
-            config.zpr_addr,
-            Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
-        );
-    }
-
-    #[test]
-    #[parallel(env)]
-    fn test_main_args_argparse_adapter_config_minimal() {
-        // Not quite minimal since we need to set control path to make CI happy.
-        let mut tomltxt = r#"
-        [global]
-        ca_file = '$CAFILE'
-        certificate_file = '$CERTFILE'
-        private_key_file = '$PKFILE'
-        control_path = "/tmp/control.sock"
-        zpr_addr = [ "10.0.0.1" ]
-
-        [adapter]
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let ca_file = TempFile::touch();
-        let cert_file = TempFile::touch();
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt
-            .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
-            .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
-            .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-
-        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
-
-        let (pmode, config) = argparse(Some(args)).unwrap();
-
-        assert_eq!(pmode, PhMode::Adapter);
-
-        assert!(!config.control_path.to_string_lossy().is_empty());
-        assert_eq!(
-            config.self_addr,
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 0)
-        );
-        assert_eq!(config.ca_file, Some(ca_file.get_path().into()));
-        assert_eq!(config.certificate_file, Some(cert_file.get_path().into()));
-        assert_eq!(
-            config.noise_private_key_source(),
-            format!("file://{}", pk_file.get_path().display())
-        );
-        assert!(config.tun_if.is_none());
-        assert!(config.logging.is_empty());
-
-        assert_eq!(
-            config.node_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 2)),
-                5000
-            ))
-        );
-        assert_eq!(
-            config.zpr_addr,
-            Vec::from([IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))])
-        );
-    }
-
-    /// `--auto-connect` precedence (zipline#28): an explicitly passed value
-    /// overrides the config file; an omitted flag preserves the config file's
-    /// value; omitted everywhere defaults to `true` (today's behaviour).
-    #[test]
-    #[parallel(env)]
-    fn test_main_args_argparse_adapter_auto_connect() {
-        let base_toml = r#"
-        [global]
-        ca_file = '$CAFILE'
-        certificate_file = '$CERTFILE'
-        private_key_file = '$PKFILE'
-        control_path = "/tmp/control.sock"
-        zpr_addr = [ "10.0.0.1" ]
-
-        [adapter]
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let ca_file = TempFile::touch();
-        let cert_file = TempFile::touch();
-        let pk_file = TempFile::touch();
-
-        let fill = |toml: &str| -> String {
-            toml.replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
-                .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
-                .replace("$CAFILE", ca_file.get_path().to_str().unwrap())
-        };
-
-        // No key in the file, no flag: default true.
-        let plain = TempFile::new_toml(&fill(base_toml));
-        let args = vec!["ph", "adapter", "-c", plain.get_path().to_str().unwrap()];
-        let (_, config) = argparse(Some(args)).unwrap();
-        assert!(config.auto_connect, "default must be auto-connect");
-
-        // No key in the file, --auto-connect=false: flag wins.
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            plain.get_path().to_str().unwrap(),
-            "--auto-connect=false",
-        ];
-        let (_, config) = argparse(Some(args)).unwrap();
-        assert!(!config.auto_connect, "--auto-connect=false must override");
-
-        // Key false in the file, no flag: config value preserved.
-        let false_toml = fill(&format!("{base_toml}\n        auto_connect = false\n"));
-        let cfg_false = TempFile::new_toml(&false_toml);
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            cfg_false.get_path().to_str().unwrap(),
-        ];
-        let (_, config) = argparse(Some(args)).unwrap();
-        assert!(
-            !config.auto_connect,
-            "omitted flag must preserve the config file value"
-        );
-
-        // Key false in the file, --auto-connect=true: flag wins over a
-        // contradicting config file.
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            cfg_false.get_path().to_str().unwrap(),
-            "--auto-connect=true",
-        ];
-        let (_, config) = argparse(Some(args)).unwrap();
-        assert!(
-            config.auto_connect,
-            "--auto-connect=true must override a config file that says false"
-        );
-    }
-
-    #[test]
-    #[parallel(env)]
     fn test_main_args_argparse_node_config_minimal() {
         // Not quite minimal since we need to set control path to make CI happy.
         let mut tomltxt = r#"
@@ -713,7 +235,11 @@ mod test {
         certificate_file = '$CERTFILE'
         private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
-        zpr_addr = [ "10.0.0.1" ]
+        zpr_addr = [ "fd5a:5052::2" ]
+
+        [node.initial_link]
+        addr = "10.0.0.9:5000"
+        cn = "relay.zpr"
         "#;
 
         let ca_file = TempFile::touch();
@@ -728,11 +254,9 @@ mod test {
 
         let tmpfile = TempFile::new_toml(&tomltxt);
 
-        let args = vec!["ph", "node", "-c", tmpfile.get_path().to_str().unwrap()];
+        let args = vec!["ph", "zode", "-c", tmpfile.get_path().to_str().unwrap()];
 
-        let (pmode, config) = argparse(Some(args)).unwrap();
-
-        assert_eq!(pmode, PhMode::Node);
+        let config = argparse(Some(args)).unwrap();
 
         assert!(!config.control_path.to_string_lossy().is_empty());
         assert_eq!(
@@ -763,7 +287,7 @@ mod test {
 
         let args = vec![
             "ph",
-            "node",
+            "zode",
             "--ca-file",
             &ca_file_fname,
             "--certificate-file",
@@ -773,12 +297,12 @@ mod test {
             "--control-path",
             &control_sock,
             "--zpr-addr",
-            "10.0.0.1",
+            "fd5a:5052::2",
+            "--initial-link",
+            "relay.zpr@10.0.0.9:5000",
         ];
 
-        let (pmode, config) = argparse(Some(args)).unwrap();
-
-        assert_eq!(pmode, PhMode::Node);
+        let config = argparse(Some(args)).unwrap();
 
         assert!(!config.control_path.to_string_lossy().is_empty());
         assert_eq!(
@@ -798,156 +322,342 @@ mod test {
         assert!(config.logging.is_empty());
     }
 
-    // CLI --advertised-substrate-addr sets the advertised address with no config file.
+    /// zl-zipline#264: a Zode never reports its own substrate address, so
+    /// `--advertised-substrate-addr` is gone: clap refuses it as unknown.
     #[test]
     #[parallel(env)]
-    fn test_main_args_argparse_node_advertised_addr_cli_only() {
-        let ca_file = TempFile::touch();
-        let ca_file_fname = String::from(ca_file.get_path().to_str().unwrap());
-        let cert_file = TempFile::touch();
-        let cert_file_fname = String::from(cert_file.get_path().to_str().unwrap());
-        let pk_file = TempFile::touch();
-        let pk_file_fname = String::from(pk_file.get_path().to_str().unwrap());
-        let control_sock = portable_tmp_paths("/tmp/control.sock");
-
-        let args = vec![
+    fn test_main_args_argparse_refuses_advertised_substrate_addr() {
+        let (cfg, _keys) = node_config_file("");
+        let path = cfg.get_path().to_str().unwrap();
+        let err = Control::try_parse_from(vec![
             "ph",
-            "node",
-            "--ca-file",
-            &ca_file_fname,
-            "--certificate-file",
-            &cert_file_fname,
-            "--private-key-file",
-            &pk_file_fname,
-            "--control-path",
-            &control_sock,
-            "--zpr-addr",
-            "10.0.0.1",
-            "--self-addr",
-            "0.0.0.0:12345",
+            "zode",
+            "-c",
+            path,
             "--advertised-substrate-addr",
             "203.0.113.7:12345",
-        ];
-
-        let (pmode, config) = argparse(Some(args)).unwrap();
-
-        assert_eq!(pmode, PhMode::Node);
-        // The bind address stays wildcard; only the advertised address is concrete.
-        assert_eq!(
-            config.self_addr,
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 12345)
-        );
-        assert_eq!(
-            config.advertised_substrate_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
-                12345
-            ))
-        );
+        ])
+        .expect_err("--advertised-substrate-addr must be refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
-    // CLI --advertised-substrate-addr wins over [node] advertised_substrate_addr.
+    // CLI --forwarding wins over [node] forwarding in either direction, and an
+    // omitted flag keeps the config file value (zl-zipline#219).
     #[test]
     #[parallel(env)]
-    fn test_main_args_argparse_node_advertised_addr_cli_overrides_config() {
-        let mut tomltxt = r#"
+    fn test_main_args_argparse_node_forwarding_cli_overrides_config() {
+        let ca_file = TempFile::touch();
+        let cert_file = TempFile::touch();
+        let pk_file = TempFile::touch();
+
+        let tomltxt = r#"
         [global]
         ca_file = '$CAFILE'
         certificate_file = '$CERTFILE'
         private_key_file = '$PKFILE'
         control_path = "/tmp/control.sock"
-        self_addr = "0.0.0.0:12345"
-        zpr_addr = [ "10.0.0.1" ]
+        self_addr = "10.0.0.1:12345"
+        zpr_addr = [ "fd5a:5052::2" ]
 
         [node]
-        advertised_substrate_addr = "203.0.113.7:6000"
-        "#;
-
-        let ca_file = TempFile::touch();
-        let cert_file = TempFile::touch();
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt
-            .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
-            .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
-            .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
+        forwarding = true
+        initial_link = { addr = "10.0.0.9:5000", cn = "relay.zpr" }
+        "#
+        .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
+        .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
+        .replace("$CAFILE", ca_file.get_path().to_str().unwrap());
         let tmpfile = TempFile::new_toml(&tomltxt);
+        let config_path = tmpfile.get_path().to_str().unwrap();
 
-        let args = vec![
+        let config = argparse(Some(vec!["ph", "zode", "-c", config_path])).unwrap();
+        assert!(config.forwarding, "the config file turns forwarding on");
+
+        let config = argparse(Some(vec![
             "ph",
-            "node",
+            "zode",
             "-c",
-            tmpfile.get_path().to_str().unwrap(),
-            "--advertised-substrate-addr",
-            "198.51.100.9:7000",
-        ];
+            config_path,
+            "--forwarding",
+            "false",
+        ]))
+        .unwrap();
+        assert!(!config.forwarding, "--forwarding false overrides the file");
+    }
 
-        let (_, config) = argparse(Some(args)).unwrap();
+    /// A `[node]` section line giving a Zode that is no relay its initial link.
+    const DIAL: &str = r#"initial_link = { addr = "10.0.0.9:5000", cn = "relay.zpr" }"#;
 
-        assert_eq!(
-            config.advertised_substrate_addr,
-            Some(SocketAddr::new(
-                IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 9)),
-                7000
-            ))
+    /// A minimal node config file whose `[node]` section is `node_section`,
+    /// with the referenced key files kept alive by the returned guards.
+    fn node_config_file(node_section: &str) -> (TempFile, [TempFile; 3]) {
+        node_config_file_at("10.0.0.1:12345", node_section)
+    }
+
+    /// [node_config_file] with substrate address `self_addr`.
+    fn node_config_file_at(self_addr: &str, node_section: &str) -> (TempFile, [TempFile; 3]) {
+        node_config_file_full(self_addr, r#"[ "fd5a:5052::2" ]"#, node_section)
+    }
+
+    /// [node_config_file] whose `zpr_addr` is the TOML array `zpr_addr`.
+    fn node_config_file_addrs(zpr_addr: &str, node_section: &str) -> (TempFile, [TempFile; 3]) {
+        node_config_file_full("10.0.0.1:12345", zpr_addr, node_section)
+    }
+
+    /// [node_config_file] with substrate address `self_addr` and `zpr_addr`
+    /// the TOML array `zpr_addr`.
+    fn node_config_file_full(
+        self_addr: &str,
+        zpr_addr: &str,
+        node_section: &str,
+    ) -> (TempFile, [TempFile; 3]) {
+        node_config_file_with(self_addr, zpr_addr, "", node_section)
+    }
+
+    /// [node_config_file] whose `[global]` section also carries
+    /// `global_extra` verbatim.
+    fn node_config_file_global(
+        global_extra: &str,
+        node_section: &str,
+    ) -> (TempFile, [TempFile; 3]) {
+        node_config_file_with(
+            "10.0.0.1:12345",
+            r#"[ "fd5a:5052::2" ]"#,
+            global_extra,
+            node_section,
+        )
+    }
+
+    /// The general form of [node_config_file]: substrate address
+    /// `self_addr`, `zpr_addr` the TOML array `zpr_addr`, and `global_extra`
+    /// appended verbatim to the `[global]` section.
+    fn node_config_file_with(
+        self_addr: &str,
+        zpr_addr: &str,
+        global_extra: &str,
+        node_section: &str,
+    ) -> (TempFile, [TempFile; 3]) {
+        let files = [TempFile::touch(), TempFile::touch(), TempFile::touch()];
+        let tomltxt = r#"
+        [global]
+        ca_file = '$CAFILE'
+        certificate_file = '$CERTFILE'
+        private_key_file = '$PKFILE'
+        control_path = "/tmp/control.sock"
+        self_addr = "$SELFADDR"
+        zpr_addr = $ZPRADDR
+        $GLOBALEXTRA
+
+        [node]
+        "#
+        .replace("$GLOBALEXTRA", global_extra)
+        .replace("$SELFADDR", self_addr)
+        .replace("$ZPRADDR", zpr_addr)
+        .replace("$CAFILE", files[0].get_path().to_str().unwrap())
+        .replace("$CERTFILE", files[1].get_path().to_str().unwrap())
+        .replace("$PKFILE", files[2].get_path().to_str().unwrap());
+        (
+            TempFile::new_toml(&format!("{tomltxt}{node_section}\n")),
+            files,
+        )
+    }
+
+    /// `ph zode --initial-link CN@IP:PORT` sets the initial link, IPv6 in
+    /// brackets too, and overrides the config file (zl-zipline#250).
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_node_initial_link_cli() {
+        let (cfg, _keys) = node_config_file_at("[::1]:12345", "");
+        let path = cfg.get_path().to_str().unwrap();
+        let config = argparse(Some(vec![
+            "ph",
+            "zode",
+            "-c",
+            path,
+            "--initial-link",
+            "relay.zpr@[fd00::9]:5000",
+        ]))
+        .unwrap();
+        let link = config.initial_link.unwrap();
+        assert_eq!(link.cn, "relay.zpr");
+        assert_eq!(link.addr, "[fd00::9]:5000".parse::<SocketAddr>().unwrap());
+
+        let (cfg, _keys) =
+            node_config_file("[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"file.zpr\"");
+        let path = cfg.get_path().to_str().unwrap();
+        let config = argparse(Some(vec!["ph", "zode", "-c", path])).unwrap();
+        assert_eq!(config.initial_link.as_ref().unwrap().cn, "file.zpr");
+        let config = argparse(Some(vec![
+            "ph",
+            "zode",
+            "-c",
+            path,
+            "--initial-link",
+            "cli.zpr@10.0.0.7:6000",
+        ]))
+        .unwrap();
+        let link = config.initial_link.unwrap();
+        assert_eq!(link.cn, "cli.zpr");
+        assert_eq!(link.addr, "10.0.0.7:6000".parse::<SocketAddr>().unwrap());
+    }
+
+    /// A Zode has at most one initial link: `--initial-link` given twice is
+    /// an error, and so is a malformed one.
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_node_initial_link_cli_rejects() {
+        let (cfg, _keys) = node_config_file("");
+        let path = cfg.get_path().to_str().unwrap();
+        let twice = Control::try_parse_from(vec![
+            "ph",
+            "zode",
+            "-c",
+            path,
+            "--initial-link",
+            "a.zpr@10.0.0.9:5000",
+            "--initial-link",
+            "b.zpr@10.0.0.8:5000",
+        ]);
+        assert!(twice.is_err(), "a second --initial-link must be refused");
+        for bad in ["@10.0.0.9:5000", "a.zpr@0.0.0.0:5000", "a.zpr@10.0.0.9:0"] {
+            assert!(
+                argparse(Some(vec!["ph", "zode", "-c", path, "--initial-link", bad])).is_err(),
+                "accepted --initial-link {bad}"
+            );
+        }
+    }
+
+    /// `ph zode --relay` overrides `relay` in the config file, and a relay
+    /// with an initial link is refused (a relay never dials, R4).
+    #[test]
+    #[parallel(env)]
+    fn test_main_args_argparse_node_relay_cli() {
+        // A relay lists vs.zpr after its own address (zl-zipline#229).
+        let relay_addrs = r#"[ "fd5a:5052::2", "fd5a:5052::1" ]"#;
+        let (cfg, _keys) = node_config_file_addrs(relay_addrs, "relay = true");
+        let path = cfg.get_path().to_str().unwrap();
+        let config = argparse(Some(vec!["ph", "zode", "-c", path])).unwrap();
+        assert!(config.relay);
+
+        let (cfg, _keys) = node_config_file("relay = true");
+        let path = cfg.get_path().to_str().unwrap();
+        let config = argparse(Some(vec![
+            "ph",
+            "zode",
+            "-c",
+            path,
+            "--relay",
+            "false",
+            "--initial-link",
+            "relay.zpr@10.0.0.9:5000",
+        ]))
+        .unwrap();
+        assert!(!config.relay);
+
+        let (cfg, _keys) = node_config_file(DIAL);
+        let path = cfg.get_path().to_str().unwrap();
+        let config = argparse(Some(vec!["ph", "zode", "-c", path])).unwrap();
+        assert!(!config.relay, "relay defaults to false");
+
+        let (cfg, _keys) = node_config_file_addrs(relay_addrs, "");
+        let path = cfg.get_path().to_str().unwrap();
+        assert!(argparse(Some(vec!["ph", "zode", "-c", path, "--relay", "true"])).is_ok());
+        assert!(
+            argparse(Some(vec![
+                "ph",
+                "zode",
+                "-c",
+                path,
+                "--relay",
+                "true",
+                "--initial-link",
+                "a.zpr@10.0.0.9:5000",
+            ]))
+            .is_err()
         );
     }
 
-    // The CLI value goes through the same validation as the config-file value:
-    // an unspecified IP is rejected because peers cannot dial it.
+    /// zl-zipline#229 (gate g117 q2): the relay config contract, with
+    /// `relay` from the `[node]` section or from `--relay`, and the
+    /// addresses from the config file or from `--zpr-addr`. `--zpr-addr`
+    /// replaces the file's `zpr_addr` list (zl-zipline#278).
     #[test]
     #[parallel(env)]
-    fn test_main_args_argparse_node_advertised_addr_cli_rejects_unspecified() {
-        let ca_file = TempFile::touch();
-        let ca_file_fname = String::from(ca_file.get_path().to_str().unwrap());
-        let cert_file = TempFile::touch();
-        let cert_file_fname = String::from(cert_file.get_path().to_str().unwrap());
-        let pk_file = TempFile::touch();
-        let pk_file_fname = String::from(pk_file.get_path().to_str().unwrap());
-        let control_sock = portable_tmp_paths("/tmp/control.sock");
+    fn test_main_args_argparse_relay_lists_visa_service_addr() {
+        let vs = "fd5a:5052::1";
+        let parse = |path: &str, extra: &[&str]| {
+            let mut args = vec!["ph", "zode", "-c", path];
+            args.extend_from_slice(extra);
+            argparse(Some(args))
+        };
+        let parse_file = |zpr_addr: &str, node_section: &str, extra: &[&str]| {
+            let (cfg, _keys) = node_config_file_addrs(zpr_addr, node_section);
+            parse(cfg.get_path().to_str().unwrap(), extra)
+        };
 
-        let args = vec![
-            "ph",
-            "node",
-            "--ca-file",
-            &ca_file_fname,
-            "--certificate-file",
-            &cert_file_fname,
-            "--private-key-file",
-            &pk_file_fname,
-            "--control-path",
-            &control_sock,
-            "--zpr-addr",
-            "10.0.0.1",
-            "--advertised-substrate-addr",
-            "0.0.0.0:12345",
-        ];
-
-        match argparse(Some(args)) {
-            Err(ArgsError::ParseError(msg)) => {
-                assert!(
-                    msg.contains("unspecified"),
-                    "expected 'unspecified' in error, got: {msg}"
-                );
-            }
-            other => panic!("expected ParseError, got: {:?}", other),
+        // `relay = true` in the [node] section, addresses in the file.
+        let config = parse_file(r#"["fd5a:5052::2", "fd5a:5052::1"]"#, "relay = true", &[])
+            .expect("a relay with vs.zpr after its own address");
+        let expected: Vec<IpAddr> = vec!["fd5a:5052::2".parse().unwrap(), vs.parse().unwrap()];
+        assert_eq!(config.zpr_addr, expected);
+        for refused in [
+            r#"["fd5a:5052::2"]"#,
+            r#"["fd5a:5052::1", "fd5a:5052::2"]"#,
+            r#"["fd5a:5052::2", "fd5a:5052::1", "fd5a:5052::1"]"#,
+            r#"["fd5a:5052::2", "fd5a:5052::1", "fd5a:5052::2"]"#,
+        ] {
+            assert!(
+                parse_file(refused, "relay = true", &[]).is_err(),
+                "relay with zpr_addr = {refused}"
+            );
         }
+
+        // `--relay true` and `--zpr-addr` on the command line; the file
+        // lists no addresses.
+        let none = "[]";
+        assert!(parse_file(none, "", &["--relay", "true", "-z", "fd5a:5052::2"]).is_err());
+        assert!(
+            parse_file(
+                none,
+                "",
+                &["--relay", "true", "-z", "fd5a:5052::2", "-z", vs]
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_file(
+                none,
+                "",
+                &["--relay", "true", "-z", vs, "-z", "fd5a:5052::2"]
+            )
+            .is_err()
+        );
+        // The command line's addresses replace the file's, so `-z vs.zpr`
+        // alone makes vs.zpr the relay's own address, which is refused.
+        assert!(parse_file(r#"["fd5a:5052::2"]"#, "relay = true", &["-z", vs]).is_err());
+
+        // A node that is not a relay never lists vs.zpr, nor any duplicate.
+        assert!(parse_file(r#"["fd5a:5052::2"]"#, DIAL, &[]).is_ok());
+        assert!(parse_file(r#"["fd5a:5052::2", "fd5a:5052::1"]"#, DIAL, &[]).is_err());
+        assert!(parse_file(none, DIAL, &["-z", "fd5a:5052::2", "-z", vs]).is_err());
+        assert!(parse_file(none, DIAL, &["-z", "fd5a:5052::2", "-z", "fd5a:5052::2"]).is_err());
+        // The file's list and the command line's list never combine
+        // (zl-zipline#278), so the same address in both is no duplicate.
+        assert!(parse_file(r#"["fd5a:5052::2"]"#, DIAL, &["-z", "fd5a:5052::2"]).is_ok());
     }
 
     #[test]
     #[serial(env)] // serialize with other tests because we modify process environment
-    fn test_main_args_argparse_adapter_key_in_env() {
+    fn test_main_args_argparse_zode_key_in_env() {
         let mut tomltxt = r#"
         [global]
         ca_file = '$CAFILE'
         certificate_file = '$CERTFILE'
         control_path = "/tmp/control.sock"
-        zpr_addr = [ "10.0.0.1" ]
+        zpr_addr = [ "fd5a:5052::2" ]
 
-        [adapter]
-        node_addr = "192.168.0.2:5000"
+        [node.initial_link]
+        addr = "10.0.0.9:5000"
+        cn = "relay.zpr"
         "#;
 
         let ca_file = TempFile::touch();
@@ -960,7 +670,7 @@ mod test {
 
         let tmpfile = TempFile::new_toml(&tomltxt);
 
-        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
+        let args = vec!["ph", "zode", "-c", tmpfile.get_path().to_str().unwrap()];
 
         let noise_key = "GExPGh5RE/nKo8WoN8EqknDDNIEjWBL6PZm08Uhvn0w=";
         unsafe {
@@ -973,206 +683,228 @@ mod test {
             env::remove_var("NOISE_PRIVATE_KEY");
         }
 
-        let (pmode, config) = presult.unwrap();
-        assert_eq!(pmode, PhMode::Adapter);
+        let config = presult.unwrap();
         assert_eq!(
             config.noise_private_key_source(),
             format!("key://{}", noise_key)
         )
     }
 
-    // Adapter without ca_file passes config validation.
-    #[test]
-    #[parallel(env)]
-    fn test_adapter_no_ca_file_passes_validation() {
-        let mut tomltxt = r#"
-        [global]
-        certificate_file = '$CERTFILE'
-        private_key_file = '$PKFILE'
-        control_path = "/tmp/control.sock"
-
-        [adapter]
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let cert_file = TempFile::touch();
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt
-            .replace("$CERTFILE", cert_file.get_path().to_str().unwrap())
-            .replace("$PKFILE", pk_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
-
-        let (pmode, config) = argparse(Some(args)).unwrap();
-        assert_eq!(pmode, PhMode::Adapter);
-        assert!(config.ca_file.is_none());
-    }
-
-    // Adapter without certificate_file but with name passes config validation.
-    #[test]
-    #[parallel(env)]
-    fn test_adapter_no_cert_with_name_passes_validation() {
-        let mut tomltxt = r#"
-        [global]
-        private_key_file = '$PKFILE'
-        control_path = "/tmp/control.sock"
-
-        [adapter]
-        name = "my-adapter"
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt.replace("$PKFILE", pk_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
-
-        let (pmode, config) = argparse(Some(args)).unwrap();
-        assert_eq!(pmode, PhMode::Adapter);
-        assert!(config.certificate_file.is_none());
-        assert_eq!(config.name, "my-adapter");
-    }
-
-    // Adapter without certificate_file and without name fails config validation, even with private key.
-    #[test]
-    #[parallel(env)]
-    fn test_adapter_no_cert_no_name_fails_validation() {
-        let mut tomltxt = r#"
-        [global]
-        private_key_file = '$PKFILE'
-        control_path = "/tmp/control.sock"
-
-        [adapter]
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt.replace("$PKFILE", pk_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-        let args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
-
-        match argparse(Some(args)) {
-            Err(ArgsError::Missing(msg)) => {
-                assert!(msg.contains("name"), "expected 'name' in error, got: {msg}");
-            }
-            other => panic!("expected Missing error, got: {:?}", other),
-        }
-    }
-
-    // CLI --name overrides config [adapter].name.
-    #[test]
-    #[parallel(env)]
-    fn test_adapter_cli_name_overrides_config_name() {
-        let mut tomltxt = r#"
-        [global]
-        private_key_file = '$PKFILE'
-        control_path = "/tmp/control.sock"
-
-        [adapter]
-        name = "config-name"
-        node_addr = "192.168.0.2:5000"
-        "#;
-
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt.replace("$PKFILE", pk_file.get_path().to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            tmpfile.get_path().to_str().unwrap(),
-            "--name",
-            "cli-name",
-        ];
-
-        let (_, config) = argparse(Some(args)).unwrap();
-        assert_eq!(config.name, "cli-name");
-    }
-
-    // CLI --name with config-file bootstrap_key and no certificate_file: bootstrap CN equals CLI name.
-    #[test]
-    #[parallel(env)]
-    fn test_adapter_cli_name_bootstrap_cn_ordering() {
-        let bootstrap_key_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/rsa-key.pem");
-
-        let mut tomltxt = r#"
-        [global]
-        private_key_file = '$PKFILE'
-        control_path = "/tmp/control.sock"
-
-        [adapter]
-        node_addr = "192.168.0.2:5000"
-        bootstrap_key = '$BSKEY'
-        "#;
-
-        let pk_file = TempFile::touch();
-
-        let tmp = tomltxt
-            .replace("$PKFILE", pk_file.get_path().to_str().unwrap())
-            .replace("$BSKEY", bootstrap_key_path.to_str().unwrap());
-        tomltxt = &tmp;
-
-        let tmpfile = TempFile::new_toml(&tomltxt);
-        let args = vec![
-            "ph",
-            "adapter",
-            "-c",
-            tmpfile.get_path().to_str().unwrap(),
-            "--name",
-            "cli-adapter-name",
-        ];
-
-        let (_, config) = argparse(Some(args)).unwrap();
-        assert_eq!(config.name, "cli-adapter-name");
-        let bootstrap = config.bootstrap.as_ref().expect("bootstrap should be set");
-        assert_eq!(bootstrap.cn(), "cli-adapter-name");
-    }
-
-    /// Parse a minimal valid adapter config whose `[global]` section carries
+    /// Parse a minimal valid Zode config whose `[global]` section carries
     /// `global_extra` verbatim, with `extra_args` appended to the command
     /// line (zipline#154 `control_group` tests).
-    fn argparse_adapter_with(
-        global_extra: &str,
-        extra_args: &[&str],
-    ) -> Result<(PhMode, Config), ArgsError> {
-        let pk_file = TempFile::touch();
-        let tomltxt = format!(
-            r#"
-        [global]
-        private_key_file = '{pk}'
-        control_path = "/tmp/control.sock"
-        {global_extra}
+    fn argparse_zode_with(global_extra: &str, extra_args: &[&str]) -> Result<Config, ArgsError> {
+        argparse_zode_full(global_extra, "", extra_args).0
+    }
 
-        [adapter]
-        name = "my-adapter"
-        node_addr = "192.168.0.2:5000"
-        "#,
-            pk = pk_file.get_path().to_str().unwrap()
+    /// The `[node]` section text of a Zode that dials `relay.zpr` over its
+    /// initial link, for the [argparse_zode_full] fixtures.
+    const INITIAL_LINK_TABLE: &str =
+        "[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"relay.zpr\"";
+
+    /// The general form of [argparse_zode_with] (zl-zipline#278): parse a
+    /// minimal valid Zode config whose `[global]` section carries
+    /// `global_extra` verbatim and whose node section is followed by
+    /// `trailing_sections` verbatim (e.g. an `[authentication]` table),
+    /// with `extra_args` appended to the command line. Returns the parse
+    /// result and the guards of the file's `ca_file`, `certificate_file`
+    /// and `private_key_file`, in that order, so a test can compare paths.
+    fn argparse_zode_full(
+        global_extra: &str,
+        trailing_sections: &str,
+        extra_args: &[&str],
+    ) -> (Result<Config, ArgsError>, [TempFile; 3]) {
+        let (tmpfile, keys) = node_config_file_global(
+            global_extra,
+            &format!("{INITIAL_LINK_TABLE}\n\n{trailing_sections}"),
         );
-        let tmpfile = TempFile::new_toml(&tomltxt);
-        let mut args = vec!["ph", "adapter", "-c", tmpfile.get_path().to_str().unwrap()];
+        let mut args = vec!["ph", "zode", "-c", tmpfile.get_path().to_str().unwrap()];
         args.extend_from_slice(extra_args);
-        argparse(Some(args))
+        (argparse(Some(args)), keys)
+    }
+
+    /// The `[global]` keys the zl-zipline#278 file-versus-flag tests set
+    /// in the file, beyond the ones [node_config_file_with] always writes
+    /// (`control_path = "/tmp/control.sock"`, `self_addr =
+    /// "10.0.0.1:12345"`, `zpr_addr = ["fd5a:5052::2"]` and the three key
+    /// files).
+    fn file_only_global_extra() -> String {
+        format!(
+            "tun_if = \"tun-file\"\nio_engine = \"{}\"\nlogging = [ [\"all\", \"INFO\"], [\"zdp\", \"DEBUG\"] ]",
+            file_io_engine()
+        )
+    }
+
+    /// An `io_engine` name the file can set that is not the command line's
+    /// `auto`: the first real engine this platform has.
+    fn file_io_engine() -> &'static str {
+        crate::batch_io::engine_names()
+            .next()
+            .expect("every platform has a packet I/O engine")
+    }
+
+    /// The `[authentication]` table the zl-zipline#278 tests put in the file.
+    const FILE_AUTH_SECTION: &str =
+        "[authentication]\nauth_private_key = \"/tmp/zl278-file-auth.pem\"";
+
+    /// zl-zipline#278: with no flags, every `[global]` value the file sets
+    /// survives, and so does `[authentication] auth_private_key`. In
+    /// particular a flag's default must not beat the file (`io_engine`).
+    #[test]
+    #[parallel(env)]
+    fn test_file_values_survive_without_flags() {
+        let (config, keys) = argparse_zode_full(&file_only_global_extra(), FILE_AUTH_SECTION, &[]);
+        let config = config.expect("a valid file-only Zode config");
+        assert_eq!(
+            config.control_path,
+            PathBuf::from(portable_tmp_paths("/tmp/control.sock"))
+        );
+        assert_eq!(
+            config.self_addr,
+            "10.0.0.1:12345".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(config.ca_file, Some(keys[0].get_path().into()));
+        assert_eq!(config.certificate_file, Some(keys[1].get_path().into()));
+        assert_eq!(
+            config.noise_private_key_source(),
+            format!("file://{}", keys[2].get_path().display())
+        );
+        assert_eq!(config.tun_if.as_deref(), Some("tun-file"));
+        assert_eq!(config.batch_io_engine, file_io_engine());
+        let expected_addrs: Vec<IpAddr> = vec!["fd5a:5052::2".parse().unwrap()];
+        assert_eq!(config.zpr_addr, expected_addrs);
+        let expected_logging = vec![
+            ("all".to_string(), "INFO".to_string()),
+            ("zdp".to_string(), "DEBUG".to_string()),
+        ];
+        assert_eq!(config.logging, expected_logging);
+        assert_eq!(
+            config.auth_private_key,
+            Some(PathBuf::from(portable_tmp_paths(
+                "/tmp/zl278-file-auth.pem"
+            )))
+        );
+    }
+
+    /// zl-zipline#278: `--control-path` overrides `control_path` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_control_path() {
+        let flag = portable_tmp_paths("/tmp/zl278-flag-control.sock");
+        let config = argparse_zode_with("", &["--control-path", &flag]).unwrap();
+        assert_eq!(config.control_path, path::absolute(&flag).unwrap());
+    }
+
+    /// zl-zipline#278: `--self-addr` overrides `self_addr` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_self_addr() {
+        let config = argparse_zode_with("", &["--self-addr", "10.0.0.2:23456"]).unwrap();
+        assert_eq!(
+            config.self_addr,
+            "10.0.0.2:23456".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    /// zl-zipline#278: `--ca-file` overrides `ca_file` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_ca_file() {
+        let flag_file = TempFile::touch();
+        let flag = flag_file.get_path().to_str().unwrap();
+        let config = argparse_zode_with("", &["--ca-file", flag]).unwrap();
+        assert_eq!(config.ca_file, Some(path::absolute(flag).unwrap()));
+    }
+
+    /// zl-zipline#278: `--certificate-file` overrides `certificate_file` in
+    /// the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_certificate_file() {
+        let flag_file = TempFile::touch();
+        let flag = flag_file.get_path().to_str().unwrap();
+        let config = argparse_zode_with("", &["--certificate-file", flag]).unwrap();
+        assert_eq!(config.certificate_file, Some(path::absolute(flag).unwrap()));
+    }
+
+    /// zl-zipline#278: `-k` overrides `private_key_file` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_private_key_file() {
+        let flag_file = TempFile::touch();
+        let flag = flag_file.get_path().to_str().unwrap();
+        let config = argparse_zode_with("", &["-k", flag]).unwrap();
+        assert_eq!(
+            config.noise_private_key_source(),
+            format!("file://{}", path::absolute(flag).unwrap().display())
+        );
+    }
+
+    /// zl-zipline#278: `--tun-if` overrides `tun_if` in the file.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_tun_if() {
+        let config =
+            argparse_zode_with(r#"tun_if = "tun-file""#, &["--tun-if", "tun-flag"]).unwrap();
+        assert_eq!(config.tun_if.as_deref(), Some("tun-flag"));
+    }
+
+    /// zl-zipline#278: `--io-engine` overrides `io_engine` in the file,
+    /// even when the flag names the default, `auto`.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_io_engine() {
+        let line = format!("io_engine = \"{}\"", file_io_engine());
+        let config = argparse_zode_with(&line, &["--io-engine", "auto"]).unwrap();
+        assert_eq!(config.batch_io_engine, "auto");
+    }
+
+    /// zl-zipline#278 Q1: `--zpr-addr` replaces the file's `zpr_addr`
+    /// list; it does not add to it.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_replaces_file_zpr_addr() {
+        let config = argparse_zode_with("", &["--zpr-addr", "fd5a:5052::3"]).unwrap();
+        let expected: Vec<IpAddr> = vec!["fd5a:5052::3".parse().unwrap()];
+        assert_eq!(config.zpr_addr, expected);
+    }
+
+    /// zl-zipline#278 Q2 (operator's answer): any `--logging` replaces the
+    /// file's whole `logging` list. There is no merge per target, so the
+    /// file's `all=INFO` is gone too.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_replaces_file_logging() {
+        let config = argparse_zode_with(
+            r#"logging = [ ["all", "INFO"], ["zdp", "DEBUG"] ]"#,
+            &["--logging", "zdp=TRACE"],
+        )
+        .unwrap();
+        assert_eq!(
+            config.logging,
+            vec![("zdp".to_string(), "TRACE".to_string())]
+        );
+    }
+
+    /// zl-zipline#278 Q3: `--auth-private-key` overrides `auth_private_key`
+    /// in the file's `[authentication]` section.
+    #[test]
+    #[parallel(env)]
+    fn test_flag_overrides_file_auth_private_key() {
+        let flag = portable_tmp_paths("/tmp/zl278-flag-auth.pem");
+        let (config, _keys) =
+            argparse_zode_full("", FILE_AUTH_SECTION, &["--auth-private-key", &flag]);
+        assert_eq!(
+            config.unwrap().auth_private_key,
+            Some(path::absolute(&flag).unwrap())
+        );
     }
 
     /// zipline#154: `control_group` in `[global]` is parsed into the config.
     #[test]
     #[parallel(env)]
     fn test_control_group_from_config_file() {
-        let (_, config) = argparse_adapter_with(r#"control_group = "zipline""#, &[]).unwrap();
+        let config = argparse_zode_with(r#"control_group = "zipline""#, &[]).unwrap();
         assert_eq!(config.control_group.as_deref(), Some("zipline"));
     }
 
@@ -1181,7 +913,7 @@ mod test {
     #[test]
     #[parallel(env)]
     fn test_control_group_flag_overrides_config_file() {
-        let (_, config) = argparse_adapter_with(
+        let config = argparse_zode_with(
             r#"control_group = "from-file""#,
             &["--control-group", "from-flag"],
         )
@@ -1189,11 +921,26 @@ mod test {
         assert_eq!(config.control_group.as_deref(), Some("from-flag"));
     }
 
+    /// zl-zipline#278 (review on core#141): a valid `--control-group`
+    /// overrides an invalid `control_group` in the file. Only the value
+    /// that wins is validated, so the file's bad name does not stop the
+    /// Zode.
+    #[test]
+    #[parallel(env)]
+    fn test_control_group_flag_overrides_invalid_file_value() {
+        let config = argparse_zode_with(
+            r#"control_group = "bad,name""#,
+            &["--control-group", "from-flag"],
+        )
+        .expect("the flag's valid name wins over the file's invalid name");
+        assert_eq!(config.control_group.as_deref(), Some("from-flag"));
+    }
+
     /// zipline#154: the flag alone sets it too.
     #[test]
     #[parallel(env)]
     fn test_control_group_from_flag_only() {
-        let (_, config) = argparse_adapter_with("", &["--control-group", "zipline"]).unwrap();
+        let config = argparse_zode_with("", &["--control-group", "zipline"]).unwrap();
         assert_eq!(config.control_group.as_deref(), Some("zipline"));
     }
 
@@ -1201,7 +948,7 @@ mod test {
     #[test]
     #[parallel(env)]
     fn test_control_group_absent_is_none() {
-        let (_, config) = argparse_adapter_with("", &[]).unwrap();
+        let config = argparse_zode_with("", &[]).unwrap();
         assert_eq!(config.control_group, None);
     }
 
@@ -1212,12 +959,12 @@ mod test {
     fn test_control_group_invalid_names_rejected() {
         for bad in ["", "a\\b", "a,b", "a/b", "a:b", "a*b", "a@b", "a\tb"] {
             let line = format!("control_group = {}", toml::Value::String(bad.to_string()));
-            let err = argparse_adapter_with(&line, &[]).expect_err(bad);
+            let err = argparse_zode_with(&line, &[]).expect_err(bad);
             assert!(
                 err.to_string().contains("control_group"),
                 "config {bad:?}: error does not name control_group: {err}"
             );
-            let err = argparse_adapter_with("", &["--control-group", bad]).expect_err(bad);
+            let err = argparse_zode_with("", &["--control-group", bad]).expect_err(bad);
             assert!(
                 err.to_string().contains("control_group"),
                 "flag {bad:?}: error does not name control_group: {err}"
@@ -1237,8 +984,170 @@ mod test {
             "ZPR Users",
             "a.b",
         ] {
-            let (_, config) = argparse_adapter_with("", &["--control-group", good]).unwrap();
+            let config = argparse_zode_with("", &["--control-group", good]).unwrap();
             assert_eq!(config.control_group.as_deref(), Some(good));
         }
+    }
+
+    /// zl-zipline#278 review: a valid `--initial-link` replaces an invalid
+    /// `[node.initial_link]` in the file, so the file's value is never
+    /// checked. With no flag, the invalid file value is still refused.
+    #[test]
+    #[parallel(env)]
+    fn test_initial_link_flag_bypasses_invalid_file_value() {
+        for bad in [
+            "[node.initial_link]\naddr = \"0.0.0.0:5000\"\ncn = \"relay.zpr\"",
+            "[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"\"",
+        ] {
+            let (cfg, _keys) = node_config_file(bad);
+            let path = cfg.get_path().to_str().unwrap();
+            let config = argparse(Some(vec![
+                "ph",
+                "zode",
+                "-c",
+                path,
+                "--initial-link",
+                "cli.zpr@10.0.0.7:6000",
+            ]))
+            .unwrap_or_else(|e| panic!("--initial-link must replace {bad:?}: {e}"));
+            let link = config.initial_link.unwrap();
+            assert_eq!(link.cn, "cli.zpr");
+            assert_eq!(link.addr, "10.0.0.7:6000".parse::<SocketAddr>().unwrap());
+
+            let err = argparse(Some(vec!["ph", "zode", "-c", path]))
+                .expect_err("an invalid file initial_link with no flag");
+            assert!(err.to_string().contains("initial_link"), "{bad:?}: {err}");
+        }
+    }
+
+    /// zl-zipline#234: `ph zode` parses the argv zipline passes
+    /// (`zipline-cmd` `ph_args`).
+    #[test]
+    #[parallel(env)]
+    fn test_zode_parses_zipline_argv() {
+        let files = [
+            TempFile::touch(),
+            TempFile::touch(),
+            TempFile::touch(),
+            TempFile::touch(),
+        ];
+        let path = |i: usize| files[i].get_path().to_str().unwrap().to_owned();
+        let (ca, cert, key, auth) = (path(0), path(1), path(2), path(3));
+        let control_sock = portable_tmp_paths("/tmp/control.sock");
+        let args = vec![
+            "ph",
+            "zode",
+            "--ca-file",
+            &ca,
+            "--certificate-file",
+            &cert,
+            "--private-key-file",
+            &key,
+            "--zpr-addr",
+            "fd5a:5052::2",
+            "--auth-private-key",
+            &auth,
+            "--initial-link",
+            "relay.zpr@10.0.0.9:5000",
+            "--tun-if",
+            "tun9",
+            "--control-group",
+            "zipline",
+            "--control-path",
+            &control_sock,
+        ];
+        let config = argparse(Some(args)).expect("zipline's ph zode argv");
+        assert_eq!(config.initial_link.unwrap().cn, "relay.zpr");
+        assert!(!config.relay);
+        assert_eq!(config.tun_if.as_deref(), Some("tun9"));
+        assert_eq!(config.control_group.as_deref(), Some("zipline"));
+        assert_eq!(config.auth_private_key, Some(PathBuf::from(&auth)));
+    }
+
+    /// zl-zipline#234: `zode` is the only subcommand. `node` and `adapter`
+    /// are unknown, with no alias, so clap refuses them (exit status 2).
+    #[test]
+    #[parallel(env)]
+    fn test_node_and_adapter_are_unknown_subcommands() {
+        for gone in ["node", "adapter"] {
+            let err = Control::try_parse_from(["ph", gone]).expect_err(gone);
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::InvalidSubcommand,
+                "{gone}"
+            );
+            assert_eq!(err.exit_code(), 2, "{gone}");
+        }
+    }
+
+    /// zl-zipline#234: a Zode is either a relay or dials an initial link,
+    /// never neither: with neither it could reach no visa service.
+    #[test]
+    #[parallel(env)]
+    fn test_zode_needs_relay_or_initial_link() {
+        let (cfg, _keys) = node_config_file("");
+        let err = argparse(Some(vec![
+            "ph",
+            "zode",
+            "-c",
+            cfg.get_path().to_str().unwrap(),
+        ]))
+        .expect_err("neither relay nor initial_link");
+        assert!(err.to_string().contains("relay or initial_link"), "{err}");
+    }
+
+    /// zl-zipline#234: there is no adapter, so a config file with an
+    /// `[adapter]` section is refused, not ignored.
+    #[test]
+    #[parallel(env)]
+    fn test_zode_config_refuses_adapter_section() {
+        let (cfg, _keys) = node_config_file_global(
+            "",
+            "[node.initial_link]\naddr = \"10.0.0.9:5000\"\ncn = \"relay.zpr\"\n\n[adapter]\nnode_addr = \"10.0.0.9:5000\"",
+        );
+        let err = argparse(Some(vec![
+            "ph",
+            "zode",
+            "-c",
+            cfg.get_path().to_str().unwrap(),
+        ]))
+        .expect_err("[adapter] section");
+        assert!(err.to_string().contains("adapter"), "{err}");
+    }
+
+    /// zl-zipline#234: no backwards compatibility, so an unknown key is
+    /// refused in every section, not ignored: adapter keys in `[global]` and
+    /// `[node]`, and a misspelt key in `[authentication]`.
+    #[test]
+    #[parallel(env)]
+    fn test_zode_config_refuses_unknown_keys() {
+        for (global_extra, rest, key) in [
+            (r#"name = "adapter1""#, DIAL, "name"),
+            ("", "auto_connect = true", "auto_connect"),
+            (
+                "",
+                "[authentication]\nauth_private_ky = \"key.pem\"",
+                "auth_private_ky",
+            ),
+        ] {
+            let (cfg, _keys) = node_config_file_global(global_extra, rest);
+            let err = argparse(Some(vec![
+                "ph",
+                "zode",
+                "-c",
+                cfg.get_path().to_str().unwrap(),
+            ]))
+            .expect_err(key);
+            assert!(err.to_string().contains(key), "{key}: {err}");
+        }
+    }
+
+    /// The shipped example config parses: it names no refused section or key.
+    #[test]
+    #[parallel(env)]
+    fn test_example_node_config_parses() {
+        let config: NodeConfig = toml::from_str(include_str!("../example-node-config.toml"))
+            .expect("example-node-config.toml must parse");
+        assert!(config.node.unwrap().initial_link.is_some());
     }
 }

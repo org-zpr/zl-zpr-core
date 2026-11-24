@@ -1,7 +1,7 @@
 # zpr-core
 
-Core ZPR components: the packet handler that runs as a ZPR node or adapter,
-the command-line tool that controls it, and the end-to-end tests that stand
+Core ZPR components: the packet handler that runs a Zode (a ZPR node that
+carries its own actor), the command-line tool that controls it, and the end-to-end tests that stand
 up a whole ZPRnet.
 
 Roadmap and backlog: [current iteration](https://github.com/orgs/org-zpr/projects/1/views/3),
@@ -14,9 +14,11 @@ Roadmap and backlog: [current iteration](https://github.com/orgs/org-zpr/project
 
 ## What is here
 
-* **`ph`**, the packet handler (`adapter/ph`). One binary, two roles:
-  `ph node` forwards ZPR traffic between adapters; `ph adapter` attaches a
-  host to a node and carries its traffic over a TUN interface.
+* **`ph`**, the packet handler (`adapter/ph`). One binary, one role:
+  `ph zode` runs a Zode, which carries its host's own traffic over a TUN
+  interface and links to other Zodes. A relay Zode (`--relay true`) hosts
+  the visa service and accepts links; every other Zode dials its relay over
+  its initial link (`--initial-link`).
 * **`ph-cli`**, the control tool (`adapter/cli`). Talks to a running `ph`
   over its control socket to start and stop links, log a user in, read
   counters, and capture packets.
@@ -31,11 +33,11 @@ protocol) are libraries `ph` is built from.
 A ZPRnet needs more than this repository:
 
 * **A running visa service**, `vs`, from the
-  [zpr-visaservice repository](https://github.com/org-zpr/zpr-visaservice).
+  [zl-zpr-visaservice repository](https://github.com/org-zpr/zl-zpr-visaservice).
   Nothing connects without it: every link is authorized by a visa it issues.
   It needs Valkey (or Redis) at runtime.
 * **A compiled policy**, produced by `zplc` from the
-  [zpr-compiler repository](https://github.com/org-zpr/zpr-compiler).
+  [zl-zpr-compiler repository](https://github.com/org-zpr/zl-zpr-compiler).
   The visa service evaluates it.
 
 The **`zpr-dev-context`** repository, checked out beside this one, holds
@@ -79,27 +81,24 @@ under `/var/run/zpr`. `ph-cli` does not; when `ph` is started with `sudo`,
 the socket is handed to the invoking user.
 
 ```sh
-sudo ./target/debug/ph node    -c node.toml       # on the node host
-sudo ./target/debug/ph adapter -c adapter.toml    # on each attached host
-./target/debug/ph-cli link show                   # as yourself, no sudo
+sudo ./target/debug/ph zode -c relay.toml --relay true            # on the relay host
+sudo ./target/debug/ph zode -c zode.toml --initial-link relay@10.1.0.8:5000   # on each other host
+./target/debug/ph-cli link show                                   # as yourself, no sudo
 ```
 
-Getting to that point takes keys, certificates, a policy, and configuration
-files for each side. [`docs/SETUP.md`](docs/SETUP.md) walks through all of
+Getting to that point takes keys, certificates, a policy, and a
+configuration file for each Zode. [`docs/SETUP.md`](docs/SETUP.md) walks through all of
 it by hand and ends with a reference for the control socket and certificate
 verification.
 
-Adapter-node link establishment and actor authorization have independent
-lifecycles. See [actor authorization](diagrams/actor_authorization.md) for the
-state machines, wire protocol, retry policy, and bootstrap exception.
-
-`ph adapter` also runs on Windows 10/11: `ph.exe adapter -c adapter.toml`
-from an elevated (Administrator) console, with the signed `wintun.dll` from
+`ph zode` also runs on Windows 10/11: `ph.exe zode -c zode.toml` from an
+elevated (Administrator) console, with the signed `wintun.dll` from
 [wintun.net](https://www.wintun.net) next to `ph.exe`. `ph-cli.exe` talks to
-it over a named pipe instead of the unix socket. Nodes stay on Linux, and
-packet capture is not available on Windows. See
-[`integration-test/windows-adapter-test.md`](integration-test/windows-adapter-test.md) for
-an end-to-end walkthrough against a Linux node.
+it over a named pipe instead of the unix socket. It runs on macOS too, under
+`sudo`, as on Linux. The end-to-end walkthroughs, each against a relay Zode
+on a Linux host, are
+[`integration-test/windows-zode-test.md`](integration-test/windows-zode-test.md)
+and [`integration-test/macos-zode-test.md`](integration-test/macos-zode-test.md).
 
 ### Integration tests
 
@@ -109,13 +108,13 @@ path runs them in a privileged Docker container:
 
 ```sh
 make integration-test-docker                                   # every test
-make -C integration-test docker-test TEST=one-node-test.sh     # one test
+make -C integration-test docker-test TEST=zode-ping-test.sh    # one test
 ```
 
 With passwordless `sudo` on a Linux host, each script also runs directly:
 
 ```sh
-integration-test/one-node-test.sh
+integration-test/zode-ping-test.sh
 ```
 
 Either way the scripts look next to themselves for binaries from the other

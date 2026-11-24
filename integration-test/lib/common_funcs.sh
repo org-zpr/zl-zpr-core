@@ -187,92 +187,6 @@ function process_exited() {
   ! ps -p "$1" > /dev/null
 }
 
-function create_network() {
-  new_netns zpr-node
-  new_netns zpr-vs
-  new_netns zpr-a
-  new_netns zpr-b
-  new_netns zpr-c
-
-  # loopback
-
-  in_ns zpr-node ip link set lo up
-  in_ns zpr-vs ip link set lo up
-  in_ns zpr-a ip link set lo up
-  in_ns zpr-b ip link set lo up
-  in_ns zpr-c ip link set lo up
-
-  # virtual Ethernet pairs
-
-  connect_ns zpr-vs veth0 zpr-node veth-zpr-vs
-  connect_ns zpr-a veth0 zpr-node veth-zpr-a
-  connect_ns zpr-b veth0 zpr-node veth-zpr-b
-  connect_ns zpr-c veth0 zpr-node veth-zpr-c
-
-  # Each substrate link gets a /24 rather than a point-to-point
-  # "addr add ADDR peer PEER" pair.  Peer addressing is tempting here -- every
-  # link really does have exactly two endpoints -- but the local address it
-  # produces is a /32, and the kernel does not answer ARP requests for such an
-  # address on an ARP-capable device like veth.  The neighbour entry then stays
-  # INCOMPLETE forever, so no substrate packet ever reaches the far end, and
-  # every adapter fails to dock.  (tun0 below is a different case: a TUN device
-  # is NOARP, so peer addressing works there and is used.)
-  #
-  # This /24 addressing is zipline's one deliberate divergence from upstream
-  # main's create_network, which still uses peer addressing (zipline#190).
-  in_ns zpr-node ip addr add "$NODE_SUBSTRATE_ADDR_VS/24" dev veth-zpr-vs
-  in_ns zpr-node ip addr add "$NODE_SUBSTRATE_ADDR_A/24" dev veth-zpr-a
-  in_ns zpr-node ip addr add "$NODE_SUBSTRATE_ADDR_B/24" dev veth-zpr-b
-  in_ns zpr-node ip addr add "$NODE_SUBSTRATE_ADDR_C/24" dev veth-zpr-c
-  if [ -n "${NODE_SUBSTRATE_ADDR_C_ALT-}" ]
-  then in_ns zpr-node ip addr add "$NODE_SUBSTRATE_ADDR_C_ALT/24" dev veth-zpr-c  # Used for testing routing.
-  fi
-  in_ns zpr-vs ip addr add "$VS_SUBSTRATE_ADDR/24" dev veth0
-  in_ns zpr-a ip addr add "$A_SUBSTRATE_ADDR/24" dev veth0
-  in_ns zpr-b ip addr add "$B_SUBSTRATE_ADDR/24" dev veth0
-  in_ns zpr-c ip addr add "$C_SUBSTRATE_ADDR/24" dev veth0
-
-  in_ns zpr-node ip link set veth-zpr-vs up
-  in_ns zpr-node ip link set veth-zpr-a up
-  in_ns zpr-node ip link set veth-zpr-b up
-  in_ns zpr-node ip link set veth-zpr-c up
-  in_ns zpr-vs ip link set veth0 up
-  in_ns zpr-a ip link set veth0 up
-  in_ns zpr-b ip link set veth0 up
-  in_ns zpr-c ip link set veth0 up
-
-  # TUN devices.  No `user` option: everything runs as the namespace's
-  # mapped root, which holds CAP_NET_ADMIN over these devices anyway.
-  in_ns zpr-node ip tuntap add name tun0 mode tun multi_queue
-  in_ns zpr-vs ip tuntap add name tun0 mode tun multi_queue
-  in_ns zpr-a ip tuntap add name tun0 mode tun multi_queue
-  in_ns zpr-b ip tuntap add name tun0 mode tun multi_queue
-  in_ns zpr-c ip tuntap add name tun0 mode tun multi_queue
-
-  in_ns zpr-node ip link set tun0 up
-  in_ns zpr-vs ip link set tun0 up
-  in_ns zpr-a ip link set tun0 up
-  in_ns zpr-b ip link set tun0 up
-  in_ns zpr-c ip link set tun0 up
-
-  # Kernel bug: kernels older than 6.10 don't set peer route correctly
-  # when interface is down.  I think <https://github.com/torvalds/linux/commit/d0098e4c6b83e502cc1cd96d67ca86bc79a6c559>
-  # fixes this issue.  For now, add the addresses after we bring the link up.
-  in_ns zpr-node ip addr add "$NODE_ZPR_ADDR" peer "$VS_ZPR_ADDR" dev tun0
-  in_ns zpr-vs ip addr add "$VS_ZPR_ADDR" peer "$NODE_ZPR_ADDR" dev tun0
-  in_ns zpr-a ip addr add "$A_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
-  in_ns zpr-b ip addr add "$B_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
-  in_ns zpr-c ip addr add "$C_ZPR_ADDR" peer "$ZPR_SUBNET" dev tun0
-}
-
-function configure_netem() {
-  echo "Configuring netem $@" > /dev/stderr
-  for NIC in vs a b c
-  do
-    in_ns zpr-node tc qdisc add dev veth-zpr-"$NIC" root netem "$@"
-  done
-}
-
 function destroy_network() {
   # The namespaces are anonymous, pinned only by their holder processes;
   # killing the holders destroys them.
@@ -318,60 +232,6 @@ admin_cert = "$(realpath "$PREGEN/zpr-rsa-cert.pem")"
 admin_key = "$(realpath "$PREGEN/zpr-rsa-key.pem")"
 vk_uri = "redis://127.0.0.1:6379"
 EOF
-}
-
-# Install the shared static-address store for the `addresses` file trusted
-# service (zipline#107). Every fixture policy that declares
-# [trusted_services.addresses] gets its data from pregen/addresses.json: one
-# CN-keyed store granting adapter1/2/3 their static ZPR addresses via
-# device.zpr_addr (zipline#99), plus a user-keyed entry for the user-only
-# OIDC adapter1 (its CN is never authenticated, so the grant is keyed on the
-# user identity the policy maps `sub` to). The visa service reads
-# <file_ts_dir>/addresses.json, and file_ts_dir defaults to the directory of
-# the vs config file — call this from that directory (the test's $TMPDIR),
-# like the happyfile/attr-query copies.
-function copy_address_store() {
-  cp "$PREGEN/addresses.json" addresses.json
-}
-
-function check_vs_valkey_port() {
-  in_ns zpr-vs bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6379'
-}
-
-function ping_test() {
-  RESULT=0
-  local deadline=(-w 5)
-  if [[ -n "${NETEM_PARAMS:-}" ]]; then
-    # With injected loss, require connectivity, not all five replies by a deadline.
-    deadline=(-W 1)
-  fi
-
-  in_ns zpr-node ping -q -c 5 "${deadline[@]}" "$VS_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  in_ns zpr-vs ping -q -c 5 "${deadline[@]}" "$NODE_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  in_ns zpr-a ping -q -c 5 "${deadline[@]}" "$B_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  in_ns zpr-b ping -q -c 5 "${deadline[@]}" "$A_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-
-  if [[ "$NUM_ACTORS" -ge 3 ]]; then
-    in_ns zpr-a ping -q -c 5 "${deadline[@]}" "$C_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-    in_ns zpr-b ping -q -c 5 "${deadline[@]}" "$C_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-    in_ns zpr-c ping -q -c 5 "${deadline[@]}" "$A_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-    in_ns zpr-c ping -q -c 5 "${deadline[@]}" "$B_ZPR_ADDR" & wait -f $!; let RESULT="RESULT||$?"
-  fi
-
-  return "$RESULT"
-}
-
-function check_carrier() {
-  NETNS=$1
-  IF=$2
-
-  # `nsenter -n` does not remount /sys (unlike `ip netns exec`), so
-  # /sys/class/net would show the wrong namespace; ask ip(8) instead.
-  in_ns "$NETNS" ip link show dev "$IF" | grep -q LOWER_UP
-}
-
-function check_actor_authorized() {
-  "$PH_DEBUG_BIN" -p "$1" link show 2 | grep -q 'Actor state: Authorized'
 }
 
 # Visible sleep for n seconds.  Takes one arg: number of seconds.
@@ -427,14 +287,7 @@ function cleanup() {
   if [ "$SHOW_LOGS" != "no" ]
      then
          emitlog "valkey.log"
-         emitlog "node.log"
          emitlog "vs.log"
-         # The VS's own adapter has to dock before the node can reach the visa
-         # service at all, so its log is emitted with the rest of them.
-         emitlog "adapter-vs.log"
-         emitlog "adapter1.log"
-         emitlog "adapter2.log"
-         emitlog "adapter3.log"
   fi
 
   popd > /dev/null

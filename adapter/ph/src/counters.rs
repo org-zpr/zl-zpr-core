@@ -103,9 +103,11 @@ pub enum FastpathCounterType {
     EncryptionFailure,
     UnknownStreamId,
     BadStructure,
+    ClassifierMismatch, // the packet does not match its stream's classifier (zl-zipline#283)
     OtherError,
 
     TtlExpired,
+    VisaExpired, // the stream's visa has expired (zl-zipline#274)
 
     #[cfg(debug_assertions)]
     ActorPacketsOutOfOrder,
@@ -147,6 +149,18 @@ pub enum ManagementCounterType {
     VisaRequestSuccess,
     VisaRequestDenied,
     VisaRequestError,
+
+    /// J11 (zl-zipline#252): a live stream could not be moved onto the
+    /// visa that supersedes its own, and stays on the old visa.
+    RebindFailed,
+    /// A bootstrap-visa hand-off (ZDP 146) refused (zl-zipline#252, J4).
+    BootstrapHandoffRefused,
+    /// A `Stream ID Request` from a Zode link answered with an error, for
+    /// any reason: not from the visa's previous hop (gap 7,
+    /// zl-zipline#253), an F2 guard, no visa or no egress, a visa denial,
+    /// or a pending bind whose next hop was lost (rule 9). The log line of
+    /// each refusal names its reason.
+    StreamIdRequestRejected,
 }
 
 impl FastpathCounterType {
@@ -189,9 +203,11 @@ impl FastpathCounterType {
             Self::EncryptionFailure => "Encryption Failure",
             Self::UnknownStreamId => "Unknown Stream ID",
             Self::BadStructure => "Fastpath Bad Structure",
+            Self::ClassifierMismatch => "Classifier Mismatch",
             Self::OtherError => "Fastpath Other Error",
 
             Self::TtlExpired => "TTL Reached 0",
+            Self::VisaExpired => "Visa Expired",
 
             #[cfg(debug_assertions)]
             Self::ActorPacketsOutOfOrder => "Actor Packets Out-Of-Order",
@@ -239,6 +255,9 @@ impl ManagementCounterType {
             Self::VisaRequestSuccess => "Visa Request Success",
             Self::VisaRequestDenied => "Visa Request Denied",
             Self::VisaRequestError => "Visa Request Error",
+            Self::RebindFailed => "Rebind Failed",
+            Self::BootstrapHandoffRefused => "Bootstrap Hand-offs Refused",
+            Self::StreamIdRequestRejected => "Stream ID Request Rejected",
         }
     }
 }

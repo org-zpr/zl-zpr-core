@@ -1,0 +1,80 @@
+# -*- mode: toml -*-
+#
+# Zode login netns fixture (zl-zipline#233), used by zode-login-test.sh and
+# zode-oidc-test.sh. zodes.zplc (the relay linked to zb, the visa service
+# docked on the relay) plus the fake IdP as an OIDC trusted service: zb's
+# own actor gains the user's attributes when someone logs in on zb. The
+# seed JWKS carries only the IdP's first signing key, so zode-oidc-test.sh's
+# key rotation makes the visa service fetch the live JWKS.
+#
+# `service` (the JWKS CONNECT proxy) is omitted, so zplc warns; expected.
+
+[resolver]
+order = ["hosts", "dns"]
+
+[resolver.hosts]
+"relay.zpr" = "fd5a:5052::2"
+"zb.zpr" = "fd5a:5052::3"
+
+[nodes.relay]
+provider = [ [ "device.zpr.adapter.cn", "relay" ] ]
+zpr_address = "relay.zpr"
+transit = true
+
+[nodes.relay.substrate_addrs]
+i0 = "10.2.0.1:5000"
+
+[nodes.zb]
+provider = [ [ "device.zpr.adapter.cn", "zb" ] ]
+zpr_address = "zb.zpr"
+# No substrate_addrs for zb (zl-zipline#255): the visa service learns
+# zb's address only from what zb reports when it connects.
+
+[links.relay-zb]
+peers = [ { node = "relay" }, { node = "zb" } ]
+
+[trusted_services.default]
+cert_path = "ca-cert.pem"
+
+[trusted_services.fake-idp]
+api             = "oidc"
+issuer          = "https://127.0.0.1:9000"
+jwks_uri        = "https://127.0.0.1:9000/jwks"
+client_id       = "zpr-test-client"
+scopes          = ["openid", "email", "profile"]
+allowed_domains = ["example.com"]
+seed_jwks       = "oidc-test-seed-jwks.json"
+
+# Short enough for the renewal leg to wait out: ph renews at
+# `expires - min(auth_renewal_lead, lifetime / 2)`, about 30 s after a
+# login. The ceiling is far past the run, and offline access lets the
+# resident auth-agent renew silently with its refresh token.
+expiration_seconds   = 60
+max_auth_age_seconds = 3600
+allow_offline_access = true
+
+returns_attributes = [
+  "sub   -> user.oidc-subject",
+  "email -> user.email",
+  "hd    -> user.domain",
+]
+identity_attributes = ["sub"]
+
+[visa_service]
+dock_node = "relay"
+
+[bootstrap]
+"relay" = "node-rsa-pubkey.pem"
+"zb" = "zb-rsa-pubkey.pem"
+"vs.zpr" = "actorvs.pem"
+
+[protocols.ping]
+l4protocol = "iana.ICMP6"
+icmp_type = "request-response"
+icmp_codes = [ 128, 129 ]
+
+[services.PingableVs]
+protocol = "ping"
+
+[services.PingableRelay]
+protocol = "ping"

@@ -43,6 +43,9 @@ pub enum HandleMgmtError {
 
     #[error("link closed")]
     LinkClosed,
+
+    #[error("bootstrap visa hand-off refused: {0}")]
+    HandoffRefused(#[from] crate::bootstrap_handoff::HandoffError),
 }
 
 const X25519_KEY_LEN: usize = 32;
@@ -56,6 +59,7 @@ impl From<&HandleMgmtError> for counters::ManagementCounterType {
             HandleMgmtError::UnknownTransaction => Self::UnknownTransaction,
             HandleMgmtError::LinkStateError(_) => Self::OtherError,
             HandleMgmtError::LinkClosed => Self::OtherError,
+            HandleMgmtError::HandoffRefused(_) => Self::BootstrapHandoffRefused,
         }
     }
 }
@@ -124,188 +128,6 @@ pub async fn handle_echo_request(_asm: &Arc<Assembly>, _pkt: Packet) -> HandleMg
     Ok(())
 }
 
-/// TODO: Not yet in RFC 6
-///
-/// Message from node requesting authentication.
-/// Sends a [zdp::ZdpInitAuthenticationResponse] back.
-///
-pub async fn handle_init_authentication_request(
-    asm: &Arc<Assembly>,
-    txn: TxnId,
-    mut pkt: Packet,
-) -> HandleMgmtResult {
-    let ingress_link_id = pkt.metadata().ingress_link_id;
-
-    let Ok(hdr) = zdp::ZdpInitAuthenticationRequestHeader::read_from_buf(&mut pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-    let is_bootstrap = hdr.flags & zdp::init_authentication_flags::BOOTSTRAP_SUPPORT != 0;
-
-    let challenge_opt: Option<auth::ZdpInitAuthenticationPayload>;
-
-    if !valid_auth_status(hdr.status)
-        || hdr.flags & !zdp::init_authentication_flags::BOOTSTRAP_SUPPORT != 0
-        || (hdr.status != zdp::AuthenticationStatus::Success
-            && (hdr.flags != 0 || hdr.data_len.get() != 0))
-    {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    if is_bootstrap {
-        if hdr.data_len.get() as usize != size_of::<auth::ZdpInitAuthenticationPayload>() {
-            return Err(HandleMgmtError::BadStructure);
-        }
-        debug!(target: ZDP, "Received Init Authentication +bootstrap for {}", asm.formatted_link_id(ingress_link_id));
-
-        let Ok(payload) = auth::ZdpInitAuthenticationPayload::read_from_buf(&mut pkt) else {
-            return Err(HandleMgmtError::BadStructure);
-        };
-        challenge_opt = Some(payload);
-    } else {
-        if hdr.data_len.get() != 0 {
-            return Err(HandleMgmtError::BadStructure);
-        }
-        debug!(target: ZDP, "Received Init Authentication for {} -- bootstrap not supported", asm.formatted_link_id(ingress_link_id));
-        challenge_opt = None;
-    }
-
-    // Upstream #1410 carries ASA TLVs here; zipline removed ASA with the
-    // BAS/OAuthRsa client (zipline#15), so any TLVs are parsed (to reject a
-    // malformed body) and ignored.
-    tlv::parse_from_buf(&mut pkt).map_err(|_| HandleMgmtError::BadStructure)?;
-    asm.peer_table
-        .get(ingress_link_id)
-        .ok_or(HandleMgmtError::LinkClosed)?
-        .actor_auth
-        .receive_offer(
-            txn,
-            crate::actor_auth::AuthenticationOffer {
-                status: hdr.status,
-                challenge: challenge_opt,
-            },
-        )?;
-
-    Ok(())
-}
-
-fn valid_auth_status(status: zdp::AuthenticationStatus) -> bool {
-    matches!(
-        status,
-        zdp::AuthenticationStatus::Success
-            | zdp::AuthenticationStatus::Rejected
-            | zdp::AuthenticationStatus::Retryable
-            | zdp::AuthenticationStatus::PolicyDenied
-    )
-}
-
-pub async fn handle_start_authentication(
-    asm: &Arc<Assembly>,
-    txn: TxnId,
-    pkt: Packet,
-) -> HandleMgmtResult {
-    if pkt.remaining() != 0 {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    asm.peer_table
-        .get(pkt.metadata().ingress_link_id)
-        .ok_or(HandleMgmtError::LinkClosed)?
-        .actor_auth
-        .start_remote(asm, txn)
-}
-
-pub async fn handle_abandon_authentication(
-    asm: &Arc<Assembly>,
-    txn: TxnId,
-    pkt: Packet,
-) -> HandleMgmtResult {
-    if pkt.remaining() != 0 {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    asm.peer_table
-        .get(pkt.metadata().ingress_link_id)
-        .ok_or(HandleMgmtError::LinkClosed)?
-        .actor_auth
-        .abandon_remote(asm, txn)
-}
-
-/// Handle a Renew Authentication request (zipline#66; NOT YET IN RFC 6)
-///
-/// Node → adapter on an Active link: carries the fresh challenge the
-/// renewed credential must bind to. Routed to the link's actor renewal
-/// state ([crate::actor_renewal]).
-pub async fn handle_renew_authentication_request(
-    asm: &Arc<Assembly>,
-    mut pkt: Packet,
-) -> HandleMgmtResult {
-    let ingress_link_id = pkt.metadata().ingress_link_id;
-
-    let Ok(hdr) = zdp::ZdpRenewAuthenticationRequestHeader::read_from_buf(&mut pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-    if usize::from(hdr.data_len.get()) < size_of::<auth::ZdpInitAuthenticationPayload>() {
-        warn!(target: ZDP, "Received Renew Authentication with unexpected payload size {}", hdr.data_len.get());
-        return Err(HandleMgmtError::BadStructure);
-    }
-    if pkt.remaining() < usize::from(hdr.data_len.get()) {
-        warn!(target: ZDP, "packet too short for renewal challenge payload");
-        return Err(HandleMgmtError::BadStructure);
-    }
-    let Ok(payload) = auth::ZdpInitAuthenticationPayload::read_from_buf(&mut pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-
-    debug!(target: ZDP, "Received Renew Authentication request for {}", asm.formatted_link_id(ingress_link_id));
-
-    crate::actor_renewal::receive_renew_request(asm, ingress_link_id, payload)
-}
-
-/// Handle a Renew Authentication response (zipline#66; NOT YET IN RFC 6)
-///
-/// Adapter → node: the renewed auth blob on success, or the failure status,
-/// plus the echoed challenge of the request it answers. Routed to the
-/// link's actor renewal state ([crate::actor_renewal]).
-pub async fn handle_renew_authentication_response(
-    asm: &Arc<Assembly>,
-    mut pkt: Packet,
-) -> HandleMgmtResult {
-    let ingress_link_id = pkt.metadata().ingress_link_id;
-
-    let Ok(hdr) = zdp::ZdpRenewAuthenticationResponseHeader::read_from_buf(&mut pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-    let challenge = hdr.challenge;
-    if !valid_auth_status(hdr.status_code) {
-        return Err(HandleMgmtError::BadStructure);
-    }
-
-    let result: Result<String, zdp::AuthenticationStatus>;
-    if hdr.status_code == zdp::AuthenticationStatus::Success {
-        let blen = hdr.blob_len.get() as usize;
-        if blen == 0 {
-            warn!(target: ZDP, "Received successful Renew Authentication response with no blob");
-            return Err(HandleMgmtError::BadStructure);
-        }
-        if pkt.remaining() < blen {
-            warn!(target: ZDP, "packet too short for renewal blob");
-            return Err(HandleMgmtError::BadStructure);
-        }
-        let blob_buffer = pkt.copy_to_bytes(blen);
-        match String::from_utf8(blob_buffer.into()) {
-            Ok(blob) => result = Ok(blob),
-            Err(_) => {
-                warn!(target: ZDP, "failed to parse renewal blob as utf8");
-                return Err(HandleMgmtError::BadStructure);
-            }
-        }
-    } else {
-        result = Err(hdr.status_code);
-    }
-
-    debug!(target: ZDP, "Received Renew Authentication response for {} (status {:?})",
-        asm.formatted_link_id(ingress_link_id), hdr.status_code);
-
-    crate::actor_renewal::receive_renew_response(asm, ingress_link_id, challenge, result)
-}
-
 /// handle a Terminate Link or Docking Session message (TODO: document in RFC 17)
 ///
 /// Sends [LinkEvent::ReceivedTerminateLink] into the link state machine.
@@ -335,10 +157,6 @@ pub async fn handle_terminate_link_or_docking_session(
 ///
 pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
     let ingress_link_id = pkt.metadata().ingress_link_id;
-    if asm.ph_mode != PhMode::Node {
-        warn!(target: ZDP, "{} received Hello Request but not in node mode", asm.formatted_link_id(ingress_link_id));
-        return Err(HandleMgmtError::MessageNotPermitted);
-    }
     debug!(target: ZDP, "Received Hello Request for {}", asm.formatted_link_id(ingress_link_id));
 
     let tlv_data = match tlv::parse_from_buf(&mut pkt) {
@@ -387,6 +205,23 @@ pub async fn handle_hello_request(asm: &Arc<Assembly>, mut pkt: Packet) -> Handl
     Ok(())
 }
 
+/// Handle a Bootstrap Visas message (ZDP 146, zl-zipline#252 J4): the
+/// relay handing this joining Zode its two bootstrap visas. Installed only
+/// if every check in [crate::bootstrap_handoff::check_handoff] passes.
+///
+/// A refusal is logged and returned as an error, which the management
+/// processor counts (`BootstrapHandoffRefused`) and turns into a link
+/// error that closes the link: the strict handler-error convention of
+/// #251 (gate g88 q2). On the initial link the joiner then redials with
+/// backoff, and the new link brings a fresh hand-off (rule 11a).
+pub async fn handle_bootstrap_visas(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
+    let link_id = pkt.metadata().ingress_link_id;
+    crate::bootstrap_handoff::accept(asm, link_id, pkt.body()).map_err(|e| {
+        warn!(target: ZDP, "{}: refused a bootstrap visa hand-off: {e}; closing the link", asm.formatted_link_id(link_id));
+        HandleMgmtError::from(e)
+    })
+}
+
 pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> HandleMgmtResult {
     let link_id = pkt.metadata().ingress_link_id;
     let event = parse_hello_response(asm, link_id, &mut pkt)?;
@@ -397,7 +232,8 @@ pub async fn handle_hello_response(asm: &Arc<Assembly>, mut pkt: Packet) -> Hand
 /// Parse a HelloResponse body into the [LinkEvent::ReceivedHelloResponse] to
 /// raise: status code, optional AAA address, and any advertised OIDC identity
 /// providers (OIDC_IDP TLVs, JSON [auth::OidcIdpInfo] each; a TLV with bad
-/// JSON is warned about and skipped).
+/// JSON is warned about and skipped). On a Zode link, a response carrying
+/// any of those TLVs yields a [LinkEvent::Close] instead.
 fn parse_hello_response(
     asm: &Arc<Assembly>,
     link_id: LinkId,
@@ -423,6 +259,27 @@ fn parse_hello_response(
     if !has_actor_auth_protocol(&tlv_data) {
         warn!(target: ZDP, "{}: incompatible actor authorization protocol", asm.formatted_link_id(link_id));
         return Err(HandleMgmtError::MessageNotPermitted);
+    }
+    // zl-zipline#250 (gaps 5 and 6): a Zode answers Hello with none of the
+    // TLVs an adapter dock gets. Refuse their mere presence on a Zode link,
+    // before the tolerant decoding below can skip an undecodable one: the
+    // event becomes a close.
+    let zode_link = asm
+        .peer_table
+        .inspect(link_id, |p| {
+            p.link_state_machine.get_link_type() == LinkType::NodeToNode
+        })
+        .unwrap_or(false);
+    let adapter_tlvs = [
+        tlv::DataType::AAA,
+        tlv::DataType::OIDC_IDP,
+        tlv::DataType::VS_BOOTSTRAP_LINK,
+    ]
+    .iter()
+    .any(|t| tlv_data.contains_key(t));
+    if zode_link && adapter_tlvs {
+        warn!(target: ZDP, "{}: refusing a Zode HelloResponse that carries AAA, OIDC_IDP or VS_BOOTSTRAP_LINK; closing", asm.formatted_link_id(link_id));
+        return Ok(LinkEvent::Close(zdp::TerminateReason::Other));
     }
     let vs_bootstrap = match tlv_data.get(&tlv::DataType::VS_BOOTSTRAP_LINK) {
         None => false,
@@ -573,232 +430,6 @@ fn process_a2a_dh_pubkey_tlv(
         }
     }
     Ok(())
-}
-
-/// Handle the AcquireZprAddressRequest (TODO: Not yet in RFC 6)
-///
-/// This message is from an adapter to a node.  Or in the future from
-/// a joining node to an existing node.
-///
-/// This request must include an authentication blob from the
-/// adapter.
-///
-/// In the future we (node/vs) will assign a ZPR address to the adapter
-/// after verifying authentication.  During a transition period to full
-/// authentication we permit the adapter to send us an address it wants
-/// to have and if authentication succeeds, we just send that address
-/// back (in the grant message).
-///
-/// The authentication blob may come from bootstrap auth or from real
-/// auth-service auth.
-///
-pub async fn handle_acquire_zpr_address_request(
-    asm: &Arc<Assembly>,
-    txn: TxnId,
-    mut pkt: Packet,
-) -> HandleMgmtResult {
-    let ingress_link_id = pkt.metadata().ingress_link_id;
-
-    let Ok((actor_addresses, blob)) = parse_acquire_zpr_address_request(&mut pkt) else {
-        error!(target: ZDP, "{} Failed to parse Acquire Zpr Address Request message", asm.formatted_link_id(ingress_link_id));
-        return Err(HandleMgmtError::BadStructure);
-    };
-
-    // Now we can do our async prcessing of the acquire which will involve talking to
-    // the visa service.
-
-    debug!(target: ZDP, "{}: received Acquire ZPR Address Request for link with addresses {:?}", asm.formatted_link_id(ingress_link_id), actor_addresses);
-
-    asm.peer_table
-        .get(ingress_link_id)
-        .ok_or(HandleMgmtError::LinkClosed)?
-        .actor_auth
-        .acquire_remote(asm, txn, actor_addresses, blob)?;
-
-    Ok(())
-}
-
-/// Handle the GrantZprAddressRequest (TODO: Not yet in RFC 6)
-///
-/// This message comes from a node post verification of the authentication blob
-/// which we get in an Acquire message.
-///
-/// Routes the transaction's outcome to the independent actor controller.
-pub async fn handle_grant_zpr_address_request(
-    asm: &Arc<Assembly>,
-    txn: TxnId,
-    mut pkt: Packet,
-) -> HandleMgmtResult {
-    let ingress_link_id = pkt.metadata().ingress_link_id;
-
-    let (status, addresses) = match parse_grant_zpr_address_request(&mut pkt)? {
-        Ok(addresses) => (zdp::AuthenticationStatus::Success, addresses),
-        Err(status) => (status, Vec::new()),
-    };
-    asm.peer_table
-        .get(ingress_link_id)
-        .ok_or(HandleMgmtError::LinkClosed)?
-        .actor_auth
-        .receive_grant(txn, status, addresses)?;
-
-    Ok(())
-}
-
-/// Returns tuple of (actor_addresses, blob)
-/// The addresses are left the address requested by the adapter. This is left over from
-/// the older register-actor-address.  Until we are actually assigning addresses we
-/// will honor the senders request.
-///
-/// The blob is a base64 encoded json object.
-fn parse_acquire_zpr_address_request(
-    pkt: &mut Packet,
-) -> Result<(Option<Vec<IpAddress>>, String), HandleMgmtError> {
-    let Ok(hdr) = zdp::ZdpAcquireZprAddressHeader::read_from_buf(pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-    if hdr.addr_count > 1 || !matches!(hdr.ip_version, L3Type::Ipv4 | L3Type::Ipv6) {
-        return Err(HandleMgmtError::BadStructure);
-    }
-
-    // In memmory:
-    //     header
-    //     blob
-    //     actor addresses (optional)
-
-    let blob: String;
-    let blen = hdr.blob_len.get() as usize;
-    if blen == 0 {
-        // BLOB must be sent!
-        error!(target: ZDP, "Received AcquireZprAddressRequest with no blob");
-        return Err(HandleMgmtError::BadStructure);
-    } else {
-        if pkt.remaining() < blen {
-            warn!(target: ZDP, "packet too short for blob");
-            return Err(HandleMgmtError::BadStructure);
-        }
-        let blob_buffer = pkt.copy_to_bytes(blen);
-        match String::from_utf8(blob_buffer.into()) {
-            Ok(b) => {
-                blob = b;
-            }
-            Err(_) => {
-                warn!(target: ZDP, "failed to parse blob as utf8");
-                return Err(HandleMgmtError::BadStructure);
-            }
-        }
-    }
-
-    let actor_addresses: Option<Vec<IpAddress>>;
-    if hdr.addr_count > 0 {
-        let bytes_needed = match hdr.ip_version {
-            L3Type::Ipv4 => 4 * hdr.addr_count as usize,
-            L3Type::Ipv6 => 16 * hdr.addr_count as usize,
-            _ => {
-                warn!(target: ZDP, "invalid ip_version field");
-                return Err(HandleMgmtError::BadStructure);
-            }
-        };
-        if pkt.remaining() < bytes_needed {
-            warn!(target: ZDP, "packet too short for addresses");
-            return Err(HandleMgmtError::BadStructure);
-        }
-        let mut addrs = Vec::new();
-        for _ in 0..hdr.addr_count {
-            let addr: IpAddress;
-            match hdr.ip_version {
-                L3Type::Ipv4 => {
-                    let Ok(addr_bytes) = <[u8; 4]>::read_from_buf(pkt) else {
-                        return Err(HandleMgmtError::BadStructure);
-                    };
-                    addr = addr_bytes.into();
-                }
-                L3Type::Ipv6 => {
-                    let Ok(addr_bytes) = <[u8; 16]>::read_from_buf(pkt) else {
-                        return Err(HandleMgmtError::BadStructure);
-                    };
-                    addr = addr_bytes.into();
-                }
-                _ => {
-                    panic!("already handled this error above")
-                }
-            }
-            addrs.push(addr);
-        }
-        actor_addresses = Some(addrs);
-    } else {
-        actor_addresses = None;
-    }
-    if pkt.remaining() != 0 {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    Ok((actor_addresses, blob))
-}
-
-/// The grant is a message from a node to an adapter (future: or to a joining node).
-/// In includes the address (or addresses) we have been assigned to use.
-fn parse_grant_zpr_address_request(
-    pkt: &mut Packet,
-) -> Result<Result<Vec<IpAddress>, zdp::AuthenticationStatus>, HandleMgmtError> {
-    let Ok(hdr) = zdp::ZdpGrantZprAddressHeader::read_from_buf(pkt) else {
-        return Err(HandleMgmtError::BadStructure);
-    };
-
-    // In memmory:
-    //     header
-    //     actor addresses (optional)
-
-    if !valid_auth_status(hdr.status_code) {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    if hdr.status_code != zdp::AuthenticationStatus::Success {
-        if hdr.addr_count != 0 || pkt.remaining() != 0 {
-            return Err(HandleMgmtError::BadStructure);
-        }
-        warn!(target: ZDP, "Received Grant Zpr Address Request with non-success status code {:?}", hdr.status_code);
-        return Ok(Err(hdr.status_code));
-    }
-    if hdr.addr_count != 1 {
-        return Err(HandleMgmtError::BadStructure);
-    }
-
-    let mut actor_addresses = Vec::new();
-    let bytes_needed = match hdr.ip_version {
-        L3Type::Ipv4 => 4 * hdr.addr_count as usize,
-        L3Type::Ipv6 => 16 * hdr.addr_count as usize,
-        _ => {
-            warn!(target: ZDP, "invalid ip_version field");
-            return Err(HandleMgmtError::BadStructure);
-        }
-    };
-    if pkt.remaining() < bytes_needed {
-        warn!(target: ZDP, "packet too short for addresses");
-        return Err(HandleMgmtError::BadStructure);
-    }
-    for _ in 0..hdr.addr_count {
-        let addr: IpAddress;
-        match hdr.ip_version {
-            L3Type::Ipv4 => {
-                let Ok(addr_bytes) = <[u8; 4]>::read_from_buf(pkt) else {
-                    return Err(HandleMgmtError::BadStructure);
-                };
-                addr = addr_bytes.into();
-            }
-            L3Type::Ipv6 => {
-                let Ok(addr_bytes) = <[u8; 16]>::read_from_buf(pkt) else {
-                    return Err(HandleMgmtError::BadStructure);
-                };
-                addr = addr_bytes.into();
-            }
-            _ => {
-                return Err(HandleMgmtError::BadStructure);
-            }
-        }
-        actor_addresses.push(addr);
-    }
-    if pkt.remaining() != 0 {
-        return Err(HandleMgmtError::BadStructure);
-    }
-    Ok(Ok(actor_addresses))
 }
 
 /// handle a Bind Actor Address Request (RFC 6.5 § 6.3.11)
@@ -1105,6 +736,20 @@ pub async fn handle_bind_egress_stream_response(
     }
 }
 
+/// Handle an Unbind Egress Stream Indication (ZdpPacketType 13).
+///
+/// Only an adapter accepts it, from its node: the node sends it to its own
+/// adapter over the local actor link when it removes or replaces a binding
+/// whose egress is that adapter, or does not use a grant the adapter gave
+/// (zl-zipline#283, `Assembly::unbind_local_egress`). The node no longer
+/// sends on the stream, so the adapter removes it from its DLT. A node
+/// refuses it from everyone:
+///
+/// - from a Zode, by F5 (zl-zipline#251): Zode links carry no teardown
+///   messages. A refusal closes the link (gate g88 q2).
+/// - from the local actor (gate g88 q3): the adapter never sends it to its
+///   node, and F4 lists the only causes of teardown (expiry, a visa
+///   service revocation, a lost link).
 pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> HandleMgmtResult {
     let Some(ingress_link_id) = NonZero::new(pkt.metadata().ingress_link_id) else {
         // who sent this??
@@ -1120,29 +765,32 @@ pub async fn handle_unbind_indication(asm: &Arc<Assembly>, pkt: Packet) -> Handl
     };
 
     match (link_type, ingress_link_id.get()) {
-        (LinkType::NodeToAdapter, _) | (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
-            // We are the node
-            debug!(target: ZDP, "{}: unbind actor address, node -> adapter", asm.formatted_link_id(ingress_link_id.get()));
-            // Remove from PFT
-            node::unbind_stream(asm, ingress_link_id, pkt.metadata().ingress_stream_id);
+        (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
+            // We are the node; the local actor does not unbind streams
+            // with us.
+            warn!(
+                target: ZDP,
+                "{}: refusing UnbindEgressStreamIndication from the local actor: F4 lists the only teardown causes",
+                asm.formatted_link_id(ingress_link_id.get())
+            );
+            return Err(HandleMgmtError::MessageNotPermitted);
         }
-        (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
+        (LinkType::Internal, DOCK_LINK_ID) => {
             // We are the adapter
             debug!(
                 target: ZDP,
-                "{}: unbind egress stream, adapter -> node",
+                "{}: unbind egress stream, node -> adapter",
                 asm.formatted_link_id(ingress_link_id.get())
             );
             // Remove from DLT
             adapter::unbind_stream(asm, ingress_link_id, pkt.metadata().ingress_stream_id);
         }
         (LinkType::NodeToNode, _) => {
-            debug!(
-                target: ZDP,
-                "{}: node -> node UNIMPLEMENTED",
-                asm.formatted_link_id(ingress_link_id.get())
-            );
-            return Err(HandleMgmtError::MessageNotPermitted);
+            return Err(refuse_zode_teardown(
+                asm,
+                ingress_link_id,
+                zdp::ZdpPacketType::UnbindEgressStreamIndication,
+            ));
         }
         (LinkType::Internal, _) => {
             error!(
@@ -1179,7 +827,7 @@ pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> Ha
     };
 
     match (link_type, ingress_link_id.get()) {
-        (LinkType::AdapterToNode, _) | (LinkType::Internal, DOCK_LINK_ID) => {
+        (LinkType::Internal, DOCK_LINK_ID) => {
             // We are the adapter: our node withdrew a stream id we send with.
             let stream_id = pkt.metadata().ingress_stream_id;
             debug!(
@@ -1205,8 +853,9 @@ pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> Ha
                 }
             }
         }
-        (LinkType::NodeToAdapter, _) | (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
-            // We are the node; adapters do not withdraw stream ids from us.
+        (LinkType::Internal, LOCAL_ACTOR_LINK_ID) => {
+            // We are the node; the local actor does not withdraw stream
+            // ids from us.
             debug!(
                 target: ZDP,
                 "{}: adapter -> node not permitted",
@@ -1215,12 +864,11 @@ pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> Ha
             return Err(HandleMgmtError::MessageNotPermitted);
         }
         (LinkType::NodeToNode, _) => {
-            debug!(
-                target: ZDP,
-                "{}: node -> node UNIMPLEMENTED",
-                asm.formatted_link_id(ingress_link_id.get())
-            );
-            return Err(HandleMgmtError::MessageNotPermitted);
+            return Err(refuse_zode_teardown(
+                asm,
+                ingress_link_id,
+                zdp::ZdpPacketType::StreamIdWithdrawal,
+            ));
         }
         (LinkType::Internal, _) => {
             error!(
@@ -1233,6 +881,24 @@ pub async fn handle_stream_id_withdrawal(asm: &Arc<Assembly>, pkt: Packet) -> Ha
     }
 
     Ok(())
+}
+
+/// Refuse a teardown message (`packet_type`, ZDP type 5 or 13) that
+/// arrived on Zode link `link_id`, by F5 (zl-zipline#251): Zode links carry
+/// no teardown messages; the visa service tears bindings down. Logs the
+/// refusal and returns the error the handler fails with, which closes the
+/// link and counts it (gate g88 q2).
+fn refuse_zode_teardown(
+    asm: &Assembly,
+    link_id: NonZero<LinkId>,
+    packet_type: zdp::ZdpPacketType,
+) -> HandleMgmtError {
+    warn!(
+        target: ZDP,
+        "{}: refusing {packet_type:?}: F5: Zode links carry no teardown messages",
+        asm.formatted_link_id(link_id.get())
+    );
+    HandleMgmtError::MessageNotPermitted
 }
 
 fn peer_type_by_id(asm: &Assembly, link_id: NonZero<LinkId>) -> PeerType {
@@ -1284,56 +950,211 @@ mod test {
         }
     }
 
-    /// A ~3 KB blob (JWT plus a self-signed blob in a JSON array) must fit
-    /// through a management packet built the way
-    /// send_acquire_zpr_address_request builds it, and parse back intact.
-    #[test]
-    fn test_acquire_zpr_address_request_3kb_blob_roundtrip() {
-        let blob = "A".repeat(3 * 1024);
+    /// AAA kept unused in v1 (zl-zpr-dev-context docs/ZODE_LINKS.md,
+    /// Design decisions, "AAA kept, unused"): the AAA TLV round-trips. A
+    /// HelloResponse that `send_hello_success_response` sends with an AAA
+    /// address decodes, on a link that is not a Zode link (a Zode link
+    /// refuses the TLV), to a ReceivedHelloResponse carrying that address.
+    #[tokio::test(flavor = "local")]
+    async fn test_hello_response_aaa_round_trips() {
+        use zerocopy::FromBytes;
+        let (egress_tx, mut egress_rx) = crate::packet_queue::packet_queue(8);
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            crate::link_state::LinkState::Active,
+        );
+        let aaa: IpAddress = "fd5a:5052:0:aaa::1"
+            .parse::<std::net::IpAddr>()
+            .unwrap()
+            .into();
 
-        // Build exactly like requests::send_acquire_zpr_address_request.
-        let mut req = core::new_heap_packet();
-        let hdr = zdp::ZdpAcquireZprAddressHeader {
-            blob_len: (blob.len() as u16).into(),
-            ip_version: L3Type::Ipv6,
-            addr_count: 0,
-        };
-        hdr.write_to_buf(&mut req).unwrap();
-        req.put_slice(blob.as_bytes());
+        crate::mgmt::requests::send_hello_success_response(&asm, link_id, 0, &[], Some(aaa))
+            .enqueue();
+        let buf = vec![0u8; crate::config::PACKET_BUFFER_SIZE].into_boxed_slice();
+        let sent = egress_rx.try_recv(buf).expect("a HelloResponse");
+        let (base_hdr, rest) = zdp::ZdpBaseHeader::ref_from_prefix(sent.body()).unwrap();
+        assert_eq!(base_hdr.packet_type, zdp::ZdpPacketType::HelloResponse);
+        let (_mgmt_hdr, body) = zdp::ZdpMgmtHeader::ref_from_prefix(rest).unwrap();
+        let mut pkt = core::new_heap_packet();
+        pkt.put_slice(body);
 
-        let (addrs, parsed_blob) = parse_acquire_zpr_address_request(&mut req).unwrap();
-        assert!(addrs.is_none());
-        assert_eq!(parsed_blob, blob);
+        // Link 99 does not exist, so it is not a Zode link.
+        match parse_hello_response(&asm, 99, &mut pkt).unwrap() {
+            LinkEvent::ReceivedHelloResponse {
+                status,
+                aaa_address,
+                ..
+            } => {
+                assert_eq!(status, zdp::ResponseCode::Success);
+                assert_eq!(aaa_address, Some(aaa));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
-    /// A StreamIdWithdrawal received by the adapter (over its node link)
-    /// must remove the ELT entry whose tether id matches the withdrawn
-    /// stream id, so the next outbound packet misses the ELT and triggers a
-    /// fresh visa request instead of sending on the revoked stream
-    /// (zipline#21).
-    #[tokio::test]
+    /// zl-zipline#250 review round 1: a Zode link refuses a HelloResponse
+    /// that carries adapter TLVs even when they do not decode, such as an
+    /// OIDC_IDP advertisement with invalid JSON; the link closes.
+    #[tokio::test(start_paused = true)]
+    async fn test_zode_hello_response_with_undecodable_idp_closes_the_link() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(64);
+                let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+                    mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+                    ..TestAssemblyBuilder::new()
+                }));
+                let link_id = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                    &asm,
+                    "b.zpr",
+                    crate::link_state::LinkState::Helloing,
+                );
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .set_zode_end(crate::link_state::ZodeEnd::Dialer {
+                        peer_cn: "b.zpr".to_owned(),
+                    })
+                    .unwrap();
+
+                let mut pkt = core::new_heap_packet();
+                zdp::ZdpHelloResponseHeader {
+                    status: zdp::ResponseCode::Success,
+                }
+                .write_to_buf(&mut pkt)
+                .unwrap();
+                tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
+                // An OIDC_IDP TLV (type, length, value) whose JSON is invalid.
+                let bad_json = b"{not json";
+                pkt.put_slice(&[tlv::DataType::OIDC_IDP, bad_json.len() as u8]);
+                pkt.put_slice(bad_json);
+                pkt.metadata_mut().ingress_link_id = link_id;
+
+                let _ = handle_hello_response(&asm, pkt).await;
+                assert_eq!(
+                    asm.peer_table
+                        .get(link_id)
+                        .unwrap()
+                        .link_state_machine
+                        .get_state(),
+                    crate::link_state::LinkState::Closing
+                );
+            })
+            .await
+    }
+
+    /// A node assembly whose initial link is to `relay.zpr`, with a Zode
+    /// link to `relay.zpr` in `state`. Returns it and the link.
+    fn joiner_with_link_in(state: crate::link_state::LinkState) -> (Arc<Assembly>, LinkId) {
+        let (egress_tx, _egress_rx) = crate::packet_queue::packet_queue(64);
+        let mut config = crate::config::Config::default();
+        config.zpr_addr = vec!["fd5a:5052::b".parse().unwrap()];
+        config.initial_link =
+            Some(crate::config::InitialLink::parse_cli("relay.zpr@10.9.9.9:5000").unwrap());
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            config: Some(rcu::RcuBox::new(config)),
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        let link_id =
+            crate::peer_table::test::insert_zode_peer_with_verified_cn(&asm, "relay.zpr", state);
+        (asm, link_id)
+    }
+
+    /// zl-zipline#252 (J4, regression test kept from core#104): a bootstrap
+    /// visa carried inside a HelloResponse is never installed, even on a
+    /// joiner's link to its relay. Only the Bootstrap Visas message after
+    /// Hello can carry one.
+    #[tokio::test(start_paused = true)]
+    async fn test_bootstrap_visa_inside_hello_is_not_installed() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, link_id) = joiner_with_link_in(crate::link_state::LinkState::Helloing);
+                asm.peer_table
+                    .get(link_id)
+                    .unwrap()
+                    .link_state_machine
+                    .set_zode_end(crate::link_state::ZodeEnd::Dialer {
+                        peer_cn: "relay.zpr".to_owned(),
+                    })
+                    .unwrap();
+
+                let visa = crate::visa_table::tests::new_vsapi_visa_tcp_default(
+                    4242,
+                    crate::visa_table::tests::never_expires(),
+                );
+                let mut pkt = core::new_heap_packet();
+                zdp::ZdpHelloResponseHeader {
+                    status: zdp::ResponseCode::Success,
+                }
+                .write_to_buf(&mut pkt)
+                .unwrap();
+                tlv::TlvEncoding::new_actor_auth_protocol().put(&mut pkt);
+                tlv::TlvEncoding::new_bootstrap_visa(visa).put(&mut pkt);
+                pkt.metadata_mut().ingress_link_id = link_id;
+
+                let _ = handle_hello_response(&asm, pkt).await;
+                assert!(
+                    !asm.visa_table.read().unwrap().contains(4242),
+                    "a visa inside Hello must not be installed"
+                );
+            })
+            .await
+    }
+
+    /// zl-zipline#252: a refused Bootstrap Visas message is an error the
+    /// management processor counts as `BootstrapHandoffRefused` and turns
+    /// into a link error (the strict handler-error convention). Here the
+    /// body is cut short.
+    #[tokio::test(start_paused = true)]
+    async fn test_refused_bootstrap_visas_is_a_counted_handler_error() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let (asm, link_id) = joiner_with_link_in(crate::link_state::LinkState::Helloing);
+                let mut pkt = core::new_heap_packet();
+                pkt.put_slice(&[2, 0]);
+                pkt.metadata_mut().ingress_link_id = link_id;
+                let err = handle_bootstrap_visas(&asm, pkt).await.unwrap_err();
+                assert!(matches!(
+                    err,
+                    HandleMgmtError::HandoffRefused(
+                        crate::bootstrap_handoff::HandoffError::Malformed
+                    )
+                ));
+                assert_eq!(
+                    counters::ManagementCounterType::from(&err),
+                    counters::ManagementCounterType::BootstrapHandoffRefused
+                );
+            })
+            .await
+    }
+
+    /// A StreamIdWithdrawal received by the Zode's own actor (on the dock
+    /// side of its internal link pair) must remove the ELT entry whose
+    /// tether id matches the withdrawn stream id, so the next outbound
+    /// packet misses the ELT and triggers a fresh visa request instead of
+    /// sending on the revoked stream (zipline#21).
+    #[tokio::test(flavor = "local")]
     async fn test_handle_stream_id_withdrawal_removes_elt_entry_by_tether_id() {
         use crate::adapter_tables::EltPep;
         use crate::defs::FiveTuple;
         use crate::mgmt::txn_mgr::TxnMgr;
-        use crate::peer_table::test::create_dummy_peer_state;
-        use std::net::{IpAddr, Ipv4Addr};
-        use zpr::packet_info::{CompressionMode, SubstrateAddr};
-        use zpr_utils::net_defs;
+        use zpr::packet_info::CompressionMode;
 
         let asm = Arc::new(create_assembly(TestAssemblyBuilder::new()));
 
-        // A peer that looks like our node (adapter -> node link).
-        let entry = asm.peer_table.vacant_entry().unwrap();
-        let key = entry.key();
-        let link_id = entry
-            .insert(create_dummy_peer_state(
-                key,
-                LinkType::AdapterToNode,
-                SubstrateAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443),
-                net_defs::ScopedIpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)),
-            ))
-            .get();
+        // The internal pair: the local actor's node side, then its dock side.
+        let (_local_actor, dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending());
+        assert_eq!(dock.get(), DOCK_LINK_ID);
+        let link_id = dock.get();
 
         // An Active ELT entry bound to tether id 42.
         let five_tuple = FiveTuple {
@@ -1366,120 +1187,147 @@ mod test {
     }
 }
 
+/// F5 (zl-zipline#251): Zode links carry no teardown messages. A Stream ID
+/// Withdrawal (type 5) or an Unbind Egress Stream Indication (type 13)
+/// arriving on one is refused, which closes the link; a type 13 from the
+/// local actor is refused too (gate g88 q3).
+#[cfg(test)]
+mod teardown_test {
+    use super::*;
+    use crate::assembly::test::{TestAssemblyBuilder, create_assembly};
+    use crate::forwarding_tables::PftPep;
+    use crate::link_state::LinkState;
+    use crate::mgmt::core;
+    use crate::visa_table::tests::never_expires;
+
+    type EgressRx = crate::packet_queue::Receiver<{ crate::config::PACKET_BUFFER_SIZE }>;
+
+    /// A Node-mode assembly whose management egress we can read back.
+    fn node() -> (Arc<Assembly>, EgressRx) {
+        let (egress_tx, egress_rx) = crate::packet_queue::packet_queue(8);
+        let asm = Arc::new(create_assembly(TestAssemblyBuilder {
+            mgmt_substrate_egress: Some(crate::queues::MgmtSubstrateEgress::new(egress_tx)),
+            ..TestAssemblyBuilder::new()
+        }));
+        (asm, egress_rx)
+    }
+
+    /// Give link `link` a PFT entry and return its stream ID.
+    fn bind_stream(asm: &Assembly, link: LinkId) -> StreamId {
+        asm.peer_table
+            .get(link)
+            .unwrap()
+            .pft
+            .insert(PftPep::new(ForwardingEntry(link, 1), 3000, never_expires()))
+            .unwrap()
+    }
+
+    /// A per-flow management packet for `stream` as the handlers see it:
+    /// arrived on `link`, with the headers already read.
+    fn arriving(link: LinkId, stream: StreamId) -> Packet {
+        let mut pkt = core::new_heap_packet();
+        pkt.metadata_mut().ingress_link_id = link;
+        pkt.metadata_mut().ingress_stream_id = stream;
+        pkt
+    }
+
+    /// Both teardown types on an Active Zode link are refused, and the
+    /// link's forwarding entry is untouched.
+    #[tokio::test]
+    async fn test_teardown_messages_on_zode_link_are_refused() {
+        let (asm, _egress_rx) = node();
+        let zode = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+            &asm,
+            "b.zpr",
+            LinkState::Active,
+        );
+        let stream = bind_stream(&asm, zode);
+
+        assert!(matches!(
+            handle_stream_id_withdrawal(&asm, arriving(zode, stream)).await,
+            Err(HandleMgmtError::MessageNotPermitted)
+        ));
+        assert!(matches!(
+            handle_unbind_indication(&asm, arriving(zode, stream)).await,
+            Err(HandleMgmtError::MessageNotPermitted)
+        ));
+        assert_eq!(asm.peer_table.get(zode).unwrap().pft.len(), 1);
+    }
+
+    /// Gate g88 q2: the refusal goes through the strict handler-error path,
+    /// so a teardown message from a Zode closes the link. Each type is sent
+    /// as a real management packet through the link's processor.
+    #[tokio::test(flavor = "local")]
+    async fn test_teardown_message_on_zode_link_closes_it() {
+        for packet_type in [
+            zdp::ZdpPacketType::StreamIdWithdrawal,
+            zdp::ZdpPacketType::UnbindEgressStreamIndication,
+        ] {
+            let (asm, mut egress_rx) = node();
+            let zode = crate::peer_table::test::insert_zode_peer_with_verified_cn(
+                &asm,
+                "b.zpr",
+                LinkState::Active,
+            );
+            let stream = bind_stream(&asm, zode);
+
+            // Build the packet the way a sender would, and take it off the
+            // egress queue as the received packet.
+            core::send_per_flow_mgmt(&asm, zode, packet_type, stream, core::new_heap_packet())
+                .enqueue();
+            let buf = vec![0u8; crate::config::PACKET_BUFFER_SIZE].into_boxed_slice();
+            let Ok(mut pkt) = egress_rx.try_recv(buf) else {
+                panic!("the packet is on the egress queue");
+            };
+            pkt.metadata_mut().ingress_link_id = zode;
+
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.send(crate::queues::MgmtProcessorMessage::Packet(pkt))
+                .await
+                .unwrap();
+            drop(tx);
+            crate::mgmt_processor_worker::launch(
+                crate::mgmt_processor_worker::Config {
+                    link_id: NonZero::new(zode).unwrap(),
+                },
+                asm.clone(),
+                rx,
+            )
+            .await;
+
+            let state = asm
+                .peer_table
+                .get(zode)
+                .map(|p| p.link_state_machine.get_state());
+            assert_ne!(state, Some(LinkState::Active), "{packet_type:?}");
+            assert_eq!(asm.peer_table.get(zode).map_or(0, |p| p.pft.len()), 1);
+        }
+    }
+
+    /// Gate g88 q3: a node refuses an Unbind Egress Stream Indication on
+    /// the local actor link. No core component sends it, and F4 lists the
+    /// only causes of teardown. The actor's forwarding entry is untouched.
+    #[tokio::test(flavor = "local")]
+    async fn test_unbind_indication_from_local_actor_is_refused() {
+        let (asm, _egress_rx) = node();
+        let (local_actor, _dock) = asm
+            .peer_table
+            .insert_internal_peer_pair(|_, _| std::future::pending());
+        let local_actor = local_actor.get();
+        assert_eq!(local_actor, zpr::packet_info::LOCAL_ACTOR_LINK_ID);
+        let stream = bind_stream(&asm, local_actor);
+
+        assert!(matches!(
+            handle_unbind_indication(&asm, arriving(local_actor, stream)).await,
+            Err(HandleMgmtError::MessageNotPermitted)
+        ));
+        assert_eq!(asm.peer_table.get(local_actor).unwrap().pft.len(), 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zpr_ext::zerocopy::IntoBytesExt;
-
-    #[test]
-    fn authentication_evidence_is_bounded_by_actual_packet_capacity() {
-        use super::super::{core, requests};
-        use std::net::IpAddr;
-        for addresses in [
-            Vec::new(),
-            vec!["127.0.0.1".parse::<IpAddr>().unwrap()],
-            vec!["::1".parse::<IpAddr>().unwrap()],
-        ] {
-            let address_len = addresses
-                .first()
-                .map_or(0, |address| if address.is_ipv4() { 4 } else { 16 });
-            let max_blob = core::new_heap_packet().remaining_mut()
-                - size_of::<zdp::ZdpAcquireZprAddressHeader>()
-                - address_len;
-            let blob = vec![b'A'; max_blob];
-            assert!(requests::validate_acquire_zpr_address_request(&addresses, &blob).is_ok());
-            assert!(
-                requests::validate_acquire_zpr_address_request(
-                    &addresses,
-                    &vec![b'A'; max_blob + 1]
-                )
-                .is_err()
-            );
-            let asm = crate::assembly::test::create_assembly(
-                crate::assembly::test::TestAssemblyBuilder::new(),
-            );
-            requests::send_acquire_zpr_address_request(&asm, 3, 42, &addresses, Some(&blob))
-                .enqueue();
-        }
-        assert!(requests::validate_acquire_zpr_address_request(&[], &[]).is_err());
-        assert!(
-            requests::validate_acquire_zpr_address_request(
-                &["::1".parse().unwrap(); 2],
-                b"evidence"
-            )
-            .is_err()
-        );
-    }
-
-    fn acquire(count: u8, blob: &[u8], addresses: &[u8]) -> Packet {
-        let mut pkt = super::super::core::new_heap_packet();
-        zdp::ZdpAcquireZprAddressHeader {
-            blob_len: (blob.len() as u16).into(),
-            ip_version: L3Type::Ipv6,
-            addr_count: count,
-        }
-        .write_to_buf(&mut pkt)
-        .unwrap();
-        pkt.put_slice(blob);
-        pkt.put_slice(addresses);
-        pkt
-    }
-
-    fn grant(status: zdp::AuthenticationStatus, count: u8, addresses: &[u8]) -> Packet {
-        let mut pkt = super::super::core::new_heap_packet();
-        zdp::ZdpGrantZprAddressHeader {
-            status_code: status,
-            ip_version: L3Type::Ipv6,
-            addr_count: count,
-        }
-        .write_to_buf(&mut pkt)
-        .unwrap();
-        pkt.put_slice(addresses);
-        pkt
-    }
-
-    #[test]
-    fn acquire_requires_evidence_and_at_most_one_address() {
-        assert!(parse_acquire_zpr_address_request(&mut acquire(0, b"evidence", &[])).is_ok());
-        let address = [1; 16];
-        assert!(parse_acquire_zpr_address_request(&mut acquire(1, b"evidence", &address)).is_ok());
-        for mut invalid in [
-            acquire(0, b"", &[]),
-            acquire(2, b"evidence", &[1; 32]),
-            acquire(1, b"evidence", &[1; 15]),
-            acquire(0, b"evidence", &[1]),
-        ] {
-            assert!(parse_acquire_zpr_address_request(&mut invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn grant_requires_exact_status_and_address_shape() {
-        use zdp::AuthenticationStatus as Status;
-        assert!(
-            parse_grant_zpr_address_request(&mut grant(Status::Success, 1, &[1; 16]))
-                .unwrap()
-                .is_ok()
-        );
-        for status in [Status::Rejected, Status::Retryable, Status::PolicyDenied] {
-            assert_eq!(
-                parse_grant_zpr_address_request(&mut grant(status, 0, &[]))
-                    .unwrap()
-                    .unwrap_err(),
-                status
-            );
-            assert!(parse_grant_zpr_address_request(&mut grant(status, 1, &[1; 16])).is_err());
-        }
-        for mut invalid in [
-            grant(Status::Success, 0, &[]),
-            grant(Status::Success, 2, &[1; 32]),
-            grant(Status::Success, 1, &[1; 15]),
-            grant(Status::Success, 1, &[1; 17]),
-            grant(Status(255), 0, &[]),
-        ] {
-            assert!(parse_grant_zpr_address_request(&mut invalid).is_err());
-        }
-    }
 
     #[test]
     fn hello_capability_requires_one_supported_version() {

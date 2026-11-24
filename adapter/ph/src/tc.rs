@@ -143,7 +143,6 @@ impl Ip5TupleTc {
         }));
     }
 
-    #[allow(dead_code)]
     /// Does the specified packet body match this classifier.
     pub fn classify_packet(&self, l3_type: L3Type, body: &[u8]) -> bool {
         // Derive the 5-tuple from the packet body.  Reject if packet is malformed.

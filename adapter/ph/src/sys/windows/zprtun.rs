@@ -7,12 +7,11 @@
 //! this device's [`Waitable`] for the fastpath `WaitSet`. There is no
 //! packet-info header (`PI_SIZE = 0`, see `tun_pi.rs`).
 //!
-//! Addresses and routes are managed by shelling out to
-//! `netsh interface ipv6 add|delete|show address|route`, the same pattern
-//! as `ip` on Linux and `ifconfig`/`route` on macOS. Upgrade path if netsh
-//! parsing proves brittle or slow: IP Helper
-//! (`CreateUnicastIpAddressEntry`, `CreateIpForwardEntry2`,
-//! `GetIpForwardTable2`) via `windows-sys`, already in the dependency tree.
+//! Addresses are managed by shelling out to
+//! `netsh interface ipv6 add|delete|show address`, the same pattern as `ip`
+//! on Linux and `ifconfig` on macOS. Upgrade path if netsh parsing proves
+//! brittle or slow: IP Helper (`CreateUnicastIpAddressEntry`) via
+//! `windows-sys`, already in the dependency tree.
 //!
 //! Adapter lifecycle (plan open question 1, operator-approved): create a
 //! fresh adapter at startup — deleting any stale adapter with our name
@@ -20,8 +19,8 @@
 //! adapter when the last Arc drops; an unclean exit leaves the adapter for
 //! the next startup's stale-delete to reap).
 
+use crate::sys::addr_hint::netsh_add_address_args;
 use crate::sys::dad;
-use crate::sys::linux_route;
 use crate::sys::wait::{WaitHandle, Waitable};
 use crate::zprtun::{ZprTunError, effective_tun_mtu};
 use std::net::{IpAddr, Ipv6Addr};
@@ -59,7 +58,7 @@ pub struct ZprTun {
     /// The adapter name (config `tun_if` or [`DEFAULT_ADAPTER_NAME`]), as
     /// netsh commands address it.
     name: String,
-    /// Serializes netsh address/route mutations, as on macOS.
+    /// Serializes netsh address mutations, as on macOS.
     mtx: std::sync::Mutex<()>,
 }
 
@@ -209,8 +208,9 @@ impl ZprTun {
         Ok(())
     }
 
-    pub fn add_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
-        self.add_address_impl(addr, false)
+    /// Add `addr/prefix_len` to the adapter and wait until it is usable.
+    pub fn add_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+        self.add_address_impl(addr, prefix_len, false)
     }
 
     /// Add the adapter authentication address (AAA, #1410) as a valid but
@@ -218,24 +218,32 @@ impl ZprTun {
     /// Linux's `preferred_lft 0`: applications prefer the granted actor
     /// address, and authentication binds the AAA explicitly. A deprecated
     /// address still passes the DAD wait ([dad::DadState::Usable]).
-    pub fn add_authentication_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
-        self.add_address_impl(addr, true)
+    pub fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
+        self.add_address_impl(addr, prefix_len, true)
     }
 
     /// Shared body of [Self::add_address] and
     /// [Self::add_authentication_address].
-    fn add_address_impl(&self, addr: IpAddr, authentication: bool) -> std::io::Result<()> {
+    ///
+    /// The prefix length goes to netsh with the address: without it netsh
+    /// applies /64, and nothing outside the address's own /64 — the DNS
+    /// Zode included — is on-link (zl-zipline#272). With it, Windows
+    /// installs the on-link route for the prefix itself.
+    fn add_address_impl(
+        &self,
+        addr: IpAddr,
+        prefix_len: u8,
+        authentication: bool,
+    ) -> std::io::Result<()> {
         let _mtx = self.lock()?;
         if self.has_address(addr)? {
             return Ok(());
         }
         let addr = require_v6("add_address", addr)?;
-        let addr_text = addr.to_string();
-        // netsh interface ipv6 add address <if> <addr> [preferredlifetime=0]
-        let mut args = vec!["add", "address", self.name.as_str(), addr_text.as_str()];
-        if authentication {
-            args.push("preferredlifetime=0");
-        }
+        // netsh interface ipv6 add address <if> <addr>/<len> [preferredlifetime=0]
+        let args =
+            netsh_add_address_args(&self.name, &IpAddr::V6(addr), prefix_len, authentication);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = self.netsh(&args).output()?;
         if !output.status.success() {
             return Err(std::io::Error::other(format!(
@@ -333,101 +341,6 @@ impl ZprTun {
             .any(|token| token.eq_ignore_ascii_case(&needle)))
     }
 
-    /// Ensure `dest/prefix_len` is routed on-link via this adapter.
-    ///
-    /// Idempotent: a route already present on our own interface is success.
-    /// `netsh add route` fails with "The object already exists" whether the
-    /// existing route targets this adapter or another one, so on failure
-    /// the table is inspected; a route on another interface is replaced
-    /// (delete + re-add), mirroring Linux `ip -6 route replace`.
-    pub fn add_route(&self, dest: IpAddr, prefix_len: u8) -> std::io::Result<()> {
-        let _mtx = self.lock()?;
-        let dest = require_v6("add_route", dest)?;
-        let prefix = format!("{dest}/{prefix_len}");
-        let output = self
-            .netsh(&["add", "route", &prefix, &self.name])
-            .output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-        // The add failed. If the prefix is already routed via us, done; if
-        // it is routed via another interface, replace it; otherwise fail.
-        let owners = self.route_owners(&prefix)?;
-        if owners.is_empty() {
-            return Err(std::io::Error::other(format!(
-                "netsh failed to add route {prefix} on {}: {}",
-                self.name,
-                netsh_output_text(&output)
-            )));
-        }
-        if owners.iter().all(|owner| owner.ifname == self.name) {
-            return Ok(());
-        }
-        debug!(
-            target: NET_OS,
-            "route {prefix} exists but not (only) via {}; replacing",
-            self.name
-        );
-        for owner in owners.iter().filter(|owner| owner.ifname != self.name) {
-            let output = self
-                .netsh(&["delete", "route", &prefix, &owner.ifname])
-                .output()?;
-            if !output.status.success() {
-                return Err(std::io::Error::other(format!(
-                    "netsh failed to delete stale route {prefix} on {}: {}",
-                    owner.ifname,
-                    netsh_output_text(&output)
-                )));
-            }
-        }
-        let output = self
-            .netsh(&["add", "route", &prefix, &self.name])
-            .output()?;
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "netsh failed to reinstall route {prefix} on {} after deleting the stale route: {}",
-                self.name,
-                netsh_output_text(&output)
-            )));
-        }
-        Ok(())
-    }
-
-    /// Report another interface already carrying the route for
-    /// `dest/prefix_len`, if any (zipline#101, Windows arm).
-    ///
-    /// Reads `netsh interface ipv6 show route` — unprivileged and
-    /// read-only — through the shared parser in [`linux_route`], with the
-    /// [`linux_route::Platform::Windows`] existence-is-liveness rule.
-    pub fn route_owner_conflict(
-        &self,
-        dest: IpAddr,
-        prefix_len: u8,
-    ) -> std::io::Result<Option<String>> {
-        let dest = require_v6("route_owner_conflict", dest)?;
-        let owners = self.route_owners(&format!("{dest}/{prefix_len}"))?;
-        Ok(
-            linux_route::route_owner_conflict(&owners, &self.name, linux_route::Platform::Windows)
-                .map(|conflict| conflict.ifname),
-        )
-    }
-
-    /// The interfaces currently carrying `prefix`, from
-    /// `netsh interface ipv6 show route`.
-    fn route_owners(&self, prefix: &str) -> std::io::Result<Vec<linux_route::RouteOwner>> {
-        let output = self.netsh(&["show", "route"]).output()?;
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "netsh failed to show routes: {}",
-                netsh_output_text(&output)
-            )));
-        }
-        Ok(linux_route::parse_netsh_route_show(
-            &String::from_utf8_lossy(&output.stdout),
-            prefix,
-        ))
-    }
-
     /// A `netsh interface ipv6 <args...>` command, logged at debug like the
     /// `ip`/`ifconfig` invocations on the other platforms.
     fn netsh(&self, args: &[&str]) -> Command {
@@ -482,9 +395,12 @@ impl ZprTun {
     }
 }
 
-/// The Wintun read-wait event: signaled while the receive ring is
-/// non-empty, which is exactly the level semantics the `WaitSet` probes
-/// rely on.
+/// The Wintun read-wait event. It is an **auto-reset** Event (wintun
+/// `api/session.c`): the driver sets it once per ring append, and the wait
+/// that reports it consumes it. It is not signaled "while the ring is
+/// non-empty", so the TUN read batch re-arms it whenever a batch may have
+/// left packets in the ring (`batch_io::windows_unbatched::read_ring_batch`,
+/// zl-zipline#292).
 impl Waitable for ZprTun {
     fn handle(&self) -> WaitHandle<'_> {
         let event = self

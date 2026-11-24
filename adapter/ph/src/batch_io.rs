@@ -1815,7 +1815,7 @@ mod windows_unbatched {
     //! TUN ring, `send_to`/`recv_from` reach the socket.
 
     use super::{BatchIoImpl, ReceivedPacket, SendFlags, windows_udp};
-    use crate::sys::wait::{WaitHandle, WaitTarget};
+    use crate::sys::wait::{WaitHandle, WaitTarget, Waitable};
     use bytes::BufMut;
     use std::io::Result;
     use std::net::SocketAddr;
@@ -1854,16 +1854,17 @@ mod windows_unbatched {
         }
     }
 
-    /// `windows_udp::do_batch_op`'s loop shape for the TUN ring legs.
+    /// `windows_udp::do_batch_op`'s loop shape for the TUN ring legs. `op`
+    /// captures its ring, so the read leg can run against a test ring
+    /// (see [`read_ring_batch`]).
     fn do_tun_batch_op<Item, Res>(
-        mut op: impl FnMut(&crate::sys::ZprTun, Item) -> Result<Res>,
-        tun: &crate::sys::ZprTun,
+        mut op: impl FnMut(Item) -> Result<Res>,
         items: &mut dyn Iterator<Item = Item>,
         results: &mut Vec<Result<Res>>,
     ) -> Result<usize> {
         let mut completed = 0;
         for item in items {
-            let res = op(tun, item);
+            let res = op(item);
             if let Err(err) = res {
                 // emulate behavior of sendmmsg(2), as the other engines do
                 if completed == 0 {
@@ -1875,6 +1876,36 @@ mod windows_unbatched {
             completed += 1;
         }
         Ok(completed)
+    }
+
+    /// Read one batch from a Wintun receive ring into `bufs`.
+    ///
+    /// `try_receive` copies the ring's next packet into the buffer and
+    /// returns its length, or `None` when the ring is empty. An empty ring
+    /// ends the batch (`WouldBlock` first, per the sendmmsg(2) emulation
+    /// all engines share). `read_event` is the ring's read-wait event, the
+    /// handle the fastpath waits on for TUN readiness.
+    ///
+    /// The batch is factored out of [`BatchIo::try_read_buf_batch`] so a
+    /// test can drive it with a fake ring and a real Event.
+    fn read_ring_batch<'a>(
+        mut try_receive: impl FnMut(&mut dyn BufMut) -> Result<Option<usize>>,
+        read_event: WaitHandle<'_>,
+        bufs: &mut dyn Iterator<Item = &'a mut dyn BufMut>,
+        results: &mut Vec<Result<usize>>,
+    ) -> Result<usize> {
+        let _ = read_event;
+        do_tun_batch_op(
+            |buf: &mut dyn BufMut| match try_receive(buf)? {
+                Some(len) => Ok(len),
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "Wintun receive ring empty",
+                )),
+            },
+            bufs,
+            results,
+        )
     }
 
     impl BatchIoImpl for BatchIo {
@@ -1891,16 +1922,15 @@ mod windows_unbatched {
         ) -> Result<usize> {
             let tun = expect_tun(handle, "try_write_batch");
             do_tun_batch_op(
-                |tun, buf: &[u8]| tun.send(buf).map(|()| buf.len()),
-                tun,
+                |buf: &[u8]| tun.send(buf).map(|()| buf.len()),
                 bufs,
                 results,
             )
         }
 
-        /// TUN ingress: drain the Wintun receive ring. An empty ring ends
-        /// the batch (`WouldBlock` first, per the sendmmsg(2) emulation all
-        /// engines share); the fastpath re-arms on the read-wait event.
+        /// TUN ingress: one batch from the Wintun receive ring, through
+        /// [`read_ring_batch`] (which also keeps the ring's read-wait
+        /// event armed, zl-zipline#292).
         fn try_read_buf_batch<'a>(
             &mut self,
             handle: WaitHandle<'_>,
@@ -1908,21 +1938,17 @@ mod windows_unbatched {
             results: &mut Vec<Result<usize>>,
         ) -> Result<usize> {
             let tun = expect_tun(handle, "try_read_buf_batch");
-            do_tun_batch_op(
-                |tun, buf: &mut dyn BufMut| match tun.try_receive()? {
-                    Some(packet) => {
+            read_ring_batch(
+                |buf| {
+                    Ok(tun.try_receive()?.map(|packet| {
                         let body = packet.bytes();
                         // An oversized frame cannot arrive: the ring frame
                         // limit (u16) is far under the packet buffer size.
                         buf.put_slice(body);
-                        Ok(body.len())
-                    }
-                    None => Err(std::io::Error::new(
-                        std::io::ErrorKind::WouldBlock,
-                        "Wintun receive ring empty",
-                    )),
+                        body.len()
+                    }))
                 },
-                tun,
+                tun.handle(),
                 bufs,
                 results,
             )
@@ -1981,6 +2007,128 @@ mod windows_unbatched {
                 results,
                 true,
             )
+        }
+    }
+
+    /// The Wintun read-wait event contract (zl-zipline#292), modelled with
+    /// a real auto-reset Event and a fake receive ring.
+    #[cfg(test)]
+    mod tests {
+        use super::read_ring_batch;
+        use crate::sys::wait::{Interest, WaitHandle, WaitSet};
+        use bytes::BufMut;
+        use std::collections::VecDeque;
+        use std::time::Duration;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
+
+        /// An auto-reset Event, like the one `WintunGetReadWaitEvent`
+        /// returns (wintun `api/session.c` creates it with
+        /// `bManualReset = FALSE`). Closed on drop.
+        struct AutoResetEvent(HANDLE);
+
+        impl AutoResetEvent {
+            /// A fresh, unsignaled auto-reset Event.
+            fn new() -> Self {
+                // SAFETY: no security attributes, auto-reset, initially
+                // unsignaled, unnamed. The handle is owned by this value
+                // and closed in Drop.
+                let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+                assert!(
+                    !event.is_null(),
+                    "CreateEventW failed: {}",
+                    std::io::Error::last_os_error()
+                );
+                Self(event)
+            }
+
+            /// Signal the event, as the driver does when it appends to the
+            /// ring.
+            fn signal(&self) {
+                // SAFETY: self.0 is a live Event owned by this value.
+                assert_ne!(unsafe { SetEvent(self.0) }, 0, "SetEvent failed");
+            }
+
+            /// The event as a `WaitSet` entry.
+            fn handle(&self) -> WaitHandle<'_> {
+                WaitHandle::from_event(self.0)
+            }
+
+            /// Whether a zero-timeout `WaitSet` wait reports the event
+            /// readable. Like the fastpath's own wait, a wake consumes the
+            /// auto-reset event.
+            fn wait_ready(&self) -> bool {
+                let mut wait_set = WaitSet::with_capacity(1);
+                let index = wait_set.push(self.handle(), Interest::READ);
+                wait_set
+                    .wait(Some(Duration::ZERO))
+                    .unwrap()
+                    .is_readable(index)
+            }
+        }
+
+        impl Drop for AutoResetEvent {
+            fn drop(&mut self) {
+                // SAFETY: self.0 was created in new() and is owned here.
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+
+        /// Drain one batch of at most `batch` packets from `ring`, the way
+        /// the fastpath's TUN ingress does after a wake. Returns how many
+        /// packets were read.
+        fn drain_one_batch(
+            ring: &mut VecDeque<Vec<u8>>,
+            event: &AutoResetEvent,
+            batch: usize,
+        ) -> usize {
+            let mut storage = vec![Vec::<u8>::new(); batch];
+            let mut bufs = storage.iter_mut().map(|buf| buf as &mut dyn BufMut);
+            let mut results = Vec::new();
+            let try_receive = |buf: &mut dyn BufMut| {
+                Ok(ring.pop_front().map(|packet| {
+                    buf.put_slice(&packet);
+                    packet.len()
+                }))
+            };
+            read_ring_batch(try_receive, event.handle(), &mut bufs, &mut results).unwrap()
+        }
+
+        /// A ring holding more than one batch: the wake consumed the
+        /// event, so after a batch-limited drain the TUN must still be
+        /// reported readable. Otherwise the rest of the ring waits until
+        /// the driver appends another packet (zl-zipline#292).
+        #[test]
+        fn full_batch_rearms_read_event() {
+            let event = AutoResetEvent::new();
+            let mut ring: VecDeque<Vec<u8>> = (0..10u8).map(|i| vec![i]).collect();
+            event.signal();
+
+            assert!(event.wait_ready());
+            assert_eq!(drain_one_batch(&mut ring, &event, 4), 4);
+            assert!(
+                event.wait_ready(),
+                "6 packets left in the ring, but the TUN is not readable"
+            );
+            assert_eq!(drain_one_batch(&mut ring, &event, 4), 4);
+            assert!(event.wait_ready());
+            assert_eq!(drain_one_batch(&mut ring, &event, 4), 2);
+        }
+
+        /// A drain that empties the ring must not re-arm the event: that
+        /// would be a busy wake with nothing to read.
+        #[test]
+        fn emptying_drain_does_not_rearm_read_event() {
+            let event = AutoResetEvent::new();
+            let mut ring: VecDeque<Vec<u8>> = (0..3u8).map(|i| vec![i]).collect();
+            event.signal();
+
+            assert!(event.wait_ready());
+            assert_eq!(drain_one_batch(&mut ring, &event, 4), 3);
+            assert!(
+                !event.wait_ready(),
+                "the ring is empty, but the TUN is readable"
+            );
         }
     }
 }

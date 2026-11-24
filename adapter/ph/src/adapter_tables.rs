@@ -289,8 +289,9 @@ impl DockLookupTable {
             return;
         }
         let new_reader = table.remove(idx);
-        std::mem::drop(table);
+        // Keep writers serialized through publication so an older reader cannot win.
         self.reader.write(new_reader);
+        std::mem::drop(table);
     }
 }
 
@@ -368,6 +369,29 @@ mod test {
 
         assert_eq!(elt.remove_by_tether_id(10), None);
         assert!(elt.get(&ft).is_some(), "pending entry must survive");
+    }
+
+    /// A removal must hide only its own entry, and an insert after it must
+    /// be visible through both guarded and inspecting reads. From upstream
+    /// #1413. Sequential only: it does not reproduce the concurrent
+    /// publication race that #1413 fixed.
+    #[test]
+    fn test_dlt_remove_then_insert_is_visible() {
+        let dlt = DockLookupTable::new();
+        let pep = || DltPep::new(tc::Ip5TupleTc::new(five_tuple(1000)), None);
+        let removed = dlt.insert(pep()).unwrap();
+        let retained = dlt.insert(pep()).unwrap();
+
+        assert!(dlt.get(removed).is_some());
+        dlt.remove(removed);
+        assert!(dlt.get(removed).is_none());
+        assert!(dlt.inspect(removed, |_| ()).is_none());
+
+        let inserted = dlt.insert(pep()).unwrap();
+        for id in [retained, inserted] {
+            assert!(dlt.get(id).is_some());
+            assert!(dlt.inspect(id, |_| ()).is_some());
+        }
     }
 
     /// A guard taken before `remove()` must stay valid after it: removing

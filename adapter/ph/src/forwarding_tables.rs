@@ -291,8 +291,9 @@ impl PeerForwardingTable {
             return;
         }
         let new_reader = table.schedule_finalization();
-        std::mem::drop(table);
+        // Keep writers serialized through publication so an older reader cannot win.
         self.reader.write(new_reader);
+        std::mem::drop(table);
     }
 
     /// The number of live entries: quarantined slots are not counted.
@@ -495,5 +496,32 @@ mod tests {
     fn test_unix_ms_of_a_time_before_the_epoch_is_zero() {
         assert_eq!(unix_ms(UNIX_EPOCH - Duration::from_secs(1)), 0);
         assert_eq!(unix_ms(UNIX_EPOCH + Duration::from_millis(1_500)), 1_500);
+    }
+
+    /// A removal must hide only its own entry, and an insert after it must
+    /// be visible through both guarded and inspecting reads. From upstream
+    /// #1413, where it calls `remove()`; here a stream is removed by
+    /// quarantine and release (zl-zipline#282), the path that publishes
+    /// the new reader. Sequential only: it does not reproduce the
+    /// concurrent publication race that #1413 fixed.
+    #[test]
+    fn remove_then_insert_is_visible() {
+        let table = PeerForwardingTable::new();
+        let removed = table.insert(live_pep()).unwrap();
+        let retained = table.insert(live_pep()).unwrap();
+        let start = Instant::now();
+
+        assert!(table.get(removed).is_some());
+        table.quarantine(removed, start);
+        table.release_quarantined_at(start + STREAM_ID_REUSE_GRACE);
+        assert!(table.get(removed).is_none());
+        assert!(table.inspect(removed, |_| ()).is_none());
+
+        let inserted = table.insert(live_pep()).unwrap();
+        assert_eq!(table.len(), 2);
+        for id in [retained, inserted] {
+            assert_eq!(table.get(id).unwrap().visa_id(), 7000);
+            assert_eq!(table.inspect(id, |pep| pep.visa_id()), Some(7000));
+        }
     }
 }

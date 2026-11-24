@@ -395,9 +395,12 @@ impl ZprTun {
     }
 }
 
-/// The Wintun read-wait event: signaled while the receive ring is
-/// non-empty, which is exactly the level semantics the `WaitSet` probes
-/// rely on.
+/// The Wintun read-wait event. It is an **auto-reset** Event (wintun
+/// `api/session.c`): the driver sets it once per ring append, and the wait
+/// that reports it consumes it. It is not signaled "while the ring is
+/// non-empty", so the TUN read batch re-arms it whenever a batch may have
+/// left packets in the ring (`batch_io::windows_unbatched::read_ring_batch`,
+/// zl-zipline#292).
 impl Waitable for ZprTun {
     fn handle(&self) -> WaitHandle<'_> {
         let event = self

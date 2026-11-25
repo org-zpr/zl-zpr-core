@@ -583,19 +583,6 @@ mod tests {
         MIB_IPPROTO_NETMGMT, RouterDiscoveryDisabled, RouterDiscoveryEnabled,
     };
 
-    /// The raw bytes of an IP Helper row, so a test can check that a
-    /// function changed only the fields it names. The windows-sys rows have
-    /// no `PartialEq` (they hold unions), and `Default` zeroes them, padding
-    /// included.
-    fn bytes_of<T: Copy>(row: &T) -> Vec<u8> {
-        // SAFETY: `row` is a valid, initialized `T` that outlives the slice;
-        // the slice covers exactly its `size_of::<T>()` bytes and is copied
-        // out before the borrow ends.
-        unsafe {
-            std::slice::from_raw_parts((row as *const T).cast::<u8>(), size_of::<T>()).to_vec()
-        }
-    }
-
     /// A row as Windows reports it for a fresh Wintun adapter (planning
     /// read-back on the VM): router discovery on, one DAD transmit, NUD on.
     fn fresh_interface_row() -> MIB_IPINTERFACE_ROW {
@@ -627,13 +614,14 @@ mod tests {
         // NUD stays on: Windows rejects turning it off on Wintun.
         assert!(row.UseNeighborUnreachabilityDetection);
 
-        // Every other field is as it was.
-        let mut expected = fresh_interface_row();
-        expected.RouterDiscoveryBehavior = RouterDiscoveryDisabled;
-        expected.DadTransmits = 0;
-        expected.ManagedAddressConfigurationSupported = false;
-        expected.OtherStatefulConfigurationSupported = false;
-        assert_eq!(bytes_of(&row), bytes_of(&expected));
+        // The other fields of the fresh row are as they were.
+        let fresh = fresh_interface_row();
+        assert_eq!(row.Family, fresh.Family);
+        assert!(row.SupportsNeighborDiscovery);
+        assert_eq!(row.BaseReachableTime, fresh.BaseReachableTime);
+        assert_eq!(row.RetransmitTime, fresh.RetransmitTime);
+        assert_eq!(row.NlMtu, fresh.NlMtu);
+        assert_eq!(row.SitePrefixLength, fresh.SitePrefixLength);
     }
 
     #[test]

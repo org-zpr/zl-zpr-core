@@ -2,7 +2,7 @@
 //! to run when a node ZPR address could not be applied to — or is missing
 //! from — the TUN device (zipline#161). Also the Windows `netsh` add-address
 //! arguments, which the Windows `add_address` runs and the Windows hint
-//! prints, so the two cannot drift apart (zl-zipline#272).
+//! prints, so the two cannot drift apart (zl-zipline#272, zl-zipline#297).
 //!
 //! Compiled on every OS so the per-platform strings stay unit-testable from
 //! Linux builds, same pattern and reason as `macos_ifconfig`: the decision of
@@ -36,8 +36,10 @@ fn hint_for(platform: Platform, addr: &IpAddr, prefix_len: u8, ifname: &str) -> 
         // Exactly the arguments the Windows `add_address` runs. An argument
         // with a space (a Wintun adapter name may have one) is quoted, so the
         // copied command line passes it as one argument, as `ph` does.
+        // `prefix_len` does not apply: Windows adds a /128 (see
+        // `netsh_add_address_args`).
         Platform::Windows => {
-            let args: Vec<String> = netsh_add_address_args(ifname, addr, prefix_len, false)
+            let args: Vec<String> = netsh_add_address_args(ifname, addr, false)
                 .into_iter()
                 .map(|arg| {
                     if arg.contains(' ') {
@@ -52,27 +54,29 @@ fn hint_for(platform: Platform, addr: &IpAddr, prefix_len: u8, ifname: &str) -> 
     }
 }
 
-/// The `netsh interface ipv6` arguments that put `addr/prefix_len` on
-/// `ifname`: what the Windows `add_address` runs, and what the Windows hint
-/// prints.
+/// The prefix length of every address `ph` puts on the Windows TUN adapter.
 ///
-/// The prefix length is required: without it netsh applies /64, and nothing
-/// outside the address's own /64 (the DNS Zode included) is on-link
-/// (zl-zipline#272). With it, Windows installs the on-link route for the
-/// prefix itself, as Linux and macOS do. `deprecated` adds
-/// `preferredlifetime=0`, which keeps the address valid but not preferred as
-/// a source (the adapter authentication address, #1410).
-pub(crate) fn netsh_add_address_args(
-    ifname: &str,
-    addr: &IpAddr,
-    prefix_len: u8,
-    deprecated: bool,
-) -> Vec<String> {
+/// The ZPR prefix is not on-link on Windows: the adapter routes it through a
+/// link-local next hop (`zprtun.rs`, zl-zipline#297). An on-link prefix makes
+/// Windows send neighbor solicitations to every peer it talks to, and Windows
+/// cannot turn neighbor unreachability detection off on a Wintun interface,
+/// so those solicitations reached `ph` as traffic to the visa service.
+const WINDOWS_ADDRESS_PREFIX_LEN: u8 = 128;
+
+/// The `netsh interface ipv6` arguments that put `addr` on `ifname` as a
+/// /128 ([`WINDOWS_ADDRESS_PREFIX_LEN`]): what the Windows `add_address`
+/// runs, and what the Windows hint prints.
+///
+/// The prefix length is explicit: without it netsh applies /64
+/// (zl-zipline#272). `deprecated` adds `preferredlifetime=0`, which keeps the
+/// address valid but not preferred as a source (the adapter authentication
+/// address, #1410).
+pub(crate) fn netsh_add_address_args(ifname: &str, addr: &IpAddr, deprecated: bool) -> Vec<String> {
     let mut args = vec![
         "add".to_string(),
         "address".to_string(),
         ifname.to_string(),
-        format!("{addr}/{prefix_len}"),
+        format!("{addr}/{WINDOWS_ADDRESS_PREFIX_LEN}"),
     ];
     if deprecated {
         args.push("preferredlifetime=0".to_string());
@@ -113,12 +117,13 @@ mod tests {
 
     #[test]
     fn windows_hint_is_netsh_add_address() {
-        // The interface name comes before the address, and the address
-        // carries the prefix length: without it netsh applies /64
-        // (zl-zipline#272).
+        // The interface name comes before the address, and the address is a
+        // /128 whatever prefix length the caller names: on Windows the ZPR
+        // prefix is routed through a link-local next hop, not on-link
+        // (zl-zipline#297).
         assert_eq!(
             hint_for(Platform::Windows, &addr(), 32, "zpr0"),
-            "netsh interface ipv6 add address zpr0 fd5a:5052::a:b:c/32"
+            "netsh interface ipv6 add address zpr0 fd5a:5052::a:b:c/128"
         );
     }
 
@@ -128,20 +133,22 @@ mod tests {
         // too (Wintun adapter names may contain spaces).
         assert_eq!(
             hint_for(Platform::Windows, &addr(), 32, "ZPR tun"),
-            "netsh interface ipv6 add address \"ZPR tun\" fd5a:5052::a:b:c/32"
+            "netsh interface ipv6 add address \"ZPR tun\" fd5a:5052::a:b:c/128"
         );
     }
 
-    // --- netsh add-address argv (zl-zipline#272): what the Windows
-    // `add_address` runs. Without the prefix length netsh applies /64, and
-    // nothing outside the Zode's own /64 (the DNS Zode included) is on-link.
+    // --- netsh add-address argv: what the Windows `add_address` runs. The
+    // address is always a /128. Without an explicit length netsh applies /64
+    // (zl-zipline#272), and an on-link prefix makes Windows probe every peer
+    // with neighbor solicitations, which ph turned into visa requests
+    // (zl-zipline#297).
 
     #[test]
-    fn netsh_add_address_args_applies_the_prefix() {
+    fn netsh_add_address_args_adds_a_host_address() {
         let addr: IpAddr = "fd5a:5052:8888::3".parse().unwrap();
         assert_eq!(
-            netsh_add_address_args("zpr", &addr, 32, false),
-            ["add", "address", "zpr", "fd5a:5052:8888::3/32"]
+            netsh_add_address_args("zpr", &addr, false),
+            ["add", "address", "zpr", "fd5a:5052:8888::3/128"]
         );
     }
 
@@ -150,12 +157,12 @@ mod tests {
         // The adapter authentication address is a valid but deprecated
         // source; the flag follows the address.
         assert_eq!(
-            netsh_add_address_args("zpr", &addr(), 32, true),
+            netsh_add_address_args("zpr", &addr(), true),
             [
                 "add",
                 "address",
                 "zpr",
-                "fd5a:5052::a:b:c/32",
+                "fd5a:5052::a:b:c/128",
                 "preferredlifetime=0"
             ]
         );

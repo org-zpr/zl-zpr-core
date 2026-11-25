@@ -13,6 +13,17 @@
 //! brittle or slow: IP Helper (`CreateUnicastIpAddressEntry`) via
 //! `windows-sys`, already in the dependency tree.
 //!
+//! Interface settings and the ZPR prefix (zl-zipline#297): at creation the
+//! adapter's IPv6 interface gets the settings wireguard-windows uses (no
+//! router discovery, no DAD, no DHCPv6 flags), and `fd5a:5052::/32` is a
+//! route through the link-local next hop [`ZPR_NEXT_HOP`], not an on-link
+//! prefix; every address is a /128. Windows cannot turn off neighbor
+//! unreachability detection on a Wintun interface, so with an on-link prefix
+//! it sent a neighbor solicitation to every peer it talked to (the visa
+//! service first), and `ph` turned each one into a visa request. With the
+//! routed prefix the only neighbor Windows probes is the next hop, a
+//! link-local address, and `ph` never issues a visa for link-local traffic.
+//!
 //! Adapter lifecycle (plan open question 1, operator-approved): create a
 //! fresh adapter at startup — deleting any stale adapter with our name
 //! first — and delete it on graceful exit (the wintun crate closes the
@@ -29,9 +40,15 @@ use std::sync::Arc;
 use tracing::*;
 use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    GetUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+    CreateIpForwardEntry2, GetIpInterfaceEntry, GetUnicastIpAddressEntry, InitializeIpForwardEntry,
+    InitializeIpInterfaceEntry, MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW, MIB_UNICASTIPADDRESS_ROW,
+    SetIpInterfaceEntry,
 };
-use windows_sys::Win32::Networking::WinSock::AF_INET6;
+use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+use windows_sys::Win32::Networking::WinSock::{
+    AF_INET6, MIB_IPPROTO_NETMGMT, RouterDiscoveryDisabled,
+};
+use zpr::addrs::{ZPR_INTERNAL_NETWORK, ZPRNET_PREFIX_LEN};
 
 use crate::logging::targets::NET_OS;
 
@@ -40,6 +57,15 @@ const DEFAULT_ADAPTER_NAME: &str = "zpr";
 
 /// The Wintun "tunnel type" shown in adapter properties.
 const TUNNEL_TYPE: &str = "ZPR";
+
+/// The next hop of the ZPR prefix route on the adapter (zl-zipline#297).
+///
+/// Nothing answers this address: a Wintun interface is layer 3, so Windows
+/// sends routed packets into the ring without resolving a link-layer
+/// address. Windows does probe it with neighbor solicitations, but they are
+/// link-local, and `ph` discards link-local traffic before it asks for a
+/// visa (`do_request_tether_id` in `adapter_manager_worker.rs`).
+const ZPR_NEXT_HOP: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
 
 /// Wintun ring capacity: 4 MiB (power of two within
 /// [`wintun::MIN_RING_CAPACITY`], [`wintun::MAX_RING_CAPACITY`]).
@@ -52,7 +78,7 @@ pub struct ZprTun {
     /// `Arc` to it internally; this one documents that the device outlives
     /// every session-independent user (netsh helpers address it by name
     /// while the ring may be shut down) and supplies the interface LUID for
-    /// the IP Helper DAD-state query in [`ZprTun::dad_state`].
+    /// the IP Helper calls ([`ZprTun::luid`]).
     adapter: Arc<wintun::Adapter>,
     session: Arc<wintun::Session>,
     /// The adapter name (config `tun_if` or [`DEFAULT_ADAPTER_NAME`]), as
@@ -76,6 +102,13 @@ impl ZprTun {
     /// `None` the adapter is named [`DEFAULT_ADAPTER_NAME`]. A stale
     /// adapter with our name (left by an unclean exit) is deleted before
     /// creating the fresh one (plan open question 1).
+    ///
+    /// The adapter's IPv6 interface is configured before any address goes
+    /// on: DAD and router discovery off ([`apply_zpr_interface_settings`]),
+    /// the ZPR prefix routed through [`ZPR_NEXT_HOP`], and the MTU. A
+    /// failure in any of them fails the start: an adapter without them
+    /// sends the host's neighbor solicitations to the visa service
+    /// (zl-zipline#297), or drops large packets (zl-zipline#214).
     ///
     /// The `address` parameter is accepted for signature parity with the
     /// other platforms but not applied at create time: addresses go on via
@@ -125,11 +158,75 @@ impl ZprTun {
             name,
             mtx: std::sync::Mutex::new(()),
         };
+        tun.configure_ipv6_interface()?;
+        tun.add_zpr_prefix_route()?;
         // A Wintun adapter comes up at MTU 65535, far above what the overlay
         // carries; the adapter is fresh every start, so set it
         // unconditionally (zl-zipline#214).
         tun.set_mtu(effective_tun_mtu(None))?;
         Ok(vec![tun])
+    }
+
+    /// The adapter's interface LUID, the key of every IP Helper call.
+    fn luid(&self) -> NET_LUID_LH {
+        // SAFETY: NET_LUID_LH is a union whose every variant is a view of
+        // the same 64 bits; reading `Value` reads them as a plain u64. (The
+        // wintun crate has its own windows-sys version of the type, so the
+        // value is copied across rather than the struct.)
+        NET_LUID_LH {
+            Value: unsafe { self.adapter.get_luid().Value },
+        }
+    }
+
+    /// Read the adapter's IPv6 interface row, apply
+    /// [`apply_zpr_interface_settings`], and write it back, through IP
+    /// Helper (`GetIpInterfaceEntry`, `SetIpInterfaceEntry`). The settings
+    /// are not persistent; the adapter is fresh every start.
+    fn configure_ipv6_interface(&self) -> std::result::Result<(), ZprTunError> {
+        let mut row = MIB_IPINTERFACE_ROW::default();
+        // SAFETY: `row` is a valid MIB_IPINTERFACE_ROW that outlives the
+        // call; the function only writes default values into it.
+        unsafe { InitializeIpInterfaceEntry(&mut row) };
+        row.Family = AF_INET6;
+        row.InterfaceLuid = self.luid();
+        // SAFETY: `row` is initialized and outlives the call; the function
+        // reads the key (Family, InterfaceLuid) and fills the rest in place.
+        let rc = unsafe { GetIpInterfaceEntry(&mut row) };
+        self.check_win32("GetIpInterfaceEntry", rc)?;
+        apply_zpr_interface_settings(&mut row);
+        // SAFETY: `row` is the row Windows just returned, with only the
+        // fields above changed; it outlives the call.
+        let rc = unsafe { SetIpInterfaceEntry(&mut row) };
+        self.check_win32("SetIpInterfaceEntry", rc)
+    }
+
+    /// Add the route `fd5a:5052::/32` via [`ZPR_NEXT_HOP`] on the adapter
+    /// through IP Helper (`CreateIpForwardEntry2`); see the module doc for
+    /// why the prefix is routed rather than on-link. The adapter is fresh
+    /// every start, so the route never exists yet.
+    fn add_zpr_prefix_route(&self) -> std::result::Result<(), ZprTunError> {
+        let mut row = MIB_IPFORWARD_ROW2::default();
+        // SAFETY: `row` is a valid MIB_IPFORWARD_ROW2 that outlives the
+        // call; the function only writes default values into it.
+        unsafe { InitializeIpForwardEntry(&mut row) };
+        zpr_prefix_route(&mut row, self.luid());
+        // SAFETY: `row` is initialized and outlives the call, which only
+        // reads it.
+        let rc = unsafe { CreateIpForwardEntry2(&row) };
+        self.check_win32("CreateIpForwardEntry2", rc)
+    }
+
+    /// Turn the Win32 return code `rc` of the IP Helper call `call` into a
+    /// result that names the call, the adapter and the error.
+    fn check_win32(&self, call: &str, rc: u32) -> std::result::Result<(), ZprTunError> {
+        if rc == NO_ERROR {
+            return Ok(());
+        }
+        Err(ZprTunError::PlatformError(format!(
+            "{call} failed on {}: Win32 error {rc} ({})",
+            self.name,
+            std::io::Error::from_raw_os_error(rc as i32)
+        )))
     }
 
     /// Set the IPv6 MTU of the adapter with
@@ -208,41 +305,40 @@ impl ZprTun {
         Ok(())
     }
 
-    /// Add `addr/prefix_len` to the adapter and wait until it is usable.
-    pub fn add_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
-        self.add_address_impl(addr, prefix_len, false)
+    /// Add `addr` to the adapter as a /128 and wait until it is usable.
+    ///
+    /// `prefix_len` is not used on Windows: the ZPR prefix is a route that
+    /// [`Self::new_mq`] installs, not an on-link prefix of the address
+    /// (zl-zipline#297). The parameter keeps the signature the same on
+    /// every platform.
+    pub fn add_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+        self.add_address_impl(addr, false)
     }
 
     /// Add the adapter authentication address (AAA, #1410) as a valid but
     /// deprecated source (`preferredlifetime=0`), the Windows equivalent of
     /// Linux's `preferred_lft 0`: applications prefer the granted actor
     /// address, and authentication binds the AAA explicitly. A deprecated
-    /// address still passes the DAD wait ([dad::DadState::Usable]).
-    pub fn add_authentication_address(&self, addr: IpAddr, prefix_len: u8) -> std::io::Result<()> {
-        self.add_address_impl(addr, prefix_len, true)
+    /// address still passes the DAD wait ([dad::DadState::Usable]). Like
+    /// [Self::add_address], it is a /128 and `prefix_len` is not used.
+    pub fn add_authentication_address(&self, addr: IpAddr, _prefix_len: u8) -> std::io::Result<()> {
+        self.add_address_impl(addr, true)
     }
 
     /// Shared body of [Self::add_address] and
     /// [Self::add_authentication_address].
     ///
-    /// The prefix length goes to netsh with the address: without it netsh
-    /// applies /64, and nothing outside the address's own /64 — the DNS
-    /// Zode included — is on-link (zl-zipline#272). With it, Windows
-    /// installs the on-link route for the prefix itself.
-    fn add_address_impl(
-        &self,
-        addr: IpAddr,
-        prefix_len: u8,
-        authentication: bool,
-    ) -> std::io::Result<()> {
+    /// The address goes on as a /128 (`netsh_add_address_args`); the rest
+    /// of the ZPR prefix, the DNS Zode and the visa service included, is
+    /// reached through the route [`Self::new_mq`] installs (zl-zipline#297).
+    fn add_address_impl(&self, addr: IpAddr, authentication: bool) -> std::io::Result<()> {
         let _mtx = self.lock()?;
         if self.has_address(addr)? {
             return Ok(());
         }
         let addr = require_v6("add_address", addr)?;
-        // netsh interface ipv6 add address <if> <addr>/<len> [preferredlifetime=0]
-        let args =
-            netsh_add_address_args(&self.name, &IpAddr::V6(addr), prefix_len, authentication);
+        // netsh interface ipv6 add address <if> <addr>/128 [preferredlifetime=0]
+        let args = netsh_add_address_args(&self.name, &IpAddr::V6(addr), authentication);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = self.netsh(&args).output()?;
         if !output.status.success() {
@@ -252,10 +348,12 @@ impl ZprTun {
                 netsh_output_text(&output)
             )));
         }
-        // netsh returns while the address is still tentative (DAD, ~1 s on
-        // Wintun), and binding to it in that window fails with
-        // WSAEADDRNOTAVAIL — the node's VSS listener lost that race on
-        // every start (zipline#162). Wait, bounded, until it is usable.
+        // Binding to an address that is not usable yet fails with
+        // WSAEADDRNOTAVAIL; the node's VSS listener lost that race on every
+        // start while DAD ran (zipline#162). DAD is off now
+        // (`DadTransmits = 0`), so the address is usable on the first read.
+        // The bounded wait stays as a guard against an address Windows has
+        // not shown yet, or a host policy that turns DAD back on.
         dad::wait_until_usable(
             || self.dad_state(addr),
             dad::DAD_WAIT_TIMEOUT,
@@ -275,11 +373,11 @@ impl ZprTun {
     /// which would not parse on a non-English Windows. An address that is
     /// not (yet) on the adapter is a `NotFound` error.
     fn dad_state(&self, addr: Ipv6Addr) -> std::io::Result<dad::DadState> {
-        let mut row = MIB_UNICASTIPADDRESS_ROW::default();
         // The lookup key is (interface LUID, address).
-        // SAFETY: NET_LUID_LH is a union whose every variant is a view of
-        // the same 64 bits; reading `Value` reads them as a plain u64.
-        row.InterfaceLuid.Value = unsafe { self.adapter.get_luid().Value };
+        let mut row = MIB_UNICASTIPADDRESS_ROW {
+            InterfaceLuid: self.luid(),
+            ..Default::default()
+        };
         row.Address.Ipv6.sin6_family = AF_INET6;
         row.Address.Ipv6.sin6_addr.u.Byte = addr.octets();
         // SAFETY: `row` is a valid, initialized MIB_UNICASTIPADDRESS_ROW
@@ -411,6 +509,49 @@ impl Waitable for ZprTun {
     }
 }
 
+/// Set the IPv6 interface fields that wireguard-windows sets on its Wintun
+/// adapters (`tunnel/addressconfig.go`), so Windows sends no router
+/// solicitations, runs no duplicate-address detection, and asks for no
+/// DHCPv6 (zl-zipline#297):
+///
+/// - `RouterDiscoveryBehavior` disabled: there is no IPv6 router on the
+///   ZPR link, so router solicitations only add traffic.
+/// - `DadTransmits` 0: an address added to the adapter is usable at once
+///   (no tentative window, zipline#162), and Windows sends no DAD neighbor
+///   solicitations or unsolicited neighbor advertisements.
+/// - `ManagedAddressConfigurationSupported` and
+///   `OtherStatefulConfigurationSupported` false: no DHCPv6.
+/// - `SitePrefixLength` at most 128: Windows can report a stale value above
+///   128, and `SetIpInterfaceEntry` rejects the row with it
+///   (ERROR_INVALID_PARAMETER).
+///
+/// Neighbor unreachability detection is left on: Windows rejects
+/// `UseNeighborUnreachabilityDetection = FALSE` on a Wintun interface with
+/// ERROR_INVALID_PARAMETER. The routed ZPR prefix ([`zpr_prefix_route`])
+/// keeps its probes off the visa service. IPv6 only: `ph` puts no IPv4 on
+/// the adapter.
+fn apply_zpr_interface_settings(row: &mut MIB_IPINTERFACE_ROW) {
+    row.RouterDiscoveryBehavior = RouterDiscoveryDisabled;
+    row.DadTransmits = 0;
+    row.ManagedAddressConfigurationSupported = false;
+    row.OtherStatefulConfigurationSupported = false;
+    row.SitePrefixLength = row.SitePrefixLength.min(128);
+}
+
+/// Fill `row` with the route `ZPR_INTERNAL_NETWORK/ZPRNET_PREFIX_LEN`
+/// (`fd5a:5052::/32`) via [`ZPR_NEXT_HOP`] on the interface `luid`, as a
+/// static route (`MIB_IPPROTO_NETMGMT`). `row` comes from
+/// `InitializeIpForwardEntry`, whose defaults (lifetimes, metric) stay.
+fn zpr_prefix_route(row: &mut MIB_IPFORWARD_ROW2, luid: NET_LUID_LH) {
+    row.InterfaceLuid = luid;
+    row.DestinationPrefix.Prefix.Ipv6.sin6_family = AF_INET6;
+    row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte = ZPR_INTERNAL_NETWORK.octets();
+    row.DestinationPrefix.PrefixLength = ZPRNET_PREFIX_LEN;
+    row.NextHop.Ipv6.sin6_family = AF_INET6;
+    row.NextHop.Ipv6.sin6_addr.u.Byte = ZPR_NEXT_HOP.octets();
+    row.Protocol = MIB_IPPROTO_NETMGMT;
+}
+
 /// IPv4 is unsupported on the ZPR TUN across platforms; error uniformly.
 fn require_v6(what: &str, addr: IpAddr) -> std::io::Result<std::net::Ipv6Addr> {
     match addr {
@@ -429,4 +570,109 @@ fn netsh_output_text(output: &std::process::Output) -> String {
         String::from_utf8_lossy(&output.stdout).trim(),
         String::from_utf8_lossy(&output.stderr).trim()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    use windows_sys::Win32::Networking::WinSock::{
+        MIB_IPPROTO_NETMGMT, RouterDiscoveryDisabled, RouterDiscoveryEnabled,
+    };
+
+    /// The raw bytes of an IP Helper row, so a test can check that a
+    /// function changed only the fields it names. The windows-sys rows have
+    /// no `PartialEq` (they hold unions), and `Default` zeroes them, padding
+    /// included.
+    fn bytes_of<T: Copy>(row: &T) -> Vec<u8> {
+        // SAFETY: `row` is a valid, initialized `T` that outlives the slice;
+        // the slice covers exactly its `size_of::<T>()` bytes and is copied
+        // out before the borrow ends.
+        unsafe {
+            std::slice::from_raw_parts((row as *const T).cast::<u8>(), size_of::<T>()).to_vec()
+        }
+    }
+
+    /// A row as Windows reports it for a fresh Wintun adapter (planning
+    /// read-back on the VM): router discovery on, one DAD transmit, NUD on.
+    fn fresh_interface_row() -> MIB_IPINTERFACE_ROW {
+        MIB_IPINTERFACE_ROW {
+            Family: AF_INET6,
+            RouterDiscoveryBehavior: RouterDiscoveryEnabled,
+            DadTransmits: 1,
+            ManagedAddressConfigurationSupported: true,
+            OtherStatefulConfigurationSupported: true,
+            UseNeighborUnreachabilityDetection: true,
+            SupportsNeighborDiscovery: true,
+            BaseReachableTime: 30_000,
+            RetransmitTime: 1_000,
+            NlMtu: 1_400,
+            SitePrefixLength: 64,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn zpr_interface_settings_turn_off_dad_and_router_discovery() {
+        let mut row = fresh_interface_row();
+        apply_zpr_interface_settings(&mut row);
+
+        assert_eq!(row.RouterDiscoveryBehavior, RouterDiscoveryDisabled);
+        assert_eq!(row.DadTransmits, 0);
+        assert!(!row.ManagedAddressConfigurationSupported);
+        assert!(!row.OtherStatefulConfigurationSupported);
+        // NUD stays on: Windows rejects turning it off on Wintun.
+        assert!(row.UseNeighborUnreachabilityDetection);
+
+        // Every other field is as it was.
+        let mut expected = fresh_interface_row();
+        expected.RouterDiscoveryBehavior = RouterDiscoveryDisabled;
+        expected.DadTransmits = 0;
+        expected.ManagedAddressConfigurationSupported = false;
+        expected.OtherStatefulConfigurationSupported = false;
+        assert_eq!(bytes_of(&row), bytes_of(&expected));
+    }
+
+    #[test]
+    fn zpr_interface_settings_clamp_site_prefix_length() {
+        let mut row = fresh_interface_row();
+        row.SitePrefixLength = 200;
+        apply_zpr_interface_settings(&mut row);
+        assert_eq!(row.SitePrefixLength, 128);
+
+        let mut row = fresh_interface_row();
+        row.SitePrefixLength = 64;
+        apply_zpr_interface_settings(&mut row);
+        assert_eq!(row.SitePrefixLength, 64);
+    }
+
+    #[test]
+    fn zpr_prefix_route_is_fd5a_5052_32_via_fe80_1() {
+        let luid = NET_LUID_LH {
+            Value: 0x1234_5678_9abc,
+        };
+        let mut row = MIB_IPFORWARD_ROW2::default();
+        zpr_prefix_route(&mut row, luid);
+
+        // SAFETY: NET_LUID_LH and SOCKADDR_INET are unions whose variants
+        // view the same bytes; `zpr_prefix_route` filled the IPv6 views.
+        unsafe {
+            assert_eq!(row.InterfaceLuid.Value, 0x1234_5678_9abc);
+            assert_eq!(row.DestinationPrefix.Prefix.si_family, AF_INET6);
+            assert_eq!(
+                Ipv6Addr::from(row.DestinationPrefix.Prefix.Ipv6.sin6_addr.u.Byte),
+                "fd5a:5052::".parse::<Ipv6Addr>().unwrap()
+            );
+            assert_eq!(row.NextHop.si_family, AF_INET6);
+            assert_eq!(
+                Ipv6Addr::from(row.NextHop.Ipv6.sin6_addr.u.Byte),
+                "fe80::1".parse::<Ipv6Addr>().unwrap()
+            );
+        }
+        assert_eq!(row.DestinationPrefix.PrefixLength, 32);
+        assert_eq!(row.Protocol, MIB_IPPROTO_NETMGMT);
+    }
 }

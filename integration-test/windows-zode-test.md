@@ -221,6 +221,19 @@ New-NetFirewallRule -DisplayName zpr-zode-vss -Direction Inbound `
   That is the address the visa service holds for zb: zb's real address on
   the VM network.
 * `ping -6 -n 5 fd5a:5052::1` (the visa service, through the relay): 5/5.
+* The adapter routes the ZPR prefix and does no DAD or router discovery
+  (zl-zipline#297). `Get-NetIPAddress -InterfaceAlias zpr-zode -AddressFamily
+  IPv6` shows `fd5a:5052::3` with `PrefixLength 128`, `Preferred`.
+  `Get-NetRoute -InterfaceAlias zpr-zode -AddressFamily IPv6` shows
+  `fd5a:5052::/32` with `NextHop fe80::1`, and no on-link `fd5a:5052::/32`.
+  `Get-NetIPInterface -InterfaceAlias zpr-zode -AddressFamily IPv6 | fl *`
+  shows `RouterDiscovery Disabled`, `DadTransmits 0`, `ManagedAddressConfiguration
+  Disabled`, `OtherStatefulConfiguration Disabled`.
+* Started with `-l flow_mgmt=DEBUG`, zb logs no `issuing visa request` for
+  ICMPv6 types 133-137 (`58, 133` to `58, 137`), and vs.log has no deny for
+  ICMPv6 type 135. `netsh interface ipv6 show neighbors zpr-zode` lists
+  `fe80::1` (Probe or Unreachable), not `fd5a:5052::1`: nothing answers the
+  next hop, and `ph` drops link-local traffic before it asks for a visa.
 
 ## 3. Log in on the Zode (zl-zipline#233)
 

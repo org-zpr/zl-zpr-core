@@ -230,8 +230,12 @@ New-NetFirewallRule -DisplayName zpr-zode-vss -Direction Inbound `
   shows `RouterDiscovery Disabled`, `DadTransmits 0`, `ManagedAddressConfiguration
   Disabled`, `OtherStatefulConfiguration Disabled`.
 * Started with `-l flow_mgmt=DEBUG`, zb logs no `issuing visa request` for
-  ICMPv6 types 133-137 (`58, 133` to `58, 137`), and vs.log has no deny for
-  ICMPv6 type 135. `netsh interface ipv6 show neighbors zpr-zode` lists
+  ICMPv6 types 133-137 (`58, 133` to `58, 137`). The visa service records
+  no new `NoMatch` deny from zb to `fd5a:5052::1` with protocol 58: in the
+  container shell, in `$WORK/run`, `"$VS_ADMIN_BIN" -s "$ADMIN_URL" -c
+  ca.crt --api-key-file vs-admin.key visas --denies --last 15m`. (vs.log
+  logs a `NoMatch` deny without the ICMPv6 type, so search the deny list,
+  not the log.) `netsh interface ipv6 show neighbors zpr-zode` lists
   `fe80::1` (Probe or Unreachable), not `fd5a:5052::1`: nothing answers the
   next hop, and `ph` drops link-local traffic before it asks for a visa.
 

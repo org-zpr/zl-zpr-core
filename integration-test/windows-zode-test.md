@@ -221,6 +221,23 @@ New-NetFirewallRule -DisplayName zpr-zode-vss -Direction Inbound `
   That is the address the visa service holds for zb: zb's real address on
   the VM network.
 * `ping -6 -n 5 fd5a:5052::1` (the visa service, through the relay): 5/5.
+* The adapter routes the ZPR prefix and does no DAD or router discovery
+  (zl-zipline#297). `Get-NetIPAddress -InterfaceAlias zpr-zode -AddressFamily
+  IPv6` shows `fd5a:5052::3` with `PrefixLength 128`, `Preferred`.
+  `Get-NetRoute -InterfaceAlias zpr-zode -AddressFamily IPv6` shows
+  `fd5a:5052::/32` with `NextHop fe80::1`, and no on-link `fd5a:5052::/32`.
+  `Get-NetIPInterface -InterfaceAlias zpr-zode -AddressFamily IPv6 | fl *`
+  shows `RouterDiscovery Disabled`, `DadTransmits 0`, `ManagedAddressConfiguration
+  Disabled`, `OtherStatefulConfiguration Disabled`.
+* Started with `-l flow_mgmt=DEBUG`, zb logs no `issuing visa request` for
+  ICMPv6 types 133-137 (`58, 133` to `58, 137`). The visa service records
+  no new `NoMatch` deny from zb to `fd5a:5052::1` with protocol 58: in the
+  container shell, in `$WORK/run`, `"$VS_ADMIN_BIN" -s "$ADMIN_URL" -c
+  ca.crt --api-key-file vs-admin.key visas --denies --last 15m`. (vs.log
+  logs a `NoMatch` deny without the ICMPv6 type, so search the deny list,
+  not the log.) `netsh interface ipv6 show neighbors zpr-zode` lists
+  `fe80::1` (Probe or Unreachable), not `fd5a:5052::1`: nothing answers the
+  next hop, and `ph` drops link-local traffic before it asks for a visa.
 
 ## 3. Log in on the Zode (zl-zipline#233)
 
@@ -464,6 +481,33 @@ service runs beside the relay).
 ## Findings
 
 *(keep one dated subsection per run)*
+
+### 2026-11-25 — Host ND no longer reaches the visa service (section 2, zl-zipline#297)
+
+* Builds (`zl-zpr-core`), on the VM: before `c5ffb70` (`zipline`), after
+  `mkolehmainen/297-win-nd` at `07ea51b`. The Linux relay ran the after
+  build. vs, vs-admin and zplc from build set `2026-11-24`. Policy:
+  `pregen/zodes-login.zplc`, relay `i0` rewritten. Windows 11, build 26200.
+* Each run: `ph.exe zode -l all=INFO -l flow_mgmt=DEBUG --tun-if zpr
+  --zpr-addr fd5a:5052::3`, a 60 s `ping -6` to `fd5a:5052::1`, then a
+  sample every minute (neighbors, TCP to and from `fd5a:5052::1`, 3 pings,
+  visa requests). Visa requests are counted from ph start, so start-up DAD
+  and NA are included.
+
+| Check | Before (316 s) | After (748 s) |
+|---|---|---|
+| visa requests, ICMPv6 types 133-137 | 87 (86 × type 135, 1 × type 136) | **0** |
+| visa requests, ICMPv6 echo (128) | 1 | 1 |
+| VS NoMatch denies, `fd5a:5052::3` → `fd5a:5052::1` proto 58 | 96 | **0** new |
+| neighbor table (`netsh ... show neighbors zpr`) | `fd5a:5052::1` Probe in every sample | `fe80::1` Probe or Unreachable in every sample; no `fd5a` neighbor |
+| address, route | `fd5a:5052::3/32`, `fd5a:5052::/32` on-link | `fd5a:5052::3/128`, `fd5a:5052::/32` via `fe80::1` (NetMgmt) |
+| interface | RouterDiscovery Enabled, DadTransmits 1 | RouterDiscovery Disabled, DadTransmits 0, M/O Disabled; NUD Enabled |
+| registered VSS | after 6 s | after 3 s |
+| VS-API (TCP 5002) and VSS (TCP 8183) connections | the same two Established in every sample | the same two Established in all 12 samples, while `fe80::1` sat in Probe/Unreachable |
+| pings to `fd5a:5052::1` | 60/60, then 3/3 per sample | 60/60, then 3/3 in all 12 samples |
+| DAD or bind errors (10049) | 0 | 0 |
+| Ctrl-C | not delivered (the runner's console); killed | `Got Ctrl-C; attempting graceful shutdown`, exited by itself |
+| `zpr` adapter after exit | none | none |
 
 ### 2026-11-14 — Zode with a wildcard address (section 2, zl-zipline#230)
 

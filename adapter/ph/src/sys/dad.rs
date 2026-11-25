@@ -1,13 +1,18 @@
 //! Waiting out IPv6 duplicate-address detection on a freshly added address
 //! (zipline#162, checklist item 1 of `integration-test/windows-zode-test.md`).
 //!
-//! Windows runs DAD on the Wintun adapter: an address added with `netsh`
+//! By default Windows runs DAD on a Wintun adapter: an address added with `netsh`
 //! sits in the *tentative* state for about a second (`DadTransmits` = 1,
 //! `RetransmitTimeMs` = 1000), and binding a socket to it in that window
 //! fails with `WSAEADDRNOTAVAIL` (10049). The node binds its VSS listener to
 //! its ZPR address right after self-addressing, so it lost that race on
 //! every start in the first VM run. The Windows `add_address` therefore
 //! waits — bounded — until the address leaves the tentative state.
+//!
+//! Since zl-zipline#297 `ph` turns DAD off on the adapter (`DadTransmits` =
+//! 0), so the address is usable on the first read and the wait costs one IP
+//! Helper call. It stays as a bounded guard against an address Windows has
+//! not shown yet, or a host policy that turns DAD back on.
 //!
 //! This module is the platform-neutral half: the DAD-state model and the
 //! polling loop. It is compiled on every OS so it stays unit-testable from
